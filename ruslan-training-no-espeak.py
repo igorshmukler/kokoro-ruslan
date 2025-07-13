@@ -46,40 +46,40 @@ class RussianPhonemeProcessor:
     Russian phoneme processor without espeak dependency
     Uses rule-based grapheme-to-phoneme conversion for Russian
     """
-    
+
     def __init__(self):
         # Russian phoneme mapping (simplified)
         self.vowels = {
             'а': 'a', 'о': 'o', 'у': 'u', 'ы': 'i', 'э': 'e',
             'я': 'ja', 'ё': 'jo', 'ю': 'ju', 'и': 'i', 'е': 'je'
         }
-        
+
         self.consonants = {
             'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'ж': 'zh',
             'з': 'z', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
             'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'ф': 'f',
             'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch'
         }
-        
+
         self.special_chars = {
             'ь': '', 'ъ': '', ' ': ' ', '.': '.', ',': ',',
             '!': '!', '?': '?', '-': '-'
         }
-        
+
         # Combined phoneme vocabulary
         self.phonemes = list(self.vowels.values()) + list(self.consonants.values()) + \
                        list(self.special_chars.values())
         self.phonemes = list(set(self.phonemes))  # Remove duplicates
-        
+
         # Create phoneme to index mapping
         self.phoneme_to_idx = {p: i for i, p in enumerate(self.phonemes)}
         self.idx_to_phoneme = {i: p for i, p in enumerate(self.phonemes)}
-        
+
     def text_to_phonemes(self, text: str) -> List[str]:
         """Convert Russian text to phonemes"""
         text = text.lower().strip()
         phonemes = []
-        
+
         for char in text:
             if char in self.vowels:
                 phonemes.append(self.vowels[char])
@@ -91,29 +91,29 @@ class RussianPhonemeProcessor:
             else:
                 # Unknown character, skip or replace with space
                 phonemes.append(' ')
-                
+
         return phonemes
-    
+
     def phonemes_to_indices(self, phonemes: List[str]) -> List[int]:
         """Convert phonemes to indices"""
         return [self.phoneme_to_idx.get(p, 0) for p in phonemes]
 
 class RuslanDataset(Dataset):
     """Dataset class for Ruslan corpus"""
-    
+
     def __init__(self, data_dir: str, config: TrainingConfig):
         self.data_dir = Path(data_dir)
         self.config = config
         self.phoneme_processor = RussianPhonemeProcessor()
-        
+
         # Load metadata
         self.samples = self._load_samples()
         logger.info(f"Loaded {len(self.samples)} samples from Ruslan corpus")
-        
+
     def _load_samples(self) -> List[Dict]:
         """Load samples from Ruslan corpus directory"""
         samples = []
-        
+
         # Look for metadata file (adjust path as needed)
         metadata_file = self.data_dir / "metadata_RUSLAN_22200.csv"
         if metadata_file.exists():
@@ -124,7 +124,7 @@ class RuslanDataset(Dataset):
                     if len(parts) >= 2:
                         audio_file = parts[0]
                         text = parts[1]
-                        
+
                         audio_path = self.data_dir / "wavs" / f"{audio_file}.wav"
                         if audio_path.exists():
                             samples.append({
@@ -137,7 +137,7 @@ class RuslanDataset(Dataset):
             logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan.")
             wav_dir = self.data_dir / "wavs"
             txt_dir = self.data_dir / "texts"
-            
+    
             if wav_dir.exists():
                 for wav_file in wav_dir.glob("*.wav"):
                     txt_file = txt_dir / f"{wav_file.stem}.txt"
@@ -149,27 +149,30 @@ class RuslanDataset(Dataset):
                             'text': text,
                             'audio_file': wav_file.stem
                         })
-        
+
         return samples
-    
+
     def __len__(self) -> int:
         return len(self.samples)
-    
+
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
-        
+
         # Load audio
         audio, sr = torchaudio.load(sample['audio_path'])
-        
+
         # Resample if necessary
         if sr != self.config.sample_rate:
             resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
             audio = resampler(audio)
-        
+
         # Convert to mono if stereo
         if audio.shape[0] > 1:
             audio = audio.mean(dim=0, keepdim=True)
-        
+
+        # Normalize audio to prevent numerical issues
+        audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
+
         # Extract mel spectrogram
         mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.config.sample_rate,
@@ -183,14 +186,19 @@ class RuslanDataset(Dataset):
             normalized=False
         )
         mel_spec = mel_transform(audio).squeeze(0)  # Remove channel dimension
-        
+
         # Convert to log scale and normalize
         mel_spec = torch.log(mel_spec + 1e-9)  # Add small epsilon to avoid log(0)
-        
+
+        # Clip extremely long sequences to prevent memory issues
+        max_frames = 1000  # Adjust based on your needs
+        if mel_spec.shape[1] > max_frames:
+            mel_spec = mel_spec[:, :max_frames]
+
         # Process text to phonemes
         phonemes = self.phoneme_processor.text_to_phonemes(sample['text'])
         phoneme_indices = self.phoneme_processor.phonemes_to_indices(phonemes)
-        
+
         return {
             'mel_spec': mel_spec,
             'phoneme_indices': torch.tensor(phoneme_indices, dtype=torch.long),
@@ -204,11 +212,11 @@ def collate_fn(batch: List[Dict]) -> Dict:
     phoneme_indices = [item['phoneme_indices'] for item in batch]
     texts = [item['text'] for item in batch]
     audio_files = [item['audio_file'] for item in batch]
-    
+
     # Pad sequences
     mel_specs_padded = pad_sequence(mel_specs, batch_first=True, padding_value=0)
     phoneme_indices_padded = pad_sequence(phoneme_indices, batch_first=True, padding_value=0)
-    
+
     return {
         'mel_specs': mel_specs_padded,
         'phoneme_indices': phoneme_indices_padded,
@@ -221,53 +229,53 @@ class KokoroModel(torch.nn.Module):
     Simplified Kokoro-style model architecture
     Text-to-Speech model with attention mechanism
     """
-    
+
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512):
         super().__init__()
         self.vocab_size = vocab_size
         self.mel_dim = mel_dim
         self.hidden_dim = hidden_dim
-        
+
         # Text encoder
         self.text_embedding = torch.nn.Embedding(vocab_size, hidden_dim)
         self.text_encoder = torch.nn.LSTM(
             hidden_dim, hidden_dim, batch_first=True, bidirectional=True
         )
-        
+
         # Project bidirectional LSTM output back to hidden_dim
         self.text_projection = torch.nn.Linear(hidden_dim * 2, hidden_dim)
-        
+
         # Mel feature projection to match hidden dimension
         self.mel_projection_in = torch.nn.Linear(mel_dim, hidden_dim)
-        
+
         # Decoder
         self.decoder = torch.nn.LSTM(
             hidden_dim + hidden_dim, hidden_dim, batch_first=True
         )
-        
+
         # Attention mechanism
         self.attention = torch.nn.MultiheadAttention(
             hidden_dim, num_heads=8, batch_first=True
         )
-        
+
         # Output projection
         self.mel_projection_out = torch.nn.Linear(hidden_dim, mel_dim)
-        
+
     def forward(self, phoneme_indices: torch.Tensor, mel_specs: torch.Tensor = None) -> torch.Tensor:
         batch_size = phoneme_indices.size(0)
-        
+
         # Text encoding
         text_emb = self.text_embedding(phoneme_indices)
         text_encoded, _ = self.text_encoder(text_emb)
-        
+
         # Project bidirectional output to hidden_dim
         text_encoded = self.text_projection(text_encoded)
-        
+
         if mel_specs is not None:
             # Training mode
             seq_len = mel_specs.size(1)
             outputs = []
-            
+
             hidden = None
             for t in range(seq_len):
                 # Current mel frame
@@ -285,7 +293,7 @@ class KokoroModel(torch.nn.Module):
                     text_encoded,
                     text_encoded
                 )
-                
+
                 # Decoder step
                 decoder_input = torch.cat([mel_projected, attended], dim=2)
                 decoder_out, hidden = self.decoder(decoder_input, hidden)
@@ -338,7 +346,8 @@ def train_model(config: TrainingConfig):
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=4
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
+        pin_memory=False  # Disable pin_memory to reduce memory usage
     )
     
     # Initialize model
@@ -364,6 +373,10 @@ def train_model(config: TrainingConfig):
             
             # Forward pass
             optimizer.zero_grad()
+            
+            # Add gradient clipping to prevent exploding gradients
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             predictions = model(phoneme_indices, mel_specs)
             
             # Calculate loss
@@ -373,6 +386,13 @@ def train_model(config: TrainingConfig):
             
             total_loss += loss.item()
             progress_bar.set_postfix({'loss': loss.item()})
+            
+            # Clear cache periodically to prevent memory buildup
+            if batch_idx % 100 == 0:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                    torch.mps.empty_cache()
         
         avg_loss = total_loss / len(dataloader)
         logger.info(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
@@ -405,7 +425,7 @@ def main():
     config = TrainingConfig(
         data_dir="./ruslan_corpus",
         output_dir="./kokoro_russian_model",
-        batch_size=8,  # Adjust based on GPU memory
+        batch_size=4,  # Reduced batch size for memory efficiency
         learning_rate=1e-4,
         num_epochs=100,
         sample_rate=22050,

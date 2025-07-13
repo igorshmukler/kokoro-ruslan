@@ -1,0 +1,26 @@
+# PyTorch and related libraries
+torch>=2.0.0
+torchaudio>=2.0.0
+
+# Data processing and utilities
+numpy>=1.21.0
+pathlib
+
+# Progress bars and logging
+tqdm>=4.64.0
+
+# Standard library dependencies (usually included with Python)
+# os
+# json
+# logging
+# re
+# typing
+# dataclasses
+
+# Optional: For better performance (if using CUDA)
+# torch-audio  # Alternative audio processing
+# librosa>=0.9.0  # Alternative audio processing library
+
+# Development and debugging (optional)
+# matplotlib>=3.5.0  # For visualization during development
+# tensorboard>=2.8.0  # For training monitoring
