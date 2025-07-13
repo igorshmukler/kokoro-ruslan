@@ -34,7 +34,10 @@ class TrainingConfig:
     sample_rate: int = 22050
     hop_length: int = 256
     win_length: int = 1024
+    n_fft: int = 1024
     n_mels: int = 80
+    f_min: float = 0.0
+    f_max: float = 8000.0
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     save_every: int = 10
 
@@ -130,8 +133,8 @@ class RuslanDataset(Dataset):
                                 'audio_file': audio_file
                             })
         else:
-            logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan.")
             # Fallback: scan for wav files and corresponding text files
+            logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan.")
             wav_dir = self.data_dir / "wavs"
             txt_dir = self.data_dir / "texts"
             
@@ -170,11 +173,19 @@ class RuslanDataset(Dataset):
         # Extract mel spectrogram
         mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.config.sample_rate,
+            n_fft=self.config.n_fft,
             n_mels=self.config.n_mels,
             hop_length=self.config.hop_length,
-            win_length=self.config.win_length
+            win_length=self.config.win_length,
+            f_min=self.config.f_min,
+            f_max=self.config.f_max,
+            power=2.0,
+            normalized=False
         )
         mel_spec = mel_transform(audio).squeeze(0)  # Remove channel dimension
+        
+        # Convert to log scale and normalize
+        mel_spec = torch.log(mel_spec + 1e-9)  # Add small epsilon to avoid log(0)
         
         # Process text to phonemes
         phonemes = self.phoneme_processor.text_to_phonemes(sample['text'])
@@ -223,9 +234,15 @@ class KokoroModel(torch.nn.Module):
             hidden_dim, hidden_dim, batch_first=True, bidirectional=True
         )
         
+        # Project bidirectional LSTM output back to hidden_dim
+        self.text_projection = torch.nn.Linear(hidden_dim * 2, hidden_dim)
+        
+        # Mel feature projection to match hidden dimension
+        self.mel_projection_in = torch.nn.Linear(mel_dim, hidden_dim)
+        
         # Decoder
         self.decoder = torch.nn.LSTM(
-            mel_dim + hidden_dim * 2, hidden_dim, batch_first=True
+            hidden_dim + hidden_dim, hidden_dim, batch_first=True
         )
         
         # Attention mechanism
@@ -234,7 +251,7 @@ class KokoroModel(torch.nn.Module):
         )
         
         # Output projection
-        self.mel_projection = torch.nn.Linear(hidden_dim, mel_dim)
+        self.mel_projection_out = torch.nn.Linear(hidden_dim, mel_dim)
         
     def forward(self, phoneme_indices: torch.Tensor, mel_specs: torch.Tensor = None) -> torch.Tensor:
         batch_size = phoneme_indices.size(0)
@@ -242,6 +259,9 @@ class KokoroModel(torch.nn.Module):
         # Text encoding
         text_emb = self.text_embedding(phoneme_indices)
         text_encoded, _ = self.text_encoder(text_emb)
+        
+        # Project bidirectional output to hidden_dim
+        text_encoded = self.text_projection(text_encoded)
         
         if mel_specs is not None:
             # Training mode
@@ -256,20 +276,22 @@ class KokoroModel(torch.nn.Module):
                 else:
                     mel_input = mel_specs[:, t-1:t, :]
                 
+                # Project mel to hidden dimension
+                mel_projected = self.mel_projection_in(mel_input)
+                
                 # Attention over text
                 attended, _ = self.attention(
-                    mel_input.expand(-1, text_encoded.size(1), -1),
+                    mel_projected,
                     text_encoded,
                     text_encoded
                 )
-                context = attended.mean(dim=1, keepdim=True)
                 
                 # Decoder step
-                decoder_input = torch.cat([mel_input, context], dim=2)
+                decoder_input = torch.cat([mel_projected, attended], dim=2)
                 decoder_out, hidden = self.decoder(decoder_input, hidden)
                 
-                # Project to mel
-                mel_pred = self.mel_projection(decoder_out)
+                # Project back to mel
+                mel_pred = self.mel_projection_out(decoder_out)
                 outputs.append(mel_pred)
             
             return torch.cat(outputs, dim=1)
@@ -281,20 +303,22 @@ class KokoroModel(torch.nn.Module):
             mel_input = torch.zeros(batch_size, 1, self.mel_dim, device=phoneme_indices.device)
             
             for t in range(max_len):
+                # Project mel to hidden dimension
+                mel_projected = self.mel_projection_in(mel_input)
+                
                 # Attention over text
                 attended, _ = self.attention(
-                    mel_input.expand(-1, text_encoded.size(1), -1),
+                    mel_projected,
                     text_encoded,
                     text_encoded
                 )
-                context = attended.mean(dim=1, keepdim=True)
                 
                 # Decoder step
-                decoder_input = torch.cat([mel_input, context], dim=2)
+                decoder_input = torch.cat([mel_projected, attended], dim=2)
                 decoder_out, hidden = self.decoder(decoder_input, hidden)
                 
-                # Project to mel
-                mel_pred = self.mel_projection(decoder_out)
+                # Project back to mel
+                mel_pred = self.mel_projection_out(decoder_out)
                 outputs.append(mel_pred)
                 
                 # Use prediction as next input
@@ -385,7 +409,12 @@ def main():
         learning_rate=1e-4,
         num_epochs=100,
         sample_rate=22050,
+        hop_length=256,
+        win_length=1024,
+        n_fft=1024,
         n_mels=80,
+        f_min=0.0,
+        f_max=8000.0,  # Set to sr/2 or lower to avoid issues
         save_every=10
     )
     
