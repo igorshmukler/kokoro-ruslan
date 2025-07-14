@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Kokoro Language Model Training Script for Russian (Ruslan Corpus)
-Training script without espeak dependency - uses direct phoneme processing
+Training script optimized for Mac MPS acceleration
 """
 
 import os
@@ -27,7 +27,7 @@ class TrainingConfig:
     """Training configuration for Kokoro model"""
     data_dir: str = "./ruslan_corpus"
     output_dir: str = "./kokoro_russian_model"
-    batch_size: int = 16
+    batch_size: int = 8  # Increased for MPS
     learning_rate: float = 1e-4
     num_epochs: int = 100
     max_seq_length: int = 1024
@@ -38,8 +38,11 @@ class TrainingConfig:
     n_mels: int = 80
     f_min: float = 0.0
     f_max: float = 8000.0
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    save_every: int = 10
+    device: str = "mps" if torch.backends.mps.is_available() else "cpu"
+    save_every: int = 2
+    use_mixed_precision: bool = True  # Enable for MPS
+    num_workers: int = 0  # Set to 0 for MPS compatibility
+    pin_memory: bool = False  # Disable for MPS
 
 class RussianPhonemeProcessor:
     """
@@ -99,12 +102,25 @@ class RussianPhonemeProcessor:
         return [self.phoneme_to_idx.get(p, 0) for p in phonemes]
 
 class RuslanDataset(Dataset):
-    """Dataset class for Ruslan corpus"""
+    """Dataset class for Ruslan corpus - optimized for MPS"""
 
     def __init__(self, data_dir: str, config: TrainingConfig):
         self.data_dir = Path(data_dir)
         self.config = config
         self.phoneme_processor = RussianPhonemeProcessor()
+
+        # Pre-create mel transform for efficiency
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.config.sample_rate,
+            n_fft=self.config.n_fft,
+            n_mels=self.config.n_mels,
+            hop_length=self.config.hop_length,
+            win_length=self.config.win_length,
+            f_min=self.config.f_min,
+            f_max=self.config.f_max,
+            power=2.0,
+            normalized=False
+        )
 
         # Load metadata
         self.samples = self._load_samples()
@@ -173,25 +189,14 @@ class RuslanDataset(Dataset):
         # Normalize audio to prevent numerical issues
         audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
 
-        # Extract mel spectrogram
-        mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=self.config.sample_rate,
-            n_fft=self.config.n_fft,
-            n_mels=self.config.n_mels,
-            hop_length=self.config.hop_length,
-            win_length=self.config.win_length,
-            f_min=self.config.f_min,
-            f_max=self.config.f_max,
-            power=2.0,
-            normalized=False
-        )
-        mel_spec = mel_transform(audio).squeeze(0)  # Remove channel dimension
+        # Extract mel spectrogram using pre-created transform
+        mel_spec = self.mel_transform(audio).squeeze(0)  # Remove channel dimension
 
         # Convert to log scale and normalize
         mel_spec = torch.log(mel_spec + 1e-9)  # Add small epsilon to avoid log(0)
 
         # Clip extremely long sequences to prevent memory issues
-        max_frames = 1000  # Adjust based on your needs
+        max_frames = 800  # Reduced for better MPS memory management
         if mel_spec.shape[1] > max_frames:
             mel_spec = mel_spec[:, :max_frames]
 
@@ -207,7 +212,7 @@ class RuslanDataset(Dataset):
         }
 
 def collate_fn(batch: List[Dict]) -> Dict:
-    """Collate function for DataLoader"""
+    """Collate function for DataLoader - optimized for MPS"""
     mel_specs = [item['mel_spec'].transpose(0, 1) for item in batch]  # (time, mel_dim)
     phoneme_indices = [item['phoneme_indices'] for item in batch]
     texts = [item['text'] for item in batch]
@@ -226,7 +231,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
 
 class KokoroModel(torch.nn.Module):
     """
-    Simplified Kokoro-style model architecture
+    Simplified Kokoro-style model architecture - optimized for MPS
     Text-to-Speech model with attention mechanism
     """
 
@@ -261,11 +266,15 @@ class KokoroModel(torch.nn.Module):
         # Output projection
         self.mel_projection_out = torch.nn.Linear(hidden_dim, mel_dim)
 
+        # Dropout for regularization
+        self.dropout = torch.nn.Dropout(0.1)
+
     def forward(self, phoneme_indices: torch.Tensor, mel_specs: torch.Tensor = None) -> torch.Tensor:
         batch_size = phoneme_indices.size(0)
 
         # Text encoding
         text_emb = self.text_embedding(phoneme_indices)
+        text_emb = self.dropout(text_emb)
         text_encoded, _ = self.text_encoder(text_emb)
 
         # Project bidirectional output to hidden_dim
@@ -286,6 +295,7 @@ class KokoroModel(torch.nn.Module):
                 
                 # Project mel to hidden dimension
                 mel_projected = self.mel_projection_in(mel_input)
+                mel_projected = self.dropout(mel_projected)
                 
                 # Attention over text
                 attended, _ = self.attention(
@@ -297,6 +307,7 @@ class KokoroModel(torch.nn.Module):
                 # Decoder step
                 decoder_input = torch.cat([mel_projected, attended], dim=2)
                 decoder_out, hidden = self.decoder(decoder_input, hidden)
+                decoder_out = self.dropout(decoder_out)
                 
                 # Project back to mel
                 mel_pred = self.mel_projection_out(decoder_out)
@@ -305,7 +316,7 @@ class KokoroModel(torch.nn.Module):
             return torch.cat(outputs, dim=1)
         else:
             # Inference mode (simplified)
-            max_len = 1000
+            max_len = 800  # Reduced for MPS
             outputs = []
             hidden = None
             mel_input = torch.zeros(batch_size, 1, self.mel_dim, device=phoneme_indices.device)
@@ -335,7 +346,7 @@ class KokoroModel(torch.nn.Module):
             return torch.cat(outputs, dim=1)
 
 def train_model(config: TrainingConfig):
-    """Main training function"""
+    """Main training function - optimized for MPS"""
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
     
@@ -346,8 +357,8 @@ def train_model(config: TrainingConfig):
         batch_size=config.batch_size,
         shuffle=True,
         collate_fn=collate_fn,
-        num_workers=0,  # Set to 0 to avoid multiprocessing issues
-        pin_memory=False  # Disable pin_memory to reduce memory usage
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory
     )
     
     # Initialize model
@@ -356,60 +367,81 @@ def train_model(config: TrainingConfig):
     model.to(config.device)
     
     # Optimizer and loss
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.01)
     criterion = torch.nn.MSELoss()
     
+    # Learning rate scheduler
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=3
+    )
+
     # Training loop
-    logger.info("Starting training...")
+    logger.info(f"Starting training on device: {config.device}")
     for epoch in range(config.num_epochs):
         model.train()
         total_loss = 0.0
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
         for batch_idx, batch in enumerate(progress_bar):
-            # Move to device
-            mel_specs = batch['mel_specs'].to(config.device)
-            phoneme_indices = batch['phoneme_indices'].to(config.device)
-            
-            # Forward pass
-            optimizer.zero_grad()
-            
-            # Add gradient clipping to prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
-            predictions = model(phoneme_indices, mel_specs)
-            
-            # Calculate loss
-            loss = criterion(predictions, mel_specs)
-            loss.backward()
-            optimizer.step()
-            
-            total_loss += loss.item()
-            progress_bar.set_postfix({'loss': loss.item()})
-            
-            # Clear cache periodically to prevent memory buildup
-            if batch_idx % 100 == 0:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            try:
+                # Move to device
+                mel_specs = batch['mel_specs'].to(config.device, non_blocking=True)
+                phoneme_indices = batch['phoneme_indices'].to(config.device, non_blocking=True)
+
+                # Forward pass
+                optimizer.zero_grad()
+
+                predictions = model(phoneme_indices, mel_specs)
+
+                # Calculate loss
+                loss = criterion(predictions, mel_specs)
+                loss.backward()
+
+                # Gradient clipping to prevent exploding gradients
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                optimizer.step()
+
+                total_loss += loss.item()
+                progress_bar.set_postfix({'loss': loss.item()})
+
+                # Clear cache periodically to prevent memory buildup
+                if batch_idx % 50 == 0:
+                    if torch.backends.mps.is_available():
+                        torch.mps.empty_cache()
+
+            except Exception as e:
+                logger.error(f"Error in batch {batch_idx}: {e}")
+                # Clear cache on error
+                if torch.backends.mps.is_available():
                     torch.mps.empty_cache()
-        
+                continue
+
         avg_loss = total_loss / len(dataloader)
         logger.info(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
-        
+
+        # Step scheduler
+        scheduler.step(avg_loss)
+
         # Save checkpoint
         if (epoch + 1) % config.save_every == 0:
             checkpoint = {
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
-                'phoneme_processor': dataset.phoneme_processor
+                'phoneme_processor': dataset.phoneme_processor,
+                'config': config
             }
             checkpoint_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
             torch.save(checkpoint, checkpoint_path)
             logger.info(f"Checkpoint saved: {checkpoint_path}")
-    
+
+        # Clear cache after each epoch
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+
     # Save final model
     final_model_path = os.path.join(config.output_dir, "kokoro_russian_final.pth")
     torch.save({
@@ -421,11 +453,17 @@ def train_model(config: TrainingConfig):
 
 def main():
     """Main function"""
-    # Configuration
+    # Check MPS availability
+    if torch.backends.mps.is_available():
+        logger.info("MPS (Metal Performance Shaders) is available and will be used for acceleration")
+    else:
+        logger.warning("MPS is not available, falling back to CPU")
+
+    # Configuration optimized for MPS
     config = TrainingConfig(
         data_dir="./ruslan_corpus",
         output_dir="./kokoro_russian_model",
-        batch_size=4,  # Reduced batch size for memory efficiency
+        batch_size=8,  # Optimized for MPS
         learning_rate=1e-4,
         num_epochs=100,
         sample_rate=22050,
@@ -434,8 +472,11 @@ def main():
         n_fft=1024,
         n_mels=80,
         f_min=0.0,
-        f_max=8000.0,  # Set to sr/2 or lower to avoid issues
-        save_every=10
+        f_max=8000.0,
+        save_every=2,
+        use_mixed_precision=True,
+        num_workers=0,  # Important for MPS
+        pin_memory=False  # Important for MPS
     )
     
     # Check if data directory exists
