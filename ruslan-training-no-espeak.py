@@ -9,6 +9,7 @@ import json
 import torch
 import torchaudio
 import numpy as np
+import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from torch.nn.utils.rnn import pad_sequence
 import logging
 from tqdm import tqdm
 import re
+import pickle
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +45,7 @@ class TrainingConfig:
     use_mixed_precision: bool = True  # Enable for MPS
     num_workers: int = 0  # Set to 0 for MPS compatibility
     pin_memory: bool = False  # Disable for MPS
+    resume_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
 
 class RussianPhonemeProcessor:
     """
@@ -101,6 +104,29 @@ class RussianPhonemeProcessor:
         """Convert phonemes to indices"""
         return [self.phoneme_to_idx.get(p, 0) for p in phonemes]
 
+    def to_dict(self) -> Dict:
+        """Convert processor to dictionary for safe serialization"""
+        return {
+            'vowels': self.vowels,
+            'consonants': self.consonants,
+            'special_chars': self.special_chars,
+            'phonemes': self.phonemes,
+            'phoneme_to_idx': self.phoneme_to_idx,
+            'idx_to_phoneme': self.idx_to_phoneme
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> 'RussianPhonemeProcessor':
+        """Create processor from dictionary"""
+        processor = cls.__new__(cls)  # Create instance without calling __init__
+        processor.vowels = data['vowels']
+        processor.consonants = data['consonants']
+        processor.special_chars = data['special_chars']
+        processor.phonemes = data['phonemes']
+        processor.phoneme_to_idx = data['phoneme_to_idx']
+        processor.idx_to_phoneme = data['idx_to_phoneme']
+        return processor
+
 class RuslanDataset(Dataset):
     """Dataset class for Ruslan corpus - optimized for MPS"""
 
@@ -124,10 +150,10 @@ class RuslanDataset(Dataset):
 
         # Load metadata
         self.samples = self._load_samples()
-        logger.info(f"Loaded {len(self.samples)} samples from Ruslan corpus")
+        logger.info(f"Loaded {len(self.samples)} samples from corpus at {data_dir}")
 
     def _load_samples(self) -> List[Dict]:
-        """Load samples from Ruslan corpus directory"""
+        """Load samples from corpus directory"""
         samples = []
 
         # Look for metadata file (adjust path as needed)
@@ -345,6 +371,95 @@ class KokoroModel(torch.nn.Module):
             
             return torch.cat(outputs, dim=1)
 
+def save_phoneme_processor(processor: RussianPhonemeProcessor, output_dir: str):
+    """Save phoneme processor separately as pickle file"""
+    processor_path = os.path.join(output_dir, "phoneme_processor.pkl")
+    with open(processor_path, 'wb') as f:
+        pickle.dump(processor.to_dict(), f)
+    logger.info(f"Phoneme processor saved: {processor_path}")
+
+def load_phoneme_processor(output_dir: str) -> RussianPhonemeProcessor:
+    """Load phoneme processor from pickle file"""
+    processor_path = os.path.join(output_dir, "phoneme_processor.pkl")
+    with open(processor_path, 'rb') as f:
+        processor_data = pickle.load(f)
+    processor = RussianPhonemeProcessor.from_dict(processor_data)
+    logger.info(f"Phoneme processor loaded: {processor_path}")
+    return processor
+
+def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
+                   scheduler: torch.optim.lr_scheduler._LRScheduler, output_dir: str) -> Tuple[int, float, RussianPhonemeProcessor]:
+    """Load checkpoint and return starting epoch, best loss, and phoneme processor"""
+    logger.info(f"Loading checkpoint from {checkpoint_path}")
+
+    # Add safe globals for our custom classes
+    torch.serialization.add_safe_globals([TrainingConfig, RussianPhonemeProcessor])
+
+    try:
+        # Try loading with weights_only=True first (new default)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        start_epoch = checkpoint['epoch'] + 1
+        best_loss = checkpoint['loss']
+
+        # Try to load phoneme processor from checkpoint first
+        if 'phoneme_processor' in checkpoint:
+            phoneme_processor = checkpoint['phoneme_processor']
+        else:
+            # Fall back to loading from separate file
+            phoneme_processor = load_phoneme_processor(output_dir)
+
+        logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+        return start_epoch, best_loss, phoneme_processor
+
+    except Exception as e:
+        logger.warning(f"Loading with weights_only=True failed: {e}")
+        logger.info("Trying to load with weights_only=False for compatibility...")
+
+        try:
+            # Try loading with weights_only=False for older checkpoints
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+            start_epoch = checkpoint['epoch'] + 1
+            best_loss = checkpoint['loss']
+
+            if 'phoneme_processor' in checkpoint:
+                phoneme_processor = checkpoint['phoneme_processor']
+            else:
+                phoneme_processor = load_phoneme_processor(output_dir)
+
+            logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+            return start_epoch, best_loss, phoneme_processor
+
+        except Exception as e2:
+            logger.error(f"Error loading checkpoint even with weights_only=False: {e2}")
+            raise e2
+
+def find_latest_checkpoint(output_dir: str) -> Optional[str]:
+    """Find the latest checkpoint in the output directory"""
+    checkpoint_dir = Path(output_dir)
+    if not checkpoint_dir.exists():
+        return None
+
+    checkpoint_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
+    if not checkpoint_files:
+        return None
+
+    # Sort by epoch number
+    checkpoint_files.sort(key=lambda x: int(x.stem.split('_')[-1]))
+    latest_checkpoint = checkpoint_files[-1]
+
+    logger.info(f"Found latest checkpoint: {latest_checkpoint}")
+    return str(latest_checkpoint)
+
 def train_model(config: TrainingConfig):
     """Main training function - optimized for MPS"""
     # Create output directory
@@ -375,9 +490,42 @@ def train_model(config: TrainingConfig):
         optimizer, mode='min', factor=0.5, patience=3
     )
 
+    # Handle checkpoint resumption
+    start_epoch = 0
+    best_loss = float('inf')
+    phoneme_processor = dataset.phoneme_processor
+
+    if config.resume_checkpoint:
+        if config.resume_checkpoint.lower() == 'auto':
+            # Automatically find latest checkpoint
+            latest_checkpoint = find_latest_checkpoint(config.output_dir)
+            if latest_checkpoint:
+                start_epoch, best_loss, phoneme_processor = load_checkpoint(
+                    latest_checkpoint, model, optimizer, scheduler, config.output_dir
+                )
+                # Update dataset's phoneme processor
+                dataset.phoneme_processor = phoneme_processor
+            else:
+                logger.info("No checkpoint found for auto-resume, starting from scratch")
+        else:
+            # Load specific checkpoint
+            if os.path.exists(config.resume_checkpoint):
+                start_epoch, best_loss, phoneme_processor = load_checkpoint(
+                    config.resume_checkpoint, model, optimizer, scheduler, config.output_dir
+                )
+                dataset.phoneme_processor = phoneme_processor
+            else:
+                logger.error(f"Checkpoint not found: {config.resume_checkpoint}")
+                return
+
+    # Save phoneme processor separately at the start
+    save_phoneme_processor(dataset.phoneme_processor, config.output_dir)
+
     # Training loop
     logger.info(f"Starting training on device: {config.device}")
-    for epoch in range(config.num_epochs):
+    logger.info(f"Training from epoch {start_epoch + 1} to {config.num_epochs}")
+
+    for epoch in range(start_epoch, config.num_epochs):
         model.train()
         total_loss = 0.0
         
@@ -431,7 +579,6 @@ def train_model(config: TrainingConfig):
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'loss': avg_loss,
-                'phoneme_processor': dataset.phoneme_processor,
                 'config': config
             }
             checkpoint_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
@@ -446,26 +593,100 @@ def train_model(config: TrainingConfig):
     final_model_path = os.path.join(config.output_dir, "kokoro_russian_final.pth")
     torch.save({
         'model_state_dict': model.state_dict(),
-        'phoneme_processor': dataset.phoneme_processor,
         'config': config
     }, final_model_path)
     logger.info(f"Final model saved: {final_model_path}")
 
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description="Kokoro Language Model Training Script for Russian",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic training with custom directories
+  python train_kokoro.py --corpus /path/to/corpus --output ./my_model
+
+  # Resume training from latest checkpoint
+  python train_kokoro.py --corpus /path/to/corpus --output ./my_model --resume auto
+
+  # Resume from specific checkpoint
+  python train_kokoro.py --corpus /path/to/corpus --output ./my_model --resume /path/to/checkpoint.pth
+
+  # Training with all custom options
+  python train_kokoro.py --corpus /path/to/corpus --output ./my_model --batch-size 16 --epochs 50
+        """
+    )
+
+    parser.add_argument(
+        '--corpus', '-c',
+        type=str,
+        default='./ruslan_corpus',
+        help='Path to the corpus directory (default: ./ruslan_corpus)'
+    )
+
+    parser.add_argument(
+        '--output', '-o',
+        type=str,
+        default='./kokoro_russian_model',
+        help='Path to the output model directory (default: ./kokoro_russian_model)'
+    )
+
+    parser.add_argument(
+        '--resume', '-r',
+        type=str,
+        default=None,
+        help='Resume training from checkpoint. Use "auto" to auto-detect latest checkpoint, or provide path to specific checkpoint file'
+    )
+
+    parser.add_argument(
+        '--batch-size', '-b',
+        type=int,
+        default=8,
+        help='Batch size for training (default: 8)'
+    )
+
+    parser.add_argument(
+        '--epochs', '-e',
+        type=int,
+        default=100,
+        help='Number of training epochs (default: 100)'
+    )
+
+    parser.add_argument(
+        '--learning-rate', '-lr',
+        type=float,
+        default=1e-4,
+        help='Learning rate (default: 1e-4)'
+    )
+
+    parser.add_argument(
+        '--save-every',
+        type=int,
+        default=2,
+        help='Save checkpoint every N epochs (default: 2)'
+    )
+
+    return parser.parse_args()
+
 def main():
     """Main function"""
+    # Parse command line arguments
+    args = parse_arguments()
+
     # Check MPS availability
     if torch.backends.mps.is_available():
         logger.info("MPS (Metal Performance Shaders) is available and will be used for acceleration")
     else:
         logger.warning("MPS is not available, falling back to CPU")
 
-    # Configuration optimized for MPS
+    # Configuration with CLI arguments
     config = TrainingConfig(
-        data_dir="./ruslan_corpus",
-        output_dir="./kokoro_russian_model",
-        batch_size=8,  # Optimized for MPS
-        learning_rate=1e-4,
-        num_epochs=100,
+        data_dir=args.corpus,
+        output_dir=args.output,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        num_epochs=args.epochs,
         sample_rate=22050,
         hop_length=256,
         win_length=1024,
@@ -473,18 +694,25 @@ def main():
         n_mels=80,
         f_min=0.0,
         f_max=8000.0,
-        save_every=2,
+        save_every=args.save_every,
         use_mixed_precision=True,
         num_workers=0,  # Important for MPS
-        pin_memory=False  # Important for MPS
+        pin_memory=False,  # Important for MPS
+        resume_checkpoint=args.resume
     )
-    
-    # Check if data directory exists
+
+    # Validate directories
     if not os.path.exists(config.data_dir):
-        logger.error(f"Data directory not found: {config.data_dir}")
-        logger.info("Please ensure the Ruslan corpus is available in the specified directory")
+        logger.error(f"Corpus directory not found: {config.data_dir}")
+        logger.info("Please ensure the corpus is available in the specified directory")
         return
-    
+
+    logger.info(f"Using corpus directory: {config.data_dir}")
+    logger.info(f"Using output directory: {config.output_dir}")
+
+    if config.resume_checkpoint:
+        logger.info(f"Resume mode: {config.resume_checkpoint}")
+
     # Start training
     train_model(config)
 
