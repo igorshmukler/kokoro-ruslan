@@ -393,10 +393,11 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
     logger.info(f"Loading checkpoint from {checkpoint_path}")
 
     # Add safe globals for our custom classes
-    torch.serialization.add_safe_globals([RussianPhonemeProcessor])
+    torch.serialization.add_safe_globals([TrainingConfig, RussianPhonemeProcessor])
 
     try:
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        # Try loading with weights_only=True first (new default)
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
 
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
@@ -416,26 +417,31 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
         return start_epoch, best_loss, phoneme_processor
 
     except Exception as e:
-        logger.error(f"Error loading checkpoint: {e}")
+        logger.warning(f"Loading with weights_only=True failed: {e}")
         logger.info("Trying to load with weights_only=False for compatibility...")
 
-        # Try loading with weights_only=False for older checkpoints
-        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        try:
+            # Try loading with weights_only=False for older checkpoints
+            checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            model.load_state_dict(checkpoint['model_state_dict'])
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
-        start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint['loss']
+            start_epoch = checkpoint['epoch'] + 1
+            best_loss = checkpoint['loss']
 
-        if 'phoneme_processor' in checkpoint:
-            phoneme_processor = checkpoint['phoneme_processor']
-        else:
-            phoneme_processor = load_phoneme_processor(output_dir)
+            if 'phoneme_processor' in checkpoint:
+                phoneme_processor = checkpoint['phoneme_processor']
+            else:
+                phoneme_processor = load_phoneme_processor(output_dir)
 
-        logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
-        return start_epoch, best_loss, phoneme_processor
+            logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+            return start_epoch, best_loss, phoneme_processor
+
+        except Exception as e2:
+            logger.error(f"Error loading checkpoint even with weights_only=False: {e2}")
+            raise e2
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     """Find the latest checkpoint in the output directory"""
