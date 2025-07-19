@@ -2,6 +2,10 @@
 torch>=2.0.0
 torchaudio>=2.0.0
 
+# Audio processing libraries
+soundfile>=0.12.0
+librosa>=0.9.0
+
 # Data processing and utilities
 numpy>=1.21.0
 pathlib
