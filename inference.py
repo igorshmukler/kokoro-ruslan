@@ -144,15 +144,27 @@ class VocoderManager:
             return self._setup_griffin_lim()
 
     def _setup_griffin_lim(self):
-        """Setup Griffin-Lim as fallback"""
+        """Setup Griffin-Lim as fallback with device compatibility"""
         logger.info("Using Griffin-Lim vocoder")
-        return torchaudio.transforms.GriffinLim(
+
+        # For MPS device compatibility, create Griffin-Lim on CPU initially
+        # and move to device later if supported
+        griffin_lim = torchaudio.transforms.GriffinLim(
             n_fft=1024,
             hop_length=256,
             win_length=1024,
             power=2.0,
             n_iter=60  # More iterations for better quality
-        ).to(self.device)
+        )
+
+        # Try to move to target device, fallback to CPU if not supported
+        try:
+            griffin_lim = griffin_lim.to(self.device)
+        except Exception as e:
+            logger.warning(f"Griffin-Lim not fully compatible with {self.device}, using CPU fallback for some operations: {e}")
+            griffin_lim = griffin_lim.to("cpu")
+
+        return griffin_lim
 
     def mel_to_audio(self, mel_spec: torch.Tensor) -> torch.Tensor:
         """Convert mel spectrogram to audio"""
@@ -189,7 +201,7 @@ class VocoderManager:
         return audio.cpu()
 
     def _griffin_lim_inference(self, mel_spec: torch.Tensor) -> torch.Tensor:
-        """Griffin-Lim inference"""
+        """Griffin-Lim inference with device compatibility handling"""
         # Convert log mel to linear scale
         mel_spec = torch.exp(mel_spec)
 
@@ -197,31 +209,30 @@ class VocoderManager:
         if len(mel_spec.shape) == 2 and mel_spec.shape[1] == 80:
             mel_spec = mel_spec.transpose(0, 1)
 
-        # Convert mel spectrogram back to linear magnitude spectrogram
-        mel_scale = torchaudio.transforms.MelScale(
-            n_mels=80,
-            sample_rate=22050,
-            f_min=0.0,
-            f_max=8000.0,
-            n_stft=513
-        ).to(self.device)
+        # Handle MPS device incompatibility with InverseMelScale
+        device_for_mel_ops = "cpu" if self.device == "mps" else self.device
 
+        # Convert mel spectrogram back to linear magnitude spectrogram
         inverse_mel_scale = torchaudio.transforms.InverseMelScale(
             n_stft=513,
             n_mels=80,
             sample_rate=22050,
             f_min=0.0,
             f_max=8000.0
-        ).to(self.device)
+        ).to(device_for_mel_ops)
 
-        mel_spec = mel_spec.to(self.device)
-        linear_spec = inverse_mel_scale(mel_spec)
+        # Move mel_spec to compatible device for inverse transform
+        mel_spec_for_inverse = mel_spec.to(device_for_mel_ops)
+        linear_spec = inverse_mel_scale(mel_spec_for_inverse)
+
+        # Move back to original device for Griffin-Lim if needed
+        if device_for_mel_ops != self.device:
+            linear_spec = linear_spec.to(self.device)
 
         # Convert linear magnitude spectrogram to audio using Griffin-Lim
         audio = self.vocoder(linear_spec)
 
         return audio.cpu()
-
 
 class KokoroTTS:
     """Main TTS inference class with neural vocoder support"""
@@ -528,9 +539,14 @@ def main():
     """Main function"""
     args = parse_arguments()
 
-    # Initialize TTS system
+    # Initialize TTS system with vocoder arguments
     try:
-        tts = KokoroTTS(args.model, args.device)
+        tts = KokoroTTS(
+            model_dir=args.model,
+            device=args.device,
+            vocoder_type=args.vocoder,
+            vocoder_path=args.vocoder_path
+        )
     except Exception as e:
         logger.error(f"Failed to initialize TTS system: {e}")
         return

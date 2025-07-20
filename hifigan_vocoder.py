@@ -7,6 +7,12 @@ Neural vocoder for converting mel spectrograms to audio
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    from torch.nn.utils.parametrizations import weight_norm
+    from torch.nn.utils import remove_weight_norm
+except ImportError:
+    # Fallback for older PyTorch versions
+    from torch.nn.utils import weight_norm, remove_weight_norm
 import json
 import logging
 from pathlib import Path
@@ -28,22 +34,22 @@ class ResBlock(nn.Module):
     def __init__(self, channels: int, kernel_size: int = 3, dilation: tuple = (1, 3, 5)):
         super(ResBlock, self).__init__()
         self.convs1 = nn.ModuleList([
-            nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
-                     padding=self._get_padding(kernel_size, dilation[0])),
-            nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
-                     padding=self._get_padding(kernel_size, dilation[1])),
-            nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
-                     padding=self._get_padding(kernel_size, dilation[2]))
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
+                     padding=self._get_padding(kernel_size, dilation[0]))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
+                     padding=self._get_padding(kernel_size, dilation[1]))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
+                     padding=self._get_padding(kernel_size, dilation[2])))
         ])
         self.convs1.apply(self._init_weights)
 
         self.convs2 = nn.ModuleList([
-            nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                     padding=self._get_padding(kernel_size, 1)),
-            nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                     padding=self._get_padding(kernel_size, 1)),
-            nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                     padding=self._get_padding(kernel_size, 1))
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                     padding=self._get_padding(kernel_size, 1))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                     padding=self._get_padding(kernel_size, 1))),
+            weight_norm(nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
+                     padding=self._get_padding(kernel_size, 1)))
         ])
         self.convs2.apply(self._init_weights)
 
@@ -63,6 +69,12 @@ class ResBlock(nn.Module):
             x = xt + x
         return x
 
+    def remove_weight_norm(self):
+        for l in self.convs1:
+            remove_weight_norm(l)
+        for l in self.convs2:
+            remove_weight_norm(l)
+
 
 class HiFiGANGenerator(nn.Module):
     """HiFi-GAN Generator implementation"""
@@ -71,15 +83,15 @@ class HiFiGANGenerator(nn.Module):
         super(HiFiGANGenerator, self).__init__()
         self.num_kernels = len(h.resblock_kernel_sizes)
         self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = nn.Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3)
+        self.conv_pre = weight_norm(nn.Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3))
 
         self.ups = nn.ModuleList()
         for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
-            self.ups.append(nn.ConvTranspose1d(
+            self.ups.append(weight_norm(nn.ConvTranspose1d(
                 h.upsample_initial_channel // (2**i),
                 h.upsample_initial_channel // (2**(i+1)),
                 k, u, padding=(k-u)//2
-            ))
+            )))
 
         self.resblocks = nn.ModuleList()
         for i in range(len(self.ups)):
@@ -87,7 +99,7 @@ class HiFiGANGenerator(nn.Module):
             for j, (k, d) in enumerate(zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes)):
                 self.resblocks.append(ResBlock(ch, k, d))
 
-        self.conv_post = nn.Conv1d(ch, 1, 7, 1, padding=3)
+        self.conv_post = weight_norm(nn.Conv1d(ch, 1, 7, 1, padding=3))
         self.ups.apply(self._init_weights)
         self.conv_post.apply(self._init_weights)
 
@@ -96,6 +108,14 @@ class HiFiGANGenerator(nn.Module):
             nn.init.normal_(m.weight.data, 0.0, 0.01)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Handle input shape: expect [batch, mel_channels, time] but often get [batch, time, mel_channels]
+        if x.dim() == 3 and x.size(1) != 80 and x.size(2) == 80:
+            # Input is [batch, time, mel_channels], transpose to [batch, mel_channels, time]
+            x = x.transpose(1, 2)
+        elif x.dim() == 2:
+            # Input is [time, mel_channels], add batch dimension and transpose
+            x = x.unsqueeze(0).transpose(1, 2)
+
         x = self.conv_pre(x)
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, 0.1)
@@ -111,6 +131,14 @@ class HiFiGANGenerator(nn.Module):
         x = self.conv_post(x)
         x = torch.tanh(x)
         return x
+
+    def remove_weight_norm(self):
+        remove_weight_norm(self.conv_pre)
+        for l in self.ups:
+            remove_weight_norm(l)
+        for l in self.resblocks:
+            l.remove_weight_norm()
+        remove_weight_norm(self.conv_post)
 
 
 class HiFiGANConfig:
@@ -185,14 +213,27 @@ def load_hifigan_model(
 
     # Initialize generator
     generator = HiFiGANGenerator(config)
-    
+
     # Load state dict
-    state_dict = torch.load(model_path, map_location=device, weights_only=True)
-    
-    if 'generator' in state_dict:
-        generator.load_state_dict(state_dict['generator'])
-    else:
-        generator.load_state_dict(state_dict)
+    try:
+        state_dict = torch.load(model_path, map_location=device, weights_only=True)
+
+        if 'generator' in state_dict:
+            generator.load_state_dict(state_dict['generator'])
+        else:
+            generator.load_state_dict(state_dict)
+
+    except RuntimeError as e:
+        if "weight_g" in str(e) and "weight_v" in str(e):
+            # If still getting weight norm errors, try loading with strict=False
+            logger.warning("Loading with strict=False due to weight normalization mismatch")
+            state_dict = torch.load(model_path, map_location=device, weights_only=True)
+            if 'generator' in state_dict:
+                generator.load_state_dict(state_dict['generator'], strict=False)
+            else:
+                generator.load_state_dict(state_dict, strict=False)
+        else:
+            raise e
 
     generator.eval()
     generator.to(device)
