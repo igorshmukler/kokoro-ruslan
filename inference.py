@@ -11,20 +11,22 @@ import numpy as np
 import argparse
 import pickle
 import json
+import requests
 from pathlib import Path
 from typing import Dict, List, Optional, Union
 import logging
 import soundfile as sf
-import requests
 from urllib.parse import urlparse
 
 # Import our model and phoneme processor
 from model import KokoroModel
 from russian_phoneme_processor import RussianPhonemeProcessor
+from hifigan_vocoder import HiFiGANGenerator, load_hifigan_model, HiFiGANConfig
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 class TrainingConfig:
     """Training configuration class - needed for checkpoint loading"""
@@ -43,98 +45,6 @@ class TrainingConfig:
         self.f_min = 0.0
         self.f_max = 8000.0
 
-class HiFiGANGenerator(torch.nn.Module):
-    """HiFi-GAN Generator implementation"""
-
-    def __init__(self, h):
-        super(HiFiGANGenerator, self).__init__()
-        self.num_kernels = len(h.resblock_kernel_sizes)
-        self.num_upsamples = len(h.upsample_rates)
-        self.conv_pre = torch.nn.Conv1d(80, h.upsample_initial_channel, 7, 1, padding=3)
-
-        self.ups = torch.nn.ModuleList()
-        for i, (u, k) in enumerate(zip(h.upsample_rates, h.upsample_kernel_sizes)):
-            self.ups.append(torch.nn.ConvTranspose1d(h.upsample_initial_channel//(2**i),
-                                                   h.upsample_initial_channel//(2**(i+1)),
-                                                   k, u, padding=(k-u)//2))
-
-        self.resblocks = torch.nn.ModuleList()
-        for i in range(len(self.ups)):
-            ch = h.upsample_initial_channel//(2**(i+1))
-            for j, (k, d) in enumerate(zip(h.resblock_kernel_sizes, h.resblock_dilation_sizes)):
-                self.resblocks.append(ResBlock(ch, k, d))
-
-        self.conv_post = torch.nn.Conv1d(ch, 1, 7, 1, padding=3)
-        self.ups.apply(self._init_weights)
-        self.conv_post.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if type(m) == torch.nn.Conv1d or type(m) == torch.nn.ConvTranspose1d:
-            torch.nn.init.normal_(m.weight.data, 0.0, 0.01)
-
-    def forward(self, x):
-        x = self.conv_pre(x)
-        for i in range(self.num_upsamples):
-            x = torch.nn.functional.leaky_relu(x, 0.1)
-            x = self.ups[i](x)
-            xs = None
-            for j in range(self.num_kernels):
-                if xs is None:
-                    xs = self.resblocks[i*self.num_kernels+j](x)
-                else:
-                    xs += self.resblocks[i*self.num_kernels+j](x)
-            x = xs / self.num_kernels
-        x = torch.nn.functional.leaky_relu(x)
-        x = self.conv_post(x)
-        x = torch.tanh(x)
-        return x
-
-class ResBlock(torch.nn.Module):
-    """Residual Block for HiFi-GAN"""
-
-    def __init__(self, channels, kernel_size=3, dilation=(1, 3, 5)):
-        super(ResBlock, self).__init__()
-        self.convs1 = torch.nn.ModuleList([
-            torch.nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[0],
-                           padding=self._get_padding(kernel_size, dilation[0])),
-            torch.nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[1],
-                           padding=self._get_padding(kernel_size, dilation[1])),
-            torch.nn.Conv1d(channels, channels, kernel_size, 1, dilation=dilation[2],
-                           padding=self._get_padding(kernel_size, dilation[2]))
-        ])
-        self.convs1.apply(self._init_weights)
-
-        self.convs2 = torch.nn.ModuleList([
-            torch.nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                           padding=self._get_padding(kernel_size, 1)),
-            torch.nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                           padding=self._get_padding(kernel_size, 1)),
-            torch.nn.Conv1d(channels, channels, kernel_size, 1, dilation=1,
-                           padding=self._get_padding(kernel_size, 1))
-        ])
-        self.convs2.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if type(m) == torch.nn.Conv1d:
-            torch.nn.init.normal_(m.weight.data, 0.0, 0.01)
-
-    def _get_padding(self, kernel_size, dilation=1):
-        return int((kernel_size*dilation - dilation)/2)
-
-    def forward(self, x):
-        for c1, c2 in zip(self.convs1, self.convs2):
-            xt = torch.nn.functional.leaky_relu(x, 0.1)
-            xt = c1(xt)
-            xt = torch.nn.functional.leaky_relu(xt, 0.1)
-            xt = c2(xt)
-            x = xt + x
-        return x
-
-class AttrDict(dict):
-    """Dictionary that allows attribute access"""
-    def __init__(self, *args, **kwargs):
-        super(AttrDict, self).__init__(*args, **kwargs)
-        self.__dict__ = self
 
 class VocoderManager:
     """Manages different vocoder backends"""
@@ -183,7 +93,7 @@ class VocoderManager:
         print()  # New line after progress
 
     def _load_hifigan(self, vocoder_path: Optional[str] = None) -> torch.nn.Module:
-        """Load HiFi-GAN vocoder"""
+        """Load HiFi-GAN vocoder using the separated module"""
         if vocoder_path and Path(vocoder_path).exists():
             # Load custom HiFi-GAN model
             model_path = Path(vocoder_path)
@@ -194,101 +104,44 @@ class VocoderManager:
                 generator_path = model_path
                 config_path = model_path.parent / "config.json"
 
-            if not config_path.exists():
-                logger.warning(f"Config file not found: {config_path}")
-                # Use default config
-                config = self._get_default_hifigan_config()
-            else:
-                with open(config_path, 'r') as f:
-                    config_dict = json.load(f)
-                config = AttrDict(config_dict)
-
-            # Load model
-            generator = HiFiGANGenerator(config)
-            state_dict = torch.load(generator_path, map_location=self.device, weights_only=True)
-            if 'generator' in state_dict:
-                generator.load_state_dict(state_dict['generator'])
-            else:
-                generator.load_state_dict(state_dict)
-
-            generator.eval()
-            generator.to(self.device)
-            logger.info(f"Loaded custom HiFi-GAN from: {vocoder_path}")
-            return generator
-
-        else:
-            # Try to load pre-trained model or download
-            vocoder_dir = Path("./vocoder_models/hifigan")
-            vocoder_dir.mkdir(parents=True, exist_ok=True)
-
-            model_name = "universal_v1"  # Default to universal model
-            model_file = vocoder_dir / f"generator_{model_name}.pth"
-            config_file = vocoder_dir / f"config_{model_name}.json"
-
-            # Download if not exists
-            if not model_file.exists() or not config_file.exists():
-                logger.info(f"Downloading HiFi-GAN {model_name} model...")
-                try:
-                    if not model_file.exists():
-                        self._download_file(self.HIFIGAN_URLS[model_name]["model"], model_file)
-                    if not config_file.exists():
-                        self._download_file(self.HIFIGAN_URLS[model_name]["config"], config_file)
-                except Exception as e:
-                    logger.warning(f"Failed to download HiFi-GAN model: {e}")
-                    logger.info("Falling back to Griffin-Lim")
-                    return self._setup_griffin_lim()
-
-            # Load downloaded model
             try:
-                with open(config_file, 'r') as f:
-                    config_dict = json.load(f)
-                config = AttrDict(config_dict)
-
-                generator = HiFiGANGenerator(config)
-                state_dict = torch.load(model_file, map_location=self.device, weights_only=True)
-                if 'generator' in state_dict:
-                    generator.load_state_dict(state_dict['generator'])
-                else:
-                    generator.load_state_dict(state_dict)
-
-                generator.eval()
-                generator.to(self.device)
-                logger.info(f"Loaded pre-trained HiFi-GAN {model_name}")
+                generator = load_hifigan_model(generator_path, config_path, self.device)
+                logger.info(f"Loaded custom HiFi-GAN from: {vocoder_path}")
                 return generator
-
             except Exception as e:
-                logger.warning(f"Failed to load HiFi-GAN: {e}")
+                logger.warning(f"Failed to load custom HiFi-GAN: {e}")
+                logger.info("Falling back to pre-trained model")
+
+        # Try to load pre-trained model or download
+        vocoder_dir = Path("./vocoder_models/hifigan")
+        vocoder_dir.mkdir(parents=True, exist_ok=True)
+
+        model_name = "universal_v1"  # Default to universal model
+        model_file = vocoder_dir / f"generator_{model_name}.pth"
+        config_file = vocoder_dir / f"config_{model_name}.json"
+
+        # Download if not exists
+        if not model_file.exists() or not config_file.exists():
+            logger.info(f"Downloading HiFi-GAN {model_name} model...")
+            try:
+                if not model_file.exists():
+                    self._download_file(self.HIFIGAN_URLS[model_name]["model"], model_file)
+                if not config_file.exists():
+                    self._download_file(self.HIFIGAN_URLS[model_name]["config"], config_file)
+            except Exception as e:
+                logger.warning(f"Failed to download HiFi-GAN model: {e}")
                 logger.info("Falling back to Griffin-Lim")
                 return self._setup_griffin_lim()
 
-    def _get_default_hifigan_config(self):
-        """Get default HiFi-GAN configuration"""
-        config = {
-            "resblock": "1",
-            "num_gpus": 0,
-            "batch_size": 16,
-            "learning_rate": 0.0002,
-            "adam_b1": 0.8,
-            "adam_b2": 0.99,
-            "lr_decay": 0.999,
-            "seed": 1234,
-            "upsample_rates": [8, 8, 2, 2],
-            "upsample_kernel_sizes": [16, 16, 4, 4],
-            "upsample_initial_channel": 512,
-            "resblock_kernel_sizes": [3, 7, 11],
-            "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
-            "segment_size": 8192,
-            "num_mels": 80,
-            "num_freq": 1025,
-            "n_fft": 1024,
-            "hop_size": 256,
-            "win_size": 1024,
-            "sampling_rate": 22050,
-            "fmin": 0,
-            "fmax": 8000,
-            "fmax_for_loss": None
-        }
-        return AttrDict(config)
+        # Load downloaded model
+        try:
+            generator = load_hifigan_model(model_file, config_file, self.device)
+            logger.info(f"Loaded pre-trained HiFi-GAN {model_name}")
+            return generator
+        except Exception as e:
+            logger.warning(f"Failed to load HiFi-GAN: {e}")
+            logger.info("Falling back to Griffin-Lim")
+            return self._setup_griffin_lim()
 
     def _setup_griffin_lim(self):
         """Setup Griffin-Lim as fallback"""
@@ -368,6 +221,7 @@ class VocoderManager:
         audio = self.vocoder(linear_spec)
 
         return audio.cpu()
+
 
 class KokoroTTS:
     """Main TTS inference class with neural vocoder support"""
@@ -673,14 +527,14 @@ Examples:
 def main():
     """Main function"""
     args = parse_arguments()
-    
+
     # Initialize TTS system
     try:
         tts = KokoroTTS(args.model, args.device)
     except Exception as e:
         logger.error(f"Failed to initialize TTS system: {e}")
         return
-    
+
     if args.interactive:
         # Interactive mode
         logger.info("Interactive mode - type 'quit' to exit")
@@ -691,20 +545,20 @@ def main():
                     break
                 if not text:
                     continue
-                
+
                 output_path = f"interactive_output_{hash(text) % 10000}.wav"
                 tts.text_to_speech(text, output_path)
                 print(f"Audio saved to: {output_path}")
-                
+
             except KeyboardInterrupt:
                 break
             except Exception as e:
                 logger.error(f"Error during conversion: {e}")
-                
+
     elif args.text:
         # Single text conversion
         tts.text_to_speech(args.text, args.output)
-        
+
     elif args.text_file:
         # Text file conversion
         try:
@@ -713,7 +567,7 @@ def main():
             tts.text_to_speech(text, args.output)
         except Exception as e:
             logger.error(f"Error reading text file: {e}")
-            
+
     else:
         logger.error("Please provide either --text, --text-file, or --interactive")
         return
