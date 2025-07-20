@@ -20,6 +20,10 @@ from tqdm import tqdm
 import re
 import pickle
 
+# Import our model and phoneme processor
+from model import KokoroModel
+from russian_phoneme_processor import RussianPhonemeProcessor
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -47,85 +51,6 @@ class TrainingConfig:
     pin_memory: bool = False  # Disable for MPS
     resume_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
 
-class RussianPhonemeProcessor:
-    """
-    Russian phoneme processor without espeak dependency
-    Uses rule-based grapheme-to-phoneme conversion for Russian
-    """
-
-    def __init__(self):
-        # Russian phoneme mapping (simplified)
-        self.vowels = {
-            'а': 'a', 'о': 'o', 'у': 'u', 'ы': 'i', 'э': 'e',
-            'я': 'ja', 'ё': 'jo', 'ю': 'ju', 'и': 'i', 'е': 'je'
-        }
-
-        self.consonants = {
-            'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'ж': 'zh',
-            'з': 'z', 'к': 'k', 'л': 'l', 'м': 'm', 'н': 'n',
-            'п': 'p', 'р': 'r', 'с': 's', 'т': 't', 'ф': 'f',
-            'х': 'kh', 'ц': 'ts', 'ч': 'ch', 'ш': 'sh', 'щ': 'shch'
-        }
-
-        self.special_chars = {
-            'ь': '', 'ъ': '', ' ': ' ', '.': '.', ',': ',',
-            '!': '!', '?': '?', '-': '-'
-        }
-
-        # Combined phoneme vocabulary
-        self.phonemes = list(self.vowels.values()) + list(self.consonants.values()) + \
-                       list(self.special_chars.values())
-        self.phonemes = list(set(self.phonemes))  # Remove duplicates
-
-        # Create phoneme to index mapping
-        self.phoneme_to_idx = {p: i for i, p in enumerate(self.phonemes)}
-        self.idx_to_phoneme = {i: p for i, p in enumerate(self.phonemes)}
-
-    def text_to_phonemes(self, text: str) -> List[str]:
-        """Convert Russian text to phonemes"""
-        text = text.lower().strip()
-        phonemes = []
-
-        for char in text:
-            if char in self.vowels:
-                phonemes.append(self.vowels[char])
-            elif char in self.consonants:
-                phonemes.append(self.consonants[char])
-            elif char in self.special_chars:
-                if self.special_chars[char]:  # Skip empty mappings
-                    phonemes.append(self.special_chars[char])
-            else:
-                # Unknown character, skip or replace with space
-                phonemes.append(' ')
-
-        return phonemes
-
-    def phonemes_to_indices(self, phonemes: List[str]) -> List[int]:
-        """Convert phonemes to indices"""
-        return [self.phoneme_to_idx.get(p, 0) for p in phonemes]
-
-    def to_dict(self) -> Dict:
-        """Convert processor to dictionary for safe serialization"""
-        return {
-            'vowels': self.vowels,
-            'consonants': self.consonants,
-            'special_chars': self.special_chars,
-            'phonemes': self.phonemes,
-            'phoneme_to_idx': self.phoneme_to_idx,
-            'idx_to_phoneme': self.idx_to_phoneme
-        }
-
-    @classmethod
-    def from_dict(cls, data: Dict) -> 'RussianPhonemeProcessor':
-        """Create processor from dictionary"""
-        processor = cls.__new__(cls)  # Create instance without calling __init__
-        processor.vowels = data['vowels']
-        processor.consonants = data['consonants']
-        processor.special_chars = data['special_chars']
-        processor.phonemes = data['phonemes']
-        processor.phoneme_to_idx = data['phoneme_to_idx']
-        processor.idx_to_phoneme = data['idx_to_phoneme']
-        return processor
 
 class RuslanDataset(Dataset):
     """Dataset class for Ruslan corpus - optimized for MPS"""
@@ -151,6 +76,7 @@ class RuslanDataset(Dataset):
         # Load metadata
         self.samples = self._load_samples()
         logger.info(f"Loaded {len(self.samples)} samples from corpus at {data_dir}")
+        logger.info(f"Using phoneme processor: {self.phoneme_processor}")
 
     def _load_samples(self) -> List[Dict]:
         """Load samples from corpus directory"""
@@ -226,9 +152,8 @@ class RuslanDataset(Dataset):
         if mel_spec.shape[1] > max_frames:
             mel_spec = mel_spec[:, :max_frames]
 
-        # Process text to phonemes
-        phonemes = self.phoneme_processor.text_to_phonemes(sample['text'])
-        phoneme_indices = self.phoneme_processor.phonemes_to_indices(phonemes)
+        # Process text to phonemes using the dedicated processor
+        phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
 
         return {
             'mel_spec': mel_spec,
@@ -236,6 +161,7 @@ class RuslanDataset(Dataset):
             'text': sample['text'],
             'audio_file': sample['audio_file']
         }
+
 
 def collate_fn(batch: List[Dict]) -> Dict:
     """Collate function for DataLoader - optimized for MPS"""
@@ -255,121 +181,6 @@ def collate_fn(batch: List[Dict]) -> Dict:
         'audio_files': audio_files
     }
 
-class KokoroModel(torch.nn.Module):
-    """
-    Simplified Kokoro-style model architecture - optimized for MPS
-    Text-to-Speech model with attention mechanism
-    """
-
-    def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.mel_dim = mel_dim
-        self.hidden_dim = hidden_dim
-
-        # Text encoder
-        self.text_embedding = torch.nn.Embedding(vocab_size, hidden_dim)
-        self.text_encoder = torch.nn.LSTM(
-            hidden_dim, hidden_dim, batch_first=True, bidirectional=True
-        )
-
-        # Project bidirectional LSTM output back to hidden_dim
-        self.text_projection = torch.nn.Linear(hidden_dim * 2, hidden_dim)
-
-        # Mel feature projection to match hidden dimension
-        self.mel_projection_in = torch.nn.Linear(mel_dim, hidden_dim)
-
-        # Decoder
-        self.decoder = torch.nn.LSTM(
-            hidden_dim + hidden_dim, hidden_dim, batch_first=True
-        )
-
-        # Attention mechanism
-        self.attention = torch.nn.MultiheadAttention(
-            hidden_dim, num_heads=8, batch_first=True
-        )
-
-        # Output projection
-        self.mel_projection_out = torch.nn.Linear(hidden_dim, mel_dim)
-
-        # Dropout for regularization
-        self.dropout = torch.nn.Dropout(0.1)
-
-    def forward(self, phoneme_indices: torch.Tensor, mel_specs: torch.Tensor = None) -> torch.Tensor:
-        batch_size = phoneme_indices.size(0)
-
-        # Text encoding
-        text_emb = self.text_embedding(phoneme_indices)
-        text_emb = self.dropout(text_emb)
-        text_encoded, _ = self.text_encoder(text_emb)
-
-        # Project bidirectional output to hidden_dim
-        text_encoded = self.text_projection(text_encoded)
-
-        if mel_specs is not None:
-            # Training mode
-            seq_len = mel_specs.size(1)
-            outputs = []
-
-            hidden = None
-            for t in range(seq_len):
-                # Current mel frame
-                if t == 0:
-                    mel_input = torch.zeros(batch_size, 1, self.mel_dim, device=mel_specs.device)
-                else:
-                    mel_input = mel_specs[:, t-1:t, :]
-                
-                # Project mel to hidden dimension
-                mel_projected = self.mel_projection_in(mel_input)
-                mel_projected = self.dropout(mel_projected)
-                
-                # Attention over text
-                attended, _ = self.attention(
-                    mel_projected,
-                    text_encoded,
-                    text_encoded
-                )
-
-                # Decoder step
-                decoder_input = torch.cat([mel_projected, attended], dim=2)
-                decoder_out, hidden = self.decoder(decoder_input, hidden)
-                decoder_out = self.dropout(decoder_out)
-                
-                # Project back to mel
-                mel_pred = self.mel_projection_out(decoder_out)
-                outputs.append(mel_pred)
-            
-            return torch.cat(outputs, dim=1)
-        else:
-            # Inference mode (simplified)
-            max_len = 800  # Reduced for MPS
-            outputs = []
-            hidden = None
-            mel_input = torch.zeros(batch_size, 1, self.mel_dim, device=phoneme_indices.device)
-            
-            for t in range(max_len):
-                # Project mel to hidden dimension
-                mel_projected = self.mel_projection_in(mel_input)
-                
-                # Attention over text
-                attended, _ = self.attention(
-                    mel_projected,
-                    text_encoded,
-                    text_encoded
-                )
-                
-                # Decoder step
-                decoder_input = torch.cat([mel_projected, attended], dim=2)
-                decoder_out, hidden = self.decoder(decoder_input, hidden)
-                
-                # Project back to mel
-                mel_pred = self.mel_projection_out(decoder_out)
-                outputs.append(mel_pred)
-                
-                # Use prediction as next input
-                mel_input = mel_pred
-            
-            return torch.cat(outputs, dim=1)
 
 def save_phoneme_processor(processor: RussianPhonemeProcessor, output_dir: str):
     """Save phoneme processor separately as pickle file"""
@@ -377,6 +188,7 @@ def save_phoneme_processor(processor: RussianPhonemeProcessor, output_dir: str):
     with open(processor_path, 'wb') as f:
         pickle.dump(processor.to_dict(), f)
     logger.info(f"Phoneme processor saved: {processor_path}")
+
 
 def load_phoneme_processor(output_dir: str) -> RussianPhonemeProcessor:
     """Load phoneme processor from pickle file"""
@@ -386,6 +198,7 @@ def load_phoneme_processor(output_dir: str) -> RussianPhonemeProcessor:
     processor = RussianPhonemeProcessor.from_dict(processor_data)
     logger.info(f"Phoneme processor loaded: {processor_path}")
     return processor
+
 
 def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: torch.optim.Optimizer,
                    scheduler: torch.optim.lr_scheduler._LRScheduler, output_dir: str) -> Tuple[int, float, RussianPhonemeProcessor]:
@@ -443,6 +256,7 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
             logger.error(f"Error loading checkpoint even with weights_only=False: {e2}")
             raise e2
 
+
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     """Find the latest checkpoint in the output directory"""
     checkpoint_dir = Path(output_dir)
@@ -459,6 +273,7 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 
     logger.info(f"Found latest checkpoint: {latest_checkpoint}")
     return str(latest_checkpoint)
+
 
 def train_model(config: TrainingConfig):
     """Main training function - optimized for MPS"""
@@ -477,9 +292,13 @@ def train_model(config: TrainingConfig):
     )
     
     # Initialize model
-    vocab_size = len(dataset.phoneme_processor.phonemes)
+    vocab_size = dataset.phoneme_processor.get_vocab_size()
     model = KokoroModel(vocab_size, config.n_mels)
     model.to(config.device)
+    
+    # Log model information
+    model_info = model.get_model_info()
+    logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
     
     # Optimizer and loss
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.01)
@@ -524,6 +343,7 @@ def train_model(config: TrainingConfig):
     # Training loop
     logger.info(f"Starting training on device: {config.device}")
     logger.info(f"Training from epoch {start_epoch + 1} to {config.num_epochs}")
+    logger.info(f"Model vocabulary size: {vocab_size}")
 
     for epoch in range(start_epoch, config.num_epochs):
         model.train()
@@ -597,6 +417,7 @@ def train_model(config: TrainingConfig):
     }, final_model_path)
     logger.info(f"Final model saved: {final_model_path}")
 
+
 def parse_arguments():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(
@@ -668,6 +489,7 @@ Examples:
     )
 
     return parser.parse_args()
+
 
 def main():
     """Main function"""

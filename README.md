@@ -41,29 +41,29 @@ The metadata CSV should be formatted as: `audio_filename|transcription`
 
 ```shell
 # Using default settings
-python ruslan-training-no-espeak.py
+python training.py
 
 # Specify custom corpus and output directories
-python ruslan-training-no-espeak.py --corpus /path/to/ruslan_corpus --output ./my_russian_model
+python training.py --corpus /path/to/ruslan_corpus --output ./my_russian_model
 ```
 
 ### On Mac (with MPS acceleration)
 
 ```shell
-PYTORCH_ENABLE_MPS_FALLBACK=1 python ruslan-training-no-espeak.py
+PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py
 ```
 
 ### Training with Custom Parameters
 
 ```shell
 # Custom batch size and epochs
-python ruslan-training-no-espeak.py --batch-size 16 --epochs 50
+python training.py --batch-size 16 --epochs 50
 
 # Custom learning rate and save frequency
-python ruslan-training-no-espeak.py --learning-rate 0.0001 --save-every 5
+python training.py --learning-rate 0.0001 --save-every 5
 
 # Full custom configuration
-python ruslan-training-no-espeak.py \
+python training.py \
     --corpus ./data/ruslan_corpus \
     --output ./models/kokoro_russian \
     --batch-size 12 \
@@ -76,13 +76,13 @@ python ruslan-training-no-espeak.py \
 
 ```shell
 # Auto-resume from latest checkpoint
-python ruslan-training-no-espeak.py --resume auto
+python training.py --resume auto
 
 # Resume from specific checkpoint
-python ruslan-training-no-espeak.py --resume ./models/checkpoint_epoch_10.pth
+python training.py --resume ./models/checkpoint_epoch_10.pth
 
 # Resume with different parameters
-python ruslan-training-no-espeak.py --resume auto --batch-size 16 --epochs 200
+python training.py --resume auto --batch-size 16 --epochs 200
 ```
 
 ## Command Line Arguments
@@ -196,13 +196,13 @@ INFO:__main__:Checkpoint saved: ./kokoro_russian_model/checkpoint_epoch_2.pth
 ### Quick Start
 ```shell
 # Download and prepare Ruslan corpus, then:
-python ruslan-training-no-espeak.py --corpus ./ruslan_corpus --epochs 10
+python training.py --corpus ./ruslan_corpus --epochs 10
 ```
 
 ### Production Training
 ```shell
 # Full training run with checkpointing
-PYTORCH_ENABLE_MPS_FALLBACK=1 python ruslan-training-no-espeak.py \
+PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py \
     --corpus ./data/ruslan_corpus \
     --output ./models/kokoro_russian_v1 \
     --batch-size 10 \
@@ -214,7 +214,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python ruslan-training-no-espeak.py \
 ### Resume Interrupted Training
 ```shell
 # Auto-resume from latest checkpoint
-PYTORCH_ENABLE_MPS_FALLBACK=1 python ruslan-training-no-espeak.py \
+PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py \
     --corpus ./data/ruslan_corpus \
     --output ./models/kokoro_russian_v1 \
     --resume auto
