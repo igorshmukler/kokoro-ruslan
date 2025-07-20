@@ -10,6 +10,8 @@ import torch
 import torchaudio
 import numpy as np
 import argparse
+import signal
+import sys
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -28,12 +30,75 @@ from russian_phoneme_processor import RussianPhonemeProcessor
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global variables for graceful shutdown
+interrupted = False
+current_model = None
+current_optimizer = None
+current_scheduler = None
+current_config = None
+current_epoch = 0
+current_phoneme_processor = None
+
+def signal_handler(signum, frame):
+    """Handle keyboard interrupt (Ctrl+C) gracefully"""
+    global interrupted
+    interrupted = True
+    logger.warning("\n" + "="*50)
+    logger.warning("Keyboard interrupt received (Ctrl+C)")
+    logger.warning("Training will stop after current batch...")
+    logger.warning("="*50)
+
+def save_interrupt_checkpoint(epoch: int, loss: float):
+    """Save checkpoint when interrupted"""
+    global current_model, current_optimizer, current_scheduler, current_config, current_phoneme_processor
+
+    if current_model is None or current_config is None:
+        logger.error("Cannot save interrupt checkpoint - model or config not available")
+        return
+
+    try:
+        # Create output directory if it doesn't exist
+        os.makedirs(current_config.output_dir, exist_ok=True)
+
+        # Save interrupt checkpoint
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': current_model.state_dict(),
+            'optimizer_state_dict': current_optimizer.state_dict() if current_optimizer else None,
+            'scheduler_state_dict': current_scheduler.state_dict() if current_scheduler else None,
+            'loss': loss,
+            'config': current_config,
+            'interrupted': True,  # Mark as interrupted checkpoint
+            'phoneme_processor': current_phoneme_processor
+        }
+
+        interrupt_path = os.path.join(current_config.output_dir, f"interrupt_checkpoint_epoch_{epoch}.pth")
+        torch.save(checkpoint, interrupt_path)
+        logger.info(f"✅ Interrupt checkpoint saved: {interrupt_path}")
+
+        # Also save as latest checkpoint for easy resuming
+        latest_path = os.path.join(current_config.output_dir, "latest_checkpoint.pth")
+        torch.save(checkpoint, latest_path)
+        logger.info(f"✅ Latest checkpoint saved: {latest_path}")
+
+        # Save phoneme processor separately
+        if current_phoneme_processor:
+            save_phoneme_processor(current_phoneme_processor, current_config.output_dir)
+
+        logger.info("💾 All checkpoint data saved successfully!")
+        logger.info(f"📝 To resume training, use: --resume {interrupt_path}")
+        logger.info("   or use: --resume auto (to auto-detect latest)")
+
+    except Exception as e:
+        logger.error(f"❌ Error saving interrupt checkpoint: {e}")
+        logger.error("⚠️  Training progress may be lost!")
+
 @dataclass
 class TrainingConfig:
     """Training configuration for Kokoro model"""
     data_dir: str = "./ruslan_corpus"
     output_dir: str = "./kokoro_russian_model"
-    batch_size: int = 8  # Increased for MPS
+    batch_size: int = 12  # Increased for MPS
     learning_rate: float = 1e-4
     num_epochs: int = 100
     max_seq_length: int = 1024
@@ -213,11 +278,17 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
 
         model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        if optimizer and 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict'] is not None:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
         start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint['loss']
+        best_loss = checkpoint.get('loss', float('inf'))
+
+        # Check if this was an interrupted checkpoint
+        if checkpoint.get('interrupted', False):
+            logger.info("📝 Resuming from interrupted training session")
 
         # Try to load phoneme processor from checkpoint first
         if 'phoneme_processor' in checkpoint:
@@ -226,7 +297,7 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
             # Fall back to loading from separate file
             phoneme_processor = load_phoneme_processor(output_dir)
 
-        logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+        logger.info(f"✅ Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
         return start_epoch, best_loss, phoneme_processor
 
     except Exception as e:
@@ -238,24 +309,28 @@ def load_checkpoint(checkpoint_path: str, model: torch.nn.Module, optimizer: tor
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
             model.load_state_dict(checkpoint['model_state_dict'])
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if optimizer and 'optimizer_state_dict' in checkpoint and checkpoint['optimizer_state_dict'] is not None:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict'] is not None:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
             start_epoch = checkpoint['epoch'] + 1
-            best_loss = checkpoint['loss']
+            best_loss = checkpoint.get('loss', float('inf'))
+
+            if checkpoint.get('interrupted', False):
+                logger.info("📝 Resuming from interrupted training session")
 
             if 'phoneme_processor' in checkpoint:
                 phoneme_processor = checkpoint['phoneme_processor']
             else:
                 phoneme_processor = load_phoneme_processor(output_dir)
 
-            logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+            logger.info(f"✅ Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
             return start_epoch, best_loss, phoneme_processor
 
         except Exception as e2:
             logger.error(f"Error loading checkpoint even with weights_only=False: {e2}")
             raise e2
-
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     """Find the latest checkpoint in the output directory"""
@@ -263,23 +338,43 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
     if not checkpoint_dir.exists():
         return None
 
+    # Look for latest checkpoint first
+    latest_checkpoint = checkpoint_dir / "latest_checkpoint.pth"
+    if latest_checkpoint.exists():
+        logger.info(f"Found latest checkpoint: {latest_checkpoint}")
+        return str(latest_checkpoint)
+
+    # Fall back to searching for numbered checkpoints
     checkpoint_files = list(checkpoint_dir.glob("checkpoint_epoch_*.pth"))
-    if not checkpoint_files:
+    interrupt_files = list(checkpoint_dir.glob("interrupt_checkpoint_epoch_*.pth"))
+
+    all_checkpoints = checkpoint_files + interrupt_files
+
+    if not all_checkpoints:
         return None
 
     # Sort by epoch number
-    checkpoint_files.sort(key=lambda x: int(x.stem.split('_')[-1]))
-    latest_checkpoint = checkpoint_files[-1]
+    all_checkpoints.sort(key=lambda x: int(x.stem.split('_')[-1]))
+    latest_checkpoint = all_checkpoints[-1]
 
     logger.info(f"Found latest checkpoint: {latest_checkpoint}")
     return str(latest_checkpoint)
 
 
 def train_model(config: TrainingConfig):
-    """Main training function - optimized for MPS"""
+    """Main training function - optimized for MPS with interrupt support"""
+    global current_model, current_optimizer, current_scheduler, current_config, current_epoch, current_phoneme_processor
+
+    # Set up signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+
+    # Store config globally for interrupt handling
+    current_config = config
+
     # Create output directory
     os.makedirs(config.output_dir, exist_ok=True)
-    
+
     # Initialize dataset
     dataset = RuslanDataset(config.data_dir, config)
     dataloader = DataLoader(
@@ -290,29 +385,33 @@ def train_model(config: TrainingConfig):
         num_workers=config.num_workers,
         pin_memory=config.pin_memory
     )
-    
+
     # Initialize model
     vocab_size = dataset.phoneme_processor.get_vocab_size()
     model = KokoroModel(vocab_size, config.n_mels)
     model.to(config.device)
-    
+    current_model = model
+
     # Log model information
     model_info = model.get_model_info()
     logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
-    
+
     # Optimizer and loss
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=0.01)
     criterion = torch.nn.MSELoss()
-    
+    current_optimizer = optimizer
+
     # Learning rate scheduler
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=3
     )
+    current_scheduler = scheduler
 
     # Handle checkpoint resumption
     start_epoch = 0
     best_loss = float('inf')
     phoneme_processor = dataset.phoneme_processor
+    current_phoneme_processor = phoneme_processor
 
     if config.resume_checkpoint:
         if config.resume_checkpoint.lower() == 'auto':
@@ -324,6 +423,7 @@ def train_model(config: TrainingConfig):
                 )
                 # Update dataset's phoneme processor
                 dataset.phoneme_processor = phoneme_processor
+                current_phoneme_processor = phoneme_processor
             else:
                 logger.info("No checkpoint found for auto-resume, starting from scratch")
         else:
@@ -333,6 +433,7 @@ def train_model(config: TrainingConfig):
                     config.resume_checkpoint, model, optimizer, scheduler, config.output_dir
                 )
                 dataset.phoneme_processor = phoneme_processor
+                current_phoneme_processor = phoneme_processor
             else:
                 logger.error(f"Checkpoint not found: {config.resume_checkpoint}")
                 return
@@ -341,82 +442,125 @@ def train_model(config: TrainingConfig):
     save_phoneme_processor(dataset.phoneme_processor, config.output_dir)
 
     # Training loop
-    logger.info(f"Starting training on device: {config.device}")
-    logger.info(f"Training from epoch {start_epoch + 1} to {config.num_epochs}")
-    logger.info(f"Model vocabulary size: {vocab_size}")
+    logger.info(f"🚀 Starting training on device: {config.device}")
+    logger.info(f"📊 Training from epoch {start_epoch + 1} to {config.num_epochs}")
+    logger.info(f"📚 Model vocabulary size: {vocab_size}")
+    logger.info("💡 Press Ctrl+C to gracefully stop training and save checkpoint")
 
-    for epoch in range(start_epoch, config.num_epochs):
-        model.train()
-        total_loss = 0.0
-        
-        progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
-        for batch_idx, batch in enumerate(progress_bar):
-            try:
-                # Move to device
-                mel_specs = batch['mel_specs'].to(config.device, non_blocking=True)
-                phoneme_indices = batch['phoneme_indices'].to(config.device, non_blocking=True)
+    try:
+        for epoch in range(start_epoch, config.num_epochs):
+            if interrupted:
+                logger.info("🛑 Training interrupted by user")
+                break
 
-                # Forward pass
-                optimizer.zero_grad()
+            current_epoch = epoch
+            model.train()
+            total_loss = 0.0
 
-                predictions = model(phoneme_indices, mel_specs)
+            progress_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{config.num_epochs}")
 
-                # Calculate loss
-                loss = criterion(predictions, mel_specs)
-                loss.backward()
+            for batch_idx, batch in enumerate(progress_bar):
+                # Check for interrupt at the beginning of each batch
+                if interrupted:
+                    logger.info("🛑 Stopping training due to keyboard interrupt...")
+                    avg_loss = total_loss / max(batch_idx, 1)
+                    save_interrupt_checkpoint(epoch, avg_loss)
+                    return
 
-                # Gradient clipping to prevent exploding gradients
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                try:
+                    # Move to device
+                    mel_specs = batch['mel_specs'].to(config.device, non_blocking=True)
+                    phoneme_indices = batch['phoneme_indices'].to(config.device, non_blocking=True)
 
-                optimizer.step()
+                    # Forward pass
+                    optimizer.zero_grad()
 
-                total_loss += loss.item()
-                progress_bar.set_postfix({'loss': loss.item()})
+                    predictions = model(phoneme_indices, mel_specs)
 
-                # Clear cache periodically to prevent memory buildup
-                if batch_idx % 50 == 0:
+                    # Calculate loss
+                    loss = criterion(predictions, mel_specs)
+                    loss.backward()
+
+                    # Gradient clipping to prevent exploding gradients
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    progress_bar.set_postfix({'loss': loss.item()})
+
+                    # Clear cache periodically to prevent memory buildup
+                    if batch_idx % 50 == 0:
+                        if torch.backends.mps.is_available():
+                            torch.mps.empty_cache()
+
+                except Exception as e:
+                    logger.error(f"Error in batch {batch_idx}: {e}")
+                    # Clear cache on error
                     if torch.backends.mps.is_available():
                         torch.mps.empty_cache()
+                    continue
 
-            except Exception as e:
-                logger.error(f"Error in batch {batch_idx}: {e}")
-                # Clear cache on error
-                if torch.backends.mps.is_available():
-                    torch.mps.empty_cache()
-                continue
+            # Check for interrupt after epoch
+            if interrupted:
+                avg_loss = total_loss / len(dataloader)
+                logger.info(f"🛑 Training interrupted at end of epoch {epoch+1}")
+                save_interrupt_checkpoint(epoch, avg_loss)
+                return
 
-        avg_loss = total_loss / len(dataloader)
-        logger.info(f"Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
+            avg_loss = total_loss / len(dataloader)
+            logger.info(f"✅ Epoch {epoch+1} completed. Average loss: {avg_loss:.4f}")
 
-        # Step scheduler
-        scheduler.step(avg_loss)
+            # Step scheduler
+            scheduler.step(avg_loss)
 
-        # Save checkpoint
-        if (epoch + 1) % config.save_every == 0:
-            checkpoint = {
-                'epoch': epoch,
+            # Save checkpoint
+            if (epoch + 1) % config.save_every == 0:
+                checkpoint = {
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'loss': avg_loss,
+                    'config': config,
+                    'phoneme_processor': current_phoneme_processor
+                }
+                checkpoint_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
+                torch.save(checkpoint, checkpoint_path)
+                logger.info(f"💾 Checkpoint saved: {checkpoint_path}")
+
+            # Clear cache after each epoch
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+
+        # Training completed normally
+        if not interrupted:
+            logger.info("🎉 Training completed successfully!")
+
+            # Save final model
+            final_model_path = os.path.join(config.output_dir, "kokoro_russian_final.pth")
+            torch.save({
                 'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'loss': avg_loss,
-                'config': config
-            }
-            checkpoint_path = os.path.join(config.output_dir, f"checkpoint_epoch_{epoch+1}.pth")
-            torch.save(checkpoint, checkpoint_path)
-            logger.info(f"Checkpoint saved: {checkpoint_path}")
+                'config': config,
+                'phoneme_processor': current_phoneme_processor
+            }, final_model_path)
+            logger.info(f"💾 Final model saved: {final_model_path}")
 
-        # Clear cache after each epoch
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()
+    except KeyboardInterrupt:
+        # This catches any remaining KeyboardInterrupt that wasn't handled by the signal handler
+        logger.info("🛑 Training interrupted by keyboard interrupt")
+        avg_loss = total_loss / max(len(dataloader), 1)
+        save_interrupt_checkpoint(current_epoch, avg_loss)
 
-    # Save final model
-    final_model_path = os.path.join(config.output_dir, "kokoro_russian_final.pth")
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'config': config
-    }, final_model_path)
-    logger.info(f"Final model saved: {final_model_path}")
-
+    except Exception as e:
+        logger.error(f"❌ Unexpected error during training: {e}")
+        # Try to save emergency checkpoint
+        try:
+            avg_loss = total_loss / max(len(dataloader), 1) if 'total_loss' in locals() else float('inf')
+            save_interrupt_checkpoint(current_epoch, avg_loss)
+        except:
+            logger.error("⚠️  Could not save emergency checkpoint")
+        raise
 
 def parse_arguments():
     """Parse command line arguments"""
@@ -428,7 +572,7 @@ Examples:
   # Basic training with custom directories
   python train_kokoro.py --corpus /path/to/corpus --output ./my_model
 
-  # Resume training from latest checkpoint
+  # Resume training from latest checkpoint (including interrupted ones)
   python train_kokoro.py --corpus /path/to/corpus --output ./my_model --resume auto
 
   # Resume from specific checkpoint
@@ -436,6 +580,11 @@ Examples:
 
   # Training with all custom options
   python train_kokoro.py --corpus /path/to/corpus --output ./my_model --batch-size 16 --epochs 50
+
+Keyboard Interrupt Support:
+  - Press Ctrl+C to gracefully stop training and save a checkpoint
+  - Use --resume auto to automatically resume from the latest checkpoint (including interrupted ones)
+  - Interrupted checkpoints are saved as both 'interrupt_checkpoint_epoch_X.pth' and 'latest_checkpoint.pth'
         """
     )
 
@@ -498,9 +647,9 @@ def main():
 
     # Check MPS availability
     if torch.backends.mps.is_available():
-        logger.info("MPS (Metal Performance Shaders) is available and will be used for acceleration")
+        logger.info("🚀 MPS (Metal Performance Shaders) is available and will be used for acceleration")
     else:
-        logger.warning("MPS is not available, falling back to CPU")
+        logger.warning("⚠️  MPS is not available, falling back to CPU")
 
     # Configuration with CLI arguments
     config = TrainingConfig(
@@ -525,18 +674,25 @@ def main():
 
     # Validate directories
     if not os.path.exists(config.data_dir):
-        logger.error(f"Corpus directory not found: {config.data_dir}")
+        logger.error(f"❌ Corpus directory not found: {config.data_dir}")
         logger.info("Please ensure the corpus is available in the specified directory")
         return
 
-    logger.info(f"Using corpus directory: {config.data_dir}")
-    logger.info(f"Using output directory: {config.output_dir}")
+    logger.info(f"📂 Using corpus directory: {config.data_dir}")
+    logger.info(f"💾 Using output directory: {config.output_dir}")
 
     if config.resume_checkpoint:
-        logger.info(f"Resume mode: {config.resume_checkpoint}")
+        logger.info(f"🔄 Resume mode: {config.resume_checkpoint}")
 
     # Start training
-    train_model(config)
+    try:
+        train_model(config)
+        logger.info("🏁 Training session ended")
+    except KeyboardInterrupt:
+        logger.info("🛑 Training session terminated by user")
+    except Exception as e:
+        logger.error(f"❌ Training failed with error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
