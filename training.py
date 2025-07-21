@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kokoro Language Model Training Script for Russian (Ruslan Corpus)
+Kokoro Text-To-Speech Language Model Training Script for Russian (Ruslan Corpus)
 Main entry point for training
 """
 
