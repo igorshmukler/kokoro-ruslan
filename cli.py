@@ -15,16 +15,16 @@ def parse_arguments():
         epilog="""
 Examples:
   # Basic training with custom directories
-  python train_kokoro.py --corpus /path/to/corpus --output ./my_model
+  python training.py --corpus /path/to/corpus --output ./my_model
 
   # Resume training from latest checkpoint
-  python train_kokoro.py --corpus /path/to/corpus --output ./my_model --resume auto
+  python training.py --corpus /path/to/corpus --output ./my_model --resume auto
 
   # Resume from specific checkpoint
-  python train_kokoro.py --corpus /path/to/corpus --output ./my_model --resume /path/to/checkpoint.pth
+  python training.py --corpus /path/to/corpus --output ./my_model --resume /path/to/checkpoint.pth
 
   # Training with all custom options
-  python train_kokoro.py --corpus /path/to/corpus --output ./my_model --batch-size 16 --epochs 50
+  python training.py --corpus /path/to/corpus --output ./my_model --batch-size 16 --epochs 50
         """
     )
 
