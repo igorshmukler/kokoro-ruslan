@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Kokoro Language Model Training Script for Russian (Ruslan Corpus)
-Main entry point for training - refactored version
+Main entry point for training
 """
 
 import os
