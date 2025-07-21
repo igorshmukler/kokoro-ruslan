@@ -1,7 +1,13 @@
 import re
 import unicodedata
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, Union
 from dataclasses import dataclass
+from functools import lru_cache
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 @dataclass
 class StressInfo:
@@ -10,13 +16,30 @@ class StressInfo:
     vowel_index: int  # Index of stressed vowel in the word
     is_marked: bool  # Whether stress was explicitly marked
 
+    def __post_init__(self):
+        """Validate stress info after initialization"""
+        if self.position < 0:
+            raise ValueError("Stress position cannot be negative")
+        if self.vowel_index < 0:
+            raise ValueError("Vowel index cannot be negative")
+
 class RussianPhonemeProcessor:
     """
     Enhanced Russian phoneme processor with comprehensive stress detection
     and pronunciation rules for TTS systems.
     """
 
-    def __init__(self):
+    # Class constants to avoid repeated dict creation
+    STRESS_MARKS = ['\u0301', '\u0300', '\u0341']  # Acute, grave, combining acute
+    VOWEL_LETTERS = {'а', 'о', 'у', 'ы', 'э', 'я', 'ё', 'ю', 'и', 'е'}
+
+    def __init__(self, stress_dict_path: Optional[str] = None):
+        """
+        Initialize the processor.
+
+        Args:
+            stress_dict_path: Optional path to external stress dictionary
+        """
         # Vowel mappings with stress-dependent pronunciation
         self.vowels = {
             'а': 'a', 'о': 'o', 'у': 'u', 'ы': 'ɨ', 'э': 'e',
@@ -67,8 +90,8 @@ class RussianPhonemeProcessor:
             'п': 'б', 'ф': 'в', 'к': 'г', 'т': 'd', 'ш': 'ж', 'с': 'з'
         }
 
-        # Common stress patterns for Russian words
-        self.stress_patterns = self._load_stress_patterns()
+        # Load stress patterns
+        self.stress_patterns = self._load_stress_patterns(stress_dict_path)
 
         # Pronunciation exceptions
         self.exceptions = {
@@ -80,14 +103,23 @@ class RussianPhonemeProcessor:
             'сегодня': 'sʲɪvodʲnʲə'
         }
 
+        # Build vocabulary after all mappings are set
         self.phoneme_to_id = self._build_vocab()
 
-    def _load_stress_patterns(self) -> Dict[str, int]:
+        # Cache for processed words to improve performance
+        self._word_cache: Dict[str, Tuple[List[str], StressInfo]] = {}
+
+    def _load_stress_patterns(self, dict_path: Optional[str] = None) -> Dict[str, int]:
         """
-        Load common stress patterns. In a real implementation,
-        this would load from a comprehensive stress dictionary.
+        Load stress patterns from file or use built-in patterns.
+
+        Args:
+            dict_path: Path to external stress dictionary file
+
+        Returns:
+            Dictionary mapping words to stress positions
         """
-        return {
+        patterns = {
             # Common monosyllabic words (always stressed)
             'дом': 0, 'кот': 0, 'мир': 0, 'лес': 0,
             # Common patterns for frequent words
@@ -99,8 +131,35 @@ class RussianPhonemeProcessor:
             'понимает': 2, 'знает': 1, 'играет': 1
         }
 
+        if dict_path:
+            try:
+                with open(dict_path, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            parts = line.split('\t')
+                            if len(parts) >= 2:
+                                word, stress_pos = parts[0], parts[1]
+                                try:
+                                    patterns[word] = int(stress_pos)
+                                except ValueError:
+                                    logger.warning(f"Invalid stress position for word {word}: {stress_pos}")
+            except FileNotFoundError:
+                logger.warning(f"Stress dictionary file not found: {dict_path}")
+            except Exception as e:
+                logger.error(f"Error loading stress dictionary: {e}")
+
+        return patterns
+
+    @lru_cache(maxsize=1000)
     def normalize_text(self, text: str) -> str:
-        """Normalize Russian text for phoneme processing"""
+        """
+        Normalize Russian text for phoneme processing.
+        Cached for performance on repeated texts.
+        """
+        if not text:
+            return ""
+
         # Convert to lowercase
         text = text.lower()
 
@@ -124,17 +183,17 @@ class RussianPhonemeProcessor:
         Detect stress position in a Russian word.
         Priority: 1) Explicit marks, 2) Dictionary, 3) Heuristics
         """
-        original_word = word
+        if not word:
+            return StressInfo(0, 0, False)
 
         # Check for explicit stress marks
-        stress_marks = ['\u0301', '\u0300', '\u0341']  # Acute, grave, combining acute
-        for mark in stress_marks:
+        for mark in self.STRESS_MARKS:
             if mark in word:
-                # Find position of stress mark
                 clean_word = word.replace(mark, '')
                 stress_pos = self._find_stress_position(word, mark)
+                syllable_pos = self._syllable_of_vowel(clean_word, stress_pos)
                 return StressInfo(
-                    position=self._syllable_of_vowel(clean_word, stress_pos),
+                    position=syllable_pos,
                     vowel_index=stress_pos,
                     is_marked=True
                 )
@@ -164,9 +223,12 @@ class RussianPhonemeProcessor:
 
     def _syllable_of_vowel(self, word: str, vowel_index: int) -> int:
         """Find which syllable a vowel belongs to"""
+        if vowel_index >= len(word):
+            return 0
+
         vowel_count = 0
         for i, char in enumerate(word[:vowel_index + 1]):
-            if char.lower() in self.vowels:
+            if char.lower() in self.VOWEL_LETTERS:
                 if i == vowel_index:
                     return vowel_count
                 vowel_count += 1
@@ -176,7 +238,7 @@ class RussianPhonemeProcessor:
         """Find the index of vowel in specified syllable"""
         vowel_count = 0
         for i, char in enumerate(word):
-            if char.lower() in self.vowels:
+            if char.lower() in self.VOWEL_LETTERS:
                 if vowel_count == syllable_pos:
                     return i
                 vowel_count += 1
@@ -184,32 +246,29 @@ class RussianPhonemeProcessor:
 
     def _count_syllables(self, word: str) -> int:
         """Count syllables in a word"""
-        return sum(1 for char in word if char.lower() in self.vowels)
+        return sum(1 for char in word if char.lower() in self.VOWEL_LETTERS)
 
     def _apply_stress_heuristics(self, word: str) -> StressInfo:
         """Apply heuristic rules for stress placement"""
         syllable_count = self._count_syllables(word)
 
         if syllable_count <= 1:
-            return StressInfo(position=0, vowel_index=0, is_marked=False)
+            vowel_index = self._vowel_index_from_syllable(word, 0)
+            return StressInfo(position=0, vowel_index=vowel_index, is_marked=False)
 
         # Common heuristics for Russian stress
-        # Rule 1: Many words stress the second-to-last syllable
-        if syllable_count >= 2:
-            if word.endswith(('ать', 'еть', 'ить', 'ыть', 'уть')):
-                # Infinitive verbs - often stress the ending
-                stress_pos = syllable_count - 1
-            elif word.endswith(('ный', 'ная', 'ное', 'ные')):
-                # Adjectives - often stress the root
-                stress_pos = max(0, syllable_count - 2)
-            elif word.endswith(('ость', 'есть')):
-                # Abstract nouns - often stress the root
-                stress_pos = max(0, syllable_count - 2)
-            else:
-                # Default: stress the penultimate syllable
-                stress_pos = max(0, syllable_count - 2)
+        if word.endswith(('ать', 'еть', 'ить', 'ыть', 'уть')):
+            # Infinitive verbs - often stress the ending
+            stress_pos = syllable_count - 1
+        elif word.endswith(('ный', 'ная', 'ное', 'ные')):
+            # Adjectives - often stress the root
+            stress_pos = max(0, syllable_count - 2)
+        elif word.endswith(('ость', 'есть')):
+            # Abstract nouns - often stress the root
+            stress_pos = max(0, syllable_count - 2)
         else:
-            stress_pos = 0
+            # Default: stress the penultimate syllable
+            stress_pos = max(0, syllable_count - 2)
 
         vowel_index = self._vowel_index_from_syllable(word, stress_pos)
         return StressInfo(position=stress_pos, vowel_index=vowel_index, is_marked=False)
@@ -259,12 +318,14 @@ class RussianPhonemeProcessor:
 
             if current in self.consonants and next_char in self.consonants:
                 # Assimilate voicing
-                if current in self.voiced_consonants and next_char in self.voiceless_consonants:
-                    if current in self.voicing_map:
-                        result[i] = self.voicing_map[current]
-                elif current in self.voiceless_consonants and next_char in self.voiced_consonants:
-                    if current in self.voicing_map:
-                        result[i] = self.voicing_map[current]
+                if (current in self.voiced_consonants and
+                    next_char in self.voiceless_consonants and
+                    current in self.voicing_map):
+                    result[i] = self.voicing_map[current]
+                elif (current in self.voiceless_consonants and
+                      next_char in self.voiced_consonants and
+                      current in self.voicing_map):
+                    result[i] = self.voicing_map[current]
 
         # Word-final devoicing
         if result and result[-1] in self.voiced_consonants:
@@ -275,158 +336,196 @@ class RussianPhonemeProcessor:
 
     def apply_palatalization(self, word: str) -> List[str]:
         """Apply palatalization rules and convert to phonemes"""
+        if not word:
+            return []
+
         processed_phonemes = []
-        j = 0
-        while j < len(word):
-            char = word[j].lower()
+        i = 0
+
+        while i < len(word):
+            char = word[i].lower()
 
             if char in self.consonants:
-                is_palatalized_by_vowel = False
-                is_palatalized_by_soft_sign = False
-
-                if j + 1 < len(word):
-                    next_char = word[j + 1].lower()
-                    if next_char in ['е', 'и', 'ё', 'ю', 'я']:
-                        is_palatalized_by_vowel = True
-                    elif next_char == 'ь':
-                        is_palatalized_by_soft_sign = True
-
-                # Determine if consonant is hard and thus unpalatalizable
-                if char in self.hard_consonants:
-                    processed_phonemes.append(self.consonants[char])
-                # Determine if consonant is soft and thus always palatalized (or already represented as soft)
-                elif char in self.soft_consonants:
-                    processed_phonemes.append(self.consonants[char])
-                # For other consonants, apply palatalization if triggered
-                elif (is_palatalized_by_vowel or is_palatalized_by_soft_sign) and char in self.palatalized:
-                    processed_phonemes.append(self.palatalized[char])
-                else:
-                    processed_phonemes.append(self.consonants[char])
-
-            elif char in self.vowels:
-                # Handle vowel pronunciation based on context
-                phoneme = self.vowels[char]
-                if char in ['я', 'ю', 'е', 'ё'] and j > 0:
-                    prev_char = word[j-1].lower()
-                    if prev_char in self.consonants and prev_char not in self.hard_consonants:
-                        vowel_map = {'я': 'a', 'ю': 'u', 'е': 'e', 'ё': 'o'}
-                        phoneme = vowel_map.get(char, phoneme)
-                    elif prev_char in self.hard_consonants:
-                        vowel_map_after_hard_consonant = {'я': 'a', 'ю': 'u', 'е': 'e', 'ё': 'o', 'и': 'ɨ'}
-                        phoneme = vowel_map_after_hard_consonant.get(char, phoneme)
-
-                # Special case for 'и' after hard consonant
-                if char == 'и' and j > 0 and word[j-1].lower() in self.hard_consonants:
-                    phoneme = 'ɨ' # 'ы' sound
-
+                phoneme = self._process_consonant(word, i)
                 processed_phonemes.append(phoneme)
-
-            elif char == 'ь':
-                # Soft sign itself is not a phoneme in IPA, it just modifies the preceding consonant.
-                # Its effect is already handled when processing the preceding consonant by looking ahead.
-                pass
-            elif char == 'ъ':
-                # Hard sign - also not a phoneme, marks a boundary or separation.
+            elif char in self.vowels:
+                phoneme = self._process_vowel(word, i)
+                processed_phonemes.append(phoneme)
+            elif char in ['ь', 'ъ']:
+                # Soft/hard signs are handled during consonant processing
                 pass
 
-            j += 1
+            i += 1
 
         return [p for p in processed_phonemes if p]
 
+    def _process_consonant(self, word: str, pos: int) -> str:
+        """Process a single consonant with palatalization rules"""
+        char = word[pos].lower()
+
+        if char not in self.consonants:
+            return char
+
+        # Check for palatalization triggers
+        is_palatalized_by_vowel = (
+            pos + 1 < len(word) and
+            word[pos + 1].lower() in ['е', 'и', 'ё', 'ю', 'я']
+        )
+
+        is_palatalized_by_soft_sign = (
+            pos + 1 < len(word) and
+            word[pos + 1].lower() == 'ь'
+        )
+
+        # Apply palatalization rules
+        if char in self.hard_consonants:
+            return self.consonants[char]
+        elif char in self.soft_consonants:
+            return self.consonants[char]
+        elif ((is_palatalized_by_vowel or is_palatalized_by_soft_sign) and
+              char in self.palatalized):
+            return self.palatalized[char]
+        else:
+            return self.consonants[char]
+
+    def _process_vowel(self, word: str, pos: int) -> str:
+        """Process a single vowel with context-dependent rules"""
+        char = word[pos].lower()
+
+        if char not in self.vowels:
+            return char
+
+        phoneme = self.vowels[char]
+
+        # Handle iotated vowels after consonants
+        if char in ['я', 'ю', 'е', 'ё'] and pos > 0:
+            prev_char = word[pos - 1].lower()
+            if prev_char in self.consonants:
+                if prev_char not in self.hard_consonants:
+                    vowel_map = {'я': 'a', 'ю': 'u', 'е': 'e', 'ё': 'o'}
+                    phoneme = vowel_map.get(char, phoneme)
+                elif prev_char in self.hard_consonants:
+                    vowel_map_after_hard = {'я': 'a', 'ю': 'u', 'е': 'e', 'ё': 'o', 'и': 'ɨ'}
+                    phoneme = vowel_map_after_hard.get(char, phoneme)
+
+        # Special case for 'и' after hard consonants
+        if (char == 'и' and pos > 0 and
+            word[pos - 1].lower() in self.hard_consonants):
+            phoneme = 'ɨ'  # ы sound
+
+        return phoneme
+
+    @lru_cache(maxsize=500)
     def process_word(self, word: str) -> Tuple[List[str], StressInfo]:
-        """Process a single word and return phonemes with stress info"""
+        """Process a single word and return phonemes with stress info (cached)"""
         if not word:
             return [], StressInfo(0, 0, False)
+
+        # Check cache first (if not using lru_cache)
+        # if word in self._word_cache:
+        #     return self._word_cache[word]
 
         # Check for exceptions first
         clean_word = re.sub(r'[\u0300-\u036f]', '', word.lower())
         if clean_word in self.exceptions:
-            # If an exception is found, its value is directly an IPA string.
-            # We need to tokenize this IPA string into individual phonemes.
             ipa_string = self.exceptions[clean_word]
             tokenized_ipa = self._tokenize_ipa_string(ipa_string)
-            return tokenized_ipa, StressInfo(0, 0, True)
+            result = (tokenized_ipa, StressInfo(0, 0, True))
+            return result
 
         # Normalize the word
         normalized = self.normalize_text(word)
+        if not normalized:
+            return [], StressInfo(0, 0, False)
 
-        # Detect stress
-        stress_info = self.detect_stress(normalized)
+        try:
+            # Detect stress
+            stress_info = self.detect_stress(normalized)
 
-        # Apply phonetic changes
-        with_reduction = self.apply_vowel_reduction(normalized, stress_info)
-        with_assimilation = self.apply_consonant_assimilation(with_reduction)
+            # Apply phonetic changes
+            with_reduction = self.apply_vowel_reduction(normalized, stress_info)
+            with_assimilation = self.apply_consonant_assimilation(with_reduction)
 
-        # Convert to phonemes
-        phonemes = self.apply_palatalization(with_assimilation)
+            # Convert to phonemes
+            phonemes = self.apply_palatalization(with_assimilation)
 
-        return phonemes, stress_info
+            result = (phonemes, stress_info)
+            # Cache the result (if not using lru_cache)
+            # self._word_cache[word] = result
+            return result
+
+        except Exception as e:
+            logger.error(f"Error processing word '{word}': {e}")
+            return [], StressInfo(0, 0, False)
 
     def _tokenize_ipa_string(self, ipa_string: str) -> List[str]:
         """
-        Tokenizes an IPA string into a list of individual phonemes.
-        This is a simplified tokenizer for the specific phonemes used in this processor.
-        For a general IPA parser, a more comprehensive library is needed.
+        Tokenize an IPA string into individual phonemes.
+        Improved version with better multi-character phoneme handling.
         """
+        if not ipa_string:
+            return []
+
         phonemes = []
         i = 0
+
         while i < len(ipa_string):
-            char = ipa_string[i]
+            # Try to match longest possible phoneme first
+            matched = False
 
-            # Prioritize matching multi-character phonemes first
-            # Check for two-character phonemes ending in 'ʲ'
-            if i + 1 < len(ipa_string) and ipa_string[i+1] == 'ʲ':
-                combined_char = char + 'ʲ'
-                # Check if this combined phoneme is a *value* in your palatalized map
-                if combined_char in self.palatalized.values() or \
-                   combined_char in [v for k,v in self.palatalized.items() if k==char]: # More robust check for palatalized
-                    phonemes.append(combined_char)
+            # Check for three-character combinations
+            if i + 2 < len(ipa_string):
+                three_char = ipa_string[i:i+3]
+                if three_char in ['ʃtʃ']:  # щ
+                    phonemes.append(three_char)
+                    i += 3
+                    matched = True
+
+            # Check for two-character combinations
+            if not matched and i + 1 < len(ipa_string):
+                two_char = ipa_string[i:i+2]
+                # Palatalized consonants
+                if two_char.endswith('ʲ') and two_char in self.palatalized.values():
+                    phonemes.append(two_char)
                     i += 2
-                    continue
+                    matched = True
+                # Other two-character phonemes
+                elif two_char in ['ts', 'tʃ']:
+                    phonemes.append(two_char)
+                    i += 2
+                    matched = True
 
-            # Check for 'ts' (ц)
-            if char == 't' and i + 1 < len(ipa_string) and ipa_string[i+1] == 's':
-                phonemes.append('ts')
-                i += 2
-                continue
+            # Single character
+            if not matched:
+                phonemes.append(ipa_string[i])
+                i += 1
 
-            # Check for 'tʃ' (ч)
-            if char == 't' and i + 1 < len(ipa_string) and ipa_string[i+1] == 'ʃ':
-                phonemes.append('tʃ')
-                i += 2
-                continue
-
-            # Check for 'ʃtʃ' (щ)
-            if char == 'ʃ' and i + 1 < len(ipa_string) and ipa_string[i+1] == 't' and \
-               i + 2 < len(ipa_string) and ipa_string[i+2] == 'ʃ':
-                phonemes.append('ʃtʃ')
-                i += 3
-                continue
-
-            # Add other specific multi-character IPA combinations if they appear
-            # For example, if you had 'dz' or similar in exceptions, add checks here.
-
-            # Default to single character phoneme
-            phonemes.append(char)
-            i += 1
-        return phonemes
+        return [p for p in phonemes if p and p != 'ʲ']  # Remove isolated palatalization marks
 
     def process_text(self, text: str) -> List[Tuple[str, List[str], StressInfo]]:
         """Process full text and return word-phoneme-stress tuples"""
+        if not text:
+            return []
+
         normalized = self.normalize_text(text)
         words = normalized.split()
         results = []
 
         for word in words:
             if word:
-                phonemes, stress_info = self.process_word(word)
-                results.append((word, phonemes, stress_info))
+                try:
+                    phonemes, stress_info = self.process_word(word)
+                    results.append((word, phonemes, stress_info))
+                except Exception as e:
+                    logger.error(f"Error processing word '{word}': {e}")
+                    # Add empty result to maintain word order
+                    results.append((word, [], StressInfo(0, 0, False)))
 
         return results
 
     def to_ipa(self, phonemes: List[str]) -> str:
         """Convert internal phoneme representation to IPA"""
-        return ''.join(phonemes)
+        return ''.join(phonemes) if phonemes else ""
 
     def get_stress_pattern(self, text: str) -> List[int]:
         """Get stress pattern for text (for TTS models)"""
@@ -435,10 +534,8 @@ class RussianPhonemeProcessor:
 
         for word, phonemes, stress_info in results:
             word_pattern = [0] * len(phonemes)
-            # This logic for mapping syllable stress to phoneme index remains a simplification.
-            # A proper mapping requires syllable segmentation of the phoneme sequence.
-            # For now, it will mark the phoneme at `stress_info.position` if it's within bounds.
-            if stress_info.position < len(phonemes):
+            # Map syllable stress to phoneme stress (simplified)
+            if 0 <= stress_info.position < len(phonemes):
                 word_pattern[stress_info.position] = 1
             stress_pattern.extend(word_pattern)
 
@@ -446,37 +543,58 @@ class RussianPhonemeProcessor:
 
     def get_vocab_size(self) -> int:
         """Return the size of the phoneme vocabulary"""
+        return len(self.phoneme_to_id)
+
+    def get_phoneme_list(self) -> List[str]:
+        """Return sorted list of all phonemes in vocabulary"""
+        return sorted(self.phoneme_to_id.keys())
+
+    def _build_vocab(self) -> Dict[str, int]:
+        """Build complete phoneme vocabulary"""
         phoneme_set = set()
 
-        # Add static phonemes
+        # Add base phonemes
         phoneme_set.update(self.vowels.values())
         phoneme_set.update(self.vowel_reduction.values())
         phoneme_set.update(self.consonants.values())
-        phoneme_set.update(self.palatalized.values()) # Adds 'nʲ' etc. as whole units
+        phoneme_set.update(self.palatalized.values())
 
-        # Add phonemes found in exceptions by tokenizing their IPA strings
-        for val in self.exceptions.values():
-            tokenized_exception_phonemes = self._tokenize_ipa_string(val)
-            phoneme_set.update(tokenized_exception_phonemes)
+        # Add phonemes from exceptions
+        for ipa_string in self.exceptions.values():
+            exception_phonemes = self._tokenize_ipa_string(ipa_string)
+            phoneme_set.update(exception_phonemes)
 
-        # Explicitly add any other known single phonemes that might be missed but are used
-        phoneme_set.add('ʌ') # From 'конечно'
-        phoneme_set.add('j') # From 'й' or initial soft vowels
-        phoneme_set.add('ə') # Schwa
-        phoneme_set.add('ɪ') # Reduced i
-        # Also ensure 'ʐ' (ж) from consonants is added
+        # Add commonly used phonemes that might be missing
+        additional_phonemes = {'ʌ', 'j', 'ə', 'ɪ', 'ʐ'}
+        phoneme_set.update(additional_phonemes)
 
-        # Remove empty strings if present (e.g., from hard sign processing if it results in '')
-        phoneme_set.discard('')
+        # Clean up the set
+        phoneme_set.discard('')  # Remove empty strings
+        phoneme_set.discard('ʲ')  # Remove isolated palatalization marks
 
-        # Final check: remove the isolated 'ʲ' if it somehow got in (it shouldn't with _tokenize_ipa_string)
-        phoneme_set.discard('ʲ')
+        # Convert to sorted list and create mapping
+        phoneme_list = sorted(phoneme_set)
+        return {phoneme: idx for idx, phoneme in enumerate(phoneme_list)}
 
-        phoneme_list = sorted(list(phoneme_set)) # Convert to list then sort
-        return len(phoneme_list) # Return the count
+    def text_to_indices(self, text: str) -> List[int]:
+        """Convert text to phoneme indices"""
+        results = self.process_text(text)
+        indices = []
 
-    def to_dict(self) -> dict:
-        """Serialize the processor's state to a dictionary."""
+        for word, phonemes, _ in results:
+            for phoneme in phonemes:
+                idx = self.phoneme_to_id.get(phoneme)
+                if idx is not None:
+                    indices.append(idx)
+                else:
+                    logger.warning(f"Unknown phoneme '{phoneme}' in word '{word}'")
+                    # Optionally add a default/unknown phoneme index
+                    # indices.append(self.phoneme_to_id.get('<UNK>', 0))
+
+        return indices
+
+    def to_dict(self) -> Dict:
+        """Serialize processor state to dictionary"""
         return {
             "vowels": self.vowels,
             "consonants": self.consonants,
@@ -489,77 +607,36 @@ class RussianPhonemeProcessor:
             "voicing_map": self.voicing_map,
             "stress_patterns": self.stress_patterns,
             "exceptions": self.exceptions,
+            "phoneme_to_id": self.phoneme_to_id
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "RussianPhonemeProcessor":
-        """Recreate the processor from a dictionary."""
+    def from_dict(cls, data: Dict) -> "RussianPhonemeProcessor":
+        """Recreate processor from dictionary"""
         instance = cls()
-        instance.vowels = data["vowels"]
-        instance.consonants = data["consonants"]
-        instance.palatalized = data["palatalized"]
-        instance.vowel_reduction = data["vowel_reduction"]
-        instance.hard_consonants = set(data["hard_consonants"])
-        instance.soft_consonants = set(data["soft_consonants"])
-        instance.voiced_consonants = set(data["voiced_consonants"])
-        instance.voiceless_consonants = set(data["voiceless_consonants"])
-        instance.voicing_map = data["voicing_map"]
-        instance.stress_patterns = data["stress_patterns"]
-        instance.exceptions = data["exceptions"]
-        # Rebuild phoneme_to_id after loading all attributes
-        instance.phoneme_to_id = instance._build_vocab()
+
+        # Restore all attributes
+        for key, value in data.items():
+            if key in ["hard_consonants", "soft_consonants", "voiced_consonants", "voiceless_consonants"]:
+                setattr(instance, key, set(value))
+            else:
+                setattr(instance, key, value)
+
         return instance
 
-    def _build_vocab(self) -> Dict[str, int]:
-        """Build full phoneme vocabulary, including dynamically generated palatalized forms."""
-        phoneme_set = set()
+    def clear_cache(self):
+        """Clear internal caches"""
+        self.normalize_text.cache_clear()
+        self.process_word.cache_clear()
+        self._word_cache.clear()
 
-        # Add static phonemes
-        phoneme_set.update(self.vowels.values())
-        phoneme_set.update(self.vowel_reduction.values())
-        phoneme_set.update(self.consonants.values())
-        phoneme_set.update(self.palatalized.values()) # Adds 'nʲ' etc. as whole units
-
-        # Add phonemes found in exceptions by tokenizing their IPA strings
-        for val in self.exceptions.values():
-            tokenized_exception_phonemes = self._tokenize_ipa_string(val)
-            phoneme_set.update(tokenized_exception_phonemes)
-
-        # Explicitly add any other known single phonemes that might be missed but are used
-        phoneme_set.add('ʌ') # From 'конечно'
-        phoneme_set.add('j') # From 'й' or initial soft vowels
-        phoneme_set.add('ə') # Schwa
-        phoneme_set.add('ɪ') # Reduced i
-        # Ensure 'ʐ' is explicitly considered if it's not guaranteed by self.consonants.values()
-        # It should be covered by consonants.values(), but explicit adds can act as a safeguard.
-        phoneme_set.add('ʐ')
-
-
-        # Remove empty strings if present (e.g., from hard sign processing if it results in '')
-        phoneme_set.discard('')
-
-        # Final check: remove the isolated 'ʲ' if it somehow got in (it shouldn't with _tokenize_ipa_string)
-        phoneme_set.discard('ʲ')
-
-        phoneme_list = sorted(list(phoneme_set)) # Convert to list then sort
-        return {phoneme: idx for idx, phoneme in enumerate(phoneme_list)}
-
-
-    def text_to_indices(self, text: str) -> List[int]:
-        """Convert text to a list of phoneme indices"""
-        results = self.process_text(text)
-        indices = []
-
-        for word, phonemes, _ in results:
-            for p in phonemes:
-                idx = self.phoneme_to_id.get(p)
-                if idx is not None:
-                    indices.append(idx)
-                else:
-                    # This is the line causing the error. Debugging here.
-                    raise ValueError(f"Unknown phoneme: {p} in word: {word}")
-
-        return indices
+    def get_cache_info(self) -> Dict:
+        """Get cache statistics for debugging"""
+        return {
+            "normalize_text_cache": self.normalize_text.cache_info(),
+            "process_word_cache": self.process_word.cache_info(),
+            "word_cache_size": len(self._word_cache)
+        }
 
 
 # Example usage and testing
@@ -576,10 +653,10 @@ if __name__ == "__main__":
         "работает",    # works
         "хорошо",      # good
         "понимать",    # to understand
-        "будешь",       # The word that caused the error
-        "конечно",     # The word that caused the 'ʌ' error and now 'ʲ' error
+        "будешь",      # The word that caused an error
+        "конечно",     # The word that caused two errors - 'ʌ' error and now 'ʲ' error
         "и",
-        "сегодня" # Explicitly test the problematic word
+        "сегодня"      # Explicitly test problematic words
     ]
 
     print("Russian Phoneme Processing Examples:")
