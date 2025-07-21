@@ -280,28 +280,27 @@ class RussianPhonemeProcessor:
 
         result = list(word)
         vowel_positions = []
-        syllable_count = 0
 
-        # Find all vowel positions and map them to syllables
+        # Find all vowel positions
         for i, char in enumerate(word):
-            if char.lower() in self.VOWEL_LETTERS:
-                vowel_positions.append((i, syllable_count))
-                syllable_count += 1
+            if char.lower() in self.vowels:
+                vowel_positions.append(i)
 
         # Apply reduction to unstressed vowels
-        for pos, syllable_idx in vowel_positions:
-            if syllable_idx != stress_info.position:  # Not the stressed vowel
+        for i, pos in enumerate(vowel_positions):
+            if i != stress_info.position:  # Not the stressed vowel
                 char = word[pos].lower()
-                distance = abs(syllable_idx - stress_info.position)
+                distance = abs(i - stress_info.position)
 
-                # More conservative reduction - only reduce o/a in specific positions
-                if distance == 1 and char in ['о']:  # First pretonic/post-tonic
-                    result[pos] = 'a'  # о -> а in pretonic
-                elif distance > 1 and char in ['о', 'а']:  # Further positions
-                    result[pos] = 'ə'  # Stronger reduction
-                # Keep other vowels mostly unchanged for now
-                # elif char in ['е', 'я'] and distance > 0:
-                #     result[pos] = 'ɪ'
+                # Apply different reduction based on distance from stress
+                if distance == 1:  # First pretonic/post-tonic
+                    if char in ['о', 'а']:
+                        result[pos] = 'ə'
+                    elif char in ['е', 'я']:
+                        result[pos] = 'ɪ'
+                else:  # Further positions - stronger reduction
+                    if char in ['о', 'а', 'е', 'я']:
+                        result[pos] = 'ə'
 
         return ''.join(result)
 
@@ -312,24 +311,21 @@ class RussianPhonemeProcessor:
 
         result = list(word.lower())
 
-        # Conservative assimilation - only clear cases
+        # Voicing assimilation
         for i in range(len(result) - 1):
             current = result[i]
             next_char = result[i + 1]
 
-            # Skip if either character is not a consonant
-            if current not in self.consonants or next_char not in self.consonants:
-                continue
-
-            # Voicing assimilation - only for adjacent consonants
-            if (current in self.voiced_consonants and
-                next_char in self.voiceless_consonants and
-                current in self.voicing_map):
-                result[i] = self.voicing_map[current]
-            elif (current in self.voiceless_consonants and
-                  next_char in self.voiced_consonants and
-                  current in self.voicing_map):
-                result[i] = self.voicing_map[current]
+            if current in self.consonants and next_char in self.consonants:
+                # Assimilate voicing
+                if (current in self.voiced_consonants and
+                    next_char in self.voiceless_consonants and
+                    current in self.voicing_map):
+                    result[i] = self.voicing_map[current]
+                elif (current in self.voiceless_consonants and
+                      next_char in self.voiced_consonants and
+                      current in self.voicing_map):
+                    result[i] = self.voicing_map[current]
 
         # Word-final devoicing
         if result and result[-1] in self.voiced_consonants:
@@ -351,29 +347,17 @@ class RussianPhonemeProcessor:
 
             if char in self.consonants:
                 phoneme = self._process_consonant(word, i)
-                if phoneme:  # Only add non-empty phonemes
-                    processed_phonemes.append(phoneme)
+                processed_phonemes.append(phoneme)
             elif char in self.vowels:
                 phoneme = self._process_vowel(word, i)
-                if phoneme:  # Only add non-empty phonemes
-                    processed_phonemes.append(phoneme)
-            elif char == 'ь':
-                # Soft sign - already handled in consonant processing, skip
+                processed_phonemes.append(phoneme)
+            elif char in ['ь', 'ъ']:
+                # Soft/hard signs are handled during consonant processing
                 pass
-            elif char == 'ъ':
-                # Hard sign - separates sounds, skip
-                pass
-            elif char == 'ə':
-                # Schwa from reduction
-                processed_phonemes.append('ə')
-            else:
-                # Unknown character - log and skip
-                import logging
-                logging.warning(f"Unknown character '{char}' at position {i} in word '{word}'")
 
             i += 1
 
-        return processed_phonemes
+        return [p for p in processed_phonemes if p]
 
     def _process_consonant(self, word: str, pos: int) -> str:
         """Process a single consonant with palatalization rules"""
