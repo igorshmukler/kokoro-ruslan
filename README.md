@@ -147,20 +147,182 @@ The script includes several optimizations for limited memory:
 
 ## Phoneme Processing
 
-The script uses a rule-based Russian grapheme-to-phoneme converter:
+The script uses an advanced rule-based Russian grapheme-to-phoneme converter with comprehensive linguistic features:
 
-### Supported Characters
+### RussianPhonemeProcessor Features
 
-- **Vowels**: а, о, у, ы, э, я, ё, ю, и, е
-- **Consonants**: б, в, г, д, ж, з, к, л, м, н, п, р, с, т, ф, х, ц, ч, ш, щ
-- **Special**: ь, ъ (soft/hard signs), punctuation, spaces
+- **Comprehensive Stress Detection**: Multi-level approach with explicit marks, dictionary lookup, and heuristic rules
+- **Vowel Reduction**: Implements Russian vowel reduction patterns based on stress position
+- **Consonant Assimilation**: Handles voicing assimilation and word-final devoicing
+- **Palatalization Rules**: Complete palatalization system with soft/hard consonant distinctions
+- **Performance Optimized**: LRU caching for frequently processed words and text normalization
+- **Exception Handling**: Built-in dictionary for irregular pronunciations
+- **IPA Output**: Full International Phonetic Alphabet representation
 
-### Example Phoneme Conversion
+### Stress Detection System
 
+The processor uses a three-tier stress detection approach:
+
+1. **Explicit Stress Marks**: Recognizes combining acute (◌́), grave (◌̀), and acute accent marks
+2. **Dictionary Lookup**: Built-in stress patterns for common words with optional external dictionary support
+3. **Heuristic Rules**: Intelligent fallback based on morphological patterns:
+   - Infinitive verbs (-ать, -еть, -ить): stress on ending
+   - Adjectives (-ный, -ная): stress on root
+   - Abstract nouns (-ость, -есть): stress on root
+   - Default: penultimate syllable stress
+
+### Phonetic Processes
+
+#### Vowel System
+- **Base Vowels**: а/a, о/o, у/u, ы/ɨ, э/e, я/ja, ё/jo, ю/ju, и/i, е/je
+- **Vowel Reduction**:
+  - First pretonic/post-tonic: о,а → ə; е,я → ɪ
+  - Further positions: о,а,е,я → ə (stronger reduction)
+- **Contextual Variants**: Iotated vowels after consonants (я→a, ю→u, etc.)
+
+#### Consonant System
+- **Base Consonants**: 20 primary consonants with IPA mapping
+- **Palatalization**: Full palatalized variants (Cʲ) triggered by:
+  - Following soft vowels (е, и, ё, ю, я)
+  - Soft sign (ь)
+- **Hard Consonants**: ж, ш, ц (never palatalized)
+- **Soft Consonants**: ч, щ, й (always palatalized)
+
+#### Phonetic Rules
+- **Voicing Assimilation**: Consonant clusters assimilate voicing
+- **Word-Final Devoicing**: Voiced consonants become voiceless at word end
+- **Consonant Simplification**: Handles consonant cluster simplifications
+
+### Supported Character Set
+
+- **Vowels**: а, о, у, ы, э, я, ё, ю, и, е (10 letters)
+- **Consonants**: б, в, г, д, ж, з, к, л, м, н, п, р, с, т, ф, х, ц, ч, ш, щ (20 letters)
+- **Special Signs**: ь (soft sign), ъ (hard sign)
+- **Stress Marks**: Combining diacritics (U+0301, U+0300, U+0341)
+
+### Usage Examples
+
+#### Basic Word Processing
+```python
+processor = RussianPhonemeProcessor()
+phonemes, stress_info = processor.process_word("говорить")
+# Returns: (['g', 'ə', 'v', 'ə', 'r', 'i', 'tʲ'], StressInfo(position=2, vowel_index=5, is_marked=False))
+
+ipa = processor.to_ipa(phonemes)
+# Returns: "gəvərʲitʲ"
 ```
-Russian: "Привет мир"
-Phonemes: ['p', 'r', 'i', 'v', 'je', 't', ' ', 'm', 'i', 'r']
+
+#### Text Processing with Stress
+```python
+results = processor.process_text("Привет, как дела?")
+for word, phonemes, stress_info in results:
+    print(f"{word} -> /{processor.to_ipa(phonemes)}/ (stress: syllable {stress_info.position})")
+
+# Output:
+# привет -> /prʲivʲet/ (stress: syllable 1)
+# как -> /kak/ (stress: syllable 0)
+# дела -> /dʲɪla/ (stress: syllable 1)
 ```
+
+#### Phoneme-to-Index Conversion
+```python
+# For neural network training
+indices = processor.text_to_indices("говорить")
+vocab_size = processor.get_vocab_size()  # Returns total phoneme count
+phoneme_list = processor.get_phoneme_list()  # Returns all phonemes
+```
+
+### Exception Dictionary
+
+Built-in irregular pronunciations for common words:
+- что → /ʃto/ (not standard /tʃto/)
+- конечно → /kənʲeʃnə/ (не-consonant simplification)
+- его → /jɪvo/ (genitive case vowel change)
+- сегодня → /sʲɪvodʲnʲə/ (historical sound changes)
+
+### Performance Features
+
+- **LRU Caching**: `@lru_cache` decorators on frequently called methods
+- **Word Caching**: Internal cache for processed words
+- **Batch Processing**: Optimized for processing multiple words/sentences
+- **Memory Management**: Cache clearing and statistics monitoring
+
+### Configuration Options
+
+```python
+# Initialize with external stress dictionary
+processor = RussianPhonemeProcessor(stress_dict_path="./stress_dict.txt")
+
+# Stress dictionary format (TSV):
+# слово	2	# word with stress on syllable 2
+# говорить	2
+# красивый	1
+```
+
+### Advanced Features
+
+#### Serialization Support
+```python
+# Save processor state
+state_dict = processor.to_dict()
+
+# Restore from state
+processor = RussianPhonemeProcessor.from_dict(state_dict)
+```
+
+#### Cache Management
+```python
+# Clear all caches
+processor.clear_cache()
+
+# Get cache statistics
+stats = processor.get_cache_info()
+print(f"Cache hits: {stats['normalize_text_cache'].hits}")
+```
+
+#### Stress Pattern Generation
+```python
+# Get binary stress pattern for TTS models
+stress_pattern = processor.get_stress_pattern("говорить по-русски")
+# Returns: [0, 0, 1, 0, 0, 0, 0, 1, 0, 0]  # 1 = stressed phoneme
+```
+
+### Phoneme Vocabulary
+
+The processor generates a complete phoneme vocabulary including:
+- Base vowel and consonant phonemes
+- Palatalized consonants (Cʲ)
+- Reduced vowels (ə, ɪ)
+- Multi-character phonemes (ts, tʃ, ʃtʃ)
+- Exception phonemes (ʌ, ʐ, etc.)
+
+Total vocabulary size: ~35-40 unique phonemes depending on exceptions and reductions used.
+
+### Integration with Training
+
+The phoneme processor integrates seamlessly with the TTS training pipeline:
+
+```python
+# In training script
+processor = RussianPhonemeProcessor()
+
+# Process text to phoneme indices
+def text_to_phonemes(text):
+    results = processor.process_text(text)
+    phoneme_ids = []
+    stress_pattern = []
+
+    for word, phonemes, stress_info in results:
+        word_ids = [processor.phoneme_to_id[p] for p in phonemes if p in processor.phoneme_to_id]
+        word_stress = [1 if i == stress_info.vowel_index else 0 for i in range(len(phonemes))]
+
+        phoneme_ids.extend(word_ids)
+        stress_pattern.extend(word_stress)
+
+    return phoneme_ids, stress_pattern
+```
+
+This comprehensive phoneme processing system ensures accurate Russian pronunciation modeling for high-quality TTS synthesis.
 
 ## Training Progress
 
