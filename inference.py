@@ -319,8 +319,8 @@ class KokoroTTS:
         if checkpoint is None:
             raise RuntimeError("Failed to load checkpoint with any method")
 
-        # Initialize model
-        vocab_size = len(self.phoneme_processor.phonemes)
+        # Initialize model - FIX: Use the correct vocab size calculation
+        vocab_size = len(self.phoneme_processor.phoneme_to_id)  # Fixed from .phonemes to .phoneme_to_id
         model = KokoroModel(vocab_size, self.n_mels)
 
         # Load state dict - handle different checkpoint formats
@@ -352,7 +352,7 @@ class KokoroTTS:
         model.to(self.device)
         model.eval()
 
-        logger.info("Model loaded successfully")
+        logger.info(f"Model loaded successfully with vocab_size={vocab_size}")
         return model
 
     def _save_audio(self, audio: torch.Tensor, output_path: str):
@@ -401,11 +401,17 @@ class KokoroTTS:
         """Convert text to speech using neural vocoder"""
         logger.info(f"Converting text: '{text}'")
 
-        # Convert text to phonemes
-        phonemes = self.phoneme_processor.text_to_phonemes(text)
-        phoneme_indices = self.phoneme_processor.phonemes_to_indices(phonemes)
+        # FIX: Use the correct method names for the phoneme processor
+        results = self.phoneme_processor.process_text(text)
+        phonemes = []
+        for word, word_phonemes, stress_info in results:
+            phonemes.extend(word_phonemes)
+
+        # Convert phonemes to indices
+        phoneme_indices = self.phoneme_processor.text_to_indices(text)
 
         logger.info(f"Phonemes: {' '.join(phonemes)}")
+        logger.info(f"Phoneme indices: {phoneme_indices[:20]}...")  # Show first 20 indices
 
         # Convert to tensor and add batch dimension
         phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0)
