@@ -18,7 +18,7 @@ import logging
 import soundfile as sf
 from urllib.parse import urlparse
 
-# Import our model and phoneme processor
+# Import our training configuration, model and phoneme processor
 from config import TrainingConfig
 from model import KokoroModel
 from russian_phoneme_processor import RussianPhonemeProcessor
