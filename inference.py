@@ -19,6 +19,7 @@ import soundfile as sf
 from urllib.parse import urlparse
 
 # Import our model and phoneme processor
+from config import TrainingConfig
 from model import KokoroModel
 from russian_phoneme_processor import RussianPhonemeProcessor
 from hifigan_vocoder import HiFiGANGenerator, load_hifigan_model, HiFiGANConfig
@@ -26,24 +27,6 @@ from hifigan_vocoder import HiFiGANGenerator, load_hifigan_model, HiFiGANConfig
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-class TrainingConfig:
-    """Training configuration class - needed for checkpoint loading"""
-    def __init__(self):
-        self.vocab_size = 50
-        self.mel_dim = 80
-        self.hidden_dim = 512
-        self.learning_rate = 0.001
-        self.batch_size = 16
-        self.num_epochs = 100
-        self.sample_rate = 22050
-        self.hop_length = 256
-        self.win_length = 1024
-        self.n_fft = 1024
-        self.n_mels = 80
-        self.f_min = 0.0
-        self.f_max = 8000.0
 
 
 class VocoderManager:
