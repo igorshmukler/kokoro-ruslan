@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+"""
+Dataset implementation for Ruslan corpus
+"""
+
+import torch
+import torchaudio
+from pathlib import Path
+from typing import Dict, List
+from torch.utils.data import Dataset
+from torch.nn.utils.rnn import pad_sequence
+import logging
+
+from config import TrainingConfig
+from russian_phoneme_processor import RussianPhonemeProcessor
+
+logger = logging.getLogger(__name__)
+
+
+class RuslanDataset(Dataset):
+    """Dataset class for Ruslan corpus - optimized for MPS"""
+
+    def __init__(self, data_dir: str, config: TrainingConfig):
+        self.data_dir = Path(data_dir)
+        self.config = config
+        self.phoneme_processor = RussianPhonemeProcessor()
+
+        # Pre-create mel transform for efficiency
+        self.mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=self.config.sample_rate,
+            n_fft=self.config.n_fft,
+            n_mels=self.config.n_mels,
+            hop_length=self.config.hop_length,
+            win_length=self.config.win_length,
+            f_min=self.config.f_min,
+            f_max=self.config.f_max,
+            power=2.0,
+            normalized=False
+        )
+
+        # Load metadata
+        self.samples = self._load_samples()
+        logger.info(f"Loaded {len(self.samples)} samples from corpus at {data_dir}")
+        logger.info(f"Using phoneme processor: {self.phoneme_processor}")
+
+    def _load_samples(self) -> List[Dict]:
+        """Load samples from corpus directory"""
+        samples = []
+
+        # Look for metadata file (adjust path as needed)
+        metadata_file = self.data_dir / "metadata_RUSLAN_22200.csv"
+        if metadata_file.exists():
+            logger.info(f"Loading metadata from {metadata_file}")
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split('|')
+                    if len(parts) >= 2:
+                        audio_file = parts[0]
+                        text = parts[1]
+
+                        audio_path = self.data_dir / "wavs" / f"{audio_file}.wav"
+                        if audio_path.exists():
+                            samples.append({
+                                'audio_path': str(audio_path),
+                                'text': text,
+                                'audio_file': audio_file
+                            })
+        else:
+            # Fallback: scan for wav files and corresponding text files
+            logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan.")
+            wav_dir = self.data_dir / "wavs"
+            txt_dir = self.data_dir / "texts"
+    
+            if wav_dir.exists():
+                for wav_file in wav_dir.glob("*.wav"):
+                    txt_file = txt_dir / f"{wav_file.stem}.txt"
+                    if txt_file.exists():
+                        with open(txt_file, 'r', encoding='utf-8') as f:
+                            text = f.read().strip()
+                        samples.append({
+                            'audio_path': str(wav_file),
+                            'text': text,
+                            'audio_file': wav_file.stem
+                        })
+
+        return samples
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> Dict:
+        sample = self.samples[idx]
+
+        # Load audio
+        audio, sr = torchaudio.load(sample['audio_path'])
+
+        # Resample if necessary
+        if sr != self.config.sample_rate:
+            resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
+            audio = resampler(audio)
+
+        # Convert to mono if stereo
+        if audio.shape[0] > 1:
+            audio = audio.mean(dim=0, keepdim=True)
+
+        # Normalize audio to prevent numerical issues
+        audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
+
+        # Extract mel spectrogram using pre-created transform
+        mel_spec = self.mel_transform(audio).squeeze(0)  # Remove channel dimension
+
+        # Convert to log scale and normalize
+        mel_spec = torch.log(mel_spec + 1e-9)  # Add small epsilon to avoid log(0)
+
+        # Clip extremely long sequences to prevent memory issues
+        max_frames = 800  # Reduced for better MPS memory management
+        if mel_spec.shape[1] > max_frames:
+            mel_spec = mel_spec[:, :max_frames]
+
+        # Process text to phonemes using the dedicated processor
+        phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
+
+        return {
+            'mel_spec': mel_spec,
+            'phoneme_indices': torch.tensor(phoneme_indices, dtype=torch.long),
+            'text': sample['text'],
+            'audio_file': sample['audio_file']
+        }
+
+
+def collate_fn(batch: List[Dict]) -> Dict:
+    """Collate function for DataLoader - optimized for MPS"""
+    mel_specs = [item['mel_spec'].transpose(0, 1) for item in batch]  # (time, mel_dim)
+    phoneme_indices = [item['phoneme_indices'] for item in batch]
+    texts = [item['text'] for item in batch]
+    audio_files = [item['audio_file'] for item in batch]
+
+    # Pad sequences
+    mel_specs_padded = pad_sequence(mel_specs, batch_first=True, padding_value=0)
+    phoneme_indices_padded = pad_sequence(phoneme_indices, batch_first=True, padding_value=0)
+
+    return {
+        'mel_specs': mel_specs_padded,
+        'phoneme_indices': phoneme_indices_padded,
+        'texts': texts,
+        'audio_files': audio_files
+    }
