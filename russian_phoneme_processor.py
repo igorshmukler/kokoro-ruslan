@@ -171,3 +171,34 @@ class RussianPhonemeProcessor:
 
     def __str__(self) -> str:
         return f"Russian Phoneme Processor with {self.get_vocab_size()} phonemes"
+
+def test_processor():
+    """Test function for the phoneme processor"""
+    processor = RussianPhonemeProcessor()
+
+    test_texts = [
+        "привет мир",
+        "как дела?",
+        "спасибо большое!",
+        "до свидания"
+    ]
+
+    print(f"Processor: {processor}")
+    print(f"Vocabulary size: {processor.get_vocab_size()}")
+    print(f"Phonemes: {processor.phonemes}")
+    print()
+
+    for text in test_texts:
+        phonemes = processor.text_to_phonemes(text)
+        indices = processor.phonemes_to_indices(phonemes)
+        reconstructed = processor.indices_to_phonemes(indices)
+
+        print(f"Text: '{text}'")
+        print(f"Phonemes: {phonemes}")
+        print(f"Indices: {indices}")
+        print(f"Reconstructed: {reconstructed}")
+        print("-" * 50)
+
+
+if __name__ == "__main__":
+    test_processor()
