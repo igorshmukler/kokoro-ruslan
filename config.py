@@ -4,7 +4,7 @@ Configuration classes for Kokoro Language Model Training
 """
 
 import torch
-from dataclasses import dataclass
+from dataclasses import dataclass, field # Import field for default_factory
 from typing import Optional
 
 
@@ -30,7 +30,13 @@ class TrainingConfig:
     num_workers: int = 0  # Set to 0 for MPS compatibility
     pin_memory: bool = False  # Disable for MPS
     resume_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
+
     # Parameters for CosineAnnealingWarmRestarts
     lr_T_0: int = 20        # Number of epochs for the first restart cycle
     lr_T_mult: int = 2      # Multiplier for subsequent cycle lengths
     lr_eta_min: float = 1e-6 # Minimum learning rate
+
+    # Parameters for Duration Modeling and End-of-Speech Prediction ---
+    hidden_dim: int = 512 # Hidden dimension for internal model layers (matches KokoroModel)
+    duration_loss_weight: float = 0.1 # Weight for the duration prediction loss
+    stop_token_loss_weight: float = 1.0 # Weight for the stop token prediction loss
