@@ -13,7 +13,7 @@ class TrainingConfig:
     """Training configuration for Kokoro model"""
     data_dir: str = "./ruslan_corpus"
     output_dir: str = "./kokoro_russian_model"
-    batch_size: int = 8  # Increased for MPS
+    batch_size: int = 12  # Increased for MPS
     learning_rate: float = 1e-4
     num_epochs: int = 100
     max_seq_length: int = 1024
