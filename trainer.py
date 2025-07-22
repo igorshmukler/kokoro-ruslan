@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
 
-from config import TrainingConfig # Ensure this imports your updated config
+from config import TrainingConfig
 from dataset import RuslanDataset, collate_fn
 from model import KokoroModel
 from checkpoint_manager import (
@@ -24,7 +24,7 @@ class KokoroTrainer:
 
     def __init__(self, config: TrainingConfig):
         self.config = config
-        self.device = torch.device(config.device) # Ensure device is a torch.device object
+        self.device = torch.device(config.device)
 
         # Initialize dataset
         self.dataset = RuslanDataset(config.data_dir, config)
@@ -119,7 +119,6 @@ class KokoroTrainer:
                 # predictions = self.model(phoneme_indices)
 
 
-                # --- FIX FOR SIZE MISMATCH ---
                 # Determine the minimum sequence length in the batch for both predictions and targets
                 min_len = min(predictions.size(1), mel_specs.size(1))
 
