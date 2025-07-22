@@ -10,10 +10,9 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
 
-# Ensure these imports point to your updated files
-from config import TrainingConfig # Ensure TrainingConfig has `hidden_dim`
+from config import TrainingConfig
 from dataset import RuslanDataset, collate_fn # Assume dataset and collate_fn provide durations and stop tokens
-from model import KokoroModel # This should be your updated KokoroModel
+from model import KokoroModel
 from checkpoint_manager import (
     save_phoneme_processor, load_checkpoint, find_latest_checkpoint,
     save_checkpoint, save_final_model

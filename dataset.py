@@ -166,8 +166,8 @@ class RuslanDataset(Dataset):
         return {
             'mel_spec': mel_spec,
             'phoneme_indices': phoneme_indices_tensor,
-            'phoneme_durations': phoneme_durations,    # NEW
-            'stop_token_targets': stop_token_targets,  # NEW
+            'phoneme_durations': phoneme_durations,
+            'stop_token_targets': stop_token_targets,
             'text': sample['text'],
             'audio_file': sample['audio_file']
         }
@@ -178,8 +178,8 @@ def collate_fn(batch: List[Dict]) -> Dict:
     # Transpose mel_spec from (n_mels, time) to (time, n_mels) for batch_first=True padding
     mel_specs = [item['mel_spec'].transpose(0, 1) for item in batch]
     phoneme_indices = [item['phoneme_indices'] for item in batch]
-    phoneme_durations = [item['phoneme_durations'] for item in batch] # NEW
-    stop_token_targets = [item['stop_token_targets'] for item in batch] # NEW (float32)
+    phoneme_durations = [item['phoneme_durations'] for item in batch]
+    stop_token_targets = [item['stop_token_targets'] for item in batch] # (float32)
 
     texts = [item['text'] for item in batch]
     audio_files = [item['audio_file'] for item in batch]
@@ -196,8 +196,8 @@ def collate_fn(batch: List[Dict]) -> Dict:
     return {
         'mel_specs': mel_specs_padded,
         'phoneme_indices': phoneme_indices_padded,
-        'phoneme_durations': phoneme_durations_padded, # NEW
-        'stop_token_targets': stop_token_targets_padded, # NEW
+        'phoneme_durations': phoneme_durations_padded,
+        'stop_token_targets': stop_token_targets_padded,
         'texts': texts,
         'audio_files': audio_files
     }
