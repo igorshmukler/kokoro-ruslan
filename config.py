@@ -30,3 +30,7 @@ class TrainingConfig:
     num_workers: int = 0  # Set to 0 for MPS compatibility
     pin_memory: bool = False  # Disable for MPS
     resume_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
+    # Parameters for CosineAnnealingWarmRestarts
+    lr_T_0: int = 20        # Number of epochs for the first restart cycle
+    lr_T_mult: int = 2      # Multiplier for subsequent cycle lengths
+    lr_eta_min: float = 1e-6 # Minimum learning rate
