@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 class KokoroModel(nn.Module):
     """
@@ -302,7 +302,7 @@ class KokoroModel(nn.Module):
         mel_specs: Optional[torch.Tensor] = None,
         phoneme_durations: Optional[torch.Tensor] = None,
         stop_token_targets: Optional[torch.Tensor] = None
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Forward pass - automatically chooses training or inference mode.
 
