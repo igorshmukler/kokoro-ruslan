@@ -528,7 +528,7 @@ class KokoroModel(nn.Module):
 
                 # Progress logging
                 if t % 50 == 0 or t < 10:
-                    logger.info(f"Generated frame {t}, stop_prob: {stop_probability:.6f}")
+                    logger.debug(f"Generated frame {t}, stop_prob: {stop_probability:.6f}")
 
                 # MULTIPLE STOPPING CONDITIONS
 
