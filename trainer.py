@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
 
+from typing import Tuple
 from config import TrainingConfig
 from dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler
 from model import KokoroModel
