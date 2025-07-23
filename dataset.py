@@ -6,10 +6,12 @@ Dataset implementation for Ruslan corpus
 import torch
 import torchaudio
 from pathlib import Path
-from typing import Dict, List
-from torch.utils.data import Dataset
+from typing import Dict, List, Tuple
+from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 import logging
+import random
+import numpy as np
 
 from config import TrainingConfig
 from russian_phoneme_processor import RussianPhonemeProcessor
@@ -38,7 +40,7 @@ class RuslanDataset(Dataset):
             normalized=False
         )
 
-        # Load metadata
+        # Load metadata and pre-calculate lengths for batching
         self.samples = self._load_samples()
         logger.info(f"Loaded {len(self.samples)} samples from corpus at {data_dir}")
         logger.info(f"Using phoneme processor: {self.phoneme_processor}")
@@ -52,11 +54,7 @@ class RuslanDataset(Dataset):
 
     def _load_samples(self) -> List[Dict]:
         """
-        Load samples from corpus directory.
-
-        NOTE: For proper duration modeling, this method would ideally also load
-        or point to pre-computed phoneme durations (e.g., from forced alignment files).
-        This current implementation only loads audio path and text.
+        Load samples from corpus directory and pre-calculate lengths.
         """
         samples = []
 
@@ -67,19 +65,46 @@ class RuslanDataset(Dataset):
                 for line in f:
                     parts = line.strip().split('|')
                     if len(parts) >= 2:
-                        audio_file = parts[0]
+                        audio_file_stem = parts[0]
                         text = parts[1]
 
-                        audio_path = self.data_dir / "wavs" / f"{audio_file}.wav"
+                        audio_path = self.data_dir / "wavs" / f"{audio_file_stem}.wav"
                         if audio_path.exists():
+                            # Pre-calculate audio length (in mel frames)
+                            try:
+                                waveform, sr = torchaudio.load(audio_path)
+                                if sr != self.config.sample_rate:
+                                    resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
+                                    waveform = resampler(waveform)
+                                # Estimate mel frames (audio_length // hop_length)
+                                audio_length_frames = waveform.shape[1] // self.config.hop_length
+                            except Exception as e:
+                                logger.warning(f"Could not load or process audio {audio_path}: {e}. Skipping.")
+                                continue
+
+                            # Pre-calculate phoneme length
+                            phoneme_indices = self.phoneme_processor.text_to_indices(text)
+                            phoneme_length = len(phoneme_indices)
+
+                            # Clip extremely long sequences to prevent memory issues during training
+                            if audio_length_frames > self.config.max_seq_length:
+                                logger.warning(f"Clipping {audio_file_stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
+                                audio_length_frames = self.config.max_seq_length
+                                # Also adjust phoneme length if it's too long, proportionally
+                                if phoneme_length > 0:
+                                    phoneme_length = int(phoneme_length * (self.config.max_seq_length / (waveform.shape[1] // self.config.hop_length)))
+                                    phoneme_length = max(1, phoneme_length) # Ensure at least 1 phoneme if original was > 0
+
                             samples.append({
                                 'audio_path': str(audio_path),
                                 'text': text,
-                                'audio_file': audio_file
-                                # Potentially add 'duration_path': self.data_dir / "durations" / f"{audio_file}.json"
+                                'audio_file': audio_file_stem,
+                                'audio_length': audio_length_frames, # in mel frames
+                                'phoneme_length': phoneme_length
                             })
         else:
-            logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan.")
+            logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan. "
+                           "Note: Lengths will be estimated on the fly for scanned files, which might be slower.")
             wav_dir = self.data_dir / "wavs"
             txt_dir = self.data_dir / "texts"
     
@@ -89,12 +114,42 @@ class RuslanDataset(Dataset):
                     if txt_file.exists():
                         with open(txt_file, 'r', encoding='utf-8') as f:
                             text = f.read().strip()
+
+                        # Pre-calculate audio length (in mel frames)
+                        try:
+                            waveform, sr = torchaudio.load(wav_file)
+                            if sr != self.config.sample_rate:
+                                resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
+                                waveform = resampler(waveform)
+                            audio_length_frames = waveform.shape[1] // self.config.hop_length
+                        except Exception as e:
+                            logger.warning(f"Could not load or process audio {wav_file}: {e}. Skipping.")
+                            continue
+
+                        # Pre-calculate phoneme length
+                        phoneme_indices = self.phoneme_processor.text_to_indices(text)
+                        phoneme_length = len(phoneme_indices)
+
+                        # Clip extremely long sequences
+                        if audio_length_frames > self.config.max_seq_length:
+                             logger.warning(f"Clipping {wav_file.stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
+                             audio_length_frames = self.config.max_seq_length
+                             if phoneme_length > 0:
+                                phoneme_length = int(phoneme_length * (self.config.max_seq_length / (waveform.shape[1] // self.config.hop_length)))
+                                phoneme_length = max(1, phoneme_length)
+
+
                         samples.append({
                             'audio_path': str(wav_file),
                             'text': text,
-                            'audio_file': wav_file.stem
+                            'audio_file': wav_file.stem,
+                            'audio_length': audio_length_frames,
+                            'phoneme_length': phoneme_length
                         })
 
+        # Sort samples by their combined length (or just audio_length) for efficient batching
+        # Sorting by audio length is generally most impactful for Mel-spectrograms
+        samples.sort(key=lambda x: x['audio_length'])
         return samples
 
     def __len__(self) -> int:
@@ -125,7 +180,6 @@ class RuslanDataset(Dataset):
         mel_spec = torch.log(mel_spec + 1e-9)  # Add small epsilon to avoid log(0)
 
         # Clip extremely long sequences to prevent memory issues
-        # This max_frames should ideally be aligned with your model's capacity
         max_frames = self.config.max_seq_length
         if mel_spec.shape[1] > max_frames:
             mel_spec = mel_spec[:, :max_frames]
@@ -135,33 +189,25 @@ class RuslanDataset(Dataset):
         phoneme_indices_tensor = torch.tensor(phoneme_indices, dtype=torch.long)
 
         # --- Generate Phoneme Durations (PLACEHOLDER/DUMMY) ---
-        # IMPORTANT: For actual training, these MUST come from forced alignment data.
-        # This is a highly simplified approximation.
         num_mel_frames = mel_spec.shape[1]
         num_phonemes = phoneme_indices_tensor.shape[0]
 
         if num_phonemes == 0:
             phoneme_durations = torch.zeros_like(phoneme_indices_tensor, dtype=torch.long)
         else:
-            # Assign an average duration and distribute remainder
             avg_duration = num_mel_frames / num_phonemes
             phoneme_durations = torch.full((num_phonemes,), int(avg_duration), dtype=torch.long)
 
-            # Distribute any remaining frames
             remainder = num_mel_frames - torch.sum(phoneme_durations).item()
             for i in range(remainder):
-                if i < num_phonemes: # Ensure we don't go out of bounds
+                if i < num_phonemes:
                     phoneme_durations[i] += 1
-
-            # Ensure no phoneme has zero or negative duration (should be at least 1)
             phoneme_durations = torch.clamp(phoneme_durations, min=1)
 
-
         # --- Generate Stop Token Targets ---
-        # A tensor of zeros, with a 1.0 at the last actual mel frame.
         stop_token_targets = torch.zeros(mel_spec.shape[1], dtype=torch.float32)
         if mel_spec.shape[1] > 0:
-            stop_token_targets[-1] = 1.0 # Mark the last frame as the stop token
+            stop_token_targets[-1] = 1.0
 
         return {
             'mel_spec': mel_spec,
@@ -169,9 +215,10 @@ class RuslanDataset(Dataset):
             'phoneme_durations': phoneme_durations,
             'stop_token_targets': stop_token_targets,
             'text': sample['text'],
-            'audio_file': sample['audio_file']
+            'audio_file': sample['audio_file'],
+            'mel_length': mel_spec.shape[1], # Actual length after potential clipping
+            'phoneme_length': phoneme_indices_tensor.shape[0] # Actual length
         }
-
 
 def collate_fn(batch: List[Dict]) -> Dict:
     """Collate function for DataLoader - optimized for MPS"""
@@ -181,23 +228,89 @@ def collate_fn(batch: List[Dict]) -> Dict:
     phoneme_durations = [item['phoneme_durations'] for item in batch]
     stop_token_targets = [item['stop_token_targets'] for item in batch] # (float32)
 
+    # Extract original lengths for loss masking if needed later
+    mel_lengths = torch.tensor([item['mel_length'] for item in batch], dtype=torch.long)
+    phoneme_lengths = torch.tensor([item['phoneme_length'] for item in batch], dtype=torch.long)
+
     texts = [item['text'] for item in batch]
     audio_files = [item['audio_file'] for item in batch]
 
     # Pad sequences
     mel_specs_padded = pad_sequence(mel_specs, batch_first=True, padding_value=0.0)
     phoneme_indices_padded = pad_sequence(phoneme_indices, batch_first=True, padding_value=0)
-    # Durations are integers, padding with 0 is fine
     phoneme_durations_padded = pad_sequence(phoneme_durations, batch_first=True, padding_value=0)
-    # Stop token targets are floats, padding with 0.0 is crucial for BCEWithLogitsLoss
     stop_token_targets_padded = pad_sequence(stop_token_targets, batch_first=True, padding_value=0.0)
-
 
     return {
         'mel_specs': mel_specs_padded,
         'phoneme_indices': phoneme_indices_padded,
         'phoneme_durations': phoneme_durations_padded,
         'stop_token_targets': stop_token_targets_padded,
+        'mel_lengths': mel_lengths,        # Add mel lengths to the batch
+        'phoneme_lengths': phoneme_lengths, # Add phoneme lengths to the batch
         'texts': texts,
         'audio_files': audio_files
     }
+
+
+class LengthBasedBatchSampler(Sampler):
+    """
+    Samples mini-batches of indices for training.
+    The samples are grouped by lengths to minimize padding.
+    Assumes the dataset is already sorted by length.
+    """
+    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False, shuffle: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+        # Create buckets of indices based on length
+        # Since the dataset is pre-sorted by audio_length, we can just group
+        self.batches = self._create_batches()
+
+    def _create_batches(self) -> List[List[int]]:
+        batches = []
+        indices = list(range(len(self.dataset)))
+
+        if self.shuffle:
+            # Shuffle within "length-similar" windows to maintain some randomness
+            # without completely destroying the length ordering.
+            # A common strategy is to shuffle fixed-size chunks of the sorted data.
+            window_size = 1000 # Example window size, tune as needed
+            num_windows = len(indices) // window_size
+            shuffled_indices = []
+            for i in range(num_windows):
+                window = indices[i * window_size : (i + 1) * window_size]
+                random.shuffle(window)
+                shuffled_indices.extend(window)
+            # Add remaining indices
+            remaining_indices = indices[num_windows * window_size:]
+            random.shuffle(remaining_indices)
+            shuffled_indices.extend(remaining_indices)
+            indices = shuffled_indices
+
+        # Group into batches
+        current_batch = []
+        for idx in indices:
+            current_batch.append(idx)
+            if len(current_batch) == self.batch_size:
+                batches.append(current_batch)
+                current_batch = []
+
+        if len(current_batch) > 0 and not self.drop_last:
+            batches.append(current_batch)
+
+        # Shuffle the order of batches
+        if self.shuffle:
+            random.shuffle(batches)
+
+        return batches
+
+    def __iter__(self):
+        # Iterate over the prepared batches
+        for batch in self.batches:
+            yield batch
+
+    def __len__(self) -> int:
+        return len(self.batches)
