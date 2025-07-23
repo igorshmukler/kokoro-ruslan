@@ -6,112 +6,10 @@ from torch.utils.checkpoint import checkpoint # Keep for gradient checkpointing
 import logging
 
 from positional_encoding import PositionalEncoding
+from transformers import TransformerDecoder, TransformerDecoderBlock, TransformerEncoderBlock
 
 logger = logging.getLogger(__name__)
 
-
-class TransformerEncoderBlock(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-
-    def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None,
-                src_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            src: the sequence to the encoder (batch_size, seq_len, d_model).
-            src_mask: the mask for the src sequence (seq_len, seq_len).
-            src_key_padding_mask: the mask for the src keys per batch (batch_size, seq_len).
-        """
-        src2 = self.self_attn(src, src, src, attn_mask=src_mask,
-                              key_padding_mask=src_key_padding_mask)[0]
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-
-        src2 = self.linear2(self.dropout(F.relu(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
-        return src
-
-class TransformerDecoderBlock(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
-        super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
-        # Implementation of Feedforward model
-        self.linear1 = nn.Linear(d_model, dim_feedforward)
-        self.dropout = nn.Dropout(dropout)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
-
-        self.norm1 = nn.LayerNorm(d_model)
-        self.norm2 = nn.LayerNorm(d_model)
-        self.norm3 = nn.LayerNorm(d_model)
-        self.dropout1 = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
-
-    def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
-                tgt_mask: Optional[torch.Tensor] = None,
-                memory_mask: Optional[torch.Tensor] = None,
-                tgt_key_padding_mask: Optional[torch.Tensor] = None,
-                memory_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            tgt: the sequence to the decoder (batch_size, tgt_seq_len, d_model).
-            memory: the sequence from the last layer of the encoder (batch_size, src_seq_len, d_model).
-            tgt_mask: the mask for the tgt sequence (tgt_seq_len, tgt_seq_len). For causal attention.
-            memory_mask: the mask for the memory sequence (src_seq_len, src_seq_len). (Typically not used for cross-attention).
-            tgt_key_padding_mask: the mask for the tgt keys per batch (batch_size, tgt_seq_len).
-            memory_key_padding_mask: the mask for the memory keys per batch (batch_size, src_seq_len).
-        """
-        # Self-attention part (masked for causality)
-        tgt2 = self.self_attn(tgt, tgt, tgt, attn_mask=tgt_mask,
-                              key_padding_mask=tgt_key_padding_mask)[0]
-        tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
-
-        # Cross-attention part
-        tgt2 = self.multihead_attn(tgt, memory, memory, attn_mask=memory_mask,
-                                   key_padding_mask=memory_key_padding_mask)[0]
-        tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
-
-        # Feed-forward part
-        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
-        tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
-        return tgt
-
-class TransformerDecoder(nn.Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int):
-        super().__init__()
-        self.layers = nn.ModuleList([
-            TransformerDecoderBlock(d_model, nhead, dim_feedforward, dropout)
-            for _ in range(num_layers)
-        ])
-        self.norm = nn.LayerNorm(d_model)
-
-    def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
-                tgt_mask: Optional[torch.Tensor] = None,
-                memory_key_padding_mask: Optional[torch.Tensor] = None,
-                tgt_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        output = tgt # Expects PE already applied for inference
-        for layer in self.layers:
-            if self.training: # Check if in training mode
-                output = checkpoint(layer, output, memory, tgt_mask, None, tgt_key_padding_mask, memory_key_padding_mask, use_reentrant=False)
-            else: # Inference mode
-                # Debugging print statement:
-                # logger.debug(f"Decoder layer input tgt shape: {output.shape}, tgt_mask shape: {tgt_mask.shape if tgt_mask is not None else 'None'}")
-                output = layer(output, memory, tgt_mask, None, tgt_key_padding_mask, memory_key_padding_mask)
-        return self.norm(output)
 
 class KokoroModel(nn.Module):
     """
@@ -122,7 +20,7 @@ class KokoroModel(nn.Module):
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
                  encoder_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
-                 max_decoder_seq_len: int = 800): # Added max_decoder_seq_len
+                 max_seq_len: int = 5000): # Use a single max_seq_len for both
         """
         Initialize the Kokoro model with Transformer encoder and decoder
         
@@ -136,19 +34,17 @@ class KokoroModel(nn.Module):
             encoder_dropout: Dropout rate for the Transformer encoder
             n_decoder_layers: Number of Transformer decoder layers
             decoder_ff_dim: Dimension of the feed-forward network in Decoder Transformer blocks
-            max_decoder_seq_len: Maximum sequence length the decoder might generate, for PE.
+            max_seq_len: Maximum sequence length for positional encodings (both encoder and decoder).
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.mel_dim = mel_dim
         self.hidden_dim = hidden_dim # This will now be d_model
-        self.max_decoder_seq_len = max_decoder_seq_len # Store this
+        self.max_seq_len = max_seq_len # Store this for PE initialization
 
         # Text encoder: Embedding + Positional Encoding + Stack of Transformer Blocks
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
-        # Positional Encoding needs to be able to go up to the max possible sequence length
-        # for both encoder and decoder. Use max_decoder_seq_len for max_len here.
-        self.encoder_positional_encoding = PositionalEncoding(hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len)
+        self.encoder_positional_encoding = PositionalEncoding(hidden_dim, dropout=encoder_dropout, max_len=self.max_seq_len)
 
         self.transformer_encoder_layers = nn.ModuleList([
             TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout)
@@ -166,6 +62,9 @@ class KokoroModel(nn.Module):
 
         # Mel feature projection to match hidden dimension for decoder input
         self.mel_projection_in = nn.Linear(mel_dim, hidden_dim)
+
+        # FIX: Add a dedicated positional encoding for the decoder input
+        self.decoder_positional_encoding = PositionalEncoding(hidden_dim, dropout=encoder_dropout, max_len=self.max_seq_len)
 
         self.decoder = TransformerDecoder(
             d_model=hidden_dim,
@@ -388,16 +287,16 @@ class KokoroModel(nn.Module):
         decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
         decoder_input_projected = self.mel_projection_in(decoder_input_mels)
 
-        # Apply positional encoding to the full decoder input sequence
+        # FIX: Apply the dedicated decoder positional encoding
         # For training, seq_offset is 0 as we're processing the full sequence from the start
-        decoder_input_projected_with_pe = self.encoder_positional_encoding(decoder_input_projected, seq_offset=0)
+        decoder_input_projected_with_pe = self.decoder_positional_encoding(decoder_input_projected, seq_offset=0)
 
         # Generate causal mask for decoder self-attention
         tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
 
         # Pass through Transformer Decoder
         decoder_outputs = self.decoder(
-            tgt=decoder_input_projected_with_pe, # Pass the input with PE
+            tgt=decoder_input_projected_with_pe, # Pass the input with its own PE
             memory=expanded_encoder_outputs,
             tgt_mask=tgt_mask, # Causal mask for self-attention
             memory_key_padding_mask=encoder_output_padding_mask, # Mask for cross-attention
@@ -413,7 +312,7 @@ class KokoroModel(nn.Module):
         return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
 
 
-    def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 800, stop_threshold: float = 0.5,
+    def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 1420, stop_threshold: float = 0.5,
                       text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Fixed forward pass during inference with multiple fallback stopping mechanisms.
@@ -450,7 +349,7 @@ class KokoroModel(nn.Module):
 
             # Calculate reasonable bounds for generation
             min_expected_length = max(20, expected_length // 2)  # At least 20 frames, or half expected
-            max_expected_length = min(max_len, expected_length * 3, 600)  # Cap at reasonable limits
+            max_expected_length = min(max_len, expected_length * 3, self.max_seq_len) # Use self.max_seq_len as upper bound for PE
 
             logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
 
@@ -463,9 +362,9 @@ class KokoroModel(nn.Module):
                 batch_size, max_expected_length, self.hidden_dim, device=device
             )
 
-            # Pre-compute positional encodings
+            # FIX: Use the dedicated decoder_positional_encoding for caching
             dummy_input = torch.zeros(batch_size, max_expected_length, self.hidden_dim, device=device)
-            pe_cache = self.encoder_positional_encoding(dummy_input, seq_offset=0)
+            pe_cache = self.decoder_positional_encoding(dummy_input, seq_offset=0) # Use decoder's PE
 
             # Cache for masks
             mask_cache = {}
@@ -631,10 +530,8 @@ class KokoroModel(nn.Module):
             return self.forward_training(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets, text_padding_mask, mel_padding_mask)
         else:
             self.eval() # Set to evaluation mode for inference
-            # Pass max_len to forward_inference, ensure it's clamped by self.max_decoder_seq_len
-            # The current setup uses a default max_len=800 in forward_inference signature.
-            # You might want to make this configurable via the `inference.py` script.
-            return self.forward_inference(phoneme_indices, max_len=self.max_decoder_seq_len * 2, text_padding_mask=text_padding_mask)
+            # Pass max_len to forward_inference, ensure it's clamped by self.max_seq_len
+            return self.forward_inference(phoneme_indices, max_len=self.max_seq_len, text_padding_mask=text_padding_mask)
 
 
     def get_model_info(self) -> dict:
