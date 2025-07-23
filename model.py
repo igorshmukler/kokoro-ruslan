@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union
+from torch.utils.checkpoint import checkpoint # Import checkpoint
 
 class KokoroModel(nn.Module):
     """
@@ -25,6 +26,7 @@ class KokoroModel(nn.Module):
 
         # Text encoder
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
+        # We'll apply checkpointing to the LSTM directly in forward
         self.text_encoder = nn.LSTM(
             hidden_dim, hidden_dim, batch_first=True, bidirectional=True
         )
@@ -43,6 +45,7 @@ class KokoroModel(nn.Module):
         self.mel_projection_in = nn.Linear(mel_dim, hidden_dim)
 
         # Decoder
+        # We'll apply checkpointing to the LSTM directly in forward
         self.decoder = nn.LSTM(
             hidden_dim + hidden_dim, hidden_dim, batch_first=True
         )
@@ -56,7 +59,6 @@ class KokoroModel(nn.Module):
         self.mel_projection_out = nn.Linear(hidden_dim, mel_dim)
 
         # End-of-Speech (Stop Token) Predictor
-        # Predicts a logit for stopping at the current frame
         self.stop_token_predictor = nn.Linear(hidden_dim, 1)
 
         # Dropout for regularization
@@ -65,6 +67,7 @@ class KokoroModel(nn.Module):
     def encode_text(self, phoneme_indices: torch.Tensor) -> torch.Tensor:
         """
         Encode phoneme indices to hidden representations.
+        This function will be checkpointed.
 
         Args:
             phoneme_indices: Tensor of shape (batch_size, seq_len)
@@ -74,7 +77,8 @@ class KokoroModel(nn.Module):
         """
         text_emb = self.text_embedding(phoneme_indices)
         text_emb = self.dropout(text_emb)
-        text_encoded, _ = self.text_encoder(text_emb)
+        # Checkpoint the LSTM layer
+        text_encoded, _ = checkpoint(self.text_encoder, text_emb, use_reentrant=False)
         
         text_encoded = self.text_projection(text_encoded)
         return text_encoded
@@ -87,6 +91,8 @@ class KokoroModel(nn.Module):
         Returns:
             Log durations of shape (batch_size, text_seq_len)
         """
+        # Duration predictor is small, might not benefit much from checkpointing itself,
+        # but its input `text_encoded` might be from a checkpointed operation.
         log_durations = self.duration_predictor(text_encoded).squeeze(-1)
         return log_durations
 
@@ -98,6 +104,9 @@ class KokoroModel(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Expands encoder outputs based on durations.
+        This static method cannot be directly checkpointed using torch.utils.checkpoint.checkpoint
+        unless wrapped in an nn.Module or a partial function that provides inputs.
+        Given its stateless nature and pure tensor operations, it's generally not a target for checkpointing.
 
         Args:
             encoder_outputs: Tensor of shape (batch_size, text_seq_len, hidden_dim)
@@ -173,10 +182,10 @@ class KokoroModel(nn.Module):
         """
         batch_size = phoneme_indices.size(0)
 
-        # Encode text
+        # Encode text - checkpointing applied inside encode_text
         text_encoded = self.encode_text(phoneme_indices)
 
-        # Predict durations
+        # Predict durations (duration_predictor is small, no checkpointing here)
         predicted_log_durations = self._predict_durations(text_encoded)
 
         # Length regulate text_encoded using ground-truth durations
@@ -187,6 +196,23 @@ class KokoroModel(nn.Module):
         outputs = []
         stop_token_outputs = [] # To store stop token predictions
         hidden = None
+
+        # Iterating over time steps, each step's computation can be complex.
+        # Checkpointing the decoder loop might be beneficial if the sequence is long.
+        # However, checkpointing inside a loop where `hidden` state is passed
+        # requires careful handling with `use_reentrant=False` and ensuring all inputs
+        # requiring gradients are passed.
+        # For simplicity and common practice with LSTMs, we often checkpoint the LSTM module directly.
+
+        # To checkpoint the *entire* decoder loop would be more complex,
+        # requiring wrapping the loop logic in a function to pass to checkpoint.
+        # A more practical approach is to checkpoint the LSTM layer itself if it's recurrent.
+
+        # Let's create a wrapper for the decoder step for checkpointing
+        def decoder_step_fn(mel_proj, attended, hx):
+            decoder_input = torch.cat([mel_proj, attended], dim=2)
+            decoder_out, new_hx = self.decoder(decoder_input, hx)
+            return decoder_out, new_hx
 
         for t in range(mel_specs.size(1)):
             # Current mel frame (teacher forcing)
@@ -199,17 +225,24 @@ class KokoroModel(nn.Module):
             mel_projected = self.mel_projection_in(mel_input)
             mel_projected = self.dropout(mel_projected)
 
-            # Attention over expanded text with padding mask
-            attended, _ = self.attention(
-                query=mel_projected,
-                key=text_encoded_expanded,
-                value=text_encoded_expanded,
-                key_padding_mask=attention_mask_text
-            )
+            # Attention mechanism - if this is a heavy part, checkpoint it.
+            # MultiheadAttention can be memory intensive.
+            # Query, Key, Value need to be passed for checkpointing.
+            # If key_padding_mask requires_grad=False, it's fine.
+            attended, _ = checkpoint(self.attention, mel_projected, text_encoded_expanded, text_encoded_expanded, key_padding_mask=attention_mask_text, use_reentrant=False)
 
-            # Decoder step
-            decoder_input = torch.cat([mel_projected, attended], dim=2)
-            decoder_out, hidden = self.decoder(decoder_input, hidden)
+            # Decoder step - checkpoint the LSTM if hidden state is passed
+            # For recurrent models like LSTM, checkpointing them directly is often sufficient.
+            # If `hidden` contains tensors that require gradients, they must be passed as inputs.
+            # Initial `hidden` (None) does not require grad.
+            if hidden is None:
+                # Need dummy tensor if hidden is None, or handle first step outside checkpoint
+                # Simpler: checkpoint the entire decoder (LSTM)
+                decoder_out, hidden = self.decoder(torch.cat([mel_projected, attended], dim=2), hidden)
+            else:
+                # Pass hx and cx explicitly for checkpointing LSTM
+                decoder_out, hidden = checkpoint(self.decoder, torch.cat([mel_projected, attended], dim=2), hidden, use_reentrant=False)
+
             decoder_out = self.dropout(decoder_out)
 
             # Project back to mel
@@ -229,6 +262,7 @@ class KokoroModel(nn.Module):
     def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 800, stop_threshold: float = 0.5) -> torch.Tensor:
         """
         Forward pass during inference (autoregressive).
+        Gradient checkpointing is generally not used during inference as it's a training-specific optimization.
         
         Args:
             phoneme_indices: Tensor of shape (batch_size, text_seq_len)
@@ -239,14 +273,11 @@ class KokoroModel(nn.Module):
             Generated mel spectrograms of shape (batch_size, generated_mel_seq_len, mel_dim)
         """
         if phoneme_indices.size(0) > 1:
-            # Multi-batch inference with stop tokens can be complex due to varying lengths.
-            # For simplicity, this implementation assumes batch_size=1 for robust stopping.
-            # For batch inference, you'd generate up to max_len and then trim individual samples.
             print("Warning: Inference with stop token is most reliable with batch_size=1.")
 
         batch_size = phoneme_indices.size(0)
         
-        # Encode text
+        # Encode text - no checkpointing for inference
         text_encoded = self.encode_text(phoneme_indices)
 
         # Predict durations
@@ -262,10 +293,9 @@ class KokoroModel(nn.Module):
         mel_input = torch.zeros(batch_size, 1, self.mel_dim, device=phoneme_indices.device)
 
         for t in range(max_len):
-            # Project mel to hidden dimension
             mel_projected = self.mel_projection_in(mel_input)
 
-            # Attention over expanded text with padding mask
+            # Attention (no checkpointing for inference)
             attended, _ = self.attention(
                 query=mel_projected,
                 key=text_encoded_expanded,
@@ -273,23 +303,18 @@ class KokoroModel(nn.Module):
                 key_padding_mask=attention_mask_text
             )
 
-            # Decoder step
+            # Decoder step (no checkpointing for inference)
             decoder_input = torch.cat([mel_projected, attended], dim=2)
             decoder_out, hidden = self.decoder(decoder_input, hidden)
 
-            # Project back to mel
             mel_pred = self.mel_projection_out(decoder_out)
             outputs.append(mel_pred)
 
-            # Predict stop token
             stop_token_logit = self.stop_token_predictor(decoder_out)
             stop_probability = torch.sigmoid(stop_token_logit)
 
-            # Use prediction as next input (autoregressive)
             mel_input = mel_pred
 
-            # Check for end of speech (for batch_size=1)
-            # For batch_size > 1, you'd typically track stops per sample and potentially pad remaining.
             if batch_size == 1 and stop_probability.item() > stop_threshold:
                 print(f"Stopping generation at frame {t} (stop_prob: {stop_probability.item():.4f})")
                 break
