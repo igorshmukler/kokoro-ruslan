@@ -120,7 +120,7 @@ The Kokoro model implements a modern Transformer-based sequence-to-sequence arch
 - **Mel Channels**: 80
 - **FFT Size**: 1024
 - **Hop Length**: 256 samples (~11.6ms)
-- **Maximum Sequence Length**: 800 mel frames (configurable)
+- **Maximum Sequence Length**: 1420 mel frames (configurable)
 
 ### Training Modes
 
@@ -179,7 +179,7 @@ Each checkpoint contains:
 The script includes several optimizations for limited memory:
 
 - **Gradient Clipping**: Prevents exploding gradients (max norm: 1.0)
-- **Sequence Limiting**: Maximum 800 mel frames per sample
+- **Sequence Limiting**: Maximum 1420 mel frames per sample
 - **Cache Clearing**: Automatic MPS cache clearing every 50 batches
 - **Mixed Precision**: Enabled for MPS acceleration
 
