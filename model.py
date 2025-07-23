@@ -3,26 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple, Union
 from torch.utils.checkpoint import checkpoint # Keep for gradient checkpointing
+import logging
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
+from positional_encoding import PositionalEncoding
 
-        position = torch.arange(max_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2) * (-torch.log(torch.tensor(10000.0)) / d_model))
-        pe = torch.zeros(1, max_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe) # Register as a buffer, not a parameter
+logger = logging.getLogger(__name__)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor, shape `(batch_size, seq_len, embedding_dim)`
-        """
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
 
 class TransformerEncoderBlock(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
@@ -107,32 +93,25 @@ class TransformerDecoderBlock(nn.Module):
 class TransformerDecoder(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float, num_layers: int):
         super().__init__()
-        self.positional_encoding = PositionalEncoding(d_model, dropout)
         self.layers = nn.ModuleList([
             TransformerDecoderBlock(d_model, nhead, dim_feedforward, dropout)
             for _ in range(num_layers)
         ])
-        self.norm = nn.LayerNorm(d_model) # Final normalization
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
                 tgt_mask: Optional[torch.Tensor] = None,
                 memory_key_padding_mask: Optional[torch.Tensor] = None,
                 tgt_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Args:
-            tgt: the sequence to the decoder (batch_size, tgt_seq_len, d_model).
-            memory: the sequence from the last layer of the encoder (batch_size, src_seq_len, d_model).
-            tgt_mask: the mask for the tgt sequence (tgt_seq_len, tgt_seq_len). For causal attention.
-            memory_key_padding_mask: the mask for the memory keys per batch (batch_size, src_seq_len).
-            tgt_key_padding_mask: the mask for the tgt keys per batch (batch_size, tgt_seq_len).
-        """
-        output = self.positional_encoding(tgt)
-
+        output = tgt # Expects PE already applied for inference
         for layer in self.layers:
-            # Checkpoint each transformer decoder block
-            output = checkpoint(layer, output, memory, tgt_mask, None, tgt_key_padding_mask, memory_key_padding_mask, use_reentrant=False)
-
-        return self.norm(output) # Apply final norm
+            if self.training: # Check if in training mode
+                output = checkpoint(layer, output, memory, tgt_mask, None, tgt_key_padding_mask, memory_key_padding_mask, use_reentrant=False)
+            else: # Inference mode
+                # Debugging print statement:
+                # logger.debug(f"Decoder layer input tgt shape: {output.shape}, tgt_mask shape: {tgt_mask.shape if tgt_mask is not None else 'None'}")
+                output = layer(output, memory, tgt_mask, None, tgt_key_padding_mask, memory_key_padding_mask)
+        return self.norm(output)
 
 class KokoroModel(nn.Module):
     """
@@ -142,7 +121,8 @@ class KokoroModel(nn.Module):
 
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
-                 encoder_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048):
+                 encoder_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
+                 max_decoder_seq_len: int = 800): # Added max_decoder_seq_len
         """
         Initialize the Kokoro model with Transformer encoder and decoder
         
@@ -156,15 +136,19 @@ class KokoroModel(nn.Module):
             encoder_dropout: Dropout rate for the Transformer encoder
             n_decoder_layers: Number of Transformer decoder layers
             decoder_ff_dim: Dimension of the feed-forward network in Decoder Transformer blocks
+            max_decoder_seq_len: Maximum sequence length the decoder might generate, for PE.
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.mel_dim = mel_dim
         self.hidden_dim = hidden_dim # This will now be d_model
+        self.max_decoder_seq_len = max_decoder_seq_len # Store this
 
         # Text encoder: Embedding + Positional Encoding + Stack of Transformer Blocks
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
-        self.encoder_positional_encoding = PositionalEncoding(hidden_dim, dropout=encoder_dropout)
+        # Positional Encoding needs to be able to go up to the max possible sequence length
+        # for both encoder and decoder. Use max_decoder_seq_len for max_len here.
+        self.encoder_positional_encoding = PositionalEncoding(hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len)
 
         self.transformer_encoder_layers = nn.ModuleList([
             TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout)
@@ -183,12 +167,11 @@ class KokoroModel(nn.Module):
         # Mel feature projection to match hidden dimension for decoder input
         self.mel_projection_in = nn.Linear(mel_dim, hidden_dim)
 
-        # Replaced LSTM Decoder with Transformer Decoder
         self.decoder = TransformerDecoder(
             d_model=hidden_dim,
             nhead=n_heads,
             dim_feedforward=decoder_ff_dim,
-            dropout=encoder_dropout, # Reusing encoder_dropout for consistency; consider separate
+            dropout=encoder_dropout,
             num_layers=n_decoder_layers
         )
 
@@ -196,37 +179,35 @@ class KokoroModel(nn.Module):
         self.mel_projection_out = nn.Linear(hidden_dim, mel_dim)
 
         # End-of-Speech (Stop Token) Predictor
-        # For simplicity, keeping it attached to the decoder output.
-        # Some models use a separate linear layer after final decoder output.
         self.stop_token_predictor = nn.Linear(hidden_dim, 1)
 
         # General dropout (can be used in different parts)
         self.dropout = nn.Dropout(encoder_dropout)
 
+        # Postnet (Placeholder - ensure this is defined in your actual model if used)
+        # If your model has a Postnet for refining mel spectrograms:
+        # self.postnet = Postnet(mel_dim=mel_dim, hidden_dim=hidden_dim, ...)
+        # For now, it's not defined, so the call in forward_inference is commented.
+
+
     def encode_text(self, phoneme_indices: torch.Tensor,
                     mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        Encode phoneme indices to hidden representations using Transformer encoder.
+        text_emb = self.text_embedding(phoneme_indices) * self.hidden_dim ** 0.5
+        # For the encoder, seq_offset is 0 as it's a fixed sequence from the beginning
+        text_emb = self.encoder_positional_encoding(text_emb, seq_offset=0) 
 
-        Args:
-            phoneme_indices: Tensor of shape (batch_size, seq_len)
-            mask: Optional boolean mask (batch_size, seq_len) for padding.
-                  True for padded positions.
-
-        Returns:
-            Encoded text representations of shape (batch_size, seq_len, hidden_dim)
-        """
-        text_emb = self.text_embedding(phoneme_indices) * self.hidden_dim ** 0.5 # Scale embeddings
-        text_emb = self.encoder_positional_encoding(text_emb)
-
-        # Apply Transformer Encoder Layers with gradient checkpointing
         x = text_emb
         for layer in self.transformer_encoder_layers:
-            if mask is not None:
-                x = checkpoint(layer, x, src_key_padding_mask=mask, use_reentrant=False)
-            else:
-                x = checkpoint(layer, x, use_reentrant=False)
-
+            if self.training: # Only use checkpointing during training
+                if mask is not None:
+                    x = checkpoint(layer, x, src_key_padding_mask=mask, use_reentrant=False)
+                else:
+                    x = checkpoint(layer, x, use_reentrant=False)
+            else: # Inference path, no checkpointing
+                if mask is not None:
+                    x = layer(x, src_key_padding_mask=mask)
+                else:
+                    x = layer(x)
         return x
 
     def _predict_durations(self, text_encoded: torch.Tensor) -> torch.Tensor:
@@ -240,63 +221,113 @@ class KokoroModel(nn.Module):
         log_durations = self.duration_predictor(text_encoded).squeeze(-1)
         return log_durations
 
-    @staticmethod
-    def _length_regulate(
-        encoder_outputs: torch.Tensor,
-        durations: torch.Tensor,
-        max_len: Optional[int] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
         """
-        Expands encoder outputs based on durations.
-
+        Expands encoder outputs based on predicted durations.
         Args:
-            encoder_outputs: Tensor of shape (batch_size, text_seq_len, hidden_dim)
-            durations: Tensor of shape (batch_size, text_seq_len), representing duration for each token.
-                       Expected to be integer values or values that can be rounded.
-            max_len: Optional. Maximum length for the expanded sequence. If not provided,
-                     calculated from batch's max expanded length.
-
+            encoder_outputs (Tensor): Encoder outputs (B, L_text, D).
+            durations (Tensor): Predicted durations (B, L_text) - these are expected to be positive integers.
+            text_padding_mask (Tensor): Boolean mask for text padding (B, L_text).
+                                        True for padded positions, False for actual content.
         Returns:
-            - Expanded tensor of shape (batch_size, expanded_seq_len, hidden_dim)
-            - A boolean mask for the expanded sequence (batch_size, expanded_seq_len)
-              (True for padded elements, False for actual data).
+            expanded_encoder_outputs (Tensor): Expanded outputs (B, L_mel, D).
+            encoder_output_padding_mask (Tensor): Padding mask for expanded outputs.
         """
-        durations_int = torch.round(durations).long()
-
-        batch_size, text_seq_len, hidden_dim = encoder_outputs.shape
-
-        expanded_lengths = torch.sum(durations_int, dim=1)
-
-        if max_len is None:
-            max_expanded_len = expanded_lengths.max().item()
-        else:
-            max_expanded_len = max_len
-
-        expanded_outputs = torch.zeros(
-            batch_size, max_expanded_len, hidden_dim, device=encoder_outputs.device
-        )
-        attention_mask = torch.ones(
-            batch_size, max_expanded_len, dtype=torch.bool, device=encoder_outputs.device
-        )
+        batch_size, max_text_len, hidden_dim = encoder_outputs.shape
+        
+        expanded_encoder_outputs_list = []
+        encoder_output_padding_mask_list = []
+        actual_expanded_lengths_per_item = [] # To store the actual length of each expanded item
 
         for i in range(batch_size):
-            current_idx = 0
-            for j in range(text_seq_len):
-                d = durations_int[i, j].item()
-                if d > 0:
-                    segment = encoder_outputs[i, j].unsqueeze(0).repeat(d, 1)
+            current_encoder_output = encoder_outputs[i] # (L_text, D)
+            current_durations = durations[i]             # (L_text,)
+            current_text_padding_mask = text_padding_mask[i] # (L_text,)
 
-                    end_idx = min(current_idx + d, max_expanded_len)
-                    segment_to_copy = segment[:end_idx - current_idx]
+            logger.debug(f"Batch {i}: Original phoneme indices length: {max_text_len}")
+            logger.debug(f"Batch {i}: current_durations (full, should have no zeros after clamp in inference): {current_durations}")
+            logger.debug(f"Batch {i}: current_text_padding_mask (True for 0s): {current_text_padding_mask}")
+            
+            # Select non-padded elements. `True` in non_padded_indices means it's actual content.
+            non_padded_indices = ~current_text_padding_mask
+            
+            filtered_encoder_output = current_encoder_output[non_padded_indices]
+            filtered_durations = current_durations[non_padded_indices] 
 
-                    expanded_outputs[i, current_idx:end_idx] = segment_to_copy
-                    attention_mask[i, current_idx:end_idx] = False
+            logger.debug(f"Batch {i}: non_padded_indices (True for content): {non_padded_indices}")
+            logger.debug(f"Batch {i}: filtered_durations (sliced durations, expected >0): {filtered_durations}")
+            logger.debug(f"Batch {i}: Number of elements in filtered_durations: {filtered_durations.numel()}")
 
-                    current_idx += d
-                    if current_idx >= max_expanded_len:
-                        break
 
-        return expanded_outputs, attention_mask
+            if filtered_durations.numel() == 0:
+                logger.warning(f"Batch {i}: filtered_durations is empty or all elements are 0/padding. "
+                               "No valid phonemes to expand. Returning empty tensor for this batch item.")
+                expanded_encoder_output = torch.empty(0, hidden_dim, device=encoder_outputs.device)
+                expanded_padding_mask = torch.ones(0, dtype=torch.bool, device=encoder_outputs.device)
+                actual_expanded_length = 0
+            else:
+                # This clamp should ideally not be needed here if clamping is done upstream
+                # but leaving it as a final failsafe, it won't change values if they are already >= 1
+                filtered_durations = torch.clamp(filtered_durations, min=1).long() 
+                logger.debug(f"Batch {i}: filtered_durations after final clamp: {filtered_durations}")
+
+                if torch.any(filtered_durations <= 0):
+                    logger.error(f"Batch {i}: Found non-positive duration values in filtered_durations: {filtered_durations}")
+                    raise ValueError("Non-positive durations found after filtering, which should not happen if clamping is effective upstream and mask is correct.")
+
+                expanded_encoder_output = torch.repeat_interleave(
+                    filtered_encoder_output, filtered_durations, dim=0
+                )
+                expanded_padding_mask = torch.zeros(expanded_encoder_output.shape[0], dtype=torch.bool, device=encoder_outputs.device)
+                actual_expanded_length = expanded_encoder_output.shape[0]
+            
+            expanded_encoder_outputs_list.append(expanded_encoder_output)
+            encoder_output_padding_mask_list.append(expanded_padding_mask)
+            actual_expanded_lengths_per_item.append(actual_expanded_length) # Store the true length
+
+        if not expanded_encoder_outputs_list:
+            logger.warning("All batch items resulted in empty expanded encoder outputs.")
+            # Ensure return has correct batch size dimensions, even if length is 0
+            return torch.empty(batch_size, 0, hidden_dim, device=encoder_outputs.device), \
+                   torch.empty(batch_size, 0, dtype=torch.bool, device=encoder_outputs.device)
+
+        # NOW calculate max_expanded_len based on the *actual* lengths generated
+        # This is the FIX: Max length should be derived from what was actually generated, not input durations including padding.
+        max_expanded_len = max(actual_expanded_lengths_per_item) 
+        logger.debug(f"Calculated max_expanded_len from actual expanded items: {max_expanded_len}")
+
+        # Final padding to the common max_expanded_len
+        final_expanded_outputs = []
+        final_padding_masks = []
+        for i in range(batch_size):
+            current_output = expanded_encoder_outputs_list[i]
+            current_mask = encoder_output_padding_mask_list[i]
+            current_len = actual_expanded_lengths_per_item[i] # Use the stored actual length
+
+            padding_needed = max_expanded_len - current_len
+
+            if padding_needed < 0:
+                # This should now ideally NEVER happen. If it does, there's a serious bug.
+                logger.error(f"FATAL ERROR: Padding needed is still negative for batch {i}: {padding_needed}. "
+                             "max_expanded_len calculation is fundamentally flawed if this occurs.")
+                # This implies max_expanded_len was not the true maximum.
+                # In this extremely unlikely scenario, we would need to truncate, but it's better to crash and fix.
+                raise RuntimeError("Internal inconsistency: current_len exceeded max_expanded_len.")
+
+            if padding_needed > 0:
+                current_output = F.pad(current_output, (0, 0, 0, padding_needed))
+                current_mask = F.pad(current_mask, (0, padding_needed), value=True)
+            
+            final_expanded_outputs.append(current_output)
+            final_padding_masks.append(current_mask)
+
+        expanded_encoder_outputs = torch.stack(final_expanded_outputs, dim=0)
+        encoder_output_padding_mask = torch.stack(final_padding_masks, dim=0)
+
+        logger.debug(f"Final Expanded encoder outputs shape: {expanded_encoder_outputs.shape}")
+        logger.debug(f"Final Encoder output padding mask shape: {encoder_output_padding_mask.shape}")
+
+        return expanded_encoder_outputs, encoder_output_padding_mask
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
@@ -333,6 +364,12 @@ class KokoroModel(nn.Module):
             - Predicted stop token logits of shape (batch_size, mel_seq_len) (for stop token loss)
         """
         batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
+        device = mel_specs.device
+
+        # Ensure text_padding_mask is provided for correct processing within _length_regulate
+        if text_padding_mask is None:
+            # Assuming 0 is the padding ID for phoneme_indices if no mask is explicitly provided
+            text_padding_mask = (phoneme_indices == 0)
 
         # Encode text using Transformer encoder
         text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
@@ -341,8 +378,9 @@ class KokoroModel(nn.Module):
         predicted_log_durations = self._predict_durations(text_encoded)
 
         # Length regulate text_encoded using ground-truth durations
+        # Pass text_padding_mask as the third argument as required by the updated _length_regulate
         expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-            text_encoded, phoneme_durations.float(), max_len=mel_seq_len # Ensure consistent length
+            text_encoded, phoneme_durations.float(), text_padding_mask
         )
 
         # Prepare decoder input (teacher forcing: shift right)
@@ -350,13 +388,16 @@ class KokoroModel(nn.Module):
         decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
         decoder_input_projected = self.mel_projection_in(decoder_input_mels)
 
+        # Apply positional encoding to the full decoder input sequence
+        # For training, seq_offset is 0 as we're processing the full sequence from the start
+        decoder_input_projected_with_pe = self.encoder_positional_encoding(decoder_input_projected, seq_offset=0)
+
         # Generate causal mask for decoder self-attention
-        tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, mel_specs.device)
+        tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
 
         # Pass through Transformer Decoder
-        # The decoder handles checkpointing internally for its layers
         decoder_outputs = self.decoder(
-            tgt=decoder_input_projected,
+            tgt=decoder_input_projected_with_pe, # Pass the input with PE
             memory=expanded_encoder_outputs,
             tgt_mask=tgt_mask, # Causal mask for self-attention
             memory_key_padding_mask=encoder_output_padding_mask, # Mask for cross-attention
@@ -371,126 +412,230 @@ class KokoroModel(nn.Module):
 
         return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
 
+
     def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 800, stop_threshold: float = 0.5,
-                          text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                      text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass during inference (autoregressive).
-
-        Args:
-            phoneme_indices: Tensor of shape (batch_size, text_seq_len)
-            max_len: Maximum length for generated sequence
-            stop_threshold: Probability threshold for stopping generation.
-            text_padding_mask: Optional boolean mask (batch_size, text_seq_len) for the
-                               text encoder's padding. True for padded positions.
-
-        Returns:
-            Generated mel spectrograms of shape (batch_size, generated_mel_seq_len, mel_dim)
+        Fixed forward pass during inference with multiple fallback stopping mechanisms.
         """
         if phoneme_indices.size(0) > 1:
-            print("Warning: Inference with stop token is most reliable with batch_size=1.")
+            logger.warning("Inference with stop token is most reliable with batch_size=1.")
 
         batch_size = phoneme_indices.size(0)
+        device = phoneme_indices.device
 
-        # Encode text (no checkpointing for inference)
-        text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
+        self.eval()
 
-        # Predict durations
-        predicted_log_durations = self._predict_durations(text_encoded)
+        with torch.no_grad():
+            # Ensure text_padding_mask is correctly defined
+            if text_padding_mask is None:
+                text_padding_mask = (phoneme_indices == 0)
 
-        # Length regulate text_encoded using predicted durations
-        expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-            text_encoded, torch.exp(predicted_log_durations)
-        )
+            # Encode text
+            text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
-        # Autoregressive decoding
-        generated_mels = []
-        # Start with a zero frame for the first input to the decoder
-        decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=phoneme_indices.device)
+            # Predict durations
+            predicted_log_durations = self._predict_durations(text_encoded)
+            durations_for_length_regulate = torch.exp(predicted_log_durations)
+            durations_for_length_regulate = torch.clamp(durations_for_length_regulate, min=1.0).long()
 
-        # For optimized inference with Transformers, you'd typically use KV caches
-        # for self-attention in the decoder. For simplicity here, we recompute each time
-        # or pass the growing sequence. Passing the growing sequence is common but less efficient.
-        # A more optimized inference would build up K/V caches.
-
-        # We will build up the decoder input sequence and pass it through the full decoder each step.
-        # This is less efficient but conceptually simpler than managing KV caches manually.
-        current_decoder_input_seq_projected = torch.empty(batch_size, 0, self.hidden_dim, device=phoneme_indices.device)
-
-        for t in range(max_len):
-            # Project current mel frame
-            mel_projected_t = self.mel_projection_in(decoder_input_mel)
-
-            # Append to the growing input sequence for the decoder
-            current_decoder_input_seq_projected = torch.cat(
-                [current_decoder_input_seq_projected, mel_projected_t], dim=1
+            # Length regulate
+            expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                text_encoded, durations_for_length_regulate, text_padding_mask
             )
 
-            # Generate causal mask for the current length
-            tgt_mask = self._generate_square_subsequent_mask(
-                current_decoder_input_seq_projected.size(1), phoneme_indices.device
+            expected_length = expanded_encoder_outputs.shape[1]
+            logger.info(f"Starting inference with expanded encoder outputs shape: {expanded_encoder_outputs.shape}")
+            logger.info(f"Expected output length based on durations: ~{expected_length} frames")
+
+            # Calculate reasonable bounds for generation
+            min_expected_length = max(20, expected_length // 2)  # At least 20 frames, or half expected
+            max_expected_length = min(max_len, expected_length * 3, 600)  # Cap at reasonable limits
+
+            logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
+
+            # Initialize generation
+            generated_mels = []
+            decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
+
+            # Pre-allocate for efficiency
+            decoder_input_seq_projected = torch.zeros(
+                batch_size, max_expected_length, self.hidden_dim, device=device
             )
 
-            # Pass the accumulated sequence through the decoder
-            # Only the last frame's output is relevant for current prediction
-            decoder_outputs_full_seq = self.decoder(
-                tgt=current_decoder_input_seq_projected,
-                memory=expanded_encoder_outputs,
-                tgt_mask=tgt_mask,
-                memory_key_padding_mask=encoder_output_padding_mask,
-                tgt_key_padding_mask=None # No padding within the sequence being generated
-            )
+            # Pre-compute positional encodings
+            dummy_input = torch.zeros(batch_size, max_expected_length, self.hidden_dim, device=device)
+            pe_cache = self.encoder_positional_encoding(dummy_input, seq_offset=0)
 
-            # Take the output of the *last* frame for prediction
-            decoder_out_t = decoder_outputs_full_seq[:, -1:, :]
+            # Cache for masks
+            mask_cache = {}
 
-            mel_pred_t = self.mel_projection_out(decoder_out_t)
-            generated_mels.append(mel_pred_t)
+            # Tracking variables for intelligent stopping
+            stop_probs_history = []
+            mel_stability_buffer = []
+            consecutive_low_stop_count = 0
 
-            stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
-            stop_probability = torch.sigmoid(stop_token_logit_t)
+            for t in range(max_expected_length):
+                # Project current mel frame
+                mel_projected_t = self.mel_projection_in(decoder_input_mel)
 
-            # Use prediction as next input
-            decoder_input_mel = mel_pred_t
+                # Use pre-computed positional encoding
+                mel_projected_t_with_pe = mel_projected_t + pe_cache[:, t:t+1, :]
 
-            if batch_size == 1 and stop_probability.item() > stop_threshold:
-                print(f"Stopping generation at frame {t} (stop_prob: {stop_probability.item():.4f})")
-                break
+                # Store in pre-allocated tensor
+                decoder_input_seq_projected[:, t:t+1, :] = mel_projected_t_with_pe
 
-        return torch.cat(generated_mels, dim=1)
+                # Get current sequence length
+                current_seq_len = t + 1
+
+                # Use cached mask or create new one
+                if current_seq_len not in mask_cache:
+                    mask_cache[current_seq_len] = self._generate_square_subsequent_mask(current_seq_len, device)
+                tgt_mask = mask_cache[current_seq_len]
+
+                # Process only the current sequence
+                current_input = decoder_input_seq_projected[:, :current_seq_len, :]
+
+                # Decoder forward pass
+                try:
+                    decoder_outputs = self.decoder(
+                        tgt=current_input,
+                        memory=expanded_encoder_outputs,
+                        tgt_mask=tgt_mask,
+                        memory_key_padding_mask=encoder_output_padding_mask,
+                        tgt_key_padding_mask=None
+                    )
+                except Exception as e:
+                    logger.error(f"Decoder failed at frame {t}: {e}")
+                    break
+
+                # Take the last frame's output
+                decoder_out_t = decoder_outputs[:, -1:, :]
+
+                # Generate mel frame
+                mel_pred_t = self.mel_projection_out(decoder_out_t)
+                generated_mels.append(mel_pred_t)
+
+                # Check stop condition
+                stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
+                stop_probability = torch.sigmoid(stop_token_logit_t).item()
+                stop_probs_history.append(stop_probability)
+
+                # Track mel frame for stability analysis
+                if len(mel_stability_buffer) >= 5:
+                    mel_stability_buffer.pop(0)
+                mel_stability_buffer.append(mel_pred_t.clone())
+
+                # Progress logging
+                if t % 50 == 0 or t < 10:
+                    logger.debug(f"Generated frame {t}, stop_prob: {stop_probability:.6f}")
+
+                # MULTIPLE STOPPING CONDITIONS
+
+                # 1. Original stop token threshold (if it works)
+                if batch_size == 1 and stop_probability > stop_threshold:
+                    logger.info(f"Stopping generation at frame {t} (stop_prob: {stop_probability:.4f})")
+                    break
+
+                # 2. Adaptive threshold based on history
+                if len(stop_probs_history) >= 10:
+                    recent_avg = sum(stop_probs_history[-10:]) / 10
+                    if recent_avg > 0.1 and stop_probability > recent_avg * 2:
+                        logger.info(f"Stopping due to adaptive threshold at frame {t} (stop_prob: {stop_probability:.4f}, avg: {recent_avg:.4f})")
+                        break
+
+                # 3. Count consecutive very low probabilities
+                if stop_probability < 0.001:
+                    consecutive_low_stop_count += 1
+                else:
+                    consecutive_low_stop_count = 0
+
+                # 4. Force stop if probabilities are consistently too low
+                if consecutive_low_stop_count > 20 and t > min_expected_length:
+                    logger.warning(f"Forcing stop at frame {t} due to consistently low stop probabilities")
+                    break
+
+                # 5. Mel frame stability check
+                if len(mel_stability_buffer) >= 5 and t > min_expected_length:
+                    # Calculate variance in recent mel frames
+                    stacked_mels = torch.cat(mel_stability_buffer, dim=1)  # (B, 5, mel_dim)
+                    mel_variance = torch.var(stacked_mels, dim=1).mean().item()
+
+                    if mel_variance < 0.001:  # Very stable/repetitive output
+                        logger.info(f"Stopping due to stable mel output at frame {t} (variance: {mel_variance:.6f})")
+                        break
+
+                # 6. Length-based intelligent stopping
+                if t >= expected_length and stop_probability > 0.01:
+                    logger.info(f"Stopping at expected length {t} with reasonable stop_prob: {stop_probability:.4f}")
+                    break
+
+                # 7. Hard safety limit
+                if t >= max_expected_length - 1:
+                    logger.warning(f"Reached maximum generation length ({max_expected_length})")
+                    break
+
+                # 8. Emergency brake for completely broken models
+                if t > 100 and max(stop_probs_history[-50:]) < 0.01:
+                    logger.error(f"Emergency stop: stop token predictor appears completely broken (max prob in last 50 frames: {max(stop_probs_history[-50:]):.6f})")
+                    break
+
+                # Use prediction as next input
+                decoder_input_mel = mel_pred_t
+
+            # Concatenate all generated frames
+            if generated_mels:
+                mel_output = torch.cat(generated_mels, dim=1)
+                logger.info(f"Generated {mel_output.shape[1]} mel frames (expected ~{expected_length})")
+
+                # Log statistics
+                if stop_probs_history:
+                    avg_stop_prob = sum(stop_probs_history) / len(stop_probs_history)
+                    max_stop_prob = max(stop_probs_history)
+                    logger.info(f"Stop probability stats - avg: {avg_stop_prob:.6f}, max: {max_stop_prob:.6f}")
+            else:
+                logger.warning("No mel frames were generated.")
+                mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
+
+            return mel_output
+
 
     def forward(
         self,
         phoneme_indices: torch.Tensor,
         mel_specs: Optional[torch.Tensor] = None,
-        phoneme_durations: Optional[torch.Tensor] = None,
-        stop_token_targets: Optional[torch.Tensor] = None,
+        phoneme_durations: Optional[torch.Tensor] = None, # Added as optional
+        stop_token_targets: Optional[torch.Tensor] = None, # Added as optional
         text_padding_mask: Optional[torch.Tensor] = None,
-        mel_padding_mask: Optional[torch.Tensor] = None # New parameter
+        mel_padding_mask: Optional[torch.Tensor] = None # Added as optional
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
-        Forward pass - automatically chooses training or inference mode.
+        Main forward pass that dispatches to training or inference mode.
 
         Args:
-            phoneme_indices: Tensor of shape (batch_size, text_seq_len)
-            mel_specs: Target mel spectrograms for training mode (optional). If provided,
-                       `phoneme_durations` and `stop_token_targets` must also be provided.
-            phoneme_durations: Ground truth durations for training mode. Required if `mel_specs` is not None.
-            stop_token_targets: Ground truth stop tokens for training mode. Required if `mel_specs` is not None.
-            text_padding_mask: Optional boolean mask (batch_size, text_seq_len) for the
-                               text encoder's padding. True for padded positions.
-            mel_padding_mask: Optional boolean mask (batch_size, mel_seq_len) for the
-                              decoder's mel sequence padding. True for padded positions.
+            phoneme_indices: Tensor of shape (batch_size, text_seq_len).
+            mel_specs: Optional; Target mel spectrograms for training, shape (batch_size, mel_seq_len, mel_dim).
+            phoneme_durations: Optional; Ground truth durations for training, shape (batch_size, text_seq_len).
+            stop_token_targets: Optional; Ground truth stop tokens for training, shape (batch_size, mel_seq_len).
+            text_padding_mask: Optional boolean mask (batch_size, text_seq_len) for encoder. True for padded positions.
+            mel_padding_mask: Optional boolean mask (batch_size, mel_seq_len) for decoder. True for padded positions.
 
         Returns:
-            - Mel spectrograms (predicted or generated) in inference mode.
-            - Tuple (predicted mel, predicted log durations, predicted stop logits) in training mode.
+            - During training: Tuple of predicted mel spectrograms, predicted log durations, predicted stop token logits.
+            - During inference: Generated mel spectrograms.
         """
         if mel_specs is not None:
+            self.train() # Set to training mode
             if phoneme_durations is None or stop_token_targets is None:
                 raise ValueError("phoneme_durations and stop_token_targets must be provided for training mode.")
             return self.forward_training(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets, text_padding_mask, mel_padding_mask)
         else:
-            return self.forward_inference(phoneme_indices, text_padding_mask=text_padding_mask)
+            self.eval() # Set to evaluation mode for inference
+            # Pass max_len to forward_inference, ensure it's clamped by self.max_decoder_seq_len
+            # The current setup uses a default max_len=800 in forward_inference signature.
+            # You might want to make this configurable via the `inference.py` script.
+            return self.forward_inference(phoneme_indices, max_len=self.max_decoder_seq_len * 2, text_padding_mask=text_padding_mask)
+
 
     def get_model_info(self) -> dict:
         """

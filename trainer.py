@@ -289,7 +289,7 @@ if __name__ == "__main__":
             self.hidden_dim = 512
             self.duration_loss_weight = 0.1
             self.stop_token_loss_weight = 1.0
-            self.max_seq_length = 1024 # Add this to your config
+            self.max_seq_length = 2500 # this will cover vast majority of sequences
             self.sample_rate = 22050
             self.hop_length = 256
             self.win_length = 1024
