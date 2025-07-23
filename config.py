@@ -16,7 +16,7 @@ class TrainingConfig:
     batch_size: int = 8  # Increased for MPS
     learning_rate: float = 1e-4
     num_epochs: int = 100
-    max_seq_length: int = 1024
+    max_seq_length: int = 5000
     sample_rate: int = 22050
     hop_length: int = 256
     win_length: int = 1024

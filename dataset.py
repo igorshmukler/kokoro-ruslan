@@ -12,6 +12,7 @@ from torch.nn.utils.rnn import pad_sequence
 import logging
 import random
 import numpy as np
+from tqdm import tqdm
 
 from config import TrainingConfig
 from russian_phoneme_processor import RussianPhonemeProcessor
@@ -61,8 +62,13 @@ class RuslanDataset(Dataset):
         metadata_file = self.data_dir / "metadata_RUSLAN_22200.csv"
         if metadata_file.exists():
             logger.info(f"Loading metadata from {metadata_file}")
+            # Get total number of lines for accurate progress bar
             with open(metadata_file, 'r', encoding='utf-8') as f:
-                for line in f:
+                total_lines = sum(1 for _ in f)
+
+            with open(metadata_file, 'r', encoding='utf-8') as f:
+                # Wrap the file iterator with tqdm
+                for line in tqdm(f, total=total_lines, desc="Loading metadata"): # <--- TQDM here
                     parts = line.strip().split('|')
                     if len(parts) >= 2:
                         audio_file_stem = parts[0]
@@ -109,7 +115,9 @@ class RuslanDataset(Dataset):
             txt_dir = self.data_dir / "texts"
     
             if wav_dir.exists():
-                for wav_file in wav_dir.glob("*.wav"):
+                # For glob, we can convert to list first to get total count for tqdm
+                wav_files = list(wav_dir.glob("*.wav"))
+                for wav_file in tqdm(wav_files, desc="Scanning audio files"): # <--- TQDM here
                     txt_file = txt_dir / f"{wav_file.stem}.txt"
                     if txt_file.exists():
                         with open(txt_file, 'r', encoding='utf-8') as f:

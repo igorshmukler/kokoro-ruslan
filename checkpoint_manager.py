@@ -70,11 +70,62 @@ def load_checkpoint(
     # Add safe globals for our custom classes
     torch.serialization.add_safe_globals([TrainingConfig, RussianPhonemeProcessor])
 
+    # Helper function to load and process state_dict
+    def _load_and_process_state_dict(model_state_dict, current_model):
+        model_keys = current_model.state_dict().keys()
+        new_state_dict = {}
+        for k, v in model_state_dict.items():
+            if k in model_keys:
+                current_param = current_model.state_dict()[k]
+                current_shape = current_param.shape
+
+                # Specific handling for positional encoding where we can truncate if needed
+                if "positional_encoding.pe" in k: # Catches both encoder and decoder PEs
+                    if v.shape == current_shape:
+                        new_state_dict[k] = v
+                    elif v.dim() == 3 and len(current_shape) == 3 and v.shape[0] == current_shape[0] and v.shape[2] == current_shape[2]:
+                        # Check if it's a difference in sequence length (second dimension)
+                        if v.shape[1] > current_shape[1]:
+                            logger.warning(
+                                f"Truncating checkpoint's '{k}' from {v.shape} to "
+                                f"{current_shape}. Ensure 'params.max_seq_len' is correctly set."
+                            )
+                            new_state_dict[k] = v[:, :current_shape[1], :]
+                        else: # v.shape[1] < current_shape[1] - cannot simply pad, usually indicates config error
+                            logger.error(
+                                f"Size mismatch for {k}: Checkpoint has {v.shape}, current model has {current_shape}. "
+                                "Cannot extend positional encoding. Check 'params.max_seq_len' in your config. "
+                                "Skipping this key, model might not load correctly without it."
+                            )
+                            # Do not add to new_state_dict, allowing load_state_dict to report missing key
+                            # or you can load with strict=False later.
+                    else: # Positional encoding has mismatched dimensions beyond just sequence length
+                        logger.error(f"Complex size mismatch for positional encoding {k}: Checkpoint has {v.shape}, current model has {current_shape}. Skipping this key.")
+                else:
+                    # For all other layers, shapes must match exactly
+                    if v.shape == current_shape:
+                        new_state_dict[k] = v
+                    else:
+                        logger.error(
+                            f"Size mismatch for {k}: Checkpoint has {v.shape}, current model has {current_shape}. "
+                            "This indicates a significant architectural change. "
+                            "Consider retraining or adjusting model definition. Skipping this key."
+                        )
+            else:
+                logger.warning(f"Skipping unexpected key in checkpoint: {k}")
+        return new_state_dict
+
+
     try:
         # Try loading with weights_only=True first (new default)
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
 
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Process and load model state dict
+        filtered_model_state_dict = _load_and_process_state_dict(checkpoint['model_state_dict'], model)
+        # We use strict=False here because _load_and_process_state_dict might skip keys it can't handle
+        # or if the current model has new parameters not in the old checkpoint.
+        model.load_state_dict(filtered_model_state_dict, strict=False)
+
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
@@ -99,7 +150,10 @@ def load_checkpoint(
             # Try loading with weights_only=False for older checkpoints
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
 
-            model.load_state_dict(checkpoint['model_state_dict'])
+            # Process and load model state dict
+            filtered_model_state_dict = _load_and_process_state_dict(checkpoint['model_state_dict'], model)
+            model.load_state_dict(filtered_model_state_dict, strict=False) # Use strict=False here
+
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
 
