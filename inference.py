@@ -178,47 +178,61 @@ class KokoroTTS:
         return model
 
     def text_to_speech(self, text: str, output_path: Optional[str] = None) -> torch.Tensor:
-        """Converts text to speech using the loaded TTS model and vocoder."""
+        """
+        Updated text_to_speech with better parameters and error handling.
+        """
         if not text:
             logger.warning("Received empty text for conversion. Returning empty audio.")
             return torch.empty(0)
 
         logger.info(f"Converting text: '{text}'")
 
-        # Step 1: Process text into phoneme sequence
-        raw_processor_output = self.phoneme_processor.process_text(text)
-        phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
+        try:
+            # Step 1: Process text into phoneme sequence
+            raw_processor_output = self.phoneme_processor.process_text(text)
+            phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
         
-        if not phoneme_sequence:
-            logger.error(f"Phoneme processor produced no phonemes for text: '{text}'. Conversion aborted.")
-            raise ValueError("No phonemes generated from the input text.")
+            if not phoneme_sequence:
+                logger.error(f"Phoneme processor produced no phonemes for text: '{text}'. Conversion aborted.")
+                raise ValueError("No phonemes generated from the input text.")
 
-        logger.debug(f"Phonemes: {' '.join(phoneme_sequence)}")
+            logger.debug(f"Phonemes: {' '.join(phoneme_sequence)}")
 
-        # Step 2: Convert phonemes to numerical indices
-        phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
-            phoneme_sequence, self.phoneme_processor.phoneme_to_id
-        )
-        logger.debug(f"Phoneme indices (first 20): {phoneme_indices[:20]}...")
+            # Step 2: Convert phonemes to numerical indices
+            phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
+                phoneme_sequence, self.phoneme_processor.phoneme_to_id
+            )
+            logger.debug(f"Phoneme indices (first 20): {phoneme_indices[:20]}...")
 
-        # Convert to tensor and add batch dimension
-        phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
+            # Convert to tensor and add batch dimension
+            phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
 
-        # Step 3: Generate mel spectrogram using the TTS model
-        with torch.no_grad():
-            mel_spec = self.model(phoneme_tensor)
+            # Step 3: Generate mel spectrogram with updated parameters
+            with torch.no_grad():
+                # Use more conservative parameters for broken models
+                mel_spec = self.model.forward_inference(
+                    phoneme_indices=phoneme_tensor,
+                    max_len=400,  # Reduced from potential 10000
+                    stop_threshold=0.01,  # Much lower threshold
+                    text_padding_mask=None
+                )
 
-        # Remove batch dimension and move to CPU for vocoder if it's CPU-bound
-        mel_spec = mel_spec.squeeze(0).cpu()
+            # Remove batch dimension and move to CPU for vocoder
+            mel_spec = mel_spec.squeeze(0).cpu()
 
-        # Step 4: Convert mel spectrogram to audio using the neural vocoder
-        audio = self.vocoder_manager.mel_to_audio(mel_spec)
+            # Step 4: Convert mel spectrogram to audio using the neural vocoder
+            audio = self.vocoder_manager.mel_to_audio(mel_spec)
 
-        # Save audio if an output path is provided
-        if output_path:
-            self.audio_utils.save_audio(audio, output_path)
+            # Save audio if an output path is provided
+            if output_path:
+                self.audio_utils.save_audio(audio, output_path)
+                logger.info(f"Audio saved to: {output_path}")
 
-        return audio
+            return audio
+
+        except Exception as e:
+            logger.error(f"Error in text_to_speech: {e}")
+            raise
 
     def batch_text_to_speech(self, texts: List[str], output_dir: str):
         """Converts multiple texts to speech, saving each to the specified output directory."""

@@ -412,20 +412,11 @@ class KokoroModel(nn.Module):
 
         return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
 
+
     def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 800, stop_threshold: float = 0.5,
-                          text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                      text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass during inference (autoregressive).
-
-        Args:
-            phoneme_indices: Tensor of shape (batch_size, text_seq_len)
-            max_len: Maximum length for generated sequence (used as hard limit for PE and output).
-            stop_threshold: Probability threshold for stopping generation.
-            text_padding_mask: Optional boolean mask (batch_size, text_seq_len) for the
-                               text encoder's padding. True for padded positions.
-
-        Returns:
-            Generated mel spectrograms of shape (batch_size, generated_mel_seq_len, mel_dim)
+        Fixed forward pass during inference with multiple fallback stopping mechanisms.
         """
         if phoneme_indices.size(0) > 1:
             logger.warning("Inference with stop token is most reliable with batch_size=1.")
@@ -433,122 +424,181 @@ class KokoroModel(nn.Module):
         batch_size = phoneme_indices.size(0)
         device = phoneme_indices.device
 
-        self.eval() # Ensure model is in evaluation mode
+        self.eval()
 
         with torch.no_grad():
-            # Ensure text_padding_mask is correctly defined for the encoder
+            # Ensure text_padding_mask is correctly defined
             if text_padding_mask is None:
-                # Assuming 0 is the padding ID. Adjust if different.
                 text_padding_mask = (phoneme_indices == 0)
 
-            # Encode text (no checkpointing for inference)
+            # Encode text
             text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
-            # Predict durations (these are log durations)
+            # Predict durations
             predicted_log_durations = self._predict_durations(text_encoded)
-
-            # Convert log durations to actual counts and ENSURE THEY ARE CLAMPED HERE
             durations_for_length_regulate = torch.exp(predicted_log_durations)
-
-            # This is where the problematic 0s should be caught and turned to 1.
-            # Clamp to a minimum of 1.0 (float) and then convert to long.
             durations_for_length_regulate = torch.clamp(durations_for_length_regulate, min=1.0).long()
 
-            logger.debug(f"Phoneme indices shape: {phoneme_indices.shape}")
-            logger.debug(f"text_padding_mask shape: {text_padding_mask.shape}")
-            logger.debug(f"Predicted log durations shape: {predicted_log_durations.shape}")
-            logger.debug(f"Durations for length regulate (pre-clamp/long): {durations_for_length_regulate.shape} - Values: {durations_for_length_regulate}")
-
-            # Length regulate text_encoded using predicted durations
+            # Length regulate
             expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
                 text_encoded, durations_for_length_regulate, text_padding_mask
             )
 
-            logger.debug(f"After _length_regulate: expanded_encoder_outputs shape: {expanded_encoder_outputs.shape}")
-            logger.debug(f"After _length_regulate: encoder_output_padding_mask shape: {encoder_output_padding_mask.shape}")
-            
-            # Initialize generated mel frames list
+            expected_length = expanded_encoder_outputs.shape[1]
+            logger.info(f"Starting inference with expanded encoder outputs shape: {expanded_encoder_outputs.shape}")
+            logger.info(f"Expected output length based on durations: ~{expected_length} frames")
+
+            # Calculate reasonable bounds for generation
+            min_expected_length = max(20, expected_length // 2)  # At least 20 frames, or half expected
+            max_expected_length = min(max_len, expected_length * 3, 600)  # Cap at reasonable limits
+
+            logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
+
+            # Initialize generation
             generated_mels = []
-            # Initialize the first decoder input mel frame (typically a zero frame)
             decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
 
-            # `current_decoder_input_seq_projected` will accumulate the projected (embedding + PE)
-            # frames. It must be initialized empty.
-            current_decoder_input_seq_projected = torch.empty(batch_size, 0, self.hidden_dim, device=device)
+            # Pre-allocate for efficiency
+            decoder_input_seq_projected = torch.zeros(
+                batch_size, max_expected_length, self.hidden_dim, device=device
+            )
 
-            # Re-use the encoder's positional encoding for the decoder's inference loop.
-            decoder_pe_layer = self.encoder_positional_encoding 
+            # Pre-compute positional encodings
+            dummy_input = torch.zeros(batch_size, max_expected_length, self.hidden_dim, device=device)
+            pe_cache = self.encoder_positional_encoding(dummy_input, seq_offset=0)
 
-            # Hard limit for sequence generation to prevent infinite loops
-            # Use `self.max_decoder_seq_len` for consistency, but `max_len` argument can override.
-            max_output_frames_limit = min(max_len, self.max_decoder_seq_len * 2) # Allow some buffer
+            # Cache for masks
+            mask_cache = {}
 
-            for t in range(max_output_frames_limit):
-                # Project the current single mel frame input to hidden_dim
+            # Tracking variables for intelligent stopping
+            stop_probs_history = []
+            mel_stability_buffer = []
+            consecutive_low_stop_count = 0
+
+            for t in range(max_expected_length):
+                # Project current mel frame
                 mel_projected_t = self.mel_projection_in(decoder_input_mel)
 
-                # Apply positional encoding for the *current* token at its absolute position `t`
-                # The positional encoding is applied to the single frame, at position `t`.
-                mel_projected_t_with_pe = decoder_pe_layer(mel_projected_t, seq_offset=t)
+                # Use pre-computed positional encoding
+                mel_projected_t_with_pe = mel_projected_t + pe_cache[:, t:t+1, :]
 
-                # Concatenate the current projected & PE-applied frame to the accumulated sequence
-                current_decoder_input_seq_projected = torch.cat(
-                    [current_decoder_input_seq_projected, mel_projected_t_with_pe], dim=1
-                )
+                # Store in pre-allocated tensor
+                decoder_input_seq_projected[:, t:t+1, :] = mel_projected_t_with_pe
 
-                # Generate causal mask for the *currently accumulated sequence length*
-                # The size of the mask grows with `t+1` (current_decoder_input_seq_projected.size(1))
-                current_seq_len = current_decoder_input_seq_projected.size(1)
-                tgt_mask = self._generate_square_subsequent_mask(current_seq_len, device)
+                # Get current sequence length
+                current_seq_len = t + 1
 
-                # Pass through Transformer Decoder.
-                # The decoder processes the *entire* accumulated sequence up to `t`.
-                decoder_outputs_full_seq = self.decoder(
-                    tgt=current_decoder_input_seq_projected, # Pass the growing sequence with PE
-                    memory=expanded_encoder_outputs,
-                    tgt_mask=tgt_mask,
-                    memory_key_padding_mask=encoder_output_padding_mask,
-                    tgt_key_padding_mask=None # No padding mask needed for a single generated sequence element
-                )
+                # Use cached mask or create new one
+                if current_seq_len not in mask_cache:
+                    mask_cache[current_seq_len] = self._generate_square_subsequent_mask(current_seq_len, device)
+                tgt_mask = mask_cache[current_seq_len]
 
-                # Take the output of the *last* frame for prediction (which corresponds to `t`)
-                decoder_out_t = decoder_outputs_full_seq[:, -1:, :]
+                # Process only the current sequence
+                current_input = decoder_input_seq_projected[:, :current_seq_len, :]
 
-                # Project to mel dimension
+                # Decoder forward pass
+                try:
+                    decoder_outputs = self.decoder(
+                        tgt=current_input,
+                        memory=expanded_encoder_outputs,
+                        tgt_mask=tgt_mask,
+                        memory_key_padding_mask=encoder_output_padding_mask,
+                        tgt_key_padding_mask=None
+                    )
+                except Exception as e:
+                    logger.error(f"Decoder failed at frame {t}: {e}")
+                    break
+
+                # Take the last frame's output
+                decoder_out_t = decoder_outputs[:, -1:, :]
+
+                # Generate mel frame
                 mel_pred_t = self.mel_projection_out(decoder_out_t)
                 generated_mels.append(mel_pred_t)
 
-                # Predict stop token
+                # Check stop condition
                 stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
-                stop_probability = torch.sigmoid(stop_token_logit_t)
+                stop_probability = torch.sigmoid(stop_token_logit_t).item()
+                stop_probs_history.append(stop_probability)
+
+                # Track mel frame for stability analysis
+                if len(mel_stability_buffer) >= 5:
+                    mel_stability_buffer.pop(0)
+                mel_stability_buffer.append(mel_pred_t.clone())
+
+                # Progress logging
+                if t % 50 == 0 or t < 10:
+                    logger.info(f"Generated frame {t}, stop_prob: {stop_probability:.6f}")
+
+                # MULTIPLE STOPPING CONDITIONS
+
+                # 1. Original stop token threshold (if it works)
+                if batch_size == 1 and stop_probability > stop_threshold:
+                    logger.info(f"Stopping generation at frame {t} (stop_prob: {stop_probability:.4f})")
+                    break
+
+                # 2. Adaptive threshold based on history
+                if len(stop_probs_history) >= 10:
+                    recent_avg = sum(stop_probs_history[-10:]) / 10
+                    if recent_avg > 0.1 and stop_probability > recent_avg * 2:
+                        logger.info(f"Stopping due to adaptive threshold at frame {t} (stop_prob: {stop_probability:.4f}, avg: {recent_avg:.4f})")
+                        break
+
+                # 3. Count consecutive very low probabilities
+                if stop_probability < 0.001:
+                    consecutive_low_stop_count += 1
+                else:
+                    consecutive_low_stop_count = 0
+
+                # 4. Force stop if probabilities are consistently too low
+                if consecutive_low_stop_count > 20 and t > min_expected_length:
+                    logger.warning(f"Forcing stop at frame {t} due to consistently low stop probabilities")
+                    break
+
+                # 5. Mel frame stability check
+                if len(mel_stability_buffer) >= 5 and t > min_expected_length:
+                    # Calculate variance in recent mel frames
+                    stacked_mels = torch.cat(mel_stability_buffer, dim=1)  # (B, 5, mel_dim)
+                    mel_variance = torch.var(stacked_mels, dim=1).mean().item()
+
+                    if mel_variance < 0.001:  # Very stable/repetitive output
+                        logger.info(f"Stopping due to stable mel output at frame {t} (variance: {mel_variance:.6f})")
+                        break
+
+                # 6. Length-based intelligent stopping
+                if t >= expected_length and stop_probability > 0.01:
+                    logger.info(f"Stopping at expected length {t} with reasonable stop_prob: {stop_probability:.4f}")
+                    break
+
+                # 7. Hard safety limit
+                if t >= max_expected_length - 1:
+                    logger.warning(f"Reached maximum generation length ({max_expected_length})")
+                    break
+
+                # 8. Emergency brake for completely broken models
+                if t > 100 and max(stop_probs_history[-50:]) < 0.01:
+                    logger.error(f"Emergency stop: stop token predictor appears completely broken (max prob in last 50 frames: {max(stop_probs_history[-50:]):.6f})")
+                    break
 
                 # Use prediction as next input
                 decoder_input_mel = mel_pred_t
 
-                # Stop condition: check stop probability for batch_size 1
-                if batch_size == 1 and stop_probability.item() > stop_threshold:
-                    logger.info(f"Stopping generation at frame {t} (stop_prob: {stop_probability.item():.4f})")
-                    break
-
-            # Concatenate all generated mel frames
+            # Concatenate all generated frames
             if generated_mels:
-                mel_output = torch.cat(generated_mels, dim=1) # (B, L_mel, mel_dim)
+                mel_output = torch.cat(generated_mels, dim=1)
+                logger.info(f"Generated {mel_output.shape[1]} mel frames (expected ~{expected_length})")
+
+                # Log statistics
+                if stop_probs_history:
+                    avg_stop_prob = sum(stop_probs_history) / len(stop_probs_history)
+                    max_stop_prob = max(stop_probs_history)
+                    logger.info(f"Stop probability stats - avg: {avg_stop_prob:.6f}, max: {max_stop_prob:.6f}")
             else:
-                # Handle case where no mels were generated (e.g., max_len=0 or immediate stop)
                 logger.warning("No mel frames were generated.")
                 mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
 
-            # Apply Postnet (if it exists)
-            # You need to define self.postnet in __init__ if you plan to use it.
-            # Example: self.postnet = Postnet(mel_dim, ...)
-            if hasattr(self, 'postnet') and self.postnet is not None and mel_output.size(1) > 0:
-                mel_output = mel_output + self.postnet(mel_output.transpose(1, 2)).transpose(1, 2)
-            elif mel_output.size(1) == 0:
-                pass # Already handled empty output
-            else:
-                logger.debug("Postnet not applied. Model does not have a 'postnet' attribute or mel_output is empty.")
-
             return mel_output
+
 
     def forward(
         self,
