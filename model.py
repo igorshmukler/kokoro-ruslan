@@ -122,7 +122,7 @@ class KokoroModel(nn.Module):
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
                  encoder_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
-                 max_decoder_seq_len: int = 800): # Added max_decoder_seq_len
+                 max_decoder_seq_len: int = 1420): # Added max_decoder_seq_len
         """
         Initialize the Kokoro model with Transformer encoder and decoder
         
@@ -413,7 +413,7 @@ class KokoroModel(nn.Module):
         return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
 
 
-    def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 800, stop_threshold: float = 0.5,
+    def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 1420, stop_threshold: float = 0.5,
                       text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Fixed forward pass during inference with multiple fallback stopping mechanisms.
@@ -632,7 +632,7 @@ class KokoroModel(nn.Module):
         else:
             self.eval() # Set to evaluation mode for inference
             # Pass max_len to forward_inference, ensure it's clamped by self.max_decoder_seq_len
-            # The current setup uses a default max_len=800 in forward_inference signature.
+            # The current setup uses a default max_len=1420 in forward_inference signature.
             # You might want to make this configurable via the `inference.py` script.
             return self.forward_inference(phoneme_indices, max_len=self.max_decoder_seq_len * 2, text_padding_mask=text_padding_mask)
 
