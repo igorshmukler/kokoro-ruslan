@@ -253,7 +253,6 @@ class KokoroModel(nn.Module):
                 text_encoded, phoneme_durations.float(), text_padding_mask
             )
 
-            # --- FIX STARTS HERE ---
             # Ensure expanded_encoder_outputs sequence length matches mel_seq_len
             with torch.profiler.record_function("mel_length_adjust"):
                 current_expanded_len = expanded_encoder_outputs.shape[1]
@@ -282,7 +281,6 @@ class KokoroModel(nn.Module):
                         encoder_output_padding_mask = torch.cat(
                             [encoder_output_padding_mask, padding_mask_tensor], dim=1
                         )
-            # --- FIX ENDS HERE ---
 
             with torch.profiler.record_function("decoder_input_prep"):
                 # Prepare decoder input (teacher forcing: shift right)
