@@ -8,8 +8,8 @@ import os
 import torch
 import logging
 
-from config import TrainingConfig
-from trainer import KokoroTrainer
+# from config import TrainingConfig
+from training import KokoroTrainer
 from cli import parse_arguments, create_config_from_args
 
 # Configure logging
