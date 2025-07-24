@@ -4,7 +4,7 @@ Configuration classes for Kokoro Language Model Training
 """
 
 import torch
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
