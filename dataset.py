@@ -28,7 +28,17 @@ class RuslanDataset(Dataset):
         self.config = config
         self.phoneme_processor = RussianPhonemeProcessor()
 
+        # Validate MelSpectrogram parameters
+        if self.config.win_length > self.config.n_fft:
+            raise ValueError(
+                f"win_length ({self.config.win_length}) cannot be greater than n_fft ({self.config.n_fft}). "
+                "Please check your TrainingConfig."
+            )
+        if self.config.hop_length <= 0:
+            raise ValueError("hop_length must be a positive integer.")
+
         # Pre-create mel transform for efficiency
+        # Explicitly setting window_fn and using `return_fast=False` for robustness
         self.mel_transform = torchaudio.transforms.MelSpectrogram(
             sample_rate=self.config.sample_rate,
             n_fft=self.config.n_fft,
@@ -38,7 +48,13 @@ class RuslanDataset(Dataset):
             f_min=self.config.f_min,
             f_max=self.config.f_max,
             power=2.0,
-            normalized=False
+            normalized=False,
+            # Explicitly define window function
+            window_fn=torch.hann_window,
+            # return_fast=False can sometimes help with backend specific issues,
+            # although it might be slightly slower. Keep as default if not needed.
+            # You can uncomment this if issues persist:
+            # return_fast=False
         )
 
         # Load metadata and pre-calculate lengths for batching
@@ -68,7 +84,7 @@ class RuslanDataset(Dataset):
 
             with open(metadata_file, 'r', encoding='utf-8') as f:
                 # Wrap the file iterator with tqdm
-                for line in tqdm(f, total=total_lines, desc="Loading metadata"): # <--- TQDM here
+                for line in tqdm(f, total=total_lines, desc="Loading metadata"):
                     parts = line.strip().split('|')
                     if len(parts) >= 2:
                         audio_file_stem = parts[0]
@@ -82,8 +98,20 @@ class RuslanDataset(Dataset):
                                 if sr != self.config.sample_rate:
                                     resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
                                     waveform = resampler(waveform)
+
+                                # Ensure waveform is at least win_length for STFT
+                                if waveform.shape[1] < self.config.win_length:
+                                    # Pad short audio with zeros
+                                    padding_needed = self.config.win_length - waveform.shape[1]
+                                    waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
+                                    # logger.debug(f"Padded short audio {audio_file_stem}. New length: {waveform.shape[1]}")
+
                                 # Estimate mel frames (audio_length // hop_length)
-                                audio_length_frames = waveform.shape[1] // self.config.hop_length
+                                # Add 1 because the number of frames is usually (waveform_length - win_length) / hop_length + 1
+                                audio_length_frames = (waveform.shape[1] - self.config.n_fft) // self.config.hop_length + 1
+                                if audio_length_frames < 1: # Handle cases where padding wasn't enough for even one frame
+                                    audio_length_frames = 1
+
                             except Exception as e:
                                 logger.warning(f"Could not load or process audio {audio_path}: {e}. Skipping.")
                                 continue
@@ -98,7 +126,13 @@ class RuslanDataset(Dataset):
                                 audio_length_frames = self.config.max_seq_length
                                 # Also adjust phoneme length if it's too long, proportionally
                                 if phoneme_length > 0:
-                                    phoneme_length = int(phoneme_length * (self.config.max_seq_length / (waveform.shape[1] // self.config.hop_length)))
+                                    # Estimate a new phoneme length based on the clipped audio length
+                                    original_audio_len_samples = waveform.shape[1]
+                                    original_audio_len_frames = (original_audio_len_samples - self.config.n_fft) // self.config.hop_length + 1
+
+                                    if original_audio_len_frames > 0: # Avoid division by zero
+                                        # Proportionally scale phoneme length
+                                        phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_audio_len_frames))
                                     phoneme_length = max(1, phoneme_length) # Ensure at least 1 phoneme if original was > 0
 
                             samples.append({
@@ -113,11 +147,11 @@ class RuslanDataset(Dataset):
                            "Note: Lengths will be estimated on the fly for scanned files, which might be slower.")
             wav_dir = self.data_dir / "wavs"
             txt_dir = self.data_dir / "texts"
-    
+
             if wav_dir.exists():
                 # For glob, we can convert to list first to get total count for tqdm
                 wav_files = list(wav_dir.glob("*.wav"))
-                for wav_file in tqdm(wav_files, desc="Scanning audio files"): # <--- TQDM here
+                for wav_file in tqdm(wav_files, desc="Scanning audio files"):
                     txt_file = txt_dir / f"{wav_file.stem}.txt"
                     if txt_file.exists():
                         with open(txt_file, 'r', encoding='utf-8') as f:
@@ -129,7 +163,17 @@ class RuslanDataset(Dataset):
                             if sr != self.config.sample_rate:
                                 resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
                                 waveform = resampler(waveform)
-                            audio_length_frames = waveform.shape[1] // self.config.hop_length
+
+                            # Ensure waveform is at least win_length for STFT
+                            if waveform.shape[1] < self.config.win_length:
+                                padding_needed = self.config.win_length - waveform.shape[1]
+                                waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
+                                # logger.debug(f"Padded short audio {wav_file.stem}. New length: {waveform.shape[1]}")
+
+                            audio_length_frames = (waveform.shape[1] - self.config.n_fft) // self.config.hop_length + 1
+                            if audio_length_frames < 1:
+                                audio_length_frames = 1
+
                         except Exception as e:
                             logger.warning(f"Could not load or process audio {wav_file}: {e}. Skipping.")
                             continue
@@ -143,7 +187,10 @@ class RuslanDataset(Dataset):
                              logger.warning(f"Clipping {wav_file.stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
                              audio_length_frames = self.config.max_seq_length
                              if phoneme_length > 0:
-                                phoneme_length = int(phoneme_length * (self.config.max_seq_length / (waveform.shape[1] // self.config.hop_length)))
+                                original_audio_len_samples = waveform.shape[1]
+                                original_audio_len_frames = (original_audio_len_samples - self.config.n_fft) // self.config.hop_length + 1
+                                if original_audio_len_frames > 0:
+                                    phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_audio_len_frames))
                                 phoneme_length = max(1, phoneme_length)
 
 
@@ -181,6 +228,14 @@ class RuslanDataset(Dataset):
         # Normalize audio to prevent numerical issues
         audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
 
+        # --- NEW: Pad audio to ensure it's at least `win_length` for STFT ---
+        # This is critical for torch.stft not to fail on very short samples.
+        if audio.shape[1] < self.config.win_length:
+            padding_needed = self.config.win_length - audio.shape[1]
+            audio = torch.nn.functional.pad(audio, (0, padding_needed))
+            # logger.debug(f"Padded audio in __getitem__. New length: {audio.shape[1]}")
+        # --- END NEW ---
+
         # Extract mel spectrogram using pre-created transform
         mel_spec = self.mel_transform(audio).squeeze(0)  # Remove channel dimension
 
@@ -207,8 +262,9 @@ class RuslanDataset(Dataset):
             phoneme_durations = torch.full((num_phonemes,), int(avg_duration), dtype=torch.long)
 
             remainder = num_mel_frames - torch.sum(phoneme_durations).item()
+            # Distribute remainder frames to early phonemes
             for i in range(remainder):
-                if i < num_phonemes:
+                if i < num_phonemes: # Ensure we don't go out of bounds
                     phoneme_durations[i] += 1
             phoneme_durations = torch.clamp(phoneme_durations, min=1)
 
