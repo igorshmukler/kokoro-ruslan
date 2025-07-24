@@ -187,7 +187,7 @@ class KokoroTTS:
                 logger.error(f"Phoneme processor produced no phonemes for text: '{text}'. Conversion aborted.")
                 raise ValueError("No phonemes generated from the input text.")
 
-            logger.debug(f"Phonemes: {' '.join(phoneme_sequence)}")
+            logger.info(f"Phonemes: {' '.join(phoneme_sequence)}")
 
             # Step 2: Convert phonemes to numerical indices
             phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
