@@ -228,13 +228,12 @@ class RuslanDataset(Dataset):
         # Normalize audio to prevent numerical issues
         audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
 
-        # --- NEW: Pad audio to ensure it's at least `win_length` for STFT ---
+        # Pad audio to ensure it's at least `win_length` for STFT ---
         # This is critical for torch.stft not to fail on very short samples.
         if audio.shape[1] < self.config.win_length:
             padding_needed = self.config.win_length - audio.shape[1]
             audio = torch.nn.functional.pad(audio, (0, padding_needed))
             # logger.debug(f"Padded audio in __getitem__. New length: {audio.shape[1]}")
-        # --- END NEW ---
 
         # Extract mel spectrogram using pre-created transform
         mel_spec = self.mel_transform(audio).squeeze(0)  # Remove channel dimension
