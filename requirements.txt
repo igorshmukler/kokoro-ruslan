@@ -13,6 +13,16 @@ pathlib
 # Progress bars and logging
 tqdm>=4.64.0
 
+# TensorBoard and its dependencies
+tensorboard==2.20.0
+tensorboard-data-server<0.8.0,>=0.7.0
+markdown>=2.6.8
+protobuf!=4.24.0,>=3.19.6
+grpcio>=1.48.2
+werkzeug>=1.0.1
+pillow
+absl-py>=0.4
+
 # Standard library dependencies (usually included with Python)
 # os
 # json
@@ -23,8 +33,6 @@ tqdm>=4.64.0
 
 # Optional: For better performance (if using CUDA)
 # torch-audio  # Alternative audio processing
-# librosa>=0.9.0  # Alternative audio processing library
 
 # Development and debugging (optional)
 # matplotlib>=3.5.0  # For visualization during development
-# tensorboard>=2.8.0  # For training monitoring
