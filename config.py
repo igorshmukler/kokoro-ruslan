@@ -4,7 +4,7 @@ Configuration classes for Kokoro Language Model Training
 """
 
 import torch
-from dataclasses import dataclass, field # Import field for default_factory
+from dataclasses import dataclass, field
 from typing import Optional
 
 
@@ -40,3 +40,9 @@ class TrainingConfig:
     hidden_dim: int = 512 # Hidden dimension for internal model layers (matches KokoroModel)
     duration_loss_weight: float = 0.1 # Weight for the duration prediction loss
     stop_token_loss_weight: float = 1.0 # Weight for the stop token prediction loss
+
+    # Profiler specific configurations
+    profile_epoch_start: int = 1   # Start profiling from this epoch (0-indexed). Set to -1 to disable.
+    profile_wait_steps: int = 1    # Number of steps to wait before starting warmup in profiler
+    profile_warmup_steps: int = 1  # Number of steps to warm up the profiler
+    profile_steps: int = 5         # Number of active steps to profile

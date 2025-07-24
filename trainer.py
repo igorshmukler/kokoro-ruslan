@@ -9,12 +9,14 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 import logging
+import torch.profiler # Import profiler for performance analysis
+import datetime # For creating unique log directories
 
 from typing import Tuple
-from config import TrainingConfig
-from dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler
-from model import KokoroModel
-from checkpoint_manager import (
+from config import TrainingConfig # Assuming this is correctly defined elsewhere
+from dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler # Assuming these are correctly defined elsewhere
+from model import KokoroModel # Assuming this is correctly defined elsewhere
+from checkpoint_manager import ( # Assuming these are correctly defined elsewhere
     save_phoneme_processor, load_checkpoint, find_latest_checkpoint,
     save_checkpoint, save_final_model
 )
@@ -76,6 +78,11 @@ class KokoroTrainer:
         self.start_epoch = 0
         self.best_loss = float('inf')
 
+        # Profiler setup
+        self.profiler = None
+        self.log_dir = os.path.join(config.output_dir, "profiler_logs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(self.log_dir, exist_ok=True)
+
 
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption"""
@@ -111,79 +118,105 @@ class KokoroTrainer:
         dur_loss_epoch = 0.0
         stop_loss_epoch = 0.0
 
-        # Ensure the dataloader is iterated properly with the batch_sampler
-        # The length of the dataloader will now be the number of batches from the sampler
         num_batches = len(self.dataloader)
+
+        # Determine if profiling for this epoch
+        is_profiling_epoch = (epoch == self.config.profile_epoch_start)
+
+        if is_profiling_epoch:
+            # Set up profiler for the specific epoch
+            # Adjust wait, warmup, active based on how many steps you want to profile
+            # Here, we profile for `profile_steps` steps after 1 wait and 1 warmup step.
+            logger.info(f"Starting profiler for epoch {epoch+1} for {self.config.profile_steps} steps.")
+            self.profiler = torch.profiler.profile(
+                schedule=torch.profiler.schedule(
+                    wait=self.config.profile_wait_steps,
+                    warmup=self.config.profile_warmup_steps,
+                    active=self.config.profile_steps,
+                    repeat=1
+                ),
+                on_trace_ready=torch.profiler.tensorboard_trace_handler(self.log_dir),
+                with_stack=True,
+                profile_memory=True,
+                record_shapes=True
+            )
+            self.profiler.__enter__() # Manually enter the context manager
 
         progress_bar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
         for batch_idx, batch in enumerate(progress_bar):
             try:
-                mel_specs = batch['mel_specs'].to(self.device, non_blocking=True)
-                phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=True)
-                phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=True)
-                stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=True)
-                mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=True)
-                phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=True)
+                # If profiling, advance the profiler schedule
+                if is_profiling_epoch and self.profiler:
+                    self.profiler.step()
+                    # Exit profiler early if we've collected enough data
+                    if batch_idx >= (self.config.profile_wait_steps + self.config.profile_warmup_steps + self.config.profile_steps):
+                        logger.info("Profiler collected enough steps. Exiting profiler context.")
+                        self.profiler.__exit__(None, None, None)
+                        self.profiler = None # Clear profiler to avoid stepping when not active
+                        is_profiling_epoch = False # Stop profiling for subsequent batches in this epoch
 
-                self.optimizer.zero_grad()
+                with torch.profiler.record_function("Data_Loading"):
+                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=True)
+                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=True)
+                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=True)
+                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=True)
+                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=True)
+                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=True)
 
-                predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                    self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                with torch.profiler.record_function("Zero_Grad"):
+                    self.optimizer.zero_grad()
 
-                # --- Calculate Losses with Masking ---
+                with torch.profiler.record_function("Model_Forward"):
+                    predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                        self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
 
-                # 1. Mel Spectrogram Loss
-                # Create a mask for valid mel frames
-                # mel_specs_padded has shape (batch_size, max_mel_len_in_batch, n_mels)
-                # predicted_mel has shape (batch_size, max_mel_len_in_batch, n_mels)
-                max_mel_len_batch = mel_specs.size(1)
-                mel_mask = torch.arange(max_mel_len_batch, device=self.device).expand(len(mel_lengths), max_mel_len_batch) < mel_lengths.unsqueeze(1)
-                mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float() # Expand to n_mels dimension
+                with torch.profiler.record_function("Loss_Calculation"):
+                    # --- Calculate Losses with Masking ---
 
-                # Apply mask to loss
-                loss_mel_unreduced = self.criterion_mel(
-                    predicted_mel,
-                    mel_specs
-                )
-                loss_mel = (loss_mel_unreduced * mel_mask).sum() / mel_mask.sum()
+                    # 1. Mel Spectrogram Loss
+                    max_mel_len_batch = mel_specs.size(1)
+                    mel_mask = torch.arange(max_mel_len_batch, device=self.device).expand(len(mel_lengths), max_mel_len_batch) < mel_lengths.unsqueeze(1)
+                    mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
+
+                    loss_mel_unreduced = self.criterion_mel(
+                        predicted_mel,
+                        mel_specs
+                    )
+                    loss_mel = (loss_mel_unreduced * mel_mask).sum() / mel_mask.sum()
 
 
-                # 2. Duration Loss
-                # Create a mask for valid phoneme durations
-                # phoneme_indices_padded has shape (batch_size, max_phoneme_len_in_batch)
-                # predicted_log_durations has shape (batch_size, max_phoneme_len_in_batch)
-                max_phoneme_len_batch = phoneme_indices.size(1)
-                phoneme_mask = torch.arange(max_phoneme_len_batch, device=self.device).expand(len(phoneme_lengths), max_phoneme_len_batch) < phoneme_lengths.unsqueeze(1)
-                phoneme_mask = phoneme_mask.float() # Convert to float for multiplication
+                    # 2. Duration Loss
+                    max_phoneme_len_batch = phoneme_indices.size(1)
+                    phoneme_mask = torch.arange(max_phoneme_len_batch, device=self.device).expand(len(phoneme_lengths), max_phoneme_len_batch) < phoneme_lengths.unsqueeze(1)
+                    phoneme_mask = phoneme_mask.float()
 
-                target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
+                    target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
 
-                loss_duration_unreduced = self.criterion_duration(
-                    predicted_log_durations,
-                    target_log_durations
-                )
-                loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+                    loss_duration_unreduced = self.criterion_duration(
+                        predicted_log_durations,
+                        target_log_durations
+                    )
+                    loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
 
-                # 3. Stop Token Loss
-                # The stop token loss is also on the mel sequence, so use the same mel_mask
-                loss_stop_token_unreduced = self.criterion_stop_token(
-                    predicted_stop_logits,
-                    stop_token_targets
-                )
-                # For stop token loss, the mask doesn't need to expand to n_mels, just sequence length
-                stop_token_mask = mel_mask[:, :, 0] # Take the 0th channel of mel_mask
-                loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
+                    # 3. Stop Token Loss
+                    stop_token_mask = mel_mask[:, :, 0]
+                    loss_stop_token_unreduced = self.criterion_stop_token(
+                        predicted_stop_logits,
+                        stop_token_targets
+                    )
+                    loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
 
-                # Combine all losses
-                total_loss = loss_mel + \
-                             loss_duration * self.config.duration_loss_weight + \
-                             loss_stop_token * self.config.stop_token_loss_weight
+                    # Combine all losses
+                    total_loss = loss_mel + \
+                                 loss_duration * self.config.duration_loss_weight + \
+                                 loss_stop_token * self.config.stop_token_loss_weight
 
-                total_loss.backward()
+                with torch.profiler.record_function("Backward_Pass"):
+                    total_loss.backward()
 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                self.optimizer.step()
+                with torch.profiler.record_function("Optimizer_Step"):
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
 
                 total_loss_epoch += total_loss.item()
                 mel_loss_epoch += loss_mel.item()
@@ -212,6 +245,12 @@ class KokoroTrainer:
                     torch.mps.empty_cache()
                 continue
 
+        # Ensure profiler is exited if it was started but didn't complete its schedule
+        if self.profiler:
+            logger.info("Profiler exiting at end of epoch.")
+            self.profiler.__exit__(None, None, None)
+            self.profiler = None
+
         return (total_loss_epoch / num_batches,
                 mel_loss_epoch / num_batches,
                 dur_loss_epoch / num_batches,
@@ -231,6 +270,7 @@ class KokoroTrainer:
         logger.info(f"Initial learning rate: {self.config.learning_rate}")
         logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult}, eta_min={self.config.lr_eta_min})")
         logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
+        logger.info(f"Profiler logs will be saved to: {self.log_dir}")
 
 
         for epoch in range(self.start_epoch, self.config.num_epochs):
@@ -298,6 +338,13 @@ if __name__ == "__main__":
             self.f_max = 8000.0
             self.num_workers = 0 # For MPS, keep at 0
             self.pin_memory = False # For MPS, keep at False
+
+            # --- Profiler specific configurations ---
+            self.profile_epoch_start = 1 # Start profiling from this epoch (0-indexed)
+                                         # Set to -1 or a high number to disable profiling
+            self.profile_wait_steps = 1  # Number of steps to wait before starting warmup
+            self.profile_warmup_steps = 1 # Number of steps to warm up the profiler
+            self.profile_steps = 5       # Number of active steps to profile
 
     temp_config = TrainingConfig()
     train_model(temp_config)
