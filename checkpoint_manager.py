@@ -11,7 +11,7 @@ from typing import Optional, Tuple
 import logging
 
 from config import TrainingConfig
-from russian_phoneme_processor import RussianPhonemeProcessor
+from data import RussianPhonemeProcessor
 
 logger = logging.getLogger(__name__)
 

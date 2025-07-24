@@ -4,26 +4,17 @@ Kokoro Russian TTS Inference Script with HiFi-GAN Vocoder
 Convert Russian text to speech using trained Kokoro model with neural vocoder
 """
 
-import os
 import torch
-import torchaudio
-import numpy as np
 import argparse
 import pickle
-import json
-import requests
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import List, Optional
 import logging
-import soundfile as sf
 from urllib.parse import urlparse
 
 # Import our training configuration, model and phoneme processor
-from config import TrainingConfig # Assuming this config contains model parameters like hidden_dim etc.
-from model import KokoroModel
-from russian_phoneme_processor import RussianPhonemeProcessor
-from hifigan_vocoder import HiFiGANGenerator, load_hifigan_model, HiFiGANConfig
-from vocoder_manager import VocoderManager
+from models import KokoroModel, load_hifigan_model, VocoderManager
+from data import RussianPhonemeProcessor
 from audio_utils import AudioUtils, PhonemeProcessorUtils
 
 # Configure logging

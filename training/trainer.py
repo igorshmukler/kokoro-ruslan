@@ -12,8 +12,8 @@ import logging
 
 from typing import Tuple
 from config import TrainingConfig
-from dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler
-from model import KokoroModel
+from data import RuslanDataset, collate_fn, LengthBasedBatchSampler
+from models import KokoroModel
 from checkpoint_manager import (
     save_phoneme_processor, load_checkpoint, find_latest_checkpoint,
     save_checkpoint, save_final_model
