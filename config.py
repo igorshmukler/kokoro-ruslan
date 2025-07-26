@@ -4,7 +4,7 @@ Configuration classes for Kokoro Language Model Training
 """
 
 import torch
-from dataclasses import dataclass, field # Import field for default_factory
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -16,7 +16,7 @@ class TrainingConfig:
     batch_size: int = 8  # Increased for MPS
     learning_rate: float = 1e-4
     num_epochs: int = 100
-    max_seq_length: int = 5000
+    max_seq_length: int = 4000
     sample_rate: int = 22050
     hop_length: int = 256
     win_length: int = 1024
@@ -28,7 +28,7 @@ class TrainingConfig:
     save_every: int = 2
     use_mixed_precision: bool = True  # Enable for MPS
     num_workers: int = 0  # Set to 0 for MPS compatibility
-    pin_memory: bool = False  # Disable for MPS
+    pin_memory: bool = True  # Disable for MPS
     resume_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
 
     # Parameters for CosineAnnealingWarmRestarts
@@ -40,3 +40,9 @@ class TrainingConfig:
     hidden_dim: int = 512 # Hidden dimension for internal model layers (matches KokoroModel)
     duration_loss_weight: float = 0.1 # Weight for the duration prediction loss
     stop_token_loss_weight: float = 1.0 # Weight for the stop token prediction loss
+
+    # Profiler specific configurations
+    profile_epoch_start: int = 1   # Start profiling from this epoch (0-indexed). Set to -1 to disable.
+    profile_wait_steps: int = 1    # Number of steps to wait before starting warmup in profiler
+    profile_warmup_steps: int = 1  # Number of steps to warm up the profiler
+    profile_steps: int = 5         # Number of active steps to profile

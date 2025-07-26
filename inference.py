@@ -4,25 +4,16 @@ Kokoro Russian TTS Inference Script with HiFi-GAN Vocoder
 Convert Russian text to speech using trained Kokoro model with neural vocoder
 """
 
-import os
 import torch
-import torchaudio
-import numpy as np
 import argparse
 import pickle
-import json
-import requests
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import List, Optional
 import logging
-import soundfile as sf
-from urllib.parse import urlparse
 
 # Import our training configuration, model and phoneme processor
-from config import TrainingConfig # Assuming this config contains model parameters like hidden_dim etc.
 from model import KokoroModel
 from russian_phoneme_processor import RussianPhonemeProcessor
-from hifigan_vocoder import HiFiGANGenerator, load_hifigan_model, HiFiGANConfig
 from vocoder_manager import VocoderManager
 from audio_utils import AudioUtils, PhonemeProcessorUtils
 
@@ -64,7 +55,7 @@ class KokoroTTS:
     def _load_phoneme_processor(self) -> RussianPhonemeProcessor:
         """Loads the phoneme processor from the model directory."""
         processor_path = self.model_dir / "phoneme_processor.pkl"
-        
+
         if processor_path.exists():
             try:
                 with open(processor_path, 'rb') as f:
@@ -77,13 +68,13 @@ class KokoroTTS:
         else:
             logger.warning("Phoneme processor not found at expected path. Creating a new one. This might lead to issues if the model was trained with a different vocabulary.")
             processor = RussianPhonemeProcessor()
-            
+
         return processor
-    
+
     def _load_model(self) -> KokoroModel:
         """Loads the trained Kokoro model with robust error handling."""
         final_model_path = self.model_dir / "kokoro_russian_final.pth"
-        checkpoint_files = sorted(list(self.model_dir.glob("checkpoint_epoch_*.pth")), 
+        checkpoint_files = sorted(list(self.model_dir.glob("checkpoint_epoch_*.pth")),
                                   key=lambda x: int(x.stem.split('_')[-1]))
 
         model_path = None
@@ -101,7 +92,7 @@ class KokoroTTS:
             lambda: torch.load(model_path, map_location='cpu', weights_only=True),
             lambda: torch.load(model_path, map_location='cpu', weights_only=False),
         ]
-        
+
         # Try loading with various methods
         for i, load_func in enumerate(try_methods):
             try:
@@ -122,7 +113,7 @@ class KokoroTTS:
             state_dict_to_load = checkpoint['model']
         elif isinstance(checkpoint, dict): # If the checkpoint itself is the state_dict
             state_dict_to_load = checkpoint
-        
+
         if state_dict_to_load is None:
             raise RuntimeError("Checkpoint does not contain a recognized model state dictionary (expected 'model_state_dict' or 'model' key, or raw state dict).")
 
@@ -134,7 +125,7 @@ class KokoroTTS:
         NUM_HEADS = 8
         FF_DIM = 2048
         DROPOUT = 0.1
-        MAX_DECODER_SEQ_LEN = 5000 # Critical: This must match the positional encoding size used during training
+        MAX_DECODER_SEQ_LEN = 4000 # Critical: This must match the positional encoding size used during training
 
         vocab_size = len(self.phoneme_processor.phoneme_to_id)
         model = KokoroModel(
@@ -170,7 +161,7 @@ class KokoroTTS:
             logger.warning(f"Failed to load model state dict strictly: {e}. Attempting non-strict load. This may indicate a mismatch between the model architecture and the loaded weights.")
             model.load_state_dict(filtered_state_dict, strict=False)
             logger.info("Model state dictionary loaded with strict=False.")
-        
+
         model.to(self.device)
         model.eval() # Set model to evaluation mode
 
@@ -191,12 +182,12 @@ class KokoroTTS:
             # Step 1: Process text into phoneme sequence
             raw_processor_output = self.phoneme_processor.process_text(text)
             phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
-        
+
             if not phoneme_sequence:
                 logger.error(f"Phoneme processor produced no phonemes for text: '{text}'. Conversion aborted.")
                 raise ValueError("No phonemes generated from the input text.")
 
-            logger.debug(f"Phonemes: {' '.join(phoneme_sequence)}")
+            logger.info(f"Phonemes: {' '.join(phoneme_sequence)}")
 
             # Step 2: Convert phonemes to numerical indices
             phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
@@ -397,7 +388,7 @@ def main():
         try:
             with open(args.text_file, 'r', encoding='utf-8') as f:
                 texts_from_file = [line.strip() for line in f if line.strip()]
-            
+
             if not texts_from_file:
                 logger.warning(f"Text file '{args.text_file}' is empty or contains no valid lines.")
                 return
