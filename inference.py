@@ -125,7 +125,7 @@ class KokoroTTS:
         NUM_HEADS = 8
         FF_DIM = 2048
         DROPOUT = 0.1
-        MAX_DECODER_SEQ_LEN = 5000 # Critical: This must match the positional encoding size used during training
+        MAX_DECODER_SEQ_LEN = 4000 # Critical: This must match the positional encoding size used during training
 
         vocab_size = len(self.phoneme_processor.phoneme_to_id)
         model = KokoroModel(

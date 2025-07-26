@@ -16,7 +16,7 @@ class TrainingConfig:
     batch_size: int = 8  # Increased for MPS
     learning_rate: float = 1e-4
     num_epochs: int = 100
-    max_seq_length: int = 5000
+    max_seq_length: int = 4000
     sample_rate: int = 22050
     hop_length: int = 256
     win_length: int = 1024
@@ -28,7 +28,7 @@ class TrainingConfig:
     save_every: int = 2
     use_mixed_precision: bool = True  # Enable for MPS
     num_workers: int = 0  # Set to 0 for MPS compatibility
-    pin_memory: bool = False  # Disable for MPS
+    pin_memory: bool = True  # Disable for MPS
     resume_checkpoint: Optional[str] = None  # Path to checkpoint to resume from
 
     # Parameters for CosineAnnealingWarmRestarts

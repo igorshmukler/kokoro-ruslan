@@ -24,14 +24,14 @@ class ModelLoader:
     def __init__(self, model_dir: str, device: str = "cpu"):
         self.model_dir = Path(model_dir)
         self.device = device
-        
+
         # Audio configuration (should match training config)
         self.n_mels = 80
 
     def load_phoneme_processor(self) -> RussianPhonemeProcessor:
         """Load the phoneme processor"""
         processor_path = self.model_dir / "phoneme_processor.pkl"
-        
+
         if processor_path.exists():
             with open(processor_path, 'rb') as f:
                 processor_data = pickle.load(f)
@@ -40,7 +40,7 @@ class ModelLoader:
         else:
             logger.warning("Phoneme processor not found, creating new one")
             processor = RussianPhonemeProcessor()
-            
+
         return processor
 
     def find_model_file(self) -> Path:
@@ -103,7 +103,7 @@ class ModelLoader:
         NUM_HEADS = 8
         FF_DIM = 2048
         DROPOUT = 0.1
-        MAX_DECODER_SEQ_LEN = 5000  # Match checkpoint's PE size
+        MAX_DECODER_SEQ_LEN = 4000  # Match checkpoint's PE size
 
         model = KokoroModel(
             vocab_size=vocab_size,
@@ -143,7 +143,7 @@ class ModelLoader:
             if k == "decoder.positional_encoding.pe":
                 logger.warning(f"Skipping unexpected key from checkpoint: {k}")
                 continue
-            
+
             if k in model_keys:
                 if model.state_dict()[k].shape == v.shape:
                     filtered_state_dict[k] = v
@@ -168,20 +168,20 @@ class ModelLoader:
         """Load complete model with robust error handling"""
         # Find model file
         model_path = self.find_model_file()
-        
+
         # Load checkpoint
         checkpoint = self.load_checkpoint(model_path)
-        
+
         # Create model
         vocab_size = len(phoneme_processor.phoneme_to_id)
         model = self.create_model(vocab_size)
-        
+
         # Load state dict
         model = self.load_state_dict(model, checkpoint)
-        
+
         # Move to device and set to eval mode
         model.to(self.device)
         model.eval()
-        
+
         logger.info("Model loaded successfully and ready for inference")
         return model
