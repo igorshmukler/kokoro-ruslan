@@ -138,7 +138,8 @@ class KokoroTTS:
             encoder_dropout=DROPOUT,
             n_decoder_layers=NUM_LAYERS,
             decoder_ff_dim=FF_DIM,
-            max_decoder_seq_len=MAX_DECODER_SEQ_LEN
+            max_decoder_seq_len=MAX_DECODER_SEQ_LEN,
+            enable_profiling= getattr(self, 'enable_profiling', False)
         )
 
         # Filter and load state dict

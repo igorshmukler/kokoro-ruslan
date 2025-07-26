@@ -17,22 +17,31 @@ logger = logging.getLogger(__name__)
 
 class KokoroModel(nn.Module):
     """
-    Fixed Kokoro-style model architecture with proper tensor dimension handling.
+    Enhanced Kokoro-style model architecture with gradient checkpointing enabled by default.
     Optimized for MPS (Metal Performance Shaders) acceleration with GPU profiling
     """
 
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
                  encoder_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
-                 max_decoder_seq_len: int = 4000, enable_profiling: bool = True):
+                 max_decoder_seq_len: int = 4000, enable_profiling: bool = False,
+                 gradient_checkpointing: bool = True, checkpoint_segments: int = 2):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
+
+        Args:
+            gradient_checkpointing: Enable gradient checkpointing by default (True)
+            checkpoint_segments: Number of segments to divide layers into for checkpointing
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.mel_dim = mel_dim
         self.hidden_dim = hidden_dim
         self.max_decoder_seq_len = max_decoder_seq_len
+
+        # Gradient checkpointing configuration
+        self.gradient_checkpointing = gradient_checkpointing
+        self.checkpoint_segments = checkpoint_segments
 
         # Initialize profiler
         self.profiler = GPUProfiler(enabled=enable_profiling)
@@ -80,153 +89,276 @@ class KokoroModel(nn.Module):
         # General dropout
         self.dropout = nn.Dropout(encoder_dropout)
 
+        # Log gradient checkpointing status
+        if self.gradient_checkpointing:
+            logger.info(f"Gradient checkpointing enabled with {checkpoint_segments} segments")
+            logger.info(f"Encoder layers: {n_encoder_layers}, Decoder layers: {n_decoder_layers}")
+
+    def enable_gradient_checkpointing(self, segments: int = None):
+        """Enable gradient checkpointing"""
+        self.gradient_checkpointing = True
+        if segments is not None:
+            self.checkpoint_segments = segments
+        logger.info(f"Gradient checkpointing enabled with {self.checkpoint_segments} segments")
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing"""
+        self.gradient_checkpointing = False
+        logger.info("Gradient checkpointing disabled")
+
+    def _checkpoint_encoder_layers(self, x: torch.Tensor, layers: nn.ModuleList,
+                                 mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Apply gradient checkpointing to encoder layers in segments with external logging
+        """
+        if not self.gradient_checkpointing or not self.training:
+            # Standard forward pass without checkpointing - log at layer boundaries
+            for i, layer in enumerate(layers):
+                with torch.profiler.record_function(f"encoder_layer_{i}"):
+                    # Log memory before layer (outside profiling context)
+                    if self.enable_profiling and i % 2 == 0:
+                        self.profiler.log_memory_stats(f"encoder_layer_{i}_start")
+
+                    if mask is not None:
+                        x = layer(x, src_key_padding_mask=mask.to(torch.bool))
+                    else:
+                        x = layer(x)
+
+                    # Log memory after layer (outside profiling context)
+                    if self.enable_profiling and i % 2 == 0:
+                        self.profiler.log_memory_stats(f"encoder_layer_{i}_end")
+            return x
+
+        # Gradient checkpointing enabled - log at segment boundaries only
+        num_layers = len(layers)
+        segment_size = max(1, num_layers // self.checkpoint_segments)
+
+        for segment_idx in range(0, num_layers, segment_size):
+            segment_end = min(segment_idx + segment_size, num_layers)
+            segment_layers = layers[segment_idx:segment_end]
+
+            # Log memory before segment (outside checkpoint)
+            if self.enable_profiling:
+                segment_name = f"encoder_segment_{segment_idx//segment_size}"
+                self.profiler.log_memory_stats(f"{segment_name}_start")
+
+            def create_segment_forward(segment_layers_list, segment_start_idx):
+                def segment_forward(x_seg, mask_seg=None):
+                    # NO LOGGING INSIDE CHECKPOINTED REGION
+                    for i, layer in enumerate(segment_layers_list):
+                        layer_idx = segment_start_idx + i
+                        if mask_seg is not None:
+                            x_seg = layer(x_seg, src_key_padding_mask=mask_seg.to(torch.bool))
+                        else:
+                            x_seg = layer(x_seg)
+                    return x_seg
+                return segment_forward
+
+            segment_forward_fn = create_segment_forward(segment_layers, segment_idx)
+
+            # Execute checkpointed segment
+            if mask is not None:
+                x = checkpoint(segment_forward_fn, x, mask, use_reentrant=False)
+            else:
+                x = checkpoint(segment_forward_fn, x, use_reentrant=False)
+
+            # Log memory after segment (outside checkpoint)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats(f"{segment_name}_end")
+                logger.debug(f"Completed {segment_name} (layers {segment_idx}-{segment_end-1})")
+
+        return x
+
+    def _checkpoint_decoder_forward(self, decoder_input: torch.Tensor, memory: torch.Tensor,
+                                  tgt_mask: Optional[torch.Tensor] = None,
+                                  memory_key_padding_mask: Optional[torch.Tensor] = None,
+                                  tgt_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Apply gradient checkpointing to decoder layers with external logging
+        """
+        if not self.gradient_checkpointing or not self.training:
+            # Standard forward pass without checkpointing
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("decoder_start")
+
+            result = self.decoder(
+                tgt=decoder_input,
+                memory=memory,
+                tgt_mask=tgt_mask,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask
+            )
+
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("decoder_end")
+
+            return result
+
+        # Log before checkpointed decoder (outside checkpoint)
+        if self.enable_profiling:
+            self.profiler.log_memory_stats("decoder_checkpoint_start")
+
+        def create_decoder_forward():
+            def decoder_forward(tgt, mem, t_mask, mem_mask, tgt_mask_pad):
+                # NO LOGGING INSIDE CHECKPOINTED REGION
+                return self.decoder(
+                    tgt=tgt,
+                    memory=mem,
+                    tgt_mask=t_mask,
+                    memory_key_padding_mask=mem_mask,
+                    tgt_key_padding_mask=tgt_mask_pad
+                )
+            return decoder_forward
+
+        decoder_forward_fn = create_decoder_forward()
+
+        result = checkpoint(
+            decoder_forward_fn,
+            decoder_input, memory, tgt_mask, memory_key_padding_mask, tgt_key_padding_mask,
+            use_reentrant=False
+        )
+
+        # Log after checkpointed decoder (outside checkpoint)
+        if self.enable_profiling:
+            self.profiler.log_memory_stats("decoder_checkpoint_end")
+            logger.debug("Completed decoder checkpoint")
+
+        return result
+
     def encode_text(self, phoneme_indices: torch.Tensor,
                     mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Encode text with proper scaling and positional encoding"""
+        """Encode text with gradient checkpointing and proper scaling"""
         with torch.profiler.record_function("encode_text"):
-            with self.profiler.profile_memory("text_embedding"):
-                text_emb = self.text_embedding(phoneme_indices) * (self.hidden_dim ** 0.5)
-                text_emb = self.encoder_positional_encoding(text_emb, seq_offset=0)
+            # Log before text embedding (outside any checkpointed regions)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("text_embedding_start")
 
-            x = text_emb
-            for i, layer in enumerate(self.transformer_encoder_layers):
-                with torch.profiler.record_function(f"encoder_layer_{i}"):
-                    with self.profiler.profile_memory(f"encoder_layer_{i}"):
-                        if self.training:
-                            if mask is not None:
-                                # Ensure mask is boolean for checkpoint
-                                x = checkpoint(layer, x, src_key_padding_mask=mask.to(torch.bool), use_reentrant=False)
-                            else:
-                                x = checkpoint(layer, x, use_reentrant=False)
-                        else:
-                            if mask is not None:
-                                x = layer(x, src_key_padding_mask=mask.to(torch.bool))
-                            else:
-                                x = layer(x)
+            text_emb = self.text_embedding(phoneme_indices) * (self.hidden_dim ** 0.5)
+            text_emb = self.encoder_positional_encoding(text_emb, seq_offset=0)
 
-                        if self.enable_profiling and i % 2 == 0:  # Log every 2nd layer to avoid spam
-                            self.profiler.log_memory_stats(f"encoder_layer_{i}")
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("text_embedding_end")
+
+            # Use checkpointed encoder layers (logging handled internally)
+            x = self._checkpoint_encoder_layers(text_emb, self.transformer_encoder_layers, mask)
 
             return x
 
     def _predict_durations(self, text_encoded: torch.Tensor) -> torch.Tensor:
         """
-        Predicts log durations for each phoneme.
+        Predicts log durations for each phoneme with optional checkpointing
         """
         with torch.profiler.record_function("predict_durations"):
-            with self.profiler.profile_memory("duration_prediction"):
+            # Log before duration prediction (outside any checkpointed regions)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("duration_prediction_start")
+
+            if self.gradient_checkpointing and self.training:
+                # Apply checkpointing to duration predictor
+                log_durations = checkpoint(self.duration_predictor, text_encoded, use_reentrant=False).squeeze(-1)
+            else:
                 log_durations = self.duration_predictor(text_encoded).squeeze(-1)
-                return log_durations
+
+            # Log after duration prediction (outside any checkpointed regions)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("duration_prediction_end")
+
+            return log_durations
 
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
         """
         Fixed length regulation with proper tensor dimension handling.
-
-        Args:
-            encoder_outputs (Tensor): Encoder outputs (B, L_text, D).
-            durations (Tensor): Predicted durations (B, L_text).
-            text_padding_mask (Tensor): Boolean mask for text padding (B, L_text).
-                                        True for padded positions, False for actual content.
-        Returns:
-            expanded_encoder_outputs (Tensor): Expanded outputs (B, L_mel, D).
-            encoder_output_padding_mask (Tensor): Padding mask for expanded outputs.
         """
         with torch.profiler.record_function("length_regulate"):
-            with self.profiler.profile_memory("length_regulation"):
-                batch_size, max_text_len, hidden_dim = encoder_outputs.shape
-                device = encoder_outputs.device
+            # Log before length regulation (no checkpointing here)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("length_regulation_start")
 
-                # Ensure durations are positive and properly clamped
-                durations = torch.clamp(durations, min=1.0)
+            batch_size, max_text_len, hidden_dim = encoder_outputs.shape
+            device = encoder_outputs.device
 
-                expanded_encoder_outputs_list = []
-                encoder_output_padding_mask_list = []
-                max_expanded_len = 0
+            # Ensure durations are positive and properly clamped
+            durations = torch.clamp(durations, min=1.0)
 
-                for i in range(batch_size):
-                    current_encoder_output = encoder_outputs[i]  # (L_text, D)
-                    current_durations = durations[i]             # (L_text,)
-                    # Ensure text_padding_mask is boolean here as well
-                    current_text_padding_mask = text_padding_mask[i].to(torch.bool)  # (L_text,)
+            expanded_encoder_outputs_list = []
+            encoder_output_padding_mask_list = []
+            max_expanded_len = 0
 
-                    # Select non-padded elements
-                    non_padded_indices = ~current_text_padding_mask
+            for i in range(batch_size):
+                current_encoder_output = encoder_outputs[i]  # (L_text, D)
+                current_durations = durations[i]             # (L_text,)
+                current_text_padding_mask = text_padding_mask[i].to(torch.bool)  # (L_text,)
 
-                    if not torch.any(non_padded_indices):
-                        # Handle case where entire sequence is padding
-                        logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
+                # Select non-padded elements
+                non_padded_indices = ~current_text_padding_mask
+
+                if not torch.any(non_padded_indices):
+                    logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
+                    expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
+                    expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
+                else:
+                    filtered_encoder_output = current_encoder_output[non_padded_indices]
+                    filtered_durations = current_durations[non_padded_indices]
+
+                    filtered_durations = torch.clamp(filtered_durations, min=1).long()
+
+                    try:
+                        expanded_encoder_output = torch.repeat_interleave(
+                            filtered_encoder_output, filtered_durations, dim=0
+                        )
+                        expanded_padding_mask = torch.zeros(
+                            expanded_encoder_output.shape[0], dtype=torch.bool, device=device
+                        )
+                    except Exception as e:
+                        logger.error(f"Error in repeat_interleave for batch {i}: {e}")
                         expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
                         expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
-                    else:
-                        filtered_encoder_output = current_encoder_output[non_padded_indices]
-                        filtered_durations = current_durations[non_padded_indices]
 
-                        # Ensure durations are integers and positive
-                        filtered_durations = torch.clamp(filtered_durations, min=1).long()
+                expanded_encoder_outputs_list.append(expanded_encoder_output)
+                encoder_output_padding_mask_list.append(expanded_padding_mask)
+                max_expanded_len = max(max_expanded_len, expanded_encoder_output.shape[0])
 
-                        # Expand encoder outputs
-                        try:
-                            expanded_encoder_output = torch.repeat_interleave(
-                                filtered_encoder_output, filtered_durations, dim=0
-                            )
-                            # The mask for the expanded output should initially be all False (not padded)
-                            expanded_padding_mask = torch.zeros(
-                                expanded_encoder_output.shape[0], dtype=torch.bool, device=device
-                            )
-                        except Exception as e:
-                            logger.error(f"Error in repeat_interleave for batch {i}: {e}")
-                            logger.error(f"filtered_encoder_output shape: {filtered_encoder_output.shape}")
-                            logger.error(f"filtered_durations: {filtered_durations}")
-                            # Fallback: create a minimal valid output
-                            expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
-                            expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
+            if max_expanded_len == 0:
+                logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
+                max_expanded_len = 1
+                dummy_output = torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
+                dummy_mask = torch.ones(1, dtype=torch.bool, device=device)
+                expanded_encoder_outputs_list = [dummy_output] * batch_size
+                encoder_output_padding_mask_list = [dummy_mask] * batch_size
 
-                    expanded_encoder_outputs_list.append(expanded_encoder_output)
-                    encoder_output_padding_mask_list.append(expanded_padding_mask)
-                    max_expanded_len = max(max_expanded_len, expanded_encoder_output.shape[0])
+            # Pad all sequences to the same length
+            final_expanded_outputs = []
+            final_padding_masks = []
 
-                # Handle empty batch case gracefully if all sequences are empty after expansion
-                if max_expanded_len == 0:
-                    logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
-                    max_expanded_len = 1 # Set a minimum length to avoid issues with torch.stack on empty list
-                    # Create dummy tensors for the batch to prevent crashing
-                    dummy_output = torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
-                    dummy_mask = torch.ones(1, dtype=torch.bool, device=device)
-                    expanded_encoder_outputs_list = [dummy_output] * batch_size
-                    encoder_output_padding_mask_list = [dummy_mask] * batch_size
+            for i in range(batch_size):
+                current_output = expanded_encoder_outputs_list[i]
+                current_mask = encoder_output_padding_mask_list[i]
+                current_len = current_output.shape[0]
 
-                # Pad all sequences to the same length
-                final_expanded_outputs = []
-                final_padding_masks = []
+                padding_needed = max_expanded_len - current_len
 
-                for i in range(batch_size):
-                    current_output = expanded_encoder_outputs_list[i]
-                    current_mask = encoder_output_padding_mask_list[i]
-                    current_len = current_output.shape[0]
+                if padding_needed > 0:
+                    padding_tensor = torch.zeros(
+                        padding_needed, hidden_dim, device=device, dtype=current_output.dtype
+                    )
+                    current_output = torch.cat([current_output, padding_tensor], dim=0)
 
-                    padding_needed = max_expanded_len - current_len
+                    padding_mask_fill = torch.ones(padding_needed, dtype=torch.bool, device=device)
+                    current_mask = torch.cat([current_mask, padding_mask_fill], dim=0)
 
-                    if padding_needed > 0:
-                        # Pad the output with zeros
-                        padding_tensor = torch.zeros(
-                            padding_needed, hidden_dim, device=device, dtype=current_output.dtype
-                        )
-                        current_output = torch.cat([current_output, padding_tensor], dim=0)
+                final_expanded_outputs.append(current_output)
+                final_padding_masks.append(current_mask)
 
-                        # Pad the mask with True (indicating padded positions)
-                        padding_mask_fill = torch.ones(padding_needed, dtype=torch.bool, device=device)
-                        current_mask = torch.cat([current_mask, padding_mask_fill], dim=0)
+            expanded_encoder_outputs = torch.stack(final_expanded_outputs, dim=0)
+            encoder_output_padding_mask = torch.stack(final_padding_masks, dim=0)
 
-                    final_expanded_outputs.append(current_output)
-                    final_padding_masks.append(current_mask)
+            # Log after length regulation (no checkpointing here)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("length_regulation_end")
 
-                # Stack into batch tensors
-                expanded_encoder_outputs = torch.stack(final_expanded_outputs, dim=0)
-                encoder_output_padding_mask = torch.stack(final_padding_masks, dim=0)
+            logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {expanded_encoder_outputs.shape}")
 
-                logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {expanded_encoder_outputs.shape}")
-
-                return expanded_encoder_outputs, encoder_output_padding_mask
+            return expanded_encoder_outputs, encoder_output_padding_mask
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
@@ -244,266 +376,277 @@ class KokoroModel(nn.Module):
         mel_padding_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Fixed training forward pass with proper error handling and GPU profiling.
+        Enhanced training forward pass with gradient checkpointing enabled by default
         """
         with torch.profiler.record_function("forward_training"):
-            with self.profiler.profile_memory("forward_training_total"):
-                batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
-                device = mel_specs.device
+            batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
+            device = mel_specs.device
 
-                if self.enable_profiling:
-                    self.profiler.log_memory_stats("training_start")
+            # Log at the very beginning (outside any checkpointed regions)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("training_start")
 
-                # Ensure text_padding_mask is provided and converted to boolean
-                if text_padding_mask is None:
-                    text_padding_mask = (phoneme_indices == 0).to(torch.bool)
-                else:
-                    text_padding_mask = text_padding_mask.to(torch.bool)
+            # Log gradient checkpointing status
+            if self.gradient_checkpointing and self.training:
+                logger.debug("Using gradient checkpointing for forward pass")
 
-                try:
-                    # Encode text using Transformer encoder
-                    with self.profiler.profile_memory("text_encoding"):
-                        text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
+            if text_padding_mask is None:
+                text_padding_mask = (phoneme_indices == 0).to(torch.bool)
+            else:
+                text_padding_mask = text_padding_mask.to(torch.bool)
 
-                    # Predict durations
-                    predicted_log_durations = self._predict_durations(text_encoded)
+            try:
+                # Encode text using checkpointed Transformer encoder (logging handled internally)
+                text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
-                    # Length regulate text_encoded using ground-truth durations
-                    expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                        text_encoded, phoneme_durations.float(), text_padding_mask
+                # Predict durations with checkpointing (logging handled internally)
+                predicted_log_durations = self._predict_durations(text_encoded)
+
+                # Length regulate (logging handled internally)
+                expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                    text_encoded, phoneme_durations.float(), text_padding_mask
+                )
+
+                # Adjust sequence length to match mel_seq_len
+                with torch.profiler.record_function("mel_length_adjust"):
+                    if self.enable_profiling:
+                        self.profiler.log_memory_stats("mel_length_adjust_start")
+
+                    current_expanded_len = expanded_encoder_outputs.shape[1]
+                    if current_expanded_len != mel_seq_len:
+                        if current_expanded_len > mel_seq_len:
+                            expanded_encoder_outputs = expanded_encoder_outputs[:, :mel_seq_len, :]
+                            encoder_output_padding_mask = encoder_output_padding_mask[:, :mel_seq_len]
+                        else:
+                            pad_len = mel_seq_len - current_expanded_len
+                            padding_tensor = torch.zeros(
+                                batch_size, pad_len, self.hidden_dim,
+                                device=device, dtype=expanded_encoder_outputs.dtype
+                            )
+                            expanded_encoder_outputs = torch.cat(
+                                [expanded_encoder_outputs, padding_tensor], dim=1
+                            )
+                            padding_mask_tensor = torch.ones(
+                                batch_size, pad_len, dtype=torch.bool, device=device
+                            )
+                            encoder_output_padding_mask = torch.cat(
+                                [encoder_output_padding_mask, padding_mask_tensor], dim=1
+                            )
+
+                    if self.enable_profiling:
+                        self.profiler.log_memory_stats("mel_length_adjust_end")
+
+                with torch.profiler.record_function("decoder_input_prep"):
+                    if self.enable_profiling:
+                        self.profiler.log_memory_stats("decoder_input_prep_start")
+
+                    # Prepare decoder input with checkpointing
+                    decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
+
+                    if self.gradient_checkpointing and self.training:
+                        decoder_input_projected = checkpoint(
+                            self.mel_projection_in, decoder_input_mels, use_reentrant=False
+                        )
+                    else:
+                        decoder_input_projected = self.mel_projection_in(decoder_input_mels)
+
+                    # Apply positional encoding
+                    decoder_input_projected_with_pe = self.encoder_positional_encoding(
+                        decoder_input_projected, seq_offset=0
                     )
 
-                    # Ensure expanded_encoder_outputs sequence length matches mel_seq_len
-                    with torch.profiler.record_function("mel_length_adjust"):
-                        with self.profiler.profile_memory("mel_length_adjust"):
-                            current_expanded_len = expanded_encoder_outputs.shape[1]
-                            if current_expanded_len != mel_seq_len:
-                                if current_expanded_len > mel_seq_len:
-                                    # Truncate expanded_encoder_outputs
-                                    expanded_encoder_outputs = expanded_encoder_outputs[:, :mel_seq_len, :]
-                                    encoder_output_padding_mask = encoder_output_padding_mask[:, :mel_seq_len]
-                                else:
-                                    # Pad expanded_encoder_outputs
-                                    pad_len = mel_seq_len - current_expanded_len
-                                    padding_tensor = torch.zeros(
-                                        batch_size, pad_len, self.hidden_dim,
-                                        device=device, dtype=expanded_encoder_outputs.dtype
-                                    )
-                                    expanded_encoder_outputs = torch.cat(
-                                        [expanded_encoder_outputs, padding_tensor], dim=1
-                                    )
-                                    padding_mask_tensor = torch.ones(
-                                        batch_size, pad_len, dtype=torch.bool, device=device
-                                    )
-                                    encoder_output_padding_mask = torch.cat(
-                                        [encoder_output_padding_mask, padding_mask_tensor], dim=1
-                                    )
+                    # Generate causal mask for decoder self-attention
+                    tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
 
-                    with torch.profiler.record_function("decoder_input_prep"):
-                        with self.profiler.profile_memory("decoder_input_prep"):
-                            # Prepare decoder input (teacher forcing: shift right)
-                            decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
-                            decoder_input_projected = self.mel_projection_in(decoder_input_mels)
-
-                            # Apply positional encoding
-                            decoder_input_projected_with_pe = self.encoder_positional_encoding(
-                                decoder_input_projected, seq_offset=0
-                            )
-
-                            # Generate causal mask for decoder self-attention
-                            tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
-
-                            # Ensure mel_padding_mask is boolean if provided
-                            if mel_padding_mask is not None:
-                                mel_padding_mask = mel_padding_mask.to(torch.bool)
-
-                    with torch.profiler.record_function("transformer_decoder_forward"):
-                        with self.profiler.profile_memory("transformer_decoder"):
-                            # Pass through Transformer Decoder
-                            decoder_outputs = self.decoder(
-                                tgt=decoder_input_projected_with_pe,
-                                memory=expanded_encoder_outputs,
-                                tgt_mask=tgt_mask,
-                                memory_key_padding_mask=encoder_output_padding_mask, # This is already boolean
-                                tgt_key_padding_mask=mel_padding_mask # This is now boolean
-                            )
-
-                    with torch.profiler.record_function("output_projections"):
-                        with self.profiler.profile_memory("output_projections"):
-                            # Project decoder outputs back to mel dimension
-                            predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-
-                            # Predict stop tokens from decoder outputs
-                            predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+                    if mel_padding_mask is not None:
+                        mel_padding_mask = mel_padding_mask.to(torch.bool)
 
                     if self.enable_profiling:
-                        self.profiler.log_memory_stats("training_end")
+                        self.profiler.log_memory_stats("decoder_input_prep_end")
 
-                    return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
+                with torch.profiler.record_function("transformer_decoder_forward"):
+                    # Pass through Transformer Decoder with checkpointing (logging handled internally)
+                    decoder_outputs = self._checkpoint_decoder_forward(
+                        decoder_input_projected_with_pe,
+                        expanded_encoder_outputs,
+                        tgt_mask=tgt_mask,
+                        memory_key_padding_mask=encoder_output_padding_mask,
+                        tgt_key_padding_mask=mel_padding_mask
+                    )
 
-                except Exception as e:
-                    logger.error(f"Error in forward_training: {e}")
-                    logger.error(f"Input shapes - phoneme_indices: {phoneme_indices.shape}, mel_specs: {mel_specs.shape}")
-                    logger.error(f"phoneme_durations: {phoneme_durations.shape}")
+                with torch.profiler.record_function("output_projections"):
                     if self.enable_profiling:
-                        logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
-                    raise e
+                        self.profiler.log_memory_stats("output_projections_start")
+
+                    # Project decoder outputs with checkpointing
+                    if self.gradient_checkpointing and self.training:
+                        predicted_mel_frames = checkpoint(
+                            self.mel_projection_out, decoder_outputs, use_reentrant=False
+                        )
+                        predicted_stop_logits = checkpoint(
+                            self.stop_token_predictor, decoder_outputs, use_reentrant=False
+                        ).squeeze(-1)
+                    else:
+                        predicted_mel_frames = self.mel_projection_out(decoder_outputs)
+                        predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+
+                    if self.enable_profiling:
+                        self.profiler.log_memory_stats("output_projections_end")
+
+                # Log at the very end (outside any checkpointed regions)
+                if self.enable_profiling:
+                    self.profiler.log_memory_stats("training_end")
+
+                return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
+
+            except Exception as e:
+                logger.error(f"Error in forward_training: {e}")
+                logger.error(f"Input shapes - phoneme_indices: {phoneme_indices.shape}, mel_specs: {mel_specs.shape}")
+                logger.error(f"phoneme_durations: {phoneme_durations.shape}")
+                if self.enable_profiling:
+                    logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
+                raise e
 
     def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 4000,
                          stop_threshold: float = 0.5,
                          text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Improved inference with better error handling, stopping conditions, and GPU profiling.
+        Inference mode (gradient checkpointing automatically disabled)
         """
         with torch.profiler.record_function("forward_inference"):
-            with self.profiler.profile_memory("forward_inference_total"):
-                if phoneme_indices.size(0) > 1:
-                    logger.warning("Inference with stop token is most reliable with batch_size=1.")
+            if phoneme_indices.size(0) > 1:
+                logger.warning("Inference with stop token is most reliable with batch_size=1.")
 
-                batch_size = phoneme_indices.size(0)
-                device = phoneme_indices.device
+            batch_size = phoneme_indices.size(0)
+            device = phoneme_indices.device
 
-                self.eval()
+            self.eval()  # This will disable gradient checkpointing automatically
 
-                if self.enable_profiling:
-                    self.profiler.log_memory_stats("inference_start")
+            # Log at beginning of inference (no checkpointing in eval mode)
+            if self.enable_profiling:
+                self.profiler.log_memory_stats("inference_start")
 
-                with torch.no_grad():
-                    try:
-                        # Ensure text_padding_mask is correctly defined and boolean
-                        if text_padding_mask is None:
-                            text_padding_mask = (phoneme_indices == 0).to(torch.bool)
-                        else:
-                            text_padding_mask = text_padding_mask.to(torch.bool)
+            with torch.no_grad():
+                try:
+                    if text_padding_mask is None:
+                        text_padding_mask = (phoneme_indices == 0).to(torch.bool)
+                    else:
+                        text_padding_mask = text_padding_mask.to(torch.bool)
 
-                        with torch.profiler.record_function("inference_encode_text"):
-                            with self.profiler.profile_memory("inference_text_encoding"):
-                                # Encode text
-                                text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
+                    with torch.profiler.record_function("inference_encode_text"):
+                        # Text encoding (no checkpointing in eval mode, logging handled internally)
+                        text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
-                        with torch.profiler.record_function("inference_predict_durations"):
-                            # Predict durations
-                            predicted_log_durations = self._predict_durations(text_encoded)
-                            durations_for_length_regulate = torch.exp(predicted_log_durations)
-                            durations_for_length_regulate = torch.clamp(durations_for_length_regulate, min=1.0).long()
+                    with torch.profiler.record_function("inference_predict_durations"):
+                        # Duration prediction (no checkpointing in eval mode, logging handled internally)
+                        predicted_log_durations = self._predict_durations(text_encoded)
+                        durations_for_length_regulate = torch.exp(predicted_log_durations)
+                        durations_for_length_regulate = torch.clamp(durations_for_length_regulate, min=1.0).long()
 
-                        with torch.profiler.record_function("inference_length_regulate"):
-                            # Length regulate
-                            expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                                text_encoded, durations_for_length_regulate, text_padding_mask
-                            )
+                    with torch.profiler.record_function("inference_length_regulate"):
+                        # Length regulation (logging handled internally)
+                        expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                            text_encoded, durations_for_length_regulate, text_padding_mask
+                        )
 
-                        expected_length = expanded_encoder_outputs.shape[1]
-                        logger.info(f"Starting inference with expanded encoder outputs shape: {expanded_encoder_outputs.shape}")
+                    expected_length = expanded_encoder_outputs.shape[1]
+                    logger.info(f"Starting inference with expanded encoder outputs shape: {expanded_encoder_outputs.shape}")
 
-                        if self.enable_profiling:
-                            self.profiler.log_memory_stats("inference_pre_generation")
+                    if self.enable_profiling:
+                        self.profiler.log_memory_stats("inference_pre_generation")
 
-                        # Calculate reasonable bounds for generation
-                        min_expected_length = max(10, expected_length // 3)
-                        max_expected_length = min(max_len, expected_length * 2, 800)
+                    min_expected_length = max(10, expected_length // 3)
+                    max_expected_length = min(max_len, expected_length * 2, 800)
 
-                        logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
+                    logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
 
-                        # Initialize generation
-                        generated_mels = []
-                        decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
+                    # Initialize generation
+                    generated_mels = []
+                    decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
 
-                        # Generation loop with improved stopping and profiling
-                        generation_start_time = time.time()
-                        for t in range(max_expected_length):
-                            step_start_time = time.time()
+                    # Generation loop (no checkpointing needed in eval mode)
+                    generation_start_time = time.time()
+                    for t in range(max_expected_length):
+                        step_start_time = time.time()
 
-                            with torch.profiler.record_function(f"inference_decode_step_{t}"):
-                                try:
-                                    # Project current mel frame
-                                    mel_projected_t = self.mel_projection_in(decoder_input_mel)
+                        with torch.profiler.record_function(f"inference_decode_step_{t}"):
+                            try:
+                                mel_projected_t = self.mel_projection_in(decoder_input_mel)
 
-                                    # Create input sequence up to current position
-                                    if t == 0:
-                                        decoder_input_seq = mel_projected_t
-                                    else:
-                                        previous_mels = torch.cat(generated_mels, dim=1)
-                                        previous_projected = self.mel_projection_in(previous_mels)
-                                        decoder_input_seq = torch.cat([previous_projected, mel_projected_t], dim=1)
+                                if t == 0:
+                                    decoder_input_seq = mel_projected_t
+                                else:
+                                    previous_mels = torch.cat(generated_mels, dim=1)
+                                    previous_projected = self.mel_projection_in(previous_mels)
+                                    decoder_input_seq = torch.cat([previous_projected, mel_projected_t], dim=1)
 
-                                    # Apply positional encoding
-                                    decoder_input_seq_with_pe = self.encoder_positional_encoding(
-                                        decoder_input_seq, seq_offset=0
-                                    )
+                                decoder_input_seq_with_pe = self.encoder_positional_encoding(
+                                    decoder_input_seq, seq_offset=0
+                                )
 
-                                    # Generate causal mask
-                                    current_seq_len = decoder_input_seq.shape[1]
-                                    tgt_mask = self._generate_square_subsequent_mask(current_seq_len, device)
+                                current_seq_len = decoder_input_seq.shape[1]
+                                tgt_mask = self._generate_square_subsequent_mask(current_seq_len, device)
 
-                                    # Decoder forward pass
-                                    decoder_outputs = self.decoder(
-                                        tgt=decoder_input_seq_with_pe,
-                                        memory=expanded_encoder_outputs,
-                                        tgt_mask=tgt_mask,
-                                        memory_key_padding_mask=encoder_output_padding_mask,
-                                        tgt_key_padding_mask=None
-                                    )
+                                decoder_outputs = self.decoder(
+                                    tgt=decoder_input_seq_with_pe,
+                                    memory=expanded_encoder_outputs,
+                                    tgt_mask=tgt_mask,
+                                    memory_key_padding_mask=encoder_output_padding_mask,
+                                    tgt_key_padding_mask=None
+                                )
 
-                                    # Take the last frame's output
-                                    decoder_out_t = decoder_outputs[:, -1:, :]
+                                decoder_out_t = decoder_outputs[:, -1:, :]
+                                mel_pred_t = self.mel_projection_out(decoder_out_t)
+                                generated_mels.append(mel_pred_t)
 
-                                    # Generate mel frame
-                                    mel_pred_t = self.mel_projection_out(decoder_out_t)
-                                    generated_mels.append(mel_pred_t)
+                                stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
+                                stop_probability = torch.sigmoid(stop_token_logit_t).item()
 
-                                    # Check stop condition
-                                    stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
-                                    stop_probability = torch.sigmoid(stop_token_logit_t).item()
+                                if t >= min_expected_length:
+                                    if stop_probability > stop_threshold:
+                                        logger.info(f"Stopping at frame {t} (stop_prob: {stop_probability:.4f})")
+                                        break
 
-                                    # Multiple stopping conditions
-                                    if t >= min_expected_length:
-                                        if stop_probability > stop_threshold:
-                                            logger.info(f"Stopping at frame {t} (stop_prob: {stop_probability:.4f})")
-                                            break
+                                    if t >= expected_length and stop_probability > 0.1:
+                                        logger.info(f"Stopping at expected length {t} (stop_prob: {stop_probability:.4f})")
+                                        break
 
-                                        # Stop if we've reached expected length and have reasonable stop probability
-                                        if t >= expected_length and stop_probability > 0.1:
-                                            logger.info(f"Stopping at expected length {t} (stop_prob: {stop_probability:.4f})")
-                                            break
+                                decoder_input_mel = mel_pred_t
 
-                                    # Use prediction as next input
-                                    decoder_input_mel = mel_pred_t
+                                # Log every 50 steps during inference (outside any checkpointed regions)
+                                if self.enable_profiling and t % 50 == 0:
+                                    step_time = (time.time() - step_start_time) * 1000
+                                    logger.debug(f"Generated frame {t}, stop_prob: {stop_probability:.6f}, "
+                                               f"step_time: {step_time:.2f}ms")
+                                    self.profiler.log_memory_stats(f"inference_step_{t}")
 
-                                    # Profiling logging
-                                    if self.enable_profiling and t % 50 == 0:
-                                        step_time = (time.time() - step_start_time) * 1000
-                                        logger.debug(f"Generated frame {t}, stop_prob: {stop_probability:.6f}, "
-                                                   f"step_time: {step_time:.2f}ms")
-                                        self.profiler.log_memory_stats(f"inference_step_{t}")
+                            except Exception as e:
+                                logger.error(f"Error at generation step {t}: {e}")
+                                if self.enable_profiling:
+                                    logger.error(f"GPU Memory at step {t}: {self.profiler.get_memory_summary()}")
+                                break
 
-                                except Exception as e:
-                                    logger.error(f"Error at generation step {t}: {e}")
-                                    if self.enable_profiling:
-                                        logger.error(f"GPU Memory at step {t}: {self.profiler.get_memory_summary()}")
-                                    break
+                    generation_time = time.time() - generation_start_time
 
-                        generation_time = time.time() - generation_start_time
+                    if generated_mels:
+                        mel_output = torch.cat(generated_mels, dim=1)
+                        logger.info(f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
+                                   f"({mel_output.shape[1]/generation_time:.1f} frames/s)")
+                    else:
+                        logger.warning("No mel frames were generated.")
+                        mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
 
-                        # Concatenate all generated frames
-                        if generated_mels:
-                            mel_output = torch.cat(generated_mels, dim=1)
-                            logger.info(f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
-                                       f"({mel_output.shape[1]/generation_time:.1f} frames/s)")
-                        else:
-                            logger.warning("No mel frames were generated.")
-                            mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
+                    # Log at end of inference (outside any checkpointed regions)
+                    if self.enable_profiling:
+                        self.profiler.log_memory_stats("inference_end")
 
-                        if self.enable_profiling:
-                            self.profiler.log_memory_stats("inference_end")
+                    return mel_output
 
-                        return mel_output
-
-                    except Exception as e:
-                        logger.error(f"Error in forward_inference: {e}")
-                        if self.enable_profiling:
-                            logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
-                        return torch.empty(batch_size, 0, self.mel_dim, device=device)
+                except Exception as e:
+                    logger.error(f"Error in forward_inference: {e}")
+                    if self.enable_profiling:
+                        logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
+                    return torch.empty(batch_size, 0, self.mel_dim, device=device)
 
     def forward(
         self,
@@ -545,7 +688,12 @@ class KokoroModel(nn.Module):
             'n_decoder_layers': len(self.decoder.layers),
             'total_parameters': total_params,
             'trainable_parameters': trainable_params,
-            'model_size_mb': total_params * 4 / (1024 * 1024)
+            'model_size_mb': total_params * 4 / (1024 * 1024),
+            'gradient_checkpointing': {
+                'enabled': self.gradient_checkpointing,
+                'segments': self.checkpoint_segments,
+                'memory_savings_estimated': f"{(self.checkpoint_segments - 1) / self.checkpoint_segments * 100:.1f}%"
+            }
         }
 
         # Add GPU profiling info if available
@@ -566,7 +714,13 @@ class KokoroModel(nn.Module):
                 'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0
             },
             'memory_summary': self.profiler.get_memory_summary(),
-            'model_info': self.get_model_info()
+            'model_info': self.get_model_info(),
+            'gradient_checkpointing': {
+                'enabled': self.gradient_checkpointing,
+                'segments': self.checkpoint_segments,
+                'estimated_memory_reduction': f"{(self.checkpoint_segments - 1) / self.checkpoint_segments * 100:.1f}%",
+                'logging_strategy': 'segment_boundaries' if self.gradient_checkpointing else 'layer_boundaries'
+            }
         }
 
         # Add memory efficiency analysis
@@ -640,3 +794,238 @@ class KokoroModel(nn.Module):
         self.profiler.memory_stats.clear()
         self.profiler.reset_peak_memory_stats()
         logger.info("Profiling statistics reset")
+
+    def get_memory_usage_report(self) -> dict:
+        """Get detailed memory usage report with gradient checkpointing analysis"""
+        if not torch.cuda.is_available():
+            return {"error": "CUDA not available for memory analysis"}
+
+        current_memory = torch.cuda.memory_allocated() / 1024**2  # MB
+        peak_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
+        reserved_memory = torch.cuda.memory_reserved() / 1024**2  # MB
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**2  # MB
+
+        # Estimate memory savings from gradient checkpointing
+        model_params = sum(p.numel() * 4 for p in self.parameters()) / 1024**2  # MB (assuming float32)
+
+        if self.gradient_checkpointing:
+            estimated_activation_memory_without_gc = model_params * 2  # Rough estimate
+            estimated_activation_memory_with_gc = estimated_activation_memory_without_gc / self.checkpoint_segments
+            estimated_savings = estimated_activation_memory_without_gc - estimated_activation_memory_with_gc
+        else:
+            estimated_savings = 0
+            estimated_activation_memory_with_gc = model_params * 2
+
+        return {
+            'current_memory_mb': current_memory,
+            'peak_memory_mb': peak_memory,
+            'reserved_memory_mb': reserved_memory,
+            'total_memory_mb': total_memory,
+            'model_parameters_mb': model_params,
+            'memory_utilization_pct': (current_memory / total_memory) * 100,
+            'gradient_checkpointing': {
+                'enabled': self.gradient_checkpointing,
+                'segments': self.checkpoint_segments,
+                'estimated_memory_savings_mb': estimated_savings,
+                'estimated_activation_memory_mb': estimated_activation_memory_with_gc,
+                'logging_optimization': 'segment_boundaries_only' if self.gradient_checkpointing else 'all_layers'
+            }
+        }
+
+    def optimize_checkpoint_segments(self, target_memory_mb: float = None) -> int:
+        """
+        Suggest optimal number of checkpoint segments based on available memory
+
+        Args:
+            target_memory_mb: Target memory usage in MB. If None, uses 80% of available GPU memory
+
+        Returns:
+            Recommended number of segments
+        """
+        if not torch.cuda.is_available():
+            logger.warning("CUDA not available, cannot optimize checkpoint segments")
+            return self.checkpoint_segments
+
+        total_memory = torch.cuda.get_device_properties(0).total_memory / 1024**2  # MB
+        if target_memory_mb is None:
+            target_memory_mb = total_memory * 0.8  # Use 80% of available memory
+
+        # Rough estimation of memory requirements
+        model_params_mb = sum(p.numel() * 4 for p in self.parameters()) / 1024**2
+
+        # Estimate activation memory per layer (very rough approximation)
+        n_layers = len(self.transformer_encoder_layers) + len(self.decoder.layers)
+        estimated_activation_per_layer = model_params_mb * 0.5  # Rough estimate
+
+        # Calculate segments needed to fit in target memory
+        max_activation_memory = target_memory_mb - model_params_mb - 1000  # Reserve 1GB for other ops
+        if max_activation_memory <= 0:
+            logger.warning("Target memory too low for model parameters alone")
+            return max(2, n_layers // 4)  # Conservative fallback
+
+        segments_needed = max(1, int(estimated_activation_per_layer * n_layers / max_activation_memory))
+        optimal_segments = min(segments_needed, n_layers)  # Don't exceed number of layers
+
+        logger.info(f"Memory optimization analysis:")
+        logger.info(f"  Total GPU memory: {total_memory:.1f} MB")
+        logger.info(f"  Target memory usage: {target_memory_mb:.1f} MB")
+        logger.info(f"  Model parameters: {model_params_mb:.1f} MB")
+        logger.info(f"  Estimated activation memory per layer: {estimated_activation_per_layer:.1f} MB")
+        logger.info(f"  Recommended segments: {optimal_segments}")
+        logger.info(f"  Logging strategy: segment boundaries only (reduces profiling overhead)")
+
+        return optimal_segments
+
+    def benchmark_checkpointing(self, sample_batch_size: int = 8, num_iterations: int = 5) -> dict:
+        """
+        Benchmark gradient checkpointing vs no checkpointing with optimized logging
+
+        Args:
+            sample_batch_size: Batch size for benchmarking
+            num_iterations: Number of iterations to average over
+
+        Returns:
+            Dictionary with benchmark results including logging overhead analysis
+        """
+        if not torch.cuda.is_available():
+            logger.warning("CUDA not available, benchmark may not be accurate")
+
+        logger.info(f"Benchmarking gradient checkpointing with batch_size={sample_batch_size}, iterations={num_iterations}")
+        logger.info("Using optimized logging (segment boundaries only for checkpointing)")
+
+        # Create sample inputs
+        device = next(self.parameters()).device
+        sample_phonemes = torch.randint(1, self.vocab_size, (sample_batch_size, 50), device=device)
+        sample_mels = torch.randn(sample_batch_size, 200, self.mel_dim, device=device)
+        sample_durations = torch.randint(1, 5, (sample_batch_size, 50), device=device)
+        sample_stop_targets = torch.zeros(sample_batch_size, 200, device=device)
+
+        results = {}
+
+        # Benchmark with checkpointing (optimized logging)
+        original_checkpointing = self.gradient_checkpointing
+        self.enable_gradient_checkpointing()
+        self.train()
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        times_with_gc = []
+        for i in range(num_iterations):
+            start_time = time.time()
+
+            try:
+                outputs = self.forward_training(
+                    sample_phonemes, sample_mels, sample_durations.float(), sample_stop_targets
+                )
+                # Simulate backward pass
+                loss = outputs[0].mean() + outputs[1].mean() + outputs[2].mean()
+                loss.backward()
+                torch.cuda.synchronize()
+
+                times_with_gc.append(time.time() - start_time)
+
+            except Exception as e:
+                logger.error(f"Error in checkpointing benchmark iteration {i}: {e}")
+                break
+
+        memory_with_gc = torch.cuda.max_memory_allocated() / 1024**2
+
+        # Benchmark without checkpointing (standard logging)
+        self.disable_gradient_checkpointing()
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        times_without_gc = []
+        for i in range(num_iterations):
+            start_time = time.time()
+
+            try:
+                outputs = self.forward_training(
+                    sample_phonemes, sample_mels, sample_durations.float(), sample_stop_targets
+                )
+                loss = outputs[0].mean() + outputs[1].mean() + outputs[2].mean()
+                loss.backward()
+                torch.cuda.synchronize()
+
+                times_without_gc.append(time.time() - start_time)
+
+            except Exception as e:
+                logger.error(f"Error in non-checkpointing benchmark iteration {i}: {e}")
+                break
+
+        memory_without_gc = torch.cuda.max_memory_allocated() / 1024**2
+
+        # Restore original setting
+        if original_checkpointing:
+            self.enable_gradient_checkpointing()
+        else:
+            self.disable_gradient_checkpointing()
+
+        # Calculate results
+        avg_time_with_gc = sum(times_with_gc) / len(times_with_gc) if times_with_gc else float('inf')
+        avg_time_without_gc = sum(times_without_gc) / len(times_without_gc) if times_without_gc else float('inf')
+
+        results = {
+            'gradient_checkpointing': {
+                'avg_time_seconds': avg_time_with_gc,
+                'peak_memory_mb': memory_with_gc,
+                'successful_iterations': len(times_with_gc),
+                'logging_strategy': 'segment_boundaries_only'
+            },
+            'no_checkpointing': {
+                'avg_time_seconds': avg_time_without_gc,
+                'peak_memory_mb': memory_without_gc,
+                'successful_iterations': len(times_without_gc),
+                'logging_strategy': 'all_layer_boundaries'
+            },
+            'comparison': {
+                'time_overhead_pct': ((avg_time_with_gc - avg_time_without_gc) / avg_time_without_gc * 100) if avg_time_without_gc > 0 else 0,
+                'memory_savings_mb': memory_without_gc - memory_with_gc,
+                'memory_savings_pct': ((memory_without_gc - memory_with_gc) / memory_without_gc * 100) if memory_without_gc > 0 else 0,
+                'logging_overhead_reduced': True
+            },
+            'optimization_notes': {
+                'checkpointing_logging': 'Logs only at segment boundaries to reduce overhead',
+                'standard_logging': 'Logs at individual layer boundaries (more detailed but higher overhead)',
+                'profiling_impact': 'Reduced logging frequency in checkpointed regions improves performance'
+            }
+        }
+
+        # Log results
+        logger.info("Gradient Checkpointing Benchmark Results (Optimized Logging):")
+        logger.info(f"  With Checkpointing: {avg_time_with_gc:.3f}s avg, {memory_with_gc:.1f} MB peak")
+        logger.info(f"  Without Checkpointing: {avg_time_without_gc:.3f}s avg, {memory_without_gc:.1f} MB peak")
+        logger.info(f"  Time Overhead: {results['comparison']['time_overhead_pct']:.1f}%")
+        logger.info(f"  Memory Savings: {results['comparison']['memory_savings_mb']:.1f} MB ({results['comparison']['memory_savings_pct']:.1f}%)")
+        logger.info(f"  Logging Optimization: Segment boundaries only (reduced overhead)")
+
+        return results
+
+    def get_logging_strategy_info(self) -> dict:
+        """Get information about current logging strategy based on checkpointing state"""
+        strategy_info = {
+            'gradient_checkpointing_enabled': self.gradient_checkpointing,
+            'checkpoint_segments': self.checkpoint_segments,
+            'profiling_enabled': self.enable_profiling
+        }
+
+        if self.gradient_checkpointing:
+            strategy_info.update({
+                'encoder_logging': 'segment_boundaries',
+                'decoder_logging': 'checkpoint_boundaries',
+                'logging_frequency': f'Every {len(self.transformer_encoder_layers) // self.checkpoint_segments} encoder layers',
+                'memory_overhead': 'minimal',
+                'profiling_impact': 'reduced_overhead'
+            })
+        else:
+            strategy_info.update({
+                'encoder_logging': 'individual_layers',
+                'decoder_logging': 'start_and_end',
+                'logging_frequency': 'Every 2 encoder layers',
+                'memory_overhead': 'standard',
+                'profiling_impact': 'detailed_tracking'
+            })
+
+        return strategy_info

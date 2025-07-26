@@ -484,7 +484,7 @@ class KokoroTrainer:
         num_batches = len(self.dataloader)
 
         # Determine if profiling for this epoch
-        is_profiling_epoch = (epoch == self.config.profile_epoch_start)
+        is_profiling_epoch = (epoch == self.config.profile_epoch_start) and self.config.enable_profiling
         enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
 
         if is_profiling_epoch:
@@ -670,11 +670,13 @@ class KokoroTrainer:
         logger.info(f"Initial learning rate: {self.config.learning_rate}")
         logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult}, eta_min={self.config.lr_eta_min})")
         logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
-        logger.info(f"Profiler logs will be saved to: {self.log_dir}")
+        enable_profiling = getattr(self.config, 'enable_profiling', False)
+        if enable_profiling:
+            logger.info(f"Profiler logs will be saved to: {self.log_dir}")
 
         # Log interbatch profiling settings
         enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
-        if enable_interbatch_profiling:
+        if enable_interbatch_profiling and enable_profiling:
             logger.info(f"Interbatch profiling enabled with report interval: {getattr(self.config, 'interbatch_report_interval', 100)}")
 
         # Run standalone profiling if requested
@@ -747,6 +749,7 @@ if __name__ == "__main__":
             self.pin_memory = False # Currently, not supported on MPS
 
             # Enhanced profiler configurations
+            self.enable_profiling = False
             self.profile_epoch_start = 1  # Start profiling from this epoch (0-indexed)
             self.profile_wait_steps = 1  # Number of steps to wait before starting warmup
             self.profile_warmup_steps = 1 # Number of steps to warm up the profiler
