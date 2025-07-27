@@ -51,13 +51,12 @@ class TrainingConfig:
 
     # Data loading
     num_workers: int = 2
-    pin_memory: bool = True
+    pin_memory: bool = False
 
     # Checkpointing
-    save_every: int = 5
+    save_every: int = 2
     resume_checkpoint: str = 'auto'
 
-    # === GRADIENT CHECKPOINTING CONFIGURATION ===
     # Enable gradient checkpointing by default
     gradient_checkpointing: bool = True
 
@@ -74,7 +73,7 @@ class TrainingConfig:
     # Run checkpointing benchmark at startup
     benchmark_checkpointing: bool = False
 
-    # === PROFILER CONFIGURATION ===
+    # Profiling
     enable_profiling: bool = False
     profile_epoch_start: int = 1  # Start profiling from this epoch (0-indexed)
     profile_wait_steps: int = 1   # Number of steps to wait before starting warmup
@@ -83,7 +82,7 @@ class TrainingConfig:
     run_standalone_profiling: bool = False  # Run standalone profiling before training
 
     # Interbatch profiling
-    enable_interbatch_profiling: bool = True
+    enable_interbatch_profiling: bool = False
     interbatch_report_interval: int = 100
 
     use_mixed_precision: bool = True
