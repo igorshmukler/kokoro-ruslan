@@ -17,6 +17,7 @@ import datetime
 from typing import Tuple, Dict, Any
 
 from config import TrainingConfig
+from device_type import DeviceType
 from dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler
 from model import KokoroModel
 from checkpoint_manager import (
@@ -24,6 +25,7 @@ from checkpoint_manager import (
     save_checkpoint, save_final_model
 )
 from interbatch_profiler import InterbatchProfiler
+from mps_grad_scaler import MPSGradScaler
 
 
 logger = logging.getLogger(__name__)
@@ -50,94 +52,6 @@ def check_mps_mixed_precision_support():
     except:
         return False
 
-class MPSGradScaler:
-    """
-    A custom gradient scaler for MPS that mimics CUDA's GradScaler behavior.
-    MPS doesn't have a built-in GradScaler, so we implement basic scaling functionality.
-    """
-
-    def __init__(self, init_scale=65536.0, growth_factor=2.0, backoff_factor=0.5, growth_interval=2000):
-        self._scale = init_scale
-        self.growth_factor = growth_factor
-        self.backoff_factor = backoff_factor
-        self.growth_interval = growth_interval
-        self._growth_tracker = 0
-        self._enabled = True
-
-    def get_scale(self):
-        return self._scale
-
-    def scale(self, loss):
-        """Scale the loss"""
-        if not self._enabled:
-            return loss
-        return loss * self._scale
-
-    def unscale_(self, optimizer):
-        """Unscale gradients - for MPS we'll do this during step()"""
-        pass  # MPS implementation will handle this in step()
-
-    def step(self, optimizer):
-        """Step the optimizer with gradient unscaling"""
-        if not self._enabled:
-            optimizer.step()
-            return
-
-        # Check for NaN/Inf gradients
-        has_inf_or_nan = False
-        for param_group in optimizer.param_groups:
-            for param in param_group['params']:
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                        has_inf_or_nan = True
-                        break
-            if has_inf_or_nan:
-                break
-
-        if has_inf_or_nan:
-            # Skip step and reduce scale
-            self._scale *= self.backoff_factor
-            self._growth_tracker = 0
-            # Zero gradients to clean up
-            optimizer.zero_grad()
-            return False  # Indicate step was skipped
-        else:
-            # Unscale gradients before stepping
-            for param_group in optimizer.param_groups:
-                for param in param_group['params']:
-                    if param.grad is not None:
-                        param.grad.div_(self._scale)
-
-            optimizer.step()
-            self._growth_tracker += 1
-            return True  # Indicate step was successful
-
-    def update(self):
-        """Update the scale"""
-        if not self._enabled:
-            return
-
-        if self._growth_tracker >= self.growth_interval:
-            self._scale *= self.growth_factor
-            self._growth_tracker = 0
-
-    def state_dict(self):
-        """Return state dict for checkpointing"""
-        return {
-            'scale': self._scale,
-            'growth_factor': self.growth_factor,
-            'backoff_factor': self.backoff_factor,
-            'growth_interval': self.growth_interval,
-            'growth_tracker': self._growth_tracker,
-        }
-
-    def load_state_dict(self, state_dict):
-        """Load state dict from checkpoint"""
-        self._scale = state_dict.get('scale', 65536.0)
-        self.growth_factor = state_dict.get('growth_factor', 2.0)
-        self.backoff_factor = state_dict.get('backoff_factor', 0.5)
-        self.growth_interval = state_dict.get('growth_interval', 2000)
-        self._growth_tracker = state_dict.get('growth_tracker', 0)
 
 class KokoroTrainer:
     """Main trainer class for the model"""
@@ -152,8 +66,8 @@ class KokoroTrainer:
 
         # Check device support for mixed precision
         if self.use_mixed_precision:
-            if self.device.type == 'cuda':
-                self.scaler = torch.cuda.amp.GradScaler(
+            if self.device.type == DeviceType.CUDA.value:
+                self.scaler = torch.cuda.amp.GradScaler('cuda',
                     init_scale=getattr(config, 'amp_init_scale', 65536.0),
                     growth_factor=getattr(config, 'amp_growth_factor', 2.0),
                     backoff_factor=getattr(config, 'amp_backoff_factor', 0.5),
@@ -162,7 +76,7 @@ class KokoroTrainer:
                 self.device_type = 'cuda'
                 logger.info("Mixed precision training enabled with CUDA GradScaler")
 
-            elif self.device.type == 'mps':
+            elif self.device.type == DeviceType.MPS.value:
                 if check_mps_mixed_precision_support():
                     self.scaler = MPSGradScaler(
                         init_scale=getattr(config, 'amp_init_scale', 65536.0),
@@ -170,13 +84,13 @@ class KokoroTrainer:
                         backoff_factor=getattr(config, 'amp_backoff_factor', 0.5),
                         growth_interval=getattr(config, 'amp_growth_interval', 2000)
                     )
-                    self.device_type = 'mps'
+                    self.device_type = DeviceType.MPS.value
                     logger.info("Mixed precision training enabled with MPS custom scaler")
                 else:
                     logger.warning("MPS mixed precision not supported, disabling mixed precision")
                     self.use_mixed_precision = False
                     self.scaler = None
-                    self.device_type = 'mps'
+                    self.device_type = DeviceType.MPS.value
 
             else:
                 logger.info(f"Mixed precision not supported on {self.device.type}, disabling")
@@ -204,7 +118,7 @@ class KokoroTrainer:
             batch_sampler=self.batch_sampler,
             collate_fn=collate_fn,
             num_workers=2, # config.num_workers,
-            pin_memory=config.pin_memory and self.device.type == 'cuda',  # Only enable for CUDA
+            pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,  # Only enable for CUDA
             prefetch_factor=3,
             persistent_workers=True
         )
@@ -267,9 +181,9 @@ class KokoroTrainer:
         if not self.use_mixed_precision:
             return torch.no_grad().__enter__()  # No-op context
 
-        if self.device_type == 'cuda':
-            return torch.cuda.amp.autocast()
-        elif self.device_type == 'mps':
+        if self.device_type == DeviceType.CUDA.value:
+            return torch.cuda.amp.autocast('cuda')
+        elif self.device_type == DeviceType.MPS.value:
             return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
         else:
             return torch.no_grad().__enter__()  # No-op context
@@ -292,18 +206,18 @@ class KokoroTrainer:
 
     def _get_device_name(self):
         """Get device name for different device types"""
-        if self.device.type == 'cuda':
+        if self.device.type == DeviceType.CUDA.value:
             return torch.cuda.get_device_name()
-        elif self.device.type == 'mps':
+        elif self.device.type == DeviceType.MPS.value:
             return 'Apple Silicon GPU'
         else:
             return 'CPU'
 
     def _is_device_available(self):
         """Check if device is available"""
-        if self.device.type == 'cuda':
+        if self.device.type == DeviceType.CUDA.value:
             return torch.cuda.is_available()
-        elif self.device.type == 'mps':
+        elif self.device.type == DeviceType.MPS.value:
             return torch.backends.mps.is_available()
         else:
             return True
@@ -328,12 +242,12 @@ class KokoroTrainer:
         }
 
         # Add device-specific profiling options
-        if self.device.type == 'cuda':
+        if self.device.type == DeviceType.CUDA.value:
             profiler_kwargs.update({
                 'profile_memory': True,
                 'with_flops': True
             })
-        elif self.device.type == 'mps':
+        elif self.device.type == DeviceType.MPS.value:
             # MPS profiling capabilities are more limited
             profiler_kwargs.update({
                 'profile_memory': False,  # Not supported on MPS
@@ -362,12 +276,12 @@ class KokoroTrainer:
         reserved_memory = 0
         total_memory = 0
 
-        if self.device.type == 'cuda':
+        if self.device.type == DeviceType.CUDA.value:
             current_memory = torch.cuda.memory_allocated() / 1024**2  # MB
             peak_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
             reserved_memory = torch.cuda.memory_reserved() / 1024**2  # MB
             total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**2  # MB
-        elif self.device.type == 'mps':
+        elif self.device.type == DeviceType.MPS.value:
             # MPS doesn't have detailed memory stats, use approximations
             try:
                 current_memory = torch.mps.current_allocated_memory() / 1024**2  # MB
@@ -393,10 +307,10 @@ class KokoroTrainer:
         current_memory = 0
         peak_memory = 0
 
-        if self.device.type == 'cuda':
+        if self.device.type == DeviceType.CUDA.value:
             current_memory = torch.cuda.memory_allocated() / 1024**2
             peak_memory = torch.cuda.max_memory_allocated() / 1024**2
-        elif self.device.type == 'mps':
+        elif self.device.type == DeviceType.MPS.value:
             try:
                 current_memory = torch.mps.current_allocated_memory() / 1024**2
                 peak_memory = current_memory
@@ -495,9 +409,9 @@ class KokoroTrainer:
             print(f"  Reserved: {memory_summary.get('reserved_memory_mb', 0):.1f} MB")
 
             device_type = device_info.get('device_type', 'unknown')
-            if device_type == 'cuda':
+            if device_type == DeviceType.CUDA.value:
                 print(f"  Total GPU: {memory_summary.get('total_memory_mb', 0):.1f} MB")
-            elif device_type == 'mps':
+            elif device_type == DeviceType.MPS.value:
                 print(f"  Estimated Total: {memory_summary.get('total_memory_mb', 0):.1f} MB")
 
             # Memory efficiency
@@ -553,10 +467,10 @@ class KokoroTrainer:
         device_type = device_info.get('device_type', 'unknown')
 
         peak_memory = memory_summary.get('peak_memory_mb', 0)
-        if device_type == 'cuda' and peak_memory > 8000:  # > 8GB
+        if device_type == DeviceType.CUDA.value and peak_memory > 8000:  # > 8GB
             recommendations.append("• Consider reducing batch size or sequence length")
             recommendations.append("• Enable gradient checkpointing for training")
-        elif device_type == 'mps' and peak_memory > 4000:  # > 4GB (MPS typically has less memory)
+        elif device_type == DeviceType.MPS.value and peak_memory > 4000:  # > 4GB (MPS typically has less memory)
             recommendations.append("• Consider reducing batch size for MPS")
             recommendations.append("• MPS memory management is different from CUDA")
 
@@ -575,7 +489,7 @@ class KokoroTrainer:
                 skip_rate = (mp_stats.get('skipped_steps', 0) / total_attempted) * 100
 
                 if skip_rate > 5:
-                    if device_type == 'mps':
+                    if device_type == DeviceType.MPS.value:
                         recommendations.append("• High step skip rate on MPS - consider reducing learning rate")
                         recommendations.append("• MPS mixed precision is experimental, monitor stability")
                     else:
@@ -585,7 +499,7 @@ class KokoroTrainer:
                     recommendations.append("• No overflows detected - scaler scale could potentially be increased")
 
         # Device-specific recommendations
-        if device_type == 'mps':
+        if device_type == DeviceType.MPS.value:
             recommendations.append("• MPS backend is optimized for Apple Silicon - memory patterns differ from CUDA")
             recommendations.append("• Consider using smaller batch sizes than CUDA equivalent")
             if self.use_mixed_precision:
@@ -603,7 +517,7 @@ class KokoroTrainer:
         interbatch_overhead = interbatch_stats.get('interbatch_overhead_pct', 0)
 
         if data_efficiency > 20:
-            if device_type == 'mps':
+            if device_type == DeviceType.MPS.value:
                 recommendations.append("• Data loading >20% on MPS - increase num_workers but avoid pin_memory")
             else:
                 recommendations.append("• Data loading taking >20% of time - increase num_workers or enable pin_memory")
@@ -624,9 +538,9 @@ class KokoroTrainer:
 
     def clear_device_cache(self):
         """Clear device cache based on device type"""
-        if self.device.type == 'cuda':
+        if self.device.type == DeviceType.CUDA.value:
             torch.cuda.empty_cache()
-        elif self.device.type == 'mps':
+        elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
     def profile_training_steps(self, num_steps: int = 10):
@@ -705,7 +619,7 @@ class KokoroTrainer:
                 self.interbatch_profiler.start_backward_pass()
                 with torch.profiler.record_function("Backward_Pass"):
                     if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
+                        if self.device_type == DeviceType.CUDA.value:
                             self.scaler.scale(total_loss).backward()
                         else:  # MPS
                             scaled_loss = self.scaler.scale(total_loss)
@@ -1096,7 +1010,7 @@ class KokoroTrainer:
 
                 if self.use_mixed_precision:
                     postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
-                    if self.device_type == 'mps':
+                    if self.device_type == DeviceType.MPS.value:
                         postfix_dict['device'] = 'MPS'
 
                 progress_bar.set_postfix(postfix_dict)
@@ -1166,7 +1080,7 @@ class KokoroTrainer:
         logger.info(f"Mixed precision training: {'Enabled' if self.use_mixed_precision else 'Disabled'}")
         if self.use_mixed_precision:
             logger.info(f"Mixed precision dtype: {self.mixed_precision_dtype}")
-            if self.device_type == 'mps':
+            if self.device_type == DeviceType.MPS.value:
                 logger.info("Using custom MPS gradient scaler (experimental)")
         logger.info(f"Total epochs: {self.config.num_epochs}, Starting from epoch: {self.start_epoch + 1}")
         logger.info(f"Model vocabulary size: {self.dataset.phoneme_processor.get_vocab_size()}")
@@ -1296,7 +1210,7 @@ if __name__ == "__main__":
     temp_config = TrainingConfig()
 
     # Device-specific adjustments
-    if temp_config.device == "mps":
+    if temp_config.device == DeviceType.MPS.value:
         print("Configuring for MPS (Apple Silicon) training:")
         print("  - Pin memory disabled for MPS")
         print("  - Mixed precision with custom MPS scaler")
@@ -1304,7 +1218,7 @@ if __name__ == "__main__":
         # Optionally reduce batch size for MPS
         temp_config.batch_size = max(8, temp_config.batch_size // 2)
         print(f"  - Adjusted batch size to {temp_config.batch_size}")
-    elif temp_config.device == "cuda":
+    elif temp_config.device == DeviceType.CUDA.value:
         print("Configuring for CUDA training:")
         print("  - Pin memory enabled for CUDA")
         print("  - Mixed precision with CUDA native GradScaler")
