@@ -13,7 +13,7 @@ from typing import Optional, Dict
 from urllib.parse import urlparse
 
 # Import vocoder modules
-from hifigan_vocoder import HiFiGANGenerator, load_hifigan_model, HiFiGANConfig
+from hifigan_vocoder import load_hifigan_model
 
 logger = logging.getLogger(__name__)
 
