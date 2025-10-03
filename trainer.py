@@ -195,7 +195,7 @@ class KokoroTrainer:
             return torch.no_grad().__enter__()  # No-op context
 
         if self.device_type == DeviceType.CUDA.value:
-            return torch.cuda.amp.autocast('cuda')
+            return torch.amp.autocast('cuda')
         elif self.device_type == DeviceType.MPS.value:
             return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
         else:
