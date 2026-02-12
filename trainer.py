@@ -262,13 +262,18 @@ class KokoroTrainer:
         logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
 
         # Initialize optimizer and loss functions
+        # Use fused optimizer for better performance on CUDA
+        use_fused = self.device_type == 'cuda' and torch.__version__ >= '2.0'
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
             weight_decay=getattr(config, 'weight_decay', 0.01),
             eps=getattr(config, 'adam_eps', 1e-8),
-            betas=getattr(config, 'adam_betas', (0.9, 0.999))
+            betas=getattr(config, 'adam_betas', (0.9, 0.999)),
+            fused=use_fused
         )
+        if use_fused:
+            logger.info("Using fused AdamW optimizer for CUDA")
 
         self.criterion_mel = nn.L1Loss(reduction='none')
         self.criterion_duration = nn.MSELoss(reduction='none')
@@ -284,12 +289,40 @@ class KokoroTrainer:
             self.criterion_energy = None
 
         # Learning rate scheduler
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer,
-            T_0=self.config.lr_T_0,
-            T_mult=self.config.lr_T_mult,
-            eta_min=self.config.lr_eta_min
-        )
+        use_onecycle = getattr(config, 'use_onecycle_lr', True)
+        if use_onecycle:
+            # Calculate total training steps for OneCycleLR
+            steps_per_epoch = len(self.dataloader)
+            total_steps = config.num_epochs * steps_per_epoch
+
+            max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 10.0)
+            pct_start = getattr(config, 'pct_start', 0.3)
+
+            self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                self.optimizer,
+                max_lr=max_lr,
+                total_steps=total_steps,
+                pct_start=pct_start,
+                anneal_strategy='cos',
+                cycle_momentum=True,
+                base_momentum=0.85,
+                max_momentum=0.95,
+                div_factor=25.0,  # initial_lr = max_lr / div_factor
+                final_div_factor=10000.0,  # min_lr = initial_lr / final_div_factor
+                last_epoch=-1  # Start from beginning
+            )
+            self.scheduler_per_batch = True
+            logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={total_steps}, pct_start={pct_start}")
+        else:
+            # Legacy CosineAnnealingWarmRestarts
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer,
+                T_0=self.config.lr_T_0,
+                T_mult=self.config.lr_T_mult,
+                eta_min=self.config.lr_eta_min
+            )
+            self.scheduler_per_batch = False
+            logger.info("CosineAnnealingWarmRestarts scheduler initialized (legacy mode)")
 
         # Training state
         self.start_epoch = 0
@@ -972,10 +1005,16 @@ class KokoroTrainer:
     def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """Train for one epoch with enhanced profiling, mixed precision, and adaptive memory management"""
         self.model.train()
+
+        # Use tensor accumulation to reduce .item() calls (CPU-GPU sync overhead)
         total_loss_epoch = 0.0
         mel_loss_epoch = 0.0
         dur_loss_epoch = 0.0
         stop_loss_epoch = 0.0
+
+        # Track losses as tensors for batched accumulation (sync every N batches)
+        loss_accumulation_interval = 10
+        accumulated_losses = []
 
         num_batches = len(self.dataloader)
 
@@ -1079,7 +1118,8 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("data_loading")
 
-                self.optimizer.zero_grad()
+                # Use set_to_none=True for faster gradient zeroing (avoids memory allocation)
+                self.optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass with mixed precision and interbatch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
@@ -1207,6 +1247,10 @@ class KokoroTrainer:
                         self.scaler.update()
                         new_scale = self.scaler.get_scale()
 
+                        # Step scheduler immediately after optimizer step (for OneCycleLR)
+                        if self.scheduler_per_batch:
+                            self.scheduler.step()
+
                         # Update mixed precision stats
                         if new_scale != old_scale:
                             self.mixed_precision_stats['scale_updates'] += 1
@@ -1227,6 +1271,10 @@ class KokoroTrainer:
                         self.scaler.update()
                         new_scale = self.scaler.get_scale()
 
+                        # Step scheduler immediately after optimizer step (for OneCycleLR)
+                        if self.scheduler_per_batch:
+                            self.scheduler.step()
+
                         # Update mixed precision stats
                         if step_successful:
                             self.mixed_precision_stats['successful_steps'] += 1
@@ -1242,6 +1290,10 @@ class KokoroTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
 
+                    # Step scheduler immediately after optimizer step (for OneCycleLR)
+                    if self.scheduler_per_batch:
+                        self.scheduler.step()
+
                 if is_profiling_epoch:
                     self.log_memory_stats("optimizer_step")
 
@@ -1250,21 +1302,39 @@ class KokoroTrainer:
                     batch_size = mel_specs.size(0)
                     self.interbatch_profiler.end_batch(batch_size)
 
-                total_loss_epoch += total_loss.item()
-                mel_loss_epoch += loss_mel.item()
-                dur_loss_epoch += loss_duration.item()
-                stop_loss_epoch += loss_stop_token.item()
+                # Accumulate losses as tensors to reduce CPU-GPU sync
+                accumulated_losses.append({
+                    'total': total_loss.detach(),
+                    'mel': loss_mel.detach(),
+                    'dur': loss_duration.detach(),
+                    'stop': loss_stop_token.detach(),
+                    'pitch': loss_pitch.detach() if loss_pitch is not None else None,
+                    'energy': loss_energy.detach() if loss_energy is not None else None
+                })
 
-                # Track variance losses if enabled
+                # Sync accumulated losses periodically to reduce overhead
+                if len(accumulated_losses) >= loss_accumulation_interval or batch_idx == num_batches - 1:
+                    for acc_loss in accumulated_losses:
+                        total_loss_epoch += acc_loss['total'].item()
+                        mel_loss_epoch += acc_loss['mel'].item()
+                        dur_loss_epoch += acc_loss['dur'].item()
+                        stop_loss_epoch += acc_loss['stop'].item()
+                    accumulated_losses.clear()
+
+                # Get current loss values for progress bar (still need .item() for display)
+                current_total_loss = total_loss.item()
+                current_mel_loss = loss_mel.item()
+                current_dur_loss = loss_duration.item()
+                current_stop_loss = loss_stop_token.item()
                 pitch_loss_value = loss_pitch.item() if loss_pitch is not None else 0.0
                 energy_loss_value = loss_energy.item() if loss_energy is not None else 0.0
 
                 # Enhanced progress bar with mixed precision info and memory pressure
                 postfix_dict = {
-                    'total_loss': total_loss.item(),
-                    'mel_loss': loss_mel.item(),
-                    'dur_loss': loss_duration.item(),
-                    'stop_loss': loss_stop_token.item(),
+                    'total_loss': current_total_loss,
+                    'mel_loss': current_mel_loss,
+                    'dur_loss': current_dur_loss,
+                    'stop_loss': current_stop_loss,
                     'lr': self.optimizer.param_groups[0]['lr']
                 }
 
@@ -1378,7 +1448,10 @@ class KokoroTrainer:
         logger.info(f"Total epochs: {self.config.num_epochs}, Starting from epoch: {self.start_epoch + 1}")
         logger.info(f"Model vocabulary size: {self.dataset.phoneme_processor.get_vocab_size()}")
         logger.info(f"Initial learning rate: {self.config.learning_rate}")
-        logger.info(f"Scheduler: CosineAnnealingWarmRestarts (T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult}, eta_min={self.config.lr_eta_min})")
+        if self.scheduler_per_batch:
+            logger.info(f"Scheduler: OneCycleLR (steps per batch, max_lr={self.config.learning_rate * getattr(self.config, 'max_lr_multiplier', 10.0):.2e})")
+        else:
+            logger.info(f"Scheduler: CosineAnnealingWarmRestarts (steps per epoch, T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult})")
         logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")
 
         enable_profiling = getattr(self.config, 'enable_profiling', False)
@@ -1408,7 +1481,9 @@ class KokoroTrainer:
         for epoch in range(self.start_epoch, self.config.num_epochs):
             avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
 
-            self.scheduler.step()
+            # Step scheduler per epoch only if NOT using OneCycleLR (which steps per batch)
+            if not self.scheduler_per_batch:
+                self.scheduler.step()
 
             current_lr = self.optimizer.param_groups[0]['lr']
             logger.info(f"Epoch {epoch+1} completed. "

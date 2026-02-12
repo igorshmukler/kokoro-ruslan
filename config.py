@@ -20,7 +20,12 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-    # Learning rate scheduler
+    # Learning rate scheduler (OneCycleLR)
+    use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
+    max_lr_multiplier: float = 10.0  # Max LR = learning_rate * this value
+    pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
+
+    # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
     lr_T_0: int = 20
     lr_T_mult: int = 2
     lr_eta_min: float = 1e-6
