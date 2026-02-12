@@ -28,6 +28,11 @@ class TrainingConfig:
     max_lr_multiplier: float = 10.0  # Max LR = learning_rate * this value
     pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
 
+    # Linear warmup before OneCycleLR
+    use_warmup: bool = True  # Enable linear warmup before OneCycleLR
+    warmup_steps: int = 500  # Number of optimizer steps for linear warmup (not batches!)
+    warmup_start_lr_ratio: float = 0.01  # Start LR = learning_rate * this value
+
     # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
     lr_T_0: int = 20
     lr_T_mult: int = 2

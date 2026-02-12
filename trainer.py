@@ -288,7 +288,7 @@ class KokoroTrainer:
             self.criterion_pitch = None
             self.criterion_energy = None
 
-        # Learning rate scheduler
+        # Learning rate scheduler with warmup
         use_onecycle = getattr(config, 'use_onecycle_lr', True)
         if use_onecycle:
             # Calculate total training steps for OneCycleLR
@@ -301,10 +301,24 @@ class KokoroTrainer:
             max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 10.0)
             pct_start = getattr(config, 'pct_start', 0.3)
 
+            # Warmup configuration
+            self.use_warmup = getattr(config, 'use_warmup', True)
+            self.warmup_steps = getattr(config, 'warmup_steps', 500)
+            self.warmup_start_lr = config.learning_rate * getattr(config, 'warmup_start_lr_ratio', 0.01)
+            self.warmup_target_lr = config.learning_rate  # Warmup ends at base learning_rate
+            self.current_optimizer_step = 0  # Track optimizer steps (not batches)
+
+            if self.use_warmup:
+                # OneCycleLR starts after warmup, so adjust total_steps
+                onecycle_steps = total_steps - self.warmup_steps
+                logger.info(f"Linear warmup enabled: {self.warmup_steps} steps ({self.warmup_start_lr:.2e} → {self.warmup_target_lr:.2e})")
+            else:
+                onecycle_steps = total_steps
+
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
                 max_lr=max_lr,
-                total_steps=total_steps,
+                total_steps=onecycle_steps,
                 pct_start=pct_start,
                 anneal_strategy='cos',
                 cycle_momentum=True,
@@ -315,10 +329,12 @@ class KokoroTrainer:
                 last_epoch=-1  # Start from beginning
             )
             self.scheduler_per_batch = True
-            logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={total_steps} "
+            logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={onecycle_steps} "
                        f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
         else:
-            # Legacy CosineAnnealingWarmRestarts
+            # Legacy CosineAnnealingWarmRestarts (no warmup)
+            self.use_warmup = False
+            self.current_optimizer_step = 0
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
                 self.optimizer,
                 T_0=self.config.lr_T_0,
@@ -773,6 +789,28 @@ class KokoroTrainer:
                     frame_idx = end_idx
 
         return phoneme_values
+
+    def _step_scheduler_with_warmup(self):
+        """
+        Step the learning rate scheduler with optional linear warmup.
+        During warmup, manually set LR to increase linearly.
+        After warmup, use the configured scheduler (e.g., OneCycleLR).
+        """
+        if self.use_warmup and self.current_optimizer_step < self.warmup_steps:
+            # Linear warmup phase
+            warmup_progress = self.current_optimizer_step / self.warmup_steps
+            current_lr = self.warmup_start_lr + (self.warmup_target_lr - self.warmup_start_lr) * warmup_progress
+
+            # Set LR for all parameter groups
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = current_lr
+
+            self.current_optimizer_step += 1
+        else:
+            # After warmup, use OneCycleLR or other scheduler
+            self.scheduler.step()
+            if self.use_warmup:
+                self.current_optimizer_step += 1
 
     def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
                          mel_specs, phoneme_durations, stop_token_targets,
@@ -1267,9 +1305,9 @@ class KokoroTrainer:
                             self.scaler.update()
                             new_scale = self.scaler.get_scale()
 
-                            # Step scheduler immediately after optimizer step (for OneCycleLR)
+                            # Step scheduler with warmup immediately after optimizer step
                             if self.scheduler_per_batch:
-                                self.scheduler.step()
+                                self._step_scheduler_with_warmup()
 
                             # Update mixed precision stats
                             if new_scale != old_scale:
@@ -1291,9 +1329,9 @@ class KokoroTrainer:
                             self.scaler.update()
                             new_scale = self.scaler.get_scale()
 
-                            # Step scheduler immediately after optimizer step (for OneCycleLR)
+                            # Step scheduler with warmup immediately after optimizer step
                             if self.scheduler_per_batch:
-                                self.scheduler.step()
+                                self._step_scheduler_with_warmup()
 
                             # Update mixed precision stats
                             if step_successful:
@@ -1310,9 +1348,9 @@ class KokoroTrainer:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                         self.optimizer.step()
 
-                        # Step scheduler immediately after optimizer step (for OneCycleLR)
+                        # Step scheduler with warmup immediately after optimizer step
                         if self.scheduler_per_batch:
-                            self.scheduler.step()
+                            self._step_scheduler_with_warmup()
 
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
