@@ -5,6 +5,7 @@ Dataset implementation for Ruslan corpus
 
 import torch
 import torchaudio
+from scipy.io import wavfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from torch.utils.data import Dataset, Sampler
@@ -305,8 +306,24 @@ class RuslanDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
 
-        # Load audio
-        audio, sr = torchaudio.load(sample['audio_path'])
+        # Load audio using scipy.io.wavfile (no C library dependencies)
+        sr, audio_np = wavfile.read(sample['audio_path'])
+
+        # Convert to float32 and normalize
+        if audio_np.dtype == np.int16:
+            audio_np = audio_np.astype(np.float32) / 32768.0
+        elif audio_np.dtype == np.int32:
+            audio_np = audio_np.astype(np.float32) / 2147483648.0
+        else:
+            audio_np = audio_np.astype(np.float32)
+
+        # Convert to torch tensor and ensure correct shape
+        audio = torch.from_numpy(audio_np).float()
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)  # Add channel dimension (1, samples)
+        elif audio.dim() == 2:
+            # Transpose if needed: scipy returns (samples, channels)
+            audio = audio.T  # Convert to (channels, samples)
 
         # Resample if necessary
         if sr != self.config.sample_rate:

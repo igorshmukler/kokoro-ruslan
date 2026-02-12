@@ -173,10 +173,10 @@ class KokoroTrainer:
             self.dataset,
             batch_sampler=self.batch_sampler,
             collate_fn=collate_fn,
-            num_workers=4,
+            num_workers=0,  # Avoid multiprocessing issues with audio loading
             pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-            prefetch_factor=3,
-            persistent_workers=True
+            prefetch_factor=None,  # Not used with num_workers=0
+            persistent_workers=False  # Not used with num_workers=0
         )
 
         # Initialize validation dataloader if validation set exists
@@ -207,10 +207,10 @@ class KokoroTrainer:
                 self.val_dataset,
                 batch_sampler=val_batch_sampler,
                 collate_fn=collate_fn,
-                num_workers=4,
+                num_workers=0,  # Avoid multiprocessing issues with audio loading
                 pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-                prefetch_factor=3,
-                persistent_workers=True
+                prefetch_factor=None,  # Not used with num_workers=0
+                persistent_workers=False  # Not used with num_workers=0
             )
         else:
             self.val_dataloader = None
@@ -718,42 +718,49 @@ class KokoroTrainer:
                          mel_lengths, phoneme_lengths,
                          predicted_pitch=None, predicted_energy=None,
                          pitch_targets=None, energy_targets=None):
-        """Calculate losses with masking (extracted for reuse)"""
-        # Mel Spectrogram Loss
-        max_mel_len_batch = mel_specs.size(1)
-        mel_mask = torch.arange(max_mel_len_batch, device=self.device).expand(
-            len(mel_lengths), max_mel_len_batch) < mel_lengths.unsqueeze(1)
-        mel_mask = mel_mask.unsqueeze(-1).expand_as(predicted_mel).float()
+        """Calculate losses with optimized masking"""
+        batch_size = mel_specs.size(0)
+        max_mel_len = mel_specs.size(1)
+        max_phoneme_len = phoneme_durations.size(1)
+        n_mels = mel_specs.size(2)
 
+        # Create base masks efficiently (2D only, no feature dimension expansion yet)
+        # Use direct comparison without intermediate .expand() to save memory
+        mel_mask_2d = torch.arange(max_mel_len, device=self.device).unsqueeze(0) < mel_lengths.unsqueeze(1)
+        phoneme_mask_2d = torch.arange(max_phoneme_len, device=self.device).unsqueeze(0) < phoneme_lengths.unsqueeze(1)
+
+        # Pre-compute mask normalization factors (reused across losses)
+        mel_mask_count = mel_mask_2d.sum()
+        phoneme_mask_count = phoneme_mask_2d.sum()
+
+        # Mel Spectrogram Loss - expand mask only along feature dim when needed
+        # Use unsqueeze + in-place broadcasting instead of expand_as for efficiency
         loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        loss_mel = (loss_mel_unreduced * mel_mask).sum() / mel_mask.sum()
+        # Broadcast 2D mask to 3D: (batch, time, 1) * (batch, time, n_mels) using view
+        mel_mask_3d = mel_mask_2d.unsqueeze(-1)  # (batch, time, 1)
+        loss_mel = (loss_mel_unreduced * mel_mask_3d).sum() / (mel_mask_count * n_mels)
 
-        # Duration Loss
-        max_phoneme_len_batch = phoneme_durations.size(1)
-        phoneme_mask = torch.arange(max_phoneme_len_batch, device=self.device).expand(
-            len(phoneme_lengths), max_phoneme_len_batch) < phoneme_lengths.unsqueeze(1)
-        phoneme_mask = phoneme_mask.float()
-
+        # Duration Loss - convert to float once
+        phoneme_mask_float = phoneme_mask_2d.float()
         target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
         loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-        loss_duration = (loss_duration_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+        loss_duration = (loss_duration_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
 
-        # Stop Token Loss
-        stop_token_mask = mel_mask[:, :, 0]
+        # Stop Token Loss - reuse mel_mask_2d directly (no need to slice from 3D)
         loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
-        loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
+        loss_stop_token = (loss_stop_token_unreduced * mel_mask_2d).sum() / mel_mask_count
 
-        # Pitch Loss (if variance predictor enabled)
+        # Pitch Loss (if variance predictor enabled) - reuse phoneme mask
         loss_pitch = torch.tensor(0.0, device=self.device)
         if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
             loss_pitch_unreduced = self.criterion_pitch(predicted_pitch, pitch_targets)
-            loss_pitch = (loss_pitch_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+            loss_pitch = (loss_pitch_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
 
-        # Energy Loss (if variance predictor enabled)
+        # Energy Loss (if variance predictor enabled) - reuse phoneme mask
         loss_energy = torch.tensor(0.0, device=self.device)
         if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
             loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
-            loss_energy = (loss_energy_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+            loss_energy = (loss_energy_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
 
         # Combine all losses
         total_loss = (loss_mel +
@@ -993,11 +1000,36 @@ class KokoroTrainer:
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_data_loading()
 
-                with torch.profiler.record_function("Data_Loading"):
-                    # Use non_blocking only for CUDA
+                # Only add profiler overhead when actually profiling
+                if is_profiling_epoch:
+                    with torch.profiler.record_function("Data_Loading"):
+                        # Use non_blocking only for CUDA
+                        non_blocking = self.device.type == 'cuda'
+
+                        # Batch transfer all required tensors at once for better performance
+                        tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
+                                       'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
+                        transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
+                                       for k in tensor_keys}
+
+                        mel_specs = transferred['mel_specs']
+                        phoneme_indices = transferred['phoneme_indices']
+                        phoneme_durations = transferred['phoneme_durations']
+                        stop_token_targets = transferred['stop_token_targets']
+                        mel_lengths = transferred['mel_lengths']
+                        phoneme_lengths = transferred['phoneme_lengths']
+
+                        # Optional tensors (pitch and energy)
+                        pitches = batch.get('pitches', None)
+                        energies = batch.get('energies', None)
+                        if pitches is not None:
+                            pitches = pitches.to(self.device, non_blocking=non_blocking)
+                        if energies is not None:
+                            energies = energies.to(self.device, non_blocking=non_blocking)
+                else:
+                    # No profiler overhead
                     non_blocking = self.device.type == 'cuda'
 
-                    # Batch transfer all required tensors at once for better performance
                     tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
                                    'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
                     transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
@@ -1010,7 +1042,6 @@ class KokoroTrainer:
                     mel_lengths = transferred['mel_lengths']
                     phoneme_lengths = transferred['phoneme_lengths']
 
-                    # Optional tensors (pitch and energy)
                     pitches = batch.get('pitches', None)
                     energies = batch.get('energies', None)
                     if pitches is not None:
@@ -1024,14 +1055,24 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("data_loading")
 
-                with torch.profiler.record_function("Zero_Grad"):
-                    self.optimizer.zero_grad()
+                self.optimizer.zero_grad()
 
                 # Forward pass with mixed precision and interbatch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_forward_pass()
 
-                with torch.profiler.record_function("Model_Forward"):
+                if is_profiling_epoch:
+                    with torch.profiler.record_function("Model_Forward"):
+                        if self.use_mixed_precision:
+                            with self.get_autocast_context():
+                                predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                                    self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                             pitch_targets=pitches, energy_targets=energies)
+                        else:
+                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                         pitch_targets=pitches, energy_targets=energies)
+                else:
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
@@ -1063,7 +1104,24 @@ class KokoroTrainer:
                     )
 
                 # Loss calculation with mixed precision
-                with torch.profiler.record_function("Loss_Calculation"):
+                if is_profiling_epoch:
+                    with torch.profiler.record_function("Loss_Calculation"):
+                        if self.use_mixed_precision:
+                            with self.get_autocast_context():
+                                total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
+                                    predicted_mel, predicted_log_durations, predicted_stop_logits,
+                                    mel_specs, phoneme_durations, stop_token_targets,
+                                    mel_lengths, phoneme_lengths,
+                                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+                                )
+                        else:
+                            total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
+                                predicted_mel, predicted_log_durations, predicted_stop_logits,
+                                mel_specs, phoneme_durations, stop_token_targets,
+                                mel_lengths, phoneme_lengths,
+                                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+                            )
+                else:
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
@@ -1087,7 +1145,17 @@ class KokoroTrainer:
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
 
-                with torch.profiler.record_function("Backward_Pass"):
+                if is_profiling_epoch:
+                    with torch.profiler.record_function("Backward_Pass"):
+                        if self.use_mixed_precision:
+                            if self.device_type == 'cuda':
+                                self.scaler.scale(total_loss).backward()
+                            else:  # MPS
+                                scaled_loss = self.scaler.scale(total_loss)
+                                scaled_loss.backward()
+                        else:
+                            total_loss.backward()
+                else:
                     if self.use_mixed_precision:
                         if self.device_type == 'cuda':
                             self.scaler.scale(total_loss).backward()
@@ -1103,53 +1171,52 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
 
-                # Optimizer step with mixed precision
-                with torch.profiler.record_function("Optimizer_Step"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            # CUDA path with built-in GradScaler
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                            old_scale = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                                    self.mixed_precision_stats['overflow_count'] += 1
-                                else:
-                                    self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['successful_steps'] += 1
-
-                        else:  # MPS path with custom scaler
-                            # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                            old_scale = self.scaler.get_scale()
-                            step_successful = self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
-                            if step_successful:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['skipped_steps'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
-
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                    else:
+                # Optimizer step with mixed precision - no profiler wrapper (lightweight operation)
+                if self.use_mixed_precision:
+                    if self.device_type == 'cuda':
+                        # CUDA path with built-in GradScaler
+                        self.scaler.unscale_(self.optimizer)
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                        self.optimizer.step()
+
+                        old_scale = self.scaler.get_scale()
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
+
+                        # Update mixed precision stats
+                        if new_scale != old_scale:
+                            self.mixed_precision_stats['scale_updates'] += 1
+                            if new_scale < old_scale:
+                                self.mixed_precision_stats['scale_decreases'] += 1
+                                self.mixed_precision_stats['overflow_count'] += 1
+                            else:
+                                self.mixed_precision_stats['successful_steps'] += 1
+                        else:
+                            self.mixed_precision_stats['successful_steps'] += 1
+
+                    else:  # MPS path with custom scaler
+                        # For MPS, clip gradients before unscaling
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                        old_scale = self.scaler.get_scale()
+                        step_successful = self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        new_scale = self.scaler.get_scale()
+
+                        # Update mixed precision stats
+                        if step_successful:
+                            self.mixed_precision_stats['successful_steps'] += 1
+                        else:
+                            self.mixed_precision_stats['skipped_steps'] += 1
+                            self.mixed_precision_stats['overflow_count'] += 1
+
+                        if new_scale != old_scale:
+                            self.mixed_precision_stats['scale_updates'] += 1
+                            if new_scale < old_scale:
+                                self.mixed_precision_stats['scale_decreases'] += 1
+                else:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                    self.optimizer.step()
 
                 if is_profiling_epoch:
                     self.log_memory_stats("optimizer_step")
