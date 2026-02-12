@@ -6,6 +6,12 @@ torchaudio>=2.0.0
 soundfile>=0.12.0
 librosa>=0.9.0
 
+# Montreal Forced Aligner for phoneme duration extraction
+# Install via conda: conda install -c conda-forge montreal-forced-aligner
+# Or pip: pip install montreal-forced-aligner
+montreal-forced-aligner>=3.0.0
+tgt>=1.4.4  # TextGrid tools for parsing MFA output
+
 # Data processing and utilities
 numpy>=1.21.0
 pathlib

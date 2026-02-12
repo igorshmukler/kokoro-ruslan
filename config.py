@@ -39,6 +39,19 @@ class TrainingConfig:
     # Loss weights
     duration_loss_weight: float = 0.1
     stop_token_loss_weight: float = 1.0
+    pitch_loss_weight: float = 0.1
+    energy_loss_weight: float = 0.1
+
+    # Variance predictor settings
+    use_variance_predictor: bool = True
+    variance_filter_size: int = 256
+    variance_kernel_size: int = 3
+    variance_dropout: float = 0.1
+    n_variance_bins: int = 256
+    pitch_min: float = 50.0
+    pitch_max: float = 800.0
+    energy_min: float = 0.0
+    energy_max: float = 100.0
 
     # Audio processing
     max_seq_length: int = 2500
@@ -56,6 +69,18 @@ class TrainingConfig:
     # Checkpointing
     save_every: int = 2
     resume_checkpoint: str = 'auto'
+
+    # Validation settings
+    validation_split: float = 0.1  # 10% of data for validation
+    validation_interval: int = 1  # Run validation every N epochs
+    early_stopping_patience: int = 10  # Stop if no improvement for N epochs
+    early_stopping_min_delta: float = 0.001  # Minimum improvement to count
+
+    # Montreal Forced Aligner (MFA) settings
+    use_mfa: bool = True
+    mfa_alignment_dir: str = "./mfa_output/alignments"
+    mfa_acoustic_model: str = "russian_mfa"
+    mfa_dictionary: str = "russian_mfa"
 
     # Enable gradient checkpointing by default
     gradient_checkpointing: bool = True
