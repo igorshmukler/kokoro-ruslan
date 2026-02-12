@@ -111,10 +111,35 @@ class KokoroTrainer:
             self.device_type = self.device.type
             logger.info("Mixed precision training disabled by configuration")
 
-        # Initialize dataset
-        self.dataset = RuslanDataset(config.data_dir, config)
+        # Initialize datasets with train/validation split
+        full_dataset = RuslanDataset(config.data_dir, config)
 
-        # Initialize the custom LengthBasedBatchSampler
+        # Create train/validation split
+        val_split = getattr(config, 'validation_split', 0.1)
+        if val_split > 0:
+            dataset_size = len(full_dataset.samples)  # Total before filtering
+            indices = list(range(dataset_size))
+
+            # Shuffle indices for random split
+            import random
+            random.seed(42)  # Fixed seed for reproducibility
+            random.shuffle(indices)
+
+            split_idx = int(dataset_size * (1 - val_split))
+            train_indices = indices[:split_idx]
+            val_indices = indices[split_idx:]
+
+            logger.info(f"Dataset split: {len(train_indices)} training, {len(val_indices)} validation samples")
+
+            # Create separate datasets
+            self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices)
+            self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices)
+        else:
+            logger.info("No validation split - using all data for training")
+            self.dataset = full_dataset
+            self.val_dataset = None
+
+        # Initialize the custom LengthBasedBatchSampler for training
         self.batch_sampler = LengthBasedBatchSampler(
             dataset=self.dataset,
             batch_size=config.batch_size,
@@ -132,9 +157,43 @@ class KokoroTrainer:
             persistent_workers=True
         )
 
+        # Initialize validation dataloader if validation set exists
+        if self.val_dataset is not None:
+            val_batch_sampler = LengthBasedBatchSampler(
+                dataset=self.val_dataset,
+                batch_size=config.batch_size,
+                drop_last=False,  # Use all validation data
+                shuffle=False  # Don't shuffle validation
+            )
+
+            self.val_dataloader = DataLoader(
+                self.val_dataset,
+                batch_sampler=val_batch_sampler,
+                collate_fn=collate_fn,
+                num_workers=2,
+                pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
+                prefetch_factor=3,
+                persistent_workers=True
+            )
+        else:
+            self.val_dataloader = None
+
         # Initialize model
         vocab_size = self.dataset.phoneme_processor.get_vocab_size()
-        self.model = KokoroModel(vocab_size, config.n_mels, config.hidden_dim)
+        self.model = KokoroModel(
+            vocab_size,
+            config.n_mels,
+            config.hidden_dim,
+            use_variance_predictor=getattr(config, 'use_variance_predictor', True),
+            variance_filter_size=getattr(config, 'variance_filter_size', 256),
+            variance_kernel_size=getattr(config, 'variance_kernel_size', 3),
+            variance_dropout=getattr(config, 'variance_dropout', 0.1),
+            n_variance_bins=getattr(config, 'n_variance_bins', 256),
+            pitch_min=getattr(config, 'pitch_min', 50.0),
+            pitch_max=getattr(config, 'pitch_max', 800.0),
+            energy_min=getattr(config, 'energy_min', 0.0),
+            energy_max=getattr(config, 'energy_max', 100.0)
+        )
         self.model.to(self.device)
 
         # Log model information
@@ -154,6 +213,15 @@ class KokoroTrainer:
         self.criterion_duration = nn.MSELoss(reduction='none')
         self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
 
+        # Variance losses (pitch and energy)
+        if getattr(config, 'use_variance_predictor', True):
+            self.criterion_pitch = nn.MSELoss(reduction='none')
+            self.criterion_energy = nn.MSELoss(reduction='none')
+            logger.info("Variance predictor losses initialized (pitch/energy)")
+        else:
+            self.criterion_pitch = None
+            self.criterion_energy = None
+
         # Learning rate scheduler
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             self.optimizer,
@@ -165,6 +233,9 @@ class KokoroTrainer:
         # Training state
         self.start_epoch = 0
         self.best_loss = float('inf')
+        self.best_val_loss = float('inf')
+        self.epochs_without_improvement = 0
+        self.validation_losses = []  # Track validation loss history
 
         # Mixed precision training stats
         self.mixed_precision_stats = {
@@ -549,9 +620,50 @@ class KokoroTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
+    def _average_pitch_energy_by_duration(self,
+                                          values: torch.Tensor,
+                                          durations: torch.Tensor,
+                                          phoneme_lengths: torch.Tensor) -> torch.Tensor:
+        """
+        Average frame-level values (pitch/energy) to phoneme-level using durations
+
+        Args:
+            values: Frame-level values (batch, mel_frames)
+            durations: Phoneme durations (batch, phonemes)
+            phoneme_lengths: Actual phoneme lengths (batch,)
+
+        Returns:
+            Phoneme-level averaged values (batch, phonemes)
+        """
+        batch_size = durations.shape[0]
+        num_phonemes = durations.shape[1]
+        device = durations.device
+
+        # Create output tensor
+        phoneme_values = torch.zeros(batch_size, num_phonemes, device=device)
+
+        for b in range(batch_size):
+            curr_durations = durations[b]  # (phonemes,)
+            curr_values = values[b]  # (frames,)
+            actual_phoneme_len = int(phoneme_lengths[b].item())
+
+            frame_idx = 0
+
+            for p in range(actual_phoneme_len):
+                dur = int(curr_durations[p].item())
+                if dur > 0 and frame_idx < len(curr_values):
+                    # Average the values for this phoneme's frames
+                    end_idx = min(frame_idx + dur, len(curr_values))
+                    phoneme_values[b, p] = curr_values[frame_idx:end_idx].mean()
+                    frame_idx = end_idx
+
+        return phoneme_values
+
     def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
                          mel_specs, phoneme_durations, stop_token_targets,
-                         mel_lengths, phoneme_lengths):
+                         mel_lengths, phoneme_lengths,
+                         predicted_pitch=None, predicted_energy=None,
+                         pitch_targets=None, energy_targets=None):
         """Calculate losses with masking (extracted for reuse)"""
         # Mel Spectrogram Loss
         max_mel_len_batch = mel_specs.size(1)
@@ -577,12 +689,26 @@ class KokoroTrainer:
         loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
         loss_stop_token = (loss_stop_token_unreduced * stop_token_mask).sum() / stop_token_mask.sum()
 
+        # Pitch Loss (if variance predictor enabled)
+        loss_pitch = torch.tensor(0.0, device=self.device)
+        if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
+            loss_pitch_unreduced = self.criterion_pitch(predicted_pitch, pitch_targets)
+            loss_pitch = (loss_pitch_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+
+        # Energy Loss (if variance predictor enabled)
+        loss_energy = torch.tensor(0.0, device=self.device)
+        if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
+            loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
+            loss_energy = (loss_energy_unreduced * phoneme_mask).sum() / phoneme_mask.sum()
+
         # Combine all losses
         total_loss = (loss_mel +
                      loss_duration * self.config.duration_loss_weight +
-                     loss_stop_token * self.config.stop_token_loss_weight)
+                     loss_stop_token * self.config.stop_token_loss_weight +
+                     loss_pitch * getattr(self.config, 'pitch_loss_weight', 0.1) +
+                     loss_energy * getattr(self.config, 'energy_loss_weight', 0.1))
 
-        return total_loss, loss_mel, loss_duration, loss_stop_token
+        return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
 
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""
@@ -621,6 +747,116 @@ class KokoroTrainer:
 
         self.dataset.phoneme_processor = phoneme_processor
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
+
+    def validate_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
+        """
+        Run validation loop to monitor overfitting
+        Returns: (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
+        """
+        if self.val_dataloader is None:
+            return 0.0, 0.0, 0.0, 0.0
+
+        self.model.eval()  # Set to evaluation mode
+
+        total_loss_epoch = 0.0
+        mel_loss_epoch = 0.0
+        dur_loss_epoch = 0.0
+        stop_loss_epoch = 0.0
+        pitch_loss_epoch = 0.0
+        energy_loss_epoch = 0.0
+        num_batches = 0
+
+        with torch.no_grad():  # Disable gradient computation
+            progress_bar = tqdm(self.val_dataloader, desc=f"Validation Epoch {epoch+1}")
+            for batch_idx, batch in enumerate(progress_bar):
+                try:
+                    # Data loading
+                    non_blocking = self.device.type == 'cuda'
+                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=non_blocking)
+                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=non_blocking)
+                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=non_blocking)
+                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=non_blocking)
+                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
+                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
+
+                    # Pitch and energy (if variance predictor enabled)
+                    pitches = batch.get('pitches', None)
+                    energies = batch.get('energies', None)
+                    if pitches is not None:
+                        pitches = pitches.to(self.device, non_blocking=non_blocking)
+                    if energies is not None:
+                        energies = energies.to(self.device, non_blocking=non_blocking)
+
+                    # Forward pass (without mixed precision for validation consistency)
+                    predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                        self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                 pitch_targets=pitches, energy_targets=energies)
+
+                    # Convert mel-frame level pitch/energy to phoneme level for loss calculation
+                    phoneme_pitches = None
+                    phoneme_energies = None
+                    if pitches is not None and predicted_pitch is not None:
+                        phoneme_pitches = self._average_pitch_energy_by_duration(
+                            pitches, phoneme_durations, phoneme_lengths
+                        )
+                    if energies is not None and predicted_energy is not None:
+                        phoneme_energies = self._average_pitch_energy_by_duration(
+                            energies, phoneme_durations, phoneme_lengths
+                        )
+
+                    # Loss calculation
+                    total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
+                        predicted_mel, predicted_log_durations, predicted_stop_logits,
+                        mel_specs, phoneme_durations, stop_token_targets,
+                        mel_lengths, phoneme_lengths,
+                        predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+                    )
+
+                    # Accumulate losses
+                    total_loss_epoch += total_loss.item()
+                    mel_loss_epoch += loss_mel.item()
+                    dur_loss_epoch += loss_duration.item()
+                    stop_loss_epoch += loss_stop_token.item()
+                    if loss_pitch is not None:
+                        pitch_loss_epoch += loss_pitch.item()
+                    if loss_energy is not None:
+                        energy_loss_epoch += loss_energy.item()
+                    num_batches += 1
+
+                    # Update progress bar
+                    progress_bar.set_postfix({
+                        'val_loss': f"{total_loss.item():.4f}",
+                        'mel': f"{loss_mel.item():.4f}",
+                        'dur': f"{loss_duration.item():.4f}",
+                        'stop': f"{loss_stop_token.item():.4f}"
+                    })
+
+                except Exception as e:
+                    logger.error(f"Error in validation batch {batch_idx}: {e}")
+                    continue
+
+        self.model.train()  # Set back to training mode
+
+        # Compute averages
+        if num_batches > 0:
+            avg_total_loss = total_loss_epoch / num_batches
+            avg_mel_loss = mel_loss_epoch / num_batches
+            avg_dur_loss = dur_loss_epoch / num_batches
+            avg_stop_loss = stop_loss_epoch / num_batches
+            avg_pitch_loss = pitch_loss_epoch / num_batches if pitch_loss_epoch > 0 else 0.0
+            avg_energy_loss = energy_loss_epoch / num_batches if energy_loss_epoch > 0 else 0.0
+
+            logger.info(f"Validation Epoch {epoch+1} - "
+                       f"Loss: {avg_total_loss:.4f}, "
+                       f"Mel: {avg_mel_loss:.4f}, "
+                       f"Dur: {avg_dur_loss:.4f}, "
+                       f"Stop: {avg_stop_loss:.4f}")
+            if avg_pitch_loss > 0:
+                logger.info(f"  Pitch: {avg_pitch_loss:.4f}, Energy: {avg_energy_loss:.4f}")
+
+            return (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
+        else:
+            return (0.0, 0.0, 0.0, 0.0)
 
     def save_checkpoint_with_scaler(self, epoch: int, loss: float):
         """Save checkpoint including scaler state"""
@@ -706,6 +942,14 @@ class KokoroTrainer:
                     mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
                     phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
 
+                    # Pitch and energy (if variance predictor enabled)
+                    pitches = batch.get('pitches', None)
+                    energies = batch.get('energies', None)
+                    if pitches is not None:
+                        pitches = pitches.to(self.device, non_blocking=non_blocking)
+                    if energies is not None:
+                        energies = energies.to(self.device, non_blocking=non_blocking)
+
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_data_loading()
 
@@ -722,11 +966,13 @@ class KokoroTrainer:
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                         pitch_targets=pitches, energy_targets=energies)
                     else:
-                        predicted_mel, predicted_log_durations, predicted_stop_logits = \
-                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                        predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                     pitch_targets=pitches, energy_targets=energies)
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_forward_pass()
@@ -734,20 +980,36 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("forward_pass")
 
+                # Convert mel-frame level pitch/energy to phoneme level for loss calculation
+                phoneme_pitches = None
+                phoneme_energies = None
+                if pitches is not None and predicted_pitch is not None:
+                    # Average pitch from mel-frame level to phoneme level using durations
+                    phoneme_pitches = self._average_pitch_energy_by_duration(
+                        pitches, phoneme_durations, phoneme_lengths
+                    )
+                if energies is not None and predicted_energy is not None:
+                    # Average energy from mel-frame level to phoneme level using durations
+                    phoneme_energies = self._average_pitch_energy_by_duration(
+                        energies, phoneme_durations, phoneme_lengths
+                    )
+
                 # Loss calculation with mixed precision
                 with torch.profiler.record_function("Loss_Calculation"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                            total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
                                 predicted_mel, predicted_log_durations, predicted_stop_logits,
                                 mel_specs, phoneme_durations, stop_token_targets,
-                                mel_lengths, phoneme_lengths
+                                mel_lengths, phoneme_lengths,
+                                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
                             )
                     else:
-                        total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                        total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
                             predicted_mel, predicted_log_durations, predicted_stop_logits,
                             mel_specs, phoneme_durations, stop_token_targets,
-                            mel_lengths, phoneme_lengths
+                            mel_lengths, phoneme_lengths,
+                            predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
                         )
 
                 if is_profiling_epoch:
@@ -834,6 +1096,10 @@ class KokoroTrainer:
                 dur_loss_epoch += loss_duration.item()
                 stop_loss_epoch += loss_stop_token.item()
 
+                # Track variance losses if enabled
+                pitch_loss_value = loss_pitch.item() if loss_pitch is not None else 0.0
+                energy_loss_value = loss_energy.item() if loss_energy is not None else 0.0
+
                 # Enhanced progress bar with mixed precision info and memory pressure
                 postfix_dict = {
                     'total_loss': total_loss.item(),
@@ -842,6 +1108,12 @@ class KokoroTrainer:
                     'stop_loss': loss_stop_token.item(),
                     'lr': self.optimizer.param_groups[0]['lr']
                 }
+
+                # Add variance losses if they exist
+                if loss_pitch is not None and loss_pitch.item() > 0:
+                    postfix_dict['pitch_loss'] = pitch_loss_value
+                if loss_energy is not None and loss_energy.item() > 0:
+                    postfix_dict['energy_loss'] = energy_loss_value
 
                 if self.use_mixed_precision:
                     postfix_dict['scale'] = f"{self.scaler.get_scale():.0f}"
@@ -987,6 +1259,40 @@ class KokoroTrainer:
                         f"Avg Stop Loss: {avg_stop_loss:.4f}, "
                         f"Current LR: {current_lr:.8f}")
 
+            # Run validation if enabled
+            validation_interval = getattr(self.config, 'validation_interval', 1)
+            if self.val_dataloader is not None and (epoch + 1) % validation_interval == 0:
+                val_total_loss, val_mel_loss, val_dur_loss, val_stop_loss = self.validate_epoch(epoch)
+                self.validation_losses.append(val_total_loss)
+
+                # Check for improvement
+                min_delta = getattr(self.config, 'early_stopping_min_delta', 0.001)
+                if val_total_loss < (self.best_val_loss - min_delta):
+                    improvement = self.best_val_loss - val_total_loss
+                    self.best_val_loss = val_total_loss
+                    self.epochs_without_improvement = 0
+                    logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
+
+                    # Save best model
+                    if self.use_mixed_precision:
+                        self.save_checkpoint_with_scaler(epoch, val_total_loss)
+                    else:
+                        save_checkpoint(
+                            self.model, self.optimizer, self.scheduler,
+                            epoch, val_total_loss, self.config, self.config.output_dir
+                        )
+                else:
+                    self.epochs_without_improvement += 1
+                    logger.info(f"⚠ No validation improvement for {self.epochs_without_improvement} epoch(s) "
+                               f"(best: {self.best_val_loss:.4f})")
+
+                # Early stopping check
+                patience = getattr(self.config, 'early_stopping_patience', 10)
+                if self.epochs_without_improvement >= patience:
+                    logger.info(f"Early stopping triggered after {patience} epochs without improvement")
+                    logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
+                    break
+
             # Log memory management stats for this epoch
             if self.enable_adaptive_memory:
                 memory_report = self.memory_manager.get_memory_report()
@@ -996,15 +1302,20 @@ class KokoroTrainer:
                 logger.info(f"  Memory Trend: {memory_report['memory_trend']:+.2f}%")
                 logger.info(f"  Cleanup Overhead: {memory_report['cleanup_overhead_percent']:.2f}%")
 
+            # Save periodic checkpoints (only if not using validation or if validation isn't better)
             if (epoch + 1) % self.config.save_every == 0:
-                if self.use_mixed_precision:
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
-                else:
-                    save_checkpoint(
-                        self.model, self.optimizer, self.scheduler,
-                        epoch, avg_total_loss, self.config, self.config.output_dir
-                    )
-                logger.info(f"Checkpoint saved for epoch {epoch+1}")
+                # Only save if we're not doing validation or if this is just a periodic save
+                should_save_periodic = (self.val_dataloader is None or
+                                       self.epochs_without_improvement > 0)
+                if should_save_periodic:
+                    if self.use_mixed_precision:
+                        self.save_checkpoint_with_scaler(epoch, avg_total_loss)
+                    else:
+                        save_checkpoint(
+                            self.model, self.optimizer, self.scheduler,
+                            epoch, avg_total_loss, self.config, self.config.output_dir
+                        )
+                    logger.info(f"Periodic checkpoint saved for epoch {epoch+1}")
 
             # Strategic memory cleanup at epoch end
             if self.enable_adaptive_memory:
@@ -1014,6 +1325,29 @@ class KokoroTrainer:
 
         logger.info("Training finished. Saving final model.")
         save_final_model(self.model, self.config, self.config.output_dir)
+
+        # Print validation summary if validation was enabled
+        if self.val_dataloader is not None and len(self.validation_losses) > 0:
+            logger.info("\n" + "="*60)
+            logger.info("VALIDATION SUMMARY")
+            logger.info("="*60)
+            logger.info(f"Best Validation Loss: {self.best_val_loss:.4f}")
+            logger.info(f"Final Validation Loss: {self.validation_losses[-1]:.4f}")
+            logger.info(f"Total Validation Runs: {len(self.validation_losses)}")
+
+            # Check for overfitting
+            if len(self.validation_losses) >= 2:
+                # Compare final vs best
+                if self.validation_losses[-1] > self.best_val_loss:
+                    difference = self.validation_losses[-1] - self.best_val_loss
+                    pct_increase = (difference / self.best_val_loss) * 100
+                    logger.info(f"⚠ Potential overfitting detected:")
+                    logger.info(f"  Final validation loss is {pct_increase:.1f}% higher than best")
+                    logger.info(f"  Consider using the checkpoint from epoch with best validation loss")
+                else:
+                    logger.info("✓ No significant overfitting detected")
+
+            logger.info("="*60 + "\n")
 
         # Print final mixed precision statistics
         if self.use_mixed_precision:

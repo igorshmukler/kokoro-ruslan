@@ -4,3 +4,5 @@ venv
 # misc
 .DS_Store
 
+# MFA output files
+mfa_output/

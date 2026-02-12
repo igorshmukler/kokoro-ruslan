@@ -6,16 +6,26 @@ Dataset implementation for Ruslan corpus
 import torch
 import torchaudio
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 import logging
 import random
 import numpy as np
 from tqdm import tqdm
+import pickle
+import os
 
 from config import TrainingConfig
 from russian_phoneme_processor import RussianPhonemeProcessor
+from mfa_integration import MFAIntegration
+
+try:
+    from variance_predictor import PitchExtractor, EnergyExtractor
+    VARIANCE_AVAILABLE = True
+except ImportError:
+    VARIANCE_AVAILABLE = False
+    logger.warning("Variance predictor module not available, pitch/energy extraction disabled")
 
 logger = logging.getLogger(__name__)
 
@@ -23,10 +33,39 @@ logger = logging.getLogger(__name__)
 class RuslanDataset(Dataset):
     """Dataset class for Ruslan corpus - optimized for MPS"""
 
-    def __init__(self, data_dir: str, config: TrainingConfig):
+    def __init__(self, data_dir: str, config: TrainingConfig, use_mfa: bool = True,
+                 indices: Optional[List[int]] = None):
         self.data_dir = Path(data_dir)
         self.config = config
         self.phoneme_processor = RussianPhonemeProcessor()
+        self.use_mfa = use_mfa
+        self.indices = indices  # Subset of indices for train/val split
+
+        # Check if variance prediction is enabled
+        self.use_variance = getattr(config, 'use_variance_predictor', True) and VARIANCE_AVAILABLE
+        if self.use_variance:
+            logger.info("Variance prediction enabled (pitch/energy extraction)")
+        else:
+            logger.info("Variance prediction disabled")
+
+        # Initialize MFA integration if enabled
+        self.mfa = None
+        if self.use_mfa and hasattr(config, 'mfa_alignment_dir'):
+            alignment_dir = Path(config.mfa_alignment_dir)
+            if alignment_dir.exists():
+                self.mfa = MFAIntegration(
+                    corpus_dir=str(self.data_dir),
+                    output_dir=str(alignment_dir.parent),
+                    hop_length=config.hop_length,
+                    sample_rate=config.sample_rate
+                )
+                logger.info(f"MFA integration enabled, using alignments from: {alignment_dir}")
+            else:
+                logger.warning(f"MFA alignment directory not found: {alignment_dir}")
+                logger.warning("Falling back to estimated durations")
+                self.use_mfa = False
+        else:
+            logger.warning("MFA not enabled in config. Using estimated durations.")
 
         # Validate MelSpectrogram parameters
         if self.config.win_length > self.config.n_fft:
@@ -57,23 +96,92 @@ class RuslanDataset(Dataset):
             # return_fast=False
         )
 
+        # Setup cache for audio metadata
+        self.cache_dir = self.data_dir / ".cache"
+        self.cache_file = self.cache_dir / "audio_metadata.pkl"
+
         # Load metadata and pre-calculate lengths for batching
         self.samples = self._load_samples()
         logger.info(f"Loaded {len(self.samples)} samples from corpus at {data_dir}")
         logger.info(f"Using phoneme processor: {self.phoneme_processor}")
 
-        # Add a warning about dummy durations if using the placeholder method
-        logger.warning(
-            "Phoneme durations are being generated as a placeholder (uniform distribution). "
-            "For high-quality TTS, you MUST replace this with actual phoneme durations "
-            "obtained from a forced aligner (e.g., Montreal Forced Aligner)."
-        )
+        # Warn about duration source
+        if self.mfa:
+            logger.info("Using MFA forced alignment for phoneme durations (high quality)")
+        else:
+            logger.warning(
+                "Phoneme durations are being estimated (lower quality). "
+                "For high-quality TTS, run MFA alignment first using: "
+                "python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output"
+            )
+
+    def _get_audio_info_cached(self, audio_path: Path, cache: dict) -> Optional[tuple]:
+        """
+        Get audio info (sample_rate, num_frames) without loading full waveform.
+        Uses cache to avoid repeated torchaudio.info() calls.
+        """
+        audio_path_str = str(audio_path)
+
+        # Check cache first
+        if audio_path_str in cache:
+            return cache[audio_path_str]
+
+        try:
+            # Use torchaudio.info() which only reads metadata, not audio data
+            info = torchaudio.info(audio_path_str)
+            sample_rate = info.sample_rate
+            num_frames = info.num_frames
+
+            # Calculate actual frames after potential resampling
+            if sample_rate != self.config.sample_rate:
+                # Estimate frames after resampling
+                num_frames = int(num_frames * self.config.sample_rate / sample_rate)
+
+            # Ensure at least win_length frames
+            if num_frames < self.config.win_length:
+                num_frames = self.config.win_length
+
+            # Cache the result
+            result = (sample_rate, num_frames)
+            cache[audio_path_str] = result
+            return result
+
+        except Exception as e:
+            logger.warning(f"Could not get info for {audio_path}: {e}")
+            return None
+
+    def _load_cache(self) -> dict:
+        """Load cached audio metadata if available"""
+        if self.cache_file.exists():
+            try:
+                with open(self.cache_file, 'rb') as f:
+                    cache = pickle.load(f)
+                logger.info(f"Loaded audio metadata cache ({len(cache)} entries)")
+                return cache
+            except Exception as e:
+                logger.warning(f"Failed to load cache: {e}")
+        return {}
+
+    def _save_cache(self, cache: dict):
+        """Save audio metadata cache"""
+        try:
+            self.cache_dir.mkdir(exist_ok=True)
+            with open(self.cache_file, 'wb') as f:
+                pickle.dump(cache, f)
+            logger.info(f"Saved audio metadata cache ({len(cache)} entries)")
+        except Exception as e:
+            logger.warning(f"Failed to save cache: {e}")
 
     def _load_samples(self) -> List[Dict]:
         """
         Load samples from corpus directory and pre-calculate lengths.
+        Uses caching to avoid repeated audio loading.
         """
         samples = []
+
+        # Load cache
+        audio_info_cache = self._load_cache()
+        cache_updated = False
 
         metadata_file = self.data_dir / "metadata_RUSLAN_22200.csv"
         if metadata_file.exists():
@@ -92,54 +200,39 @@ class RuslanDataset(Dataset):
 
                         audio_path = self.data_dir / "wavs" / f"{audio_file_stem}.wav"
                         if audio_path.exists():
-                            # Pre-calculate audio length (in mel frames)
-                            try:
-                                waveform, sr = torchaudio.load(audio_path)
-                                if sr != self.config.sample_rate:
-                                    resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
-                                    waveform = resampler(waveform)
-
-                                # Ensure waveform is at least win_length for STFT
-                                if waveform.shape[1] < self.config.win_length:
-                                    # Pad short audio with zeros
-                                    padding_needed = self.config.win_length - waveform.shape[1]
-                                    waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
-                                    # logger.debug(f"Padded short audio {audio_file_stem}. New length: {waveform.shape[1]}")
-
-                                # Estimate mel frames (audio_length // hop_length)
-                                # Add 1 because the number of frames is usually (waveform_length - win_length) / hop_length + 1
-                                audio_length_frames = (waveform.shape[1] - self.config.n_fft) // self.config.hop_length + 1
-                                if audio_length_frames < 1: # Handle cases where padding wasn't enough for even one frame
-                                    audio_length_frames = 1
-
-                            except Exception as e:
-                                logger.warning(f"Could not load or process audio {audio_path}: {e}. Skipping.")
+                            # Get audio info efficiently (cached)
+                            audio_info = self._get_audio_info_cached(audio_path, audio_info_cache)
+                            if audio_info is None:
                                 continue
+
+                            cache_updated = True
+                            sample_rate, num_frames = audio_info
+
+                            # Calculate mel frames
+                            audio_length_frames = (num_frames - self.config.n_fft) // self.config.hop_length + 1
+                            if audio_length_frames < 1:
+                                audio_length_frames = 1
 
                             # Pre-calculate phoneme length
                             phoneme_indices = self.phoneme_processor.text_to_indices(text)
                             phoneme_length = len(phoneme_indices)
 
                             # Clip extremely long sequences to prevent memory issues during training
+                            original_frames = audio_length_frames
                             if audio_length_frames > self.config.max_seq_length:
                                 logger.warning(f"Clipping {audio_file_stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
                                 audio_length_frames = self.config.max_seq_length
                                 # Also adjust phoneme length if it's too long, proportionally
-                                if phoneme_length > 0:
-                                    # Estimate a new phoneme length based on the clipped audio length
-                                    original_audio_len_samples = waveform.shape[1]
-                                    original_audio_len_frames = (original_audio_len_samples - self.config.n_fft) // self.config.hop_length + 1
-
-                                    if original_audio_len_frames > 0: # Avoid division by zero
-                                        # Proportionally scale phoneme length
-                                        phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_audio_len_frames))
-                                    phoneme_length = max(1, phoneme_length) # Ensure at least 1 phoneme if original was > 0
+                                if phoneme_length > 0 and original_frames > 0:
+                                    # Proportionally scale phoneme length
+                                    phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_frames))
+                                    phoneme_length = max(1, phoneme_length)
 
                             samples.append({
                                 'audio_path': str(audio_path),
                                 'text': text,
                                 'audio_file': audio_file_stem,
-                                'audio_length': audio_length_frames, # in mel frames
+                                'audio_length': audio_length_frames,
                                 'phoneme_length': phoneme_length
                             })
         else:
@@ -157,42 +250,31 @@ class RuslanDataset(Dataset):
                         with open(txt_file, 'r', encoding='utf-8') as f:
                             text = f.read().strip()
 
-                        # Pre-calculate audio length (in mel frames)
-                        try:
-                            waveform, sr = torchaudio.load(wav_file)
-                            if sr != self.config.sample_rate:
-                                resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
-                                waveform = resampler(waveform)
-
-                            # Ensure waveform is at least win_length for STFT
-                            if waveform.shape[1] < self.config.win_length:
-                                padding_needed = self.config.win_length - waveform.shape[1]
-                                waveform = torch.nn.functional.pad(waveform, (0, padding_needed))
-                                # logger.debug(f"Padded short audio {wav_file.stem}. New length: {waveform.shape[1]}")
-
-                            audio_length_frames = (waveform.shape[1] - self.config.n_fft) // self.config.hop_length + 1
-                            if audio_length_frames < 1:
-                                audio_length_frames = 1
-
-                        except Exception as e:
-                            logger.warning(f"Could not load or process audio {wav_file}: {e}. Skipping.")
+                        # Get audio info efficiently (cached)
+                        audio_info = self._get_audio_info_cached(wav_file, audio_info_cache)
+                        if audio_info is None:
                             continue
+
+                        cache_updated = True
+                        sample_rate, num_frames = audio_info
+
+                        # Calculate mel frames
+                        audio_length_frames = (num_frames - self.config.n_fft) // self.config.hop_length + 1
+                        if audio_length_frames < 1:
+                            audio_length_frames = 1
 
                         # Pre-calculate phoneme length
                         phoneme_indices = self.phoneme_processor.text_to_indices(text)
                         phoneme_length = len(phoneme_indices)
 
                         # Clip extremely long sequences
+                        original_frames = audio_length_frames
                         if audio_length_frames > self.config.max_seq_length:
-                             logger.warning(f"Clipping {wav_file.stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
-                             audio_length_frames = self.config.max_seq_length
-                             if phoneme_length > 0:
-                                original_audio_len_samples = waveform.shape[1]
-                                original_audio_len_frames = (original_audio_len_samples - self.config.n_fft) // self.config.hop_length + 1
-                                if original_audio_len_frames > 0:
-                                    phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_audio_len_frames))
+                            logger.warning(f"Clipping {wav_file.stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
+                            audio_length_frames = self.config.max_seq_length
+                            if phoneme_length > 0 and original_frames > 0:
+                                phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_frames))
                                 phoneme_length = max(1, phoneme_length)
-
 
                         samples.append({
                             'audio_path': str(wav_file),
@@ -202,9 +284,19 @@ class RuslanDataset(Dataset):
                             'phoneme_length': phoneme_length
                         })
 
+        # Save updated cache
+        if cache_updated:
+            self._save_cache(audio_info_cache)
+
         # Sort samples by their combined length (or just audio_length) for efficient batching
         # Sorting by audio length is generally most impactful for Mel-spectrograms
         samples.sort(key=lambda x: x['audio_length'])
+
+        # If indices are provided, filter to subset (for train/val split)
+        if self.indices is not None:
+            samples = [samples[i] for i in self.indices if i < len(samples)]
+            logger.info(f"Using subset of {len(samples)} samples (from indices)")
+
         return samples
 
     def __len__(self) -> int:
@@ -250,33 +342,107 @@ class RuslanDataset(Dataset):
         phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
         phoneme_indices_tensor = torch.tensor(phoneme_indices, dtype=torch.long)
 
-        # --- Generate Phoneme Durations (PLACEHOLDER/DUMMY) ---
+        # --- Get Phoneme Durations (MFA or Estimated) ---
         num_mel_frames = mel_spec.shape[1]
         num_phonemes = phoneme_indices_tensor.shape[0]
 
-        if num_phonemes == 0:
-            phoneme_durations = torch.zeros_like(phoneme_indices_tensor, dtype=torch.long)
-        else:
-            avg_duration = num_mel_frames / num_phonemes
-            phoneme_durations = torch.full((num_phonemes,), int(avg_duration), dtype=torch.long)
+        # Try to get MFA alignments first
+        mfa_durations = None
+        if self.mfa is not None:
+            mfa_durations = self.mfa.get_phoneme_durations(sample['audio_file'])
 
-            remainder = num_mel_frames - torch.sum(phoneme_durations).item()
-            # Distribute remainder frames to early phonemes
-            for i in range(remainder):
-                if i < num_phonemes: # Ensure we don't go out of bounds
-                    phoneme_durations[i] += 1
+        if mfa_durations is not None and len(mfa_durations) > 0:
+            # Use MFA durations
+            phoneme_durations = torch.tensor(mfa_durations, dtype=torch.long)
+
+            # Handle length mismatch between MFA phonemes and our phonemes
+            if len(phoneme_durations) != num_phonemes:
+                # Log warning only occasionally to avoid spam
+                if idx % 1000 == 0:
+                    logger.debug(f"MFA duration length ({len(phoneme_durations)}) != "
+                               f"phoneme length ({num_phonemes}) for {sample['audio_file']}")
+
+                # Adjust durations to match phoneme count
+                if len(phoneme_durations) > num_phonemes:
+                    # Truncate
+                    phoneme_durations = phoneme_durations[:num_phonemes]
+                else:
+                    # Pad with estimated durations for missing phonemes
+                    missing = num_phonemes - len(phoneme_durations)
+                    avg_dur = int(phoneme_durations.float().mean().item()) if len(phoneme_durations) > 0 else 5
+                    padding = torch.full((missing,), avg_dur, dtype=torch.long)
+                    phoneme_durations = torch.cat([phoneme_durations, padding])
+
+            # Ensure durations are at least 1 frame
             phoneme_durations = torch.clamp(phoneme_durations, min=1)
+
+        else:
+            # Fall back to estimated durations
+            if num_phonemes == 0:
+                phoneme_durations = torch.zeros_like(phoneme_indices_tensor, dtype=torch.long)
+            else:
+                avg_duration = num_mel_frames / num_phonemes
+                phoneme_durations = torch.full((num_phonemes,), int(avg_duration), dtype=torch.long)
+
+                remainder = num_mel_frames - torch.sum(phoneme_durations).item()
+                # Distribute remainder frames to early phonemes
+                for i in range(remainder):
+                    if i < num_phonemes: # Ensure we don't go out of bounds
+                        phoneme_durations[i] += 1
+                phoneme_durations = torch.clamp(phoneme_durations, min=1)
 
         # --- Generate Stop Token Targets ---
         stop_token_targets = torch.zeros(mel_spec.shape[1], dtype=torch.float32)
         if mel_spec.shape[1] > 0:
             stop_token_targets[-1] = 1.0
 
+        # --- Extract Pitch and Energy (if variance prediction enabled) ---
+        pitch = None
+        energy = None
+
+        if self.use_variance:
+            try:
+                # Extract pitch from audio
+                pitch = PitchExtractor.extract_pitch(
+                    audio.squeeze(0),  # Remove channel dim
+                    sample_rate=self.config.sample_rate,
+                    hop_length=self.config.hop_length
+                )
+
+                # Match length to mel frames
+                if len(pitch) > num_mel_frames:
+                    pitch = pitch[:num_mel_frames]
+                elif len(pitch) < num_mel_frames:
+                    padding = torch.zeros(num_mel_frames - len(pitch), device=pitch.device)
+                    pitch = torch.cat([pitch, padding])
+
+                # Extract energy from mel spectrogram
+                energy = EnergyExtractor.extract_energy_from_mel(mel_spec)
+
+                # Ensure energy matches mel frames
+                if len(energy) > num_mel_frames:
+                    energy = energy[:num_mel_frames]
+                elif len(energy) < num_mel_frames:
+                    padding = torch.zeros(num_mel_frames - len(energy), device=energy.device)
+                    energy = torch.cat([energy, padding])
+
+            except Exception as e:
+                logger.warning(f"Failed to extract pitch/energy for {sample['audio_file']}: {e}")
+                # Use zeros as fallback
+                pitch = torch.zeros(num_mel_frames)
+                energy = torch.zeros(num_mel_frames)
+        else:
+            # Variance prediction disabled, use zeros
+            pitch = torch.zeros(num_mel_frames)
+            energy = torch.zeros(num_mel_frames)
+
         return {
             'mel_spec': mel_spec,
             'phoneme_indices': phoneme_indices_tensor,
             'phoneme_durations': phoneme_durations,
             'stop_token_targets': stop_token_targets,
+            'pitch': pitch,
+            'energy': energy,
             'text': sample['text'],
             'audio_file': sample['audio_file'],
             'mel_length': mel_spec.shape[1], # Actual length after potential clipping
@@ -291,6 +457,10 @@ def collate_fn(batch: List[Dict]) -> Dict:
     phoneme_durations = [item['phoneme_durations'] for item in batch]
     stop_token_targets = [item['stop_token_targets'] for item in batch] # (float32)
 
+    # Pitch and energy
+    pitches = [item['pitch'] for item in batch]
+    energies = [item['energy'] for item in batch]
+
     # Extract original lengths for loss masking if needed later
     mel_lengths = torch.tensor([item['mel_length'] for item in batch], dtype=torch.long)
     phoneme_lengths = torch.tensor([item['phoneme_length'] for item in batch], dtype=torch.long)
@@ -303,12 +473,16 @@ def collate_fn(batch: List[Dict]) -> Dict:
     phoneme_indices_padded = pad_sequence(phoneme_indices, batch_first=True, padding_value=0)
     phoneme_durations_padded = pad_sequence(phoneme_durations, batch_first=True, padding_value=0)
     stop_token_targets_padded = pad_sequence(stop_token_targets, batch_first=True, padding_value=0.0)
+    pitches_padded = pad_sequence(pitches, batch_first=True, padding_value=0.0)
+    energies_padded = pad_sequence(energies, batch_first=True, padding_value=0.0)
 
     return {
         'mel_specs': mel_specs_padded,
         'phoneme_indices': phoneme_indices_padded,
         'phoneme_durations': phoneme_durations_padded,
         'stop_token_targets': stop_token_targets_padded,
+        'pitches': pitches_padded,
+        'energies': energies_padded,
         'mel_lengths': mel_lengths,        # Add mel lengths to the batch
         'phoneme_lengths': phoneme_lengths, # Add phoneme lengths to the batch
         'texts': texts,

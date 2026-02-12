@@ -12,6 +12,13 @@ from positional_encoding import PositionalEncoding
 from transformers import TransformerDecoder, TransformerEncoderBlock
 from gpu_profiler import GPUProfiler
 
+try:
+    from variance_predictor import VarianceAdaptor
+    VARIANCE_AVAILABLE = True
+except ImportError:
+    VARIANCE_AVAILABLE = False
+    logger.warning("Variance predictor not available")
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,19 +32,25 @@ class KokoroModel(nn.Module):
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
                  encoder_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
                  max_decoder_seq_len: int = 4000, enable_profiling: bool = False,
-                 gradient_checkpointing: bool = True, checkpoint_segments: int = 2):
+                 gradient_checkpointing: bool = True, checkpoint_segments: int = 2,
+                 use_variance_predictor: bool = True, variance_filter_size: int = 256,
+                 variance_kernel_size: int = 3, variance_dropout: float = 0.1,
+                 n_variance_bins: int = 256, pitch_min: float = 50.0,
+                 pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
         Args:
             gradient_checkpointing: Enable gradient checkpointing by default (True)
             checkpoint_segments: Number of segments to divide layers into for checkpointing
+            use_variance_predictor: Enable variance predictor for pitch/energy
         """
         super().__init__()
         self.vocab_size = vocab_size
         self.mel_dim = mel_dim
         self.hidden_dim = hidden_dim
         self.max_decoder_seq_len = max_decoder_seq_len
+        self.use_variance_predictor = use_variance_predictor and VARIANCE_AVAILABLE
 
         # Gradient checkpointing configuration
         self.gradient_checkpointing = gradient_checkpointing
@@ -58,16 +71,32 @@ class KokoroModel(nn.Module):
             for _ in range(n_encoder_layers)
         ])
 
-        # Duration Predictor
-        self.duration_predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(encoder_dropout),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(encoder_dropout),
-            nn.Linear(hidden_dim // 2, 1)
-        )
+        # Variance Adaptor (includes duration, pitch, energy predictors)
+        if self.use_variance_predictor:
+            self.variance_adaptor = VarianceAdaptor(
+                hidden_dim=hidden_dim,
+                filter_size=variance_filter_size,
+                kernel_size=variance_kernel_size,
+                dropout=variance_dropout,
+                n_bins=n_variance_bins,
+                pitch_min=pitch_min,
+                pitch_max=pitch_max,
+                energy_min=energy_min,
+                energy_max=energy_max
+            )
+            logger.info("Variance predictor enabled (pitch/energy)")
+        else:
+            # Fallback duration predictor
+            self.duration_predictor = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(encoder_dropout),
+                nn.Linear(hidden_dim, hidden_dim // 2),
+                nn.ReLU(),
+                nn.Dropout(encoder_dropout),
+                nn.Linear(hidden_dim // 2, 1)
+            )
+            logger.info("Variance predictor disabled, using basic duration predictor")
 
         # Mel feature projection to match hidden dimension for decoder input
         self.mel_projection_in = nn.Linear(mel_dim, hidden_dim)
@@ -360,6 +389,63 @@ class KokoroModel(nn.Module):
 
             return expanded_encoder_outputs, encoder_output_padding_mask
 
+    def _average_by_duration(self,
+                            values: torch.Tensor,
+                            durations: torch.Tensor,
+                            mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Average frame-level values (pitch/energy) to phoneme-level using durations
+
+        Args:
+            values: Frame-level values (batch, mel_frames)
+            durations: Phoneme durations (batch, phonemes)
+            mask: Phoneme padding mask (batch, phonemes)
+
+        Returns:
+            Phoneme-level averaged values (batch, phonemes)
+        """
+        batch_size = durations.shape[0]
+        num_phonemes = durations.shape[1]
+        device = durations.device
+
+        phoneme_values = []
+
+        for b in range(batch_size):
+            curr_durations = durations[b]  # (phonemes,)
+            curr_values = values[b]  # (frames,)
+            curr_mask = mask[b] if mask is not None else torch.zeros_like(curr_durations).bool()
+
+            phoneme_level_values = []
+            frame_idx = 0
+
+            for p, dur in enumerate(curr_durations):
+                if curr_mask[p]:  # Skip masked phonemes
+                    phoneme_level_values.append(0.0)
+                    continue
+
+                dur_int = int(dur.item())
+                if dur_int > 0 and frame_idx < len(curr_values):
+                    # Average the values for this phoneme's frames
+                    end_idx = min(frame_idx + dur_int, len(curr_values))
+                    phoneme_value = curr_values[frame_idx:end_idx].mean()
+                    phoneme_level_values.append(phoneme_value.item())
+                    frame_idx = end_idx
+                else:
+                    phoneme_level_values.append(0.0)
+
+            phoneme_values.append(torch.tensor(phoneme_level_values, device=device))
+
+        # Pad to same length
+        max_len = max(len(pv) for pv in phoneme_values)
+        padded_values = []
+        for pv in phoneme_values:
+            if len(pv) < max_len:
+                padding = torch.zeros(max_len - len(pv), device=device)
+                pv = torch.cat([pv, padding])
+            padded_values.append(pv)
+
+        return torch.stack(padded_values, dim=0)
+
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
         """Generates an upper-triangular matrix of -inf, used for masked self-attention."""
@@ -372,11 +458,17 @@ class KokoroModel(nn.Module):
         mel_specs: torch.Tensor,
         phoneme_durations: torch.Tensor,
         stop_token_targets: torch.Tensor,
+        pitch_targets: Optional[torch.Tensor] = None,
+        energy_targets: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
         mel_padding_mask: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, ...]:
         """
-        Enhanced training forward pass with gradient checkpointing enabled by default
+        Enhanced training forward pass with variance prediction
+
+        Returns:
+            Tuple of (predicted_mel_frames, predicted_log_durations, predicted_stop_logits,
+                     predicted_pitch, predicted_energy)
         """
         with torch.profiler.record_function("forward_training"):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
@@ -399,8 +491,42 @@ class KokoroModel(nn.Module):
                 # Encode text using checkpointed Transformer encoder (logging handled internally)
                 text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
-                # Predict durations with checkpointing (logging handled internally)
-                predicted_log_durations = self._predict_durations(text_encoded)
+                # Use variance adaptor if enabled
+                if self.use_variance_predictor:
+                    # Variance adaptor predicts duration, pitch, energy and adds embeddings
+                    # For training, we need to average pitch/energy from mel-level to phoneme-level
+                    phoneme_pitch = None
+                    phoneme_energy = None
+
+                    if pitch_targets is not None:
+                        # Average pitch per phoneme duration
+                        phoneme_pitch = self._average_by_duration(
+                            pitch_targets, phoneme_durations, text_padding_mask
+                        )
+
+                    if energy_targets is not None:
+                        # Average energy per phoneme duration
+                        phoneme_energy = self._average_by_duration(
+                            energy_targets, phoneme_durations, text_padding_mask
+                        )
+
+                    # Apply variance adaptor
+                    adapted_encoder_output, predicted_log_durations, predicted_pitch, predicted_energy = \
+                        self.variance_adaptor(
+                            text_encoded,
+                            mask=text_padding_mask,
+                            pitch_target=phoneme_pitch,
+                            energy_target=phoneme_energy,
+                            duration_target=phoneme_durations.float()
+                        )
+
+                    # Use adapted output for length regulation
+                    text_encoded = adapted_encoder_output
+                else:
+                    # Fallback to basic duration predictor
+                    predicted_log_durations = self._predict_durations(text_encoded)
+                    predicted_pitch = None
+                    predicted_energy = None
 
                 # Length regulate (logging handled internally)
                 expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
@@ -497,7 +623,7 @@ class KokoroModel(nn.Module):
                 if self.enable_profiling:
                     self.profiler.log_memory_stats("training_end")
 
-                return predicted_mel_frames, predicted_log_durations, predicted_stop_logits
+                return predicted_mel_frames, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy
 
             except Exception as e:
                 logger.error(f"Error in forward_training: {e}")
@@ -654,6 +780,8 @@ class KokoroModel(nn.Module):
         mel_specs: Optional[torch.Tensor] = None,
         phoneme_durations: Optional[torch.Tensor] = None,
         stop_token_targets: Optional[torch.Tensor] = None,
+        pitch_targets: Optional[torch.Tensor] = None,
+        energy_targets: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
         mel_padding_mask: Optional[torch.Tensor] = None
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
@@ -666,7 +794,8 @@ class KokoroModel(nn.Module):
                 raise ValueError("phoneme_durations and stop_token_targets must be provided for training mode.")
             return self.forward_training(
                 phoneme_indices, mel_specs, phoneme_durations,
-                stop_token_targets, text_padding_mask, mel_padding_mask
+                stop_token_targets, pitch_targets, energy_targets,
+                text_padding_mask, mel_padding_mask
             )
         else:
             self.eval()

@@ -77,11 +77,62 @@ Examples:
         help='Save checkpoint every N epochs (default: 2)'
     )
 
+    parser.add_argument(
+        '--mfa-alignments',
+        type=str,
+        default=None,
+        help='Path to MFA alignment directory (default: auto-detect from ./mfa_output/alignments)'
+    )
+
+    parser.add_argument(
+        '--no-mfa',
+        action='store_true',
+        help='Disable MFA alignments and use estimated durations'
+    )
+
+    parser.add_argument(
+        '--val-split',
+        type=float,
+        default=0.1,
+        help='Validation split ratio (default: 0.1 = 10%%)'
+    )
+
+    parser.add_argument(
+        '--no-validation',
+        action='store_true',
+        help='Disable validation (use all data for training)'
+    )
+
+    parser.add_argument(
+        '--early-stopping-patience',
+        type=int,
+        default=10,
+        help='Early stopping patience in epochs (default: 10)'
+    )
+
+    parser.add_argument(
+        '--validation-interval',
+        type=int,
+        default=1,
+        help='Run validation every N epochs (default: 1)'
+    )
+
     return parser.parse_args()
 
 
 def create_config_from_args(args) -> TrainingConfig:
     """Create TrainingConfig from parsed arguments"""
+
+    # Determine MFA alignment directory
+    mfa_alignment_dir = "./mfa_output/alignments"
+    if args.mfa_alignments:
+        mfa_alignment_dir = args.mfa_alignments
+
+    use_mfa = not args.no_mfa
+
+    # Validation settings
+    validation_split = 0.0 if args.no_validation else args.val_split
+
     return TrainingConfig(
         data_dir=args.corpus,
         output_dir=args.output,
@@ -97,7 +148,12 @@ def create_config_from_args(args) -> TrainingConfig:
         f_max=8000.0,
         save_every=args.save_every,
         use_mixed_precision=True,
+        use_mfa=use_mfa,
+        mfa_alignment_dir=mfa_alignment_dir,
         num_workers=0,  # Important for MPS
         pin_memory=False,  # Important for MPS
-        resume_checkpoint=args.resume
+        resume_checkpoint=args.resume,
+        validation_split=validation_split,
+        validation_interval=args.validation_interval,
+        early_stopping_patience=args.early_stopping_patience
     )
