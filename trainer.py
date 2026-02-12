@@ -292,8 +292,11 @@ class KokoroTrainer:
         use_onecycle = getattr(config, 'use_onecycle_lr', True)
         if use_onecycle:
             # Calculate total training steps for OneCycleLR
+            # With gradient accumulation, optimizer steps = batches / accumulation_steps
             steps_per_epoch = len(self.dataloader)
-            total_steps = config.num_epochs * steps_per_epoch
+            gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+            optimizer_steps_per_epoch = (steps_per_epoch + gradient_accumulation_steps - 1) // gradient_accumulation_steps
+            total_steps = config.num_epochs * optimizer_steps_per_epoch
 
             max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 10.0)
             pct_start = getattr(config, 'pct_start', 0.3)
@@ -312,7 +315,8 @@ class KokoroTrainer:
                 last_epoch=-1  # Start from beginning
             )
             self.scheduler_per_batch = True
-            logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={total_steps}, pct_start={pct_start}")
+            logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={total_steps} "
+                       f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
         else:
             # Legacy CosineAnnealingWarmRestarts
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -1018,6 +1022,10 @@ class KokoroTrainer:
 
         num_batches = len(self.dataloader)
 
+        # Gradient accumulation for larger effective batch sizes
+        gradient_accumulation_steps = getattr(self.config, 'gradient_accumulation_steps', 1)
+        accumulated_step = 0  # Track steps within accumulation cycle
+
         # Determine if profiling for this epoch
         is_profiling_epoch = (epoch == self.config.profile_epoch_start) and self.config.enable_profiling
         enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
@@ -1118,8 +1126,9 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("data_loading")
 
-                # Use set_to_none=True for faster gradient zeroing (avoids memory allocation)
-                self.optimizer.zero_grad(set_to_none=True)
+                # Zero gradients only at start of accumulation cycle
+                if accumulated_step == 0:
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass with mixed precision and interbatch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
@@ -1205,6 +1214,9 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("loss_calculation")
 
+                # Scale loss by gradient accumulation steps for proper gradient averaging
+                scaled_total_loss = total_loss / gradient_accumulation_steps
+
                 # Backward pass with mixed precision and interbatch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
@@ -1213,21 +1225,21 @@ class KokoroTrainer:
                     with torch.profiler.record_function("Backward_Pass"):
                         if self.use_mixed_precision:
                             if self.device_type == 'cuda':
-                                self.scaler.scale(total_loss).backward()
+                                self.scaler.scale(scaled_total_loss).backward()
                             else:  # MPS
-                                scaled_loss = self.scaler.scale(total_loss)
+                                scaled_loss = self.scaler.scale(scaled_total_loss)
                                 scaled_loss.backward()
                         else:
-                            total_loss.backward()
+                            scaled_total_loss.backward()
                 else:
                     if self.use_mixed_precision:
                         if self.device_type == 'cuda':
-                            self.scaler.scale(total_loss).backward()
+                            self.scaler.scale(scaled_total_loss).backward()
                         else:  # MPS
-                            scaled_loss = self.scaler.scale(total_loss)
+                            scaled_loss = self.scaler.scale(scaled_total_loss)
                             scaled_loss.backward()
                     else:
-                        total_loss.backward()
+                        scaled_total_loss.backward()
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_backward_pass()
@@ -1235,64 +1247,75 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
 
-                # Optimizer step with mixed precision - no profiler wrapper (lightweight operation)
-                if self.use_mixed_precision:
-                    if self.device_type == 'cuda':
-                        # CUDA path with built-in GradScaler
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                # Increment accumulation step counter
+                accumulated_step += 1
 
-                        old_scale = self.scaler.get_scale()
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        new_scale = self.scaler.get_scale()
+                # Determine if we should step the optimizer (accumulation complete or last batch)
+                is_last_batch = (batch_idx == num_batches - 1)
+                should_step = (accumulated_step >= gradient_accumulation_steps) or is_last_batch
 
-                        # Step scheduler immediately after optimizer step (for OneCycleLR)
-                        if self.scheduler_per_batch:
-                            self.scheduler.step()
+                # Optimizer step with mixed precision - only when accumulation is complete
+                if should_step:
+                    if self.use_mixed_precision:
+                        if self.device_type == 'cuda':
+                            # CUDA path with built-in GradScaler
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                        # Update mixed precision stats
-                        if new_scale != old_scale:
-                            self.mixed_precision_stats['scale_updates'] += 1
-                            if new_scale < old_scale:
-                                self.mixed_precision_stats['scale_decreases'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
+                            old_scale = self.scaler.get_scale()
+                            self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                            new_scale = self.scaler.get_scale()
+
+                            # Step scheduler immediately after optimizer step (for OneCycleLR)
+                            if self.scheduler_per_batch:
+                                self.scheduler.step()
+
+                            # Update mixed precision stats
+                            if new_scale != old_scale:
+                                self.mixed_precision_stats['scale_updates'] += 1
+                                if new_scale < old_scale:
+                                    self.mixed_precision_stats['scale_decreases'] += 1
+                                    self.mixed_precision_stats['overflow_count'] += 1
+                                else:
+                                    self.mixed_precision_stats['successful_steps'] += 1
                             else:
                                 self.mixed_precision_stats['successful_steps'] += 1
-                        else:
-                            self.mixed_precision_stats['successful_steps'] += 1
 
-                    else:  # MPS path with custom scaler
-                        # For MPS, clip gradients before unscaling
+                        else:  # MPS path with custom scaler
+                            # For MPS, clip gradients before unscaling
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+
+                            old_scale = self.scaler.get_scale()
+                            step_successful = self.scaler.step(self.optimizer)
+                            self.scaler.update()
+                            new_scale = self.scaler.get_scale()
+
+                            # Step scheduler immediately after optimizer step (for OneCycleLR)
+                            if self.scheduler_per_batch:
+                                self.scheduler.step()
+
+                            # Update mixed precision stats
+                            if step_successful:
+                                self.mixed_precision_stats['successful_steps'] += 1
+                            else:
+                                self.mixed_precision_stats['skipped_steps'] += 1
+                                self.mixed_precision_stats['overflow_count'] += 1
+
+                            if new_scale != old_scale:
+                                self.mixed_precision_stats['scale_updates'] += 1
+                                if new_scale < old_scale:
+                                    self.mixed_precision_stats['scale_decreases'] += 1
+                    else:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-
-                        old_scale = self.scaler.get_scale()
-                        step_successful = self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                        new_scale = self.scaler.get_scale()
+                        self.optimizer.step()
 
                         # Step scheduler immediately after optimizer step (for OneCycleLR)
                         if self.scheduler_per_batch:
                             self.scheduler.step()
 
-                        # Update mixed precision stats
-                        if step_successful:
-                            self.mixed_precision_stats['successful_steps'] += 1
-                        else:
-                            self.mixed_precision_stats['skipped_steps'] += 1
-                            self.mixed_precision_stats['overflow_count'] += 1
-
-                        if new_scale != old_scale:
-                            self.mixed_precision_stats['scale_updates'] += 1
-                            if new_scale < old_scale:
-                                self.mixed_precision_stats['scale_decreases'] += 1
-                else:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    self.optimizer.step()
-
-                    # Step scheduler immediately after optimizer step (for OneCycleLR)
-                    if self.scheduler_per_batch:
-                        self.scheduler.step()
+                    # Reset accumulation counter after stepping
+                    accumulated_step = 0
 
                 if is_profiling_epoch:
                     self.log_memory_stats("optimizer_step")

@@ -20,6 +20,9 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
+    # Gradient accumulation for larger effective batch sizes
+    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * gradient_accumulation_steps
+
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
     max_lr_multiplier: float = 10.0  # Max LR = learning_rate * this value
