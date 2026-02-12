@@ -118,6 +118,11 @@ class TrainingConfig:
 
     use_mixed_precision: bool = True
 
+    # torch.compile optimization (PyTorch 2.0+)
+    use_torch_compile: bool = True
+    torch_compile_mode: str = 'reduce-overhead'  # 'default', 'reduce-overhead', 'max-autotune'
+    torch_compile_dynamic: bool = True  # Handle dynamic shapes better
+
     def __post_init__(self):
         """Post-initialization to handle gradient checkpointing optimization"""
 

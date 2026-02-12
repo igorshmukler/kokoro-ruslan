@@ -233,6 +233,30 @@ class KokoroTrainer:
         )
         self.model.to(self.device)
 
+        # Apply torch.compile for optimized training (PyTorch 2.0+)
+        # Note: Disabled for MPS due to float64 support limitations
+        use_compile = getattr(config, 'use_torch_compile', False)
+        if use_compile and torch.__version__ >= '2.0':
+            # Only enable torch.compile for CUDA - MPS has limited dtype support
+            if self.device_type == 'cuda':
+                try:
+                    compile_mode = getattr(config, 'torch_compile_mode', 'reduce-overhead')
+                    compile_dynamic = getattr(config, 'torch_compile_dynamic', True)
+
+                    self.model = torch.compile(
+                        self.model,
+                        mode=compile_mode,
+                        fullgraph=False,  # Allow graph breaks for complex model architecture
+                        dynamic=compile_dynamic  # Better handling of dynamic shapes
+                    )
+                    logger.info(f"Model compiled with torch.compile (mode='{compile_mode}', dynamic={compile_dynamic})")
+                except Exception as e:
+                    logger.warning(f"torch.compile failed: {e}. Training will proceed without compilation.")
+            else:
+                logger.info(f"torch.compile disabled for {self.device_type} (limited dtype support)")
+        elif use_compile:
+            logger.warning(f"torch.compile requested but PyTorch version is {torch.__version__} (requires 2.0+)")
+
         # Log model information
         model_info = self.model.get_model_info()
         logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
