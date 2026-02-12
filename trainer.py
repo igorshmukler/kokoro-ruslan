@@ -46,16 +46,20 @@ def check_mps_mixed_precision_support():
     major, minor = int(torch_version[0]), int(torch_version[1])
 
     if major < 2:
+        logger.info(f"MPS autocast requires PyTorch 2.0+, found {torch.__version__}")
         return False
 
     # Test if autocast works on MPS
     try:
         device = torch.device('mps')
         x = torch.randn(2, 2, device=device)
+        # Try using the autocast API
         with torch.autocast(device_type='mps', dtype=torch.float16):
             y = torch.mm(x, x)
+        logger.info("MPS autocast support verified")
         return True
-    except:
+    except (RuntimeError, AttributeError) as e:
+        logger.warning(f"MPS autocast not supported: {e}")
         return False
 
 
@@ -139,19 +143,37 @@ class KokoroTrainer:
             self.dataset = full_dataset
             self.val_dataset = None
 
-        # Initialize the custom LengthBasedBatchSampler for training
-        self.batch_sampler = LengthBasedBatchSampler(
-            dataset=self.dataset,
-            batch_size=config.batch_size,
-            drop_last=True,
-            shuffle=True
-        )
+        # Initialize batch sampler for training (dynamic or fixed)
+        use_dynamic = getattr(config, 'use_dynamic_batching', True)
+
+        if use_dynamic:
+            from dataset import DynamicFrameBatchSampler
+
+            logger.info("Using dynamic frame-based batching")
+            self.batch_sampler = DynamicFrameBatchSampler(
+                dataset=self.dataset,
+                max_frames=getattr(config, 'max_frames_per_batch', 20000),
+                min_batch_size=getattr(config, 'min_batch_size', 4),
+                max_batch_size=getattr(config, 'max_batch_size', 32),
+                drop_last=True,
+                shuffle=True
+            )
+        else:
+            from dataset import LengthBasedBatchSampler
+
+            logger.info("Using fixed batch size")
+            self.batch_sampler = LengthBasedBatchSampler(
+                dataset=self.dataset,
+                batch_size=config.batch_size,
+                drop_last=True,
+                shuffle=True
+            )
 
         self.dataloader = DataLoader(
             self.dataset,
             batch_sampler=self.batch_sampler,
             collate_fn=collate_fn,
-            num_workers=2,
+            num_workers=4,
             pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
             prefetch_factor=3,
             persistent_workers=True
@@ -159,18 +181,33 @@ class KokoroTrainer:
 
         # Initialize validation dataloader if validation set exists
         if self.val_dataset is not None:
-            val_batch_sampler = LengthBasedBatchSampler(
-                dataset=self.val_dataset,
-                batch_size=config.batch_size,
-                drop_last=False,  # Use all validation data
-                shuffle=False  # Don't shuffle validation
-            )
+            # Use dynamic batching for validation too
+            if use_dynamic:
+                from dataset import DynamicFrameBatchSampler
+
+                val_batch_sampler = DynamicFrameBatchSampler(
+                    dataset=self.val_dataset,
+                    max_frames=getattr(config, 'max_frames_per_batch', 20000),
+                    min_batch_size=getattr(config, 'min_batch_size', 4),
+                    max_batch_size=getattr(config, 'max_batch_size', 32),
+                    drop_last=False,  # Use all validation data
+                    shuffle=False  # Don't shuffle validation
+                )
+            else:
+                from dataset import LengthBasedBatchSampler
+
+                val_batch_sampler = LengthBasedBatchSampler(
+                    dataset=self.val_dataset,
+                    batch_size=config.batch_size,
+                    drop_last=False,  # Use all validation data
+                    shuffle=False  # Don't shuffle validation
+                )
 
             self.val_dataloader = DataLoader(
                 self.val_dataset,
                 batch_sampler=val_batch_sampler,
                 collate_fn=collate_fn,
-                num_workers=2,
+                num_workers=4,
                 pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
                 prefetch_factor=3,
                 persistent_workers=True
@@ -262,15 +299,32 @@ class KokoroTrainer:
 
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
+        from contextlib import nullcontext
+
         if not self.use_mixed_precision:
-            return torch.no_grad().__enter__()  # No-op context
+            return nullcontext()
 
         if self.device_type == DeviceType.CUDA.value:
-            return torch.amp.autocast('cuda')
+            return torch.amp.autocast('cuda', dtype=self.mixed_precision_dtype)
         elif self.device_type == DeviceType.MPS.value:
-            return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
+            # MPS autocast support varies by PyTorch version
+            # Try to use it, but fall back gracefully if not supported
+            try:
+                # Test if MPS autocast is supported
+                test_tensor = torch.randn(2, 2, device=self.device)
+                with torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype):
+                    _ = test_tensor * 2
+                # If successful, return the context
+                return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
+            except (RuntimeError, AttributeError) as e:
+                # Fall back to no autocast for MPS if not supported
+                logger.warning(f"MPS autocast not supported in this PyTorch version: {e}")
+                logger.warning("Disabling AMP for MPS - training will use full precision")
+                # Disable mixed precision for future calls
+                self.use_mixed_precision = False
+                return nullcontext()
         else:
-            return torch.no_grad().__enter__()  # No-op context
+            return nullcontext()
 
     def adaptive_memory_cleanup(self, batch_idx: int, force: bool = False) -> Dict[str, Any]:
         """Perform adaptive memory cleanup"""
@@ -770,16 +824,23 @@ class KokoroTrainer:
             progress_bar = tqdm(self.val_dataloader, desc=f"Validation Epoch {epoch+1}")
             for batch_idx, batch in enumerate(progress_bar):
                 try:
-                    # Data loading
+                    # Data loading - batch transfer for efficiency
                     non_blocking = self.device.type == 'cuda'
-                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=non_blocking)
-                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=non_blocking)
-                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=non_blocking)
-                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=non_blocking)
-                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
-                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
 
-                    # Pitch and energy (if variance predictor enabled)
+                    # Batch transfer all required tensors at once
+                    tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
+                                   'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
+                    transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
+                                   for k in tensor_keys}
+
+                    mel_specs = transferred['mel_specs']
+                    phoneme_indices = transferred['phoneme_indices']
+                    phoneme_durations = transferred['phoneme_durations']
+                    stop_token_targets = transferred['stop_token_targets']
+                    mel_lengths = transferred['mel_lengths']
+                    phoneme_lengths = transferred['phoneme_lengths']
+
+                    # Optional tensors (pitch and energy)
                     pitches = batch.get('pitches', None)
                     energies = batch.get('energies', None)
                     if pitches is not None:
@@ -935,14 +996,21 @@ class KokoroTrainer:
                 with torch.profiler.record_function("Data_Loading"):
                     # Use non_blocking only for CUDA
                     non_blocking = self.device.type == 'cuda'
-                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=non_blocking)
-                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=non_blocking)
-                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=non_blocking)
-                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=non_blocking)
-                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=non_blocking)
-                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=non_blocking)
 
-                    # Pitch and energy (if variance predictor enabled)
+                    # Batch transfer all required tensors at once for better performance
+                    tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
+                                   'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
+                    transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
+                                   for k in tensor_keys}
+
+                    mel_specs = transferred['mel_specs']
+                    phoneme_indices = transferred['phoneme_indices']
+                    phoneme_durations = transferred['phoneme_durations']
+                    stop_token_targets = transferred['stop_token_targets']
+                    mel_lengths = transferred['mel_lengths']
+                    phoneme_lengths = transferred['phoneme_lengths']
+
+                    # Optional tensors (pitch and energy)
                     pitches = batch.get('pitches', None)
                     energies = batch.get('energies', None)
                     if pitches is not None:
@@ -1368,6 +1436,253 @@ class KokoroTrainer:
         if self.enable_adaptive_memory:
             logger.info("Final Memory Management Report:")
             self.print_memory_management_report()
+
+    def _time_training_loop(self, use_amp: bool, num_batches: int = 10) -> float:
+        """
+        Time a training loop with or without AMP
+
+        Args:
+            use_amp: Whether to use automatic mixed precision
+            num_batches: Number of batches to time
+
+        Returns:
+            Total time in seconds for the specified batches
+        """
+        self.model.train()
+        total_time = 0.0
+        batches_processed = 0
+
+        # Save current AMP state to restore later
+        original_amp_state = self.use_mixed_precision
+        original_scaler = self.scaler
+
+        # Set AMP state for this timing run
+        self.use_mixed_precision = use_amp
+        if use_amp and original_scaler is None:
+            # Create temporary scaler if needed
+            if self.device.type == DeviceType.CUDA.value:
+                self.scaler = torch.amp.GradScaler('cuda')
+            elif self.device.type == DeviceType.MPS.value:
+                self.scaler = MPSGradScaler()
+        elif not use_amp:
+            self.scaler = None
+
+        logger.info(f"Timing training loop {'WITH' if use_amp else 'WITHOUT'} AMP for {num_batches} batches...")
+
+        # Warmup: run 2 batches to avoid cold start effects
+        warmup_batches = min(2, num_batches // 2)
+        batch_iter = iter(self.dataloader)
+
+        for _ in range(warmup_batches):
+            try:
+                batch = next(batch_iter)
+                self._run_single_batch(batch, measure_time=False)
+            except StopIteration:
+                batch_iter = iter(self.dataloader)
+                batch = next(batch_iter)
+                self._run_single_batch(batch, measure_time=False)
+
+        # Actual timing
+        start_time = time.time()
+
+        for _ in range(num_batches):
+            try:
+                batch = next(batch_iter)
+                self._run_single_batch(batch, measure_time=False)
+                batches_processed += 1
+            except StopIteration:
+                batch_iter = iter(self.dataloader)
+                batch = next(batch_iter)
+                self._run_single_batch(batch, measure_time=False)
+                batches_processed += 1
+
+        # Ensure all GPU operations are complete
+        if self.device.type == DeviceType.CUDA.value:
+            torch.cuda.synchronize()
+        elif self.device.type == DeviceType.MPS.value:
+            torch.mps.synchronize()
+
+        total_time = time.time() - start_time
+
+        # Restore original AMP state
+        self.use_mixed_precision = original_amp_state
+        self.scaler = original_scaler
+
+        avg_time_per_batch = total_time / batches_processed if batches_processed > 0 else 0
+        logger.info(f"  Processed {batches_processed} batches in {total_time:.2f}s ({avg_time_per_batch:.3f}s per batch)")
+
+        return total_time
+
+    def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
+        """
+        Run a single training batch
+
+        Args:
+            batch: Batch data dictionary
+            measure_time: Whether to return timing information
+
+        Returns:
+            Time taken if measure_time is True, else None
+        """
+        start_time = time.time() if measure_time else None
+
+        # Data loading - batch transfer for efficiency
+        non_blocking = self.device.type == 'cuda'
+
+        # Batch transfer all required tensors at once
+        tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
+                       'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
+        transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
+                       for k in tensor_keys}
+
+        mel_specs = transferred['mel_specs']
+        phoneme_indices = transferred['phoneme_indices']
+        phoneme_durations = transferred['phoneme_durations']
+        stop_token_targets = transferred['stop_token_targets']
+        mel_lengths = transferred['mel_lengths']
+        phoneme_lengths = transferred['phoneme_lengths']
+
+        # Optional tensors (pitch and energy)
+        pitches = batch.get('pitches', None)
+        energies = batch.get('energies', None)
+        if pitches is not None:
+            pitches = pitches.to(self.device, non_blocking=non_blocking)
+        if energies is not None:
+            energies = energies.to(self.device, non_blocking=non_blocking)
+
+        self.optimizer.zero_grad()
+
+        # Forward pass with optional AMP
+        if self.use_mixed_precision:
+            with self.get_autocast_context():
+                predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                    self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                             pitch_targets=pitches, energy_targets=energies)
+
+                # Convert pitch/energy to phoneme level
+                phoneme_pitches = None
+                phoneme_energies = None
+                if pitches is not None and predicted_pitch is not None:
+                    phoneme_pitches = self._average_pitch_energy_by_duration(
+                        pitches, phoneme_durations, phoneme_lengths
+                    )
+                if energies is not None and predicted_energy is not None:
+                    phoneme_energies = self._average_pitch_energy_by_duration(
+                        energies, phoneme_durations, phoneme_lengths
+                    )
+
+                # Loss calculation
+                total_loss, _, _, _, _, _ = self._calculate_losses(
+                    predicted_mel, predicted_log_durations, predicted_stop_logits,
+                    mel_specs, phoneme_durations, stop_token_targets,
+                    mel_lengths, phoneme_lengths,
+                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+                )
+
+            # Backward pass with scaler
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            # No AMP
+            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
+                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                         pitch_targets=pitches, energy_targets=energies)
+
+            # Convert pitch/energy to phoneme level
+            phoneme_pitches = None
+            phoneme_energies = None
+            if pitches is not None and predicted_pitch is not None:
+                phoneme_pitches = self._average_pitch_energy_by_duration(
+                    pitches, phoneme_durations, phoneme_lengths
+                )
+            if energies is not None and predicted_energy is not None:
+                phoneme_energies = self._average_pitch_energy_by_duration(
+                    energies, phoneme_durations, phoneme_lengths
+                )
+
+            # Loss calculation
+            total_loss, _, _, _, _, _ = self._calculate_losses(
+                predicted_mel, predicted_log_durations, predicted_stop_logits,
+                mel_specs, phoneme_durations, stop_token_targets,
+                mel_lengths, phoneme_lengths,
+                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+            )
+
+            # Regular backward pass
+            total_loss.backward()
+            self.optimizer.step()
+
+        if measure_time:
+            return time.time() - start_time
+        return None
+
+    def profile_amp_benefits(self, num_batches: int = 10) -> Dict[str, float]:
+        """
+        Compare training speed with and without AMP
+
+        Args:
+            num_batches: Number of batches to test (default: 10)
+
+        Returns:
+            Dictionary with timing results and speedup
+        """
+        logger.info("\n" + "="*60)
+        logger.info("AUTOMATIC MIXED PRECISION (AMP) PROFILING")
+        logger.info("="*60)
+        logger.info(f"Device: {self.device.type.upper()}")
+        logger.info(f"Testing with {num_batches} batches")
+        logger.info(f"Mixed precision dtype: {self.mixed_precision_dtype}")
+
+        # Check if AMP is supported
+        if self.device.type == DeviceType.CPU.value:
+            logger.warning("AMP is not supported on CPU. Skipping profiling.")
+            return {'with_amp': 0.0, 'without_amp': 0.0, 'speedup': 1.0, 'supported': False}
+
+        # Run without AMP first (baseline)
+        logger.info("\n[1/2] Running WITHOUT AMP (baseline)...")
+        without_amp_time = self._time_training_loop(use_amp=False, num_batches=num_batches)
+
+        # Clear cache between runs
+        self.clear_device_cache()
+
+        # Run with AMP
+        logger.info("\n[2/2] Running WITH AMP...")
+        with_amp_time = self._time_training_loop(use_amp=True, num_batches=num_batches)
+
+        # Calculate speedup
+        speedup = without_amp_time / with_amp_time if with_amp_time > 0 else 0.0
+
+        # Print results
+        logger.info("\n" + "="*60)
+        logger.info("AMP PROFILING RESULTS")
+        logger.info("="*60)
+        logger.info(f"Without AMP: {without_amp_time:.2f}s ({without_amp_time/num_batches:.3f}s per batch)")
+        logger.info(f"With AMP:    {with_amp_time:.2f}s ({with_amp_time/num_batches:.3f}s per batch)")
+        logger.info(f"Speedup:     {speedup:.2f}x")
+
+        if speedup > 1.2:
+            logger.info(f"✓ AMP provides significant speedup ({speedup:.2f}x faster)")
+            logger.info("  Recommendation: Keep AMP enabled (use_mixed_precision=True)")
+        elif speedup > 1.05:
+            logger.info(f"✓ AMP provides modest speedup ({speedup:.2f}x faster)")
+            logger.info("  Recommendation: AMP is beneficial, keep it enabled")
+        elif speedup > 0.95:
+            logger.info(f"≈ AMP has minimal impact ({speedup:.2f}x)")
+            logger.info("  Recommendation: AMP overhead is negligible, can keep enabled")
+        else:
+            logger.info(f"⚠ AMP is slower ({speedup:.2f}x)")
+            logger.info("  Recommendation: Consider disabling AMP (use_mixed_precision=False)")
+            logger.info("  Note: This can happen on some architectures or with small models")
+
+        logger.info("="*60 + "\n")
+
+        return {
+            'with_amp': with_amp_time,
+            'without_amp': without_amp_time,
+            'speedup': speedup,
+            'supported': True
+        }
 
     def profile_training_steps(self, num_steps: int = 10):
         """Profile a specific number of training steps with mixed precision support and adaptive memory management"""

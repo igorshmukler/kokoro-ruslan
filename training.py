@@ -44,6 +44,34 @@ def main():
 
     # Initialize trainer and start training
     trainer = KokoroTrainer(config)
+
+    # Profile AMP benefits if requested
+    if args.profile_amp:
+        logger.info("\n" + "="*70)
+        logger.info("Running AMP profiling before training...")
+        logger.info("="*70)
+
+        amp_results = trainer.profile_amp_benefits(num_batches=args.profile_amp_batches)
+
+        # Ask user if they want to continue with current settings
+        if amp_results.get('supported', False):
+            speedup = amp_results.get('speedup', 1.0)
+
+            if speedup < 1.0:
+                logger.warning("\nAMP profiling shows slower performance.")
+                logger.warning("You may want to disable mixed precision in the config.")
+                logger.warning("Continue training anyway? (Ctrl+C to cancel)")
+                try:
+                    import time
+                    time.sleep(3)  # Give user time to read and cancel if needed
+                except KeyboardInterrupt:
+                    logger.info("\nTraining cancelled by user.")
+                    return
+
+        logger.info("\n" + "="*70)
+        logger.info("Starting training...")
+        logger.info("="*70 + "\n")
+
     trainer.train()
 
 

@@ -6,3 +6,4 @@ venv
 
 # MFA output files
 mfa_output/
+__pycache__/

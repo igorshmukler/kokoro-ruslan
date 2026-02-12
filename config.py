@@ -66,6 +66,12 @@ class TrainingConfig:
     num_workers: int = 2
     pin_memory: bool = False
 
+    # Dynamic batching (batch by total frames instead of fixed size)
+    use_dynamic_batching: bool = True  # Enable frame-based batching
+    max_frames_per_batch: int = 20000  # Maximum mel frames per batch
+    min_batch_size: int = 4  # Minimum samples per batch
+    max_batch_size: int = 32  # Maximum samples per batch
+
     # Checkpointing
     save_every: int = 2
     resume_checkpoint: str = 'auto'
