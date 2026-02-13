@@ -7,3 +7,25 @@ venv
 # MFA output files
 mfa_output/
 __pycache__/
+
+
+# Data directories
+data/raw/*
+!data/raw/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Model checkpoints
+models/checkpoints/*
+!models/checkpoints/.gitkeep
+models/vocoder/*
+!models/vocoder/.gitkeep
+
+# Logs
+logs/training/*
+!logs/training/.gitkeep
+logs/profiling/*
+!logs/profiling/.gitkeep
+
+# Examples outputs
+examples/outputs/
