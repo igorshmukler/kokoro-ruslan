@@ -1375,6 +1375,14 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
 
+                # Aggressive MPS cache clearing to prevent OOM
+                if self.device_type == DeviceType.MPS.value:
+                    # Clear cache after every backward pass on MPS
+                    torch.mps.empty_cache()
+                    # Also run Python garbage collection
+                    import gc
+                    gc.collect()
+
                 # Increment accumulation step counter
                 accumulated_step += 1
 
@@ -1454,6 +1462,10 @@ class KokoroTrainer:
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
 
+                    # Clear MPS cache after optimizer step
+                    if self.device_type == DeviceType.MPS.value:
+                        torch.mps.empty_cache()
+
                 if is_profiling_epoch:
                     self.log_memory_stats("optimizer_step")
 
@@ -1480,6 +1492,19 @@ class KokoroTrainer:
                         dur_loss_epoch += acc_loss['dur'].item()
                         stop_loss_epoch += acc_loss['stop'].item()
                     accumulated_losses.clear()
+
+                    # Delete tensors and clear MPS cache periodically
+                    if self.device_type == DeviceType.MPS.value:
+                        # Explicitly delete large tensors
+                        del predicted_mel, predicted_log_durations, predicted_stop_logits
+                        if 'predicted_pitch' in locals():
+                            del predicted_pitch
+                        if 'predicted_energy' in locals():
+                            del predicted_energy
+                        # Clear cache
+                        torch.mps.empty_cache()
+                        import gc
+                        gc.collect()
 
                 # Get current loss values for progress bar (still need .item() for display)
                 current_total_loss = total_loss.item()
