@@ -36,7 +36,8 @@ class KokoroModel(nn.Module):
                  use_variance_predictor: bool = True, variance_filter_size: int = 256,
                  variance_kernel_size: int = 3, variance_dropout: float = 0.1,
                  n_variance_bins: int = 256, pitch_min: float = 50.0,
-                 pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0):
+                 pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0,
+                 use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
@@ -44,6 +45,8 @@ class KokoroModel(nn.Module):
             gradient_checkpointing: Enable gradient checkpointing by default (True)
             checkpoint_segments: Number of segments to divide layers into for checkpointing
             use_variance_predictor: Enable variance predictor for pitch/energy
+            use_stochastic_depth: Enable stochastic depth (layer dropout) for regularization
+            stochastic_depth_rate: Maximum drop probability for the last layer (linearly scaled)
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -66,9 +69,16 @@ class KokoroModel(nn.Module):
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
         )
 
+        # Stochastic depth: linearly increase drop_path from 0 to stochastic_depth_rate
+        drop_path_rates = [
+            (i / max(n_encoder_layers - 1, 1)) * stochastic_depth_rate if use_stochastic_depth else 0.0
+            for i in range(n_encoder_layers)
+        ]
+
         self.transformer_encoder_layers = nn.ModuleList([
-            TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout)
-            for _ in range(n_encoder_layers)
+            TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout,
+                                   drop_path_rate=drop_path_rates[i])
+            for i in range(n_encoder_layers)
         ])
 
         # Variance Adaptor (includes duration, pitch, energy predictors)

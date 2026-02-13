@@ -230,7 +230,9 @@ class KokoroTrainer:
             pitch_min=getattr(config, 'pitch_min', 50.0),
             pitch_max=getattr(config, 'pitch_max', 800.0),
             energy_min=getattr(config, 'energy_min', 0.0),
-            energy_max=getattr(config, 'energy_max', 100.0)
+            energy_max=getattr(config, 'energy_max', 100.0),
+            use_stochastic_depth=getattr(config, 'use_stochastic_depth', True),
+            stochastic_depth_rate=getattr(config, 'stochastic_depth_rate', 0.1)
         )
         self.model.to(self.device)
 

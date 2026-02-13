@@ -8,6 +8,33 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
+    """
+    Stochastic Depth (Drop Path) per sample.
+    Randomly drops entire residual branches during training.
+
+    Args:
+        x: Input tensor
+        drop_prob: Probability of dropping the path
+        training: Whether in training mode
+
+    Returns:
+        Output tensor with stochastic depth applied
+    """
+    if drop_prob == 0.0 or not training:
+        return x
+
+    keep_prob = 1 - drop_prob
+    # Work with diff shapes: (batch_size,) for batch dimension
+    shape = (x.shape[0],) + (1,) * (x.ndim - 1)  # (B, 1, 1, ...)
+    random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+    random_tensor.floor_()  # Binarize: 0 or 1
+
+    # Scale by keep_prob to maintain expected value
+    output = x.div(keep_prob) * random_tensor
+    return output
+
 class MultiHeadAttentionImproved(nn.Module):
     """Improved multi-head attention with better initialization and optional relative positioning"""
 
@@ -162,9 +189,10 @@ class ImprovedTransformerEncoderBlock(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', use_prenorm: bool = True,
-                 use_relative_pos: bool = False):
+                 use_relative_pos: bool = False, drop_path_rate: float = 0.0):
         super().__init__()
         self.use_prenorm = use_prenorm
+        self.drop_path_rate = drop_path_rate
 
         # Self-attention module
         self.self_attn = MultiHeadAttentionImproved(
@@ -233,11 +261,15 @@ class ImprovedTransformerEncoderBlock(nn.Module):
             attn_output, _ = self.self_attn(src_norm, src_norm, src_norm,
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
+            # Apply stochastic depth to attention output
+            attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
             src = src + self.dropout1(attn_output) # Residual connection + Dropout
 
             # Feed-forward sub-layer
             src_norm = self.norm2(src) # Apply LayerNorm BEFORE FFN
             ff_output = self._ff_block(src_norm)
+            # Apply stochastic depth to FFN output
+            ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
             src = src + self.dropout2(ff_output) # Residual connection + Dropout
         else:
             # Post-normalization (Original Transformer)
@@ -245,10 +277,14 @@ class ImprovedTransformerEncoderBlock(nn.Module):
             attn_output, _ = self.self_attn(src, src, src,
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
+            # Apply stochastic depth to attention output
+            attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
             src = self.norm1(src + self.dropout1(attn_output)) # Residual + Dropout + LayerNorm
 
             # Feed-forward sub-layer
             ff_output = self._ff_block(src)
+            # Apply stochastic depth to FFN output
+            ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
             src = self.norm2(src + self.dropout2(ff_output)) # Residual + Dropout + LayerNorm
 
         return src
@@ -430,9 +466,11 @@ class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     Backward compatibility wrapper for the original TransformerEncoderBlock.
     Defaults to original Transformer's post-norm, ReLU, no relative pos.
     """
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
+                 drop_path_rate: float = 0.0):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
-                        activation='relu', use_prenorm=False, use_relative_pos=False)
+                        activation='relu', use_prenorm=False, use_relative_pos=False,
+                        drop_path_rate=drop_path_rate)
 
 
 class TransformerDecoder(ImprovedTransformerDecoder):

@@ -54,6 +54,11 @@ class TrainingConfig:
     encoder_dropout: float = 0.1
     max_decoder_seq_len: int = 4000
 
+    # Stochastic depth (layer dropout) for regularization
+    use_stochastic_depth: bool = True  # Enable layer dropout during training
+    stochastic_depth_rate: float = 0.1  # Maximum drop probability for last layer
+    # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
+
     # Loss weights
     duration_loss_weight: float = 0.1
     stop_token_loss_weight: float = 1.0
