@@ -3,6 +3,7 @@ venv
 
 # misc
 .DS_Store
+ruslan_corpus/
 
 # MFA output files
 mfa_output/

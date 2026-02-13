@@ -32,6 +32,7 @@ src/kokoro/utils/cache_manager.py
 src/kokoro/utils/device_type.py
 src/kokoro/utils/gpu_profiler.py
 src/kokoro/utils/interbatch_profiler.py
+src/kokoro/utils/mps_optimizer.py
 src/kokoro/utils/profiling_tools.py
 src/kokoro/utils/utils.py
 src/kokoro_ruslan.egg-info/PKG-INFO

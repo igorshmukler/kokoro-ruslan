@@ -23,7 +23,7 @@ if readme_file.exists():
 
 setup(
     name="kokoro-ruslan",
-    version="0.1.0",
+    version="0.0.2",
     author="Kokoro-Ruslan Team",
     description="Transformer-based Russian Text-to-Speech System",
     long_description=long_description,

@@ -96,7 +96,7 @@ class TrainingConfig:
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
-    max_frames_per_batch: int = 20000  # Maximum mel frames per batch
+    max_frames_per_batch: int = 20000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
     max_batch_size: int = 32  # Maximum samples per batch
 
@@ -159,7 +159,24 @@ class TrainingConfig:
             from pathlib import Path
             self.feature_cache_dir = str(Path(self.data_dir) / ".feature_cache")
 
-        # Validate checkpoint segments
+        # MPS-specific memory optimizations
+        if self.device == 'mps' or (torch.backends.mps.is_available() and self.device != 'cuda'):
+            # Reduce memory usage for MPS to prevent OOM
+            if self.max_frames_per_batch > 10000:
+                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 12000")
+                self.max_frames_per_batch = 12000
+
+            if self.max_seq_length > 1500:
+                print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1500")
+                self.max_seq_length = 1500
+
+            if self.batch_size > 8:
+                print(f"MPS detected: Reducing batch_size from {self.batch_size} to 8")
+                self.batch_size = 8
+
+            if self.max_batch_size > 16:
+                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 16")
+                self.max_batch_size = 16
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1
             print("Warning: checkpoint_segments must be >= 1, setting to 1")
