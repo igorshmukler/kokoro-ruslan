@@ -1375,16 +1375,16 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
 
-                # Aggressive MPS cache clearing to prevent OOM
+                # MPS cache clearing - only when needed based on memory pressure
                 if self.device_type == DeviceType.MPS.value:
-                    # Clear cache after every backward pass on MPS
-                    torch.mps.empty_cache()
-                    # Also run Python garbage collection
-                    import gc
-                    gc.collect()
-
-                # Increment accumulation step counter
-                accumulated_step += 1
+                    # Only clear if memory pressure is moderate or higher
+                    pressure = cleanup_result.get('pressure_level', 'low')
+                    if pressure in ['moderate', 'high', 'critical']:
+                        torch.mps.empty_cache()
+                    # Run GC only on high/critical pressure or every 100 batches
+                    if pressure in ['high', 'critical'] or batch_idx % 100 == 0:
+                        import gc
+                        gc.collect()
 
                 # Determine if we should step the optimizer (accumulation complete or last batch)
                 is_last_batch = (batch_idx == num_batches - 1)
@@ -1462,12 +1462,11 @@ class KokoroTrainer:
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
 
-                    # Clear MPS cache after optimizer step
+                    # Clear MPS cache after optimizer step only if needed
                     if self.device_type == DeviceType.MPS.value:
-                        torch.mps.empty_cache()
-
-                if is_profiling_epoch:
-                    self.log_memory_stats("optimizer_step")
+                        pressure = cleanup_result.get('pressure_level', 'low')
+                        if pressure in ['high', 'critical']:
+                            torch.mps.empty_cache()
 
                 # End batch profiling
                 if enable_interbatch_profiling or is_profiling_epoch:
@@ -1493,18 +1492,20 @@ class KokoroTrainer:
                         stop_loss_epoch += acc_loss['stop'].item()
                     accumulated_losses.clear()
 
-                    # Delete tensors and clear MPS cache periodically
+                    # Delete tensors and clear MPS cache only when memory pressure is high
                     if self.device_type == DeviceType.MPS.value:
-                        # Explicitly delete large tensors
-                        del predicted_mel, predicted_log_durations, predicted_stop_logits
-                        if 'predicted_pitch' in locals():
-                            del predicted_pitch
-                        if 'predicted_energy' in locals():
-                            del predicted_energy
-                        # Clear cache
-                        torch.mps.empty_cache()
-                        import gc
-                        gc.collect()
+                        pressure = cleanup_result.get('pressure_level', 'low')
+                        if pressure in ['high', 'critical']:
+                            # Explicitly delete large tensors
+                            del predicted_mel, predicted_log_durations, predicted_stop_logits
+                            if 'predicted_pitch' in locals():
+                                del predicted_pitch
+                            if 'predicted_energy' in locals():
+                                del predicted_energy
+                            # Clear cache
+                            torch.mps.empty_cache()
+                            import gc
+                            gc.collect()
 
                 # Get current loss values for progress bar (still need .item() for display)
                 current_total_loss = total_loss.item()
