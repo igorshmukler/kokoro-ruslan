@@ -51,6 +51,7 @@ setup(
             "kokoro-train=kokoro.cli.training:main",
             "kokoro-infer=kokoro.cli.cli:main",
             "kokoro-preprocess=kokoro.cli.preprocess:main",
+            "kokoro-precompute=kokoro.cli.precompute_features:main",
         ]
     },
     python_requires=">=3.9",
