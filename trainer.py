@@ -14,6 +14,7 @@ import logging
 import torch.profiler
 import datetime
 import gc
+import copy
 
 from typing import Tuple, Dict, Any, Optional
 from dataclasses import dataclass
@@ -350,6 +351,27 @@ class KokoroTrainer:
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
         self.validation_losses = []  # Track validation loss history
+
+        # EMA (Exponential Moving Average) of model weights
+        self.use_ema = getattr(config, 'use_ema', True)
+        self.ema_decay = getattr(config, 'ema_decay', 0.9999)
+        self.ema_update_every = getattr(config, 'ema_update_every', 1)
+        self.ema_updates = 0  # Track number of EMA updates
+
+        if self.use_ema:
+            # Initialize EMA model as a deep copy of the current model
+            # This ensures all model parameters and configuration are correctly copied
+            self.ema_model = copy.deepcopy(self.model).to(self.device)
+            self.ema_model.eval()  # EMA model is always in eval mode
+
+            # Freeze EMA model (no gradients needed)
+            for param in self.ema_model.parameters():
+                param.requires_grad = False
+
+            logger.info(f"EMA initialized: decay={self.ema_decay}, update_every={self.ema_update_every}")
+        else:
+            self.ema_model = None
+            logger.info("EMA disabled")
 
         # Mixed precision training stats
         self.mixed_precision_stats = {
@@ -790,6 +812,34 @@ class KokoroTrainer:
 
         return phoneme_values
 
+    def _update_ema(self):
+        """
+        Update EMA model weights using exponential moving average.
+        EMA weights = decay * EMA weights + (1 - decay) * current weights
+        """
+        if not self.use_ema or self.ema_model is None:
+            return
+
+        # Only update every N steps if configured
+        if self.ema_updates % self.ema_update_every != 0:
+            self.ema_updates += 1
+            return
+
+        with torch.no_grad():
+            # Get state dicts
+            model_params = self.model.state_dict()
+            ema_params = self.ema_model.state_dict()
+
+            # Update each parameter
+            for key in model_params.keys():
+                if model_params[key].dtype in [torch.float32, torch.float16, torch.bfloat16]:
+                    # Apply EMA update: ema = decay * ema + (1 - decay) * current
+                    ema_params[key].mul_(self.ema_decay).add_(
+                        model_params[key], alpha=(1 - self.ema_decay)
+                    )
+
+            self.ema_updates += 1
+
     def _step_scheduler_with_warmup(self):
         """
         Step the learning rate scheduler with optional linear warmup.
@@ -905,18 +955,39 @@ class KokoroTrainer:
             except Exception as e:
                 logger.warning(f"Could not load scaler state: {e}")
 
+        # Load EMA model state if available
+        if self.use_ema and self.ema_model is not None:
+            try:
+                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if 'ema_model_state_dict' in checkpoint:
+                    self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+                    if 'ema_updates' in checkpoint:
+                        self.ema_updates = checkpoint['ema_updates']
+                    logger.info(f"Loaded EMA model state from checkpoint (updates: {self.ema_updates})")
+                else:
+                    logger.info("No EMA state found in checkpoint, initializing EMA from current model")
+                    self.ema_model.load_state_dict(self.model.state_dict())
+            except Exception as e:
+                logger.warning(f"Could not load EMA state: {e}")
+
         self.dataset.phoneme_processor = phoneme_processor
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
     def validate_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """
-        Run validation loop to monitor overfitting
+        Run validation loop to monitor overfitting.
+        Uses EMA model if available for better validation metrics.
         Returns: (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
         """
         if self.val_dataloader is None:
             return 0.0, 0.0, 0.0, 0.0
 
-        self.model.eval()  # Set to evaluation mode
+        # Use EMA model for validation if available, otherwise use regular model
+        model_to_validate = self.ema_model if (self.use_ema and self.ema_model is not None) else self.model
+        model_to_validate.eval()  # Set to evaluation mode
+
+        if self.use_ema and self.ema_model is not None:
+            logger.info("Validation using EMA model")
 
         total_loss_epoch = 0.0
         mel_loss_epoch = 0.0
@@ -956,7 +1027,7 @@ class KokoroTrainer:
 
                     # Forward pass (without mixed precision for validation consistency)
                     predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                        self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                        model_to_validate(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
                                  pitch_targets=pitches, energy_targets=energies)
 
                     # Convert mel-frame level pitch/energy to phoneme level for loss calculation
@@ -1026,7 +1097,7 @@ class KokoroTrainer:
             return (0.0, 0.0, 0.0, 0.0)
 
     def save_checkpoint_with_scaler(self, epoch: int, loss: float):
-        """Save checkpoint including scaler state"""
+        """Save checkpoint including scaler state and EMA weights"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -1039,6 +1110,12 @@ class KokoroTrainer:
         if self.use_mixed_precision and self.scaler:
             checkpoint['scaler'] = self.scaler.state_dict()
             checkpoint['device_type'] = self.device_type  # Store device type for proper restoration
+
+        # Save EMA model weights if enabled
+        if self.use_ema and self.ema_model is not None:
+            checkpoint['ema_model_state_dict'] = self.ema_model.state_dict()
+            checkpoint['ema_updates'] = self.ema_updates
+            logger.info(f"Saving EMA weights (updates: {self.ema_updates})")
 
         checkpoint_path = os.path.join(self.config.output_dir, f'checkpoint_epoch_{epoch+1}.pth')
         torch.save(checkpoint, checkpoint_path)
@@ -1309,6 +1386,9 @@ class KokoroTrainer:
                             if self.scheduler_per_batch:
                                 self._step_scheduler_with_warmup()
 
+                            # Update EMA model weights
+                            self._update_ema()
+
                             # Update mixed precision stats
                             if new_scale != old_scale:
                                 self.mixed_precision_stats['scale_updates'] += 1
@@ -1333,6 +1413,9 @@ class KokoroTrainer:
                             if self.scheduler_per_batch:
                                 self._step_scheduler_with_warmup()
 
+                            # Update EMA model weights
+                            self._update_ema()
+
                             # Update mixed precision stats
                             if step_successful:
                                 self.mixed_precision_stats['successful_steps'] += 1
@@ -1351,6 +1434,9 @@ class KokoroTrainer:
                         # Step scheduler with warmup immediately after optimizer step
                         if self.scheduler_per_batch:
                             self._step_scheduler_with_warmup()
+
+                        # Update EMA model weights
+                        self._update_ema()
 
                     # Reset accumulation counter after stepping
                     accumulated_step = 0

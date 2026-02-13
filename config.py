@@ -33,6 +33,11 @@ class TrainingConfig:
     warmup_steps: int = 500  # Number of optimizer steps for linear warmup (not batches!)
     warmup_start_lr_ratio: float = 0.01  # Start LR = learning_rate * this value
 
+    # EMA (Exponential Moving Average) of model weights
+    use_ema: bool = True  # Enable EMA for better inference quality
+    ema_decay: float = 0.9999  # EMA decay rate (higher = slower update, more smoothing)
+    ema_update_every: int = 1  # Update EMA every N optimizer steps (1 = every step)
+
     # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
     lr_T_0: int = 20
     lr_T_mult: int = 2
