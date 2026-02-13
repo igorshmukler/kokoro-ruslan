@@ -115,7 +115,9 @@ class ModelLoader:
             encoder_dropout=DROPOUT,
             n_decoder_layers=NUM_LAYERS,
             decoder_ff_dim=FF_DIM,
-            max_decoder_seq_len=MAX_DECODER_SEQ_LEN
+            max_decoder_seq_len=MAX_DECODER_SEQ_LEN,
+            use_stochastic_depth=False,  # Disabled for inference
+            stochastic_depth_rate=0.0
         )
 
         logger.info(f"Created model with vocab_size={vocab_size}")

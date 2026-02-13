@@ -1,6 +1,8 @@
 # PyTorch and related libraries
-torch>=2.0.0
-torchaudio>=2.0.0
+# Updated for MPS autocast support (requires PyTorch 2.1+)
+torch==2.8.0
+torchvision==0.23.0
+torchaudio==2.8.0
 
 # Audio processing libraries
 soundfile>=0.12.0

@@ -36,7 +36,8 @@ class KokoroModel(nn.Module):
                  use_variance_predictor: bool = True, variance_filter_size: int = 256,
                  variance_kernel_size: int = 3, variance_dropout: float = 0.1,
                  n_variance_bins: int = 256, pitch_min: float = 50.0,
-                 pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0):
+                 pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0,
+                 use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
@@ -44,6 +45,8 @@ class KokoroModel(nn.Module):
             gradient_checkpointing: Enable gradient checkpointing by default (True)
             checkpoint_segments: Number of segments to divide layers into for checkpointing
             use_variance_predictor: Enable variance predictor for pitch/energy
+            use_stochastic_depth: Enable stochastic depth (layer dropout) for regularization
+            stochastic_depth_rate: Maximum drop probability for the last layer (linearly scaled)
         """
         super().__init__()
         self.vocab_size = vocab_size
@@ -66,9 +69,16 @@ class KokoroModel(nn.Module):
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
         )
 
+        # Stochastic depth: linearly increase drop_path from 0 to stochastic_depth_rate
+        drop_path_rates = [
+            (i / max(n_encoder_layers - 1, 1)) * stochastic_depth_rate if use_stochastic_depth else 0.0
+            for i in range(n_encoder_layers)
+        ]
+
         self.transformer_encoder_layers = nn.ModuleList([
-            TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout)
-            for _ in range(n_encoder_layers)
+            TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout,
+                                   drop_path_rate=drop_path_rates[i])
+            for i in range(n_encoder_layers)
         ])
 
         # Variance Adaptor (includes duration, pitch, energy predictors)
@@ -394,7 +404,7 @@ class KokoroModel(nn.Module):
                             durations: torch.Tensor,
                             mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Average frame-level values (pitch/energy) to phoneme-level using durations
+        Vectorized average of frame-level values (pitch/energy) to phoneme-level using durations
 
         Args:
             values: Frame-level values (batch, mel_frames)
@@ -404,47 +414,52 @@ class KokoroModel(nn.Module):
         Returns:
             Phoneme-level averaged values (batch, phonemes)
         """
-        batch_size = durations.shape[0]
-        num_phonemes = durations.shape[1]
+        batch_size, num_phonemes = durations.shape
         device = durations.device
 
-        phoneme_values = []
+        # Clamp durations to valid range and convert to long
+        durations_clamped = torch.clamp(durations.long(), min=0)
 
+        # Create phoneme mask if not provided
+        if mask is None:
+            phoneme_mask = torch.zeros_like(durations_clamped, dtype=torch.bool)
+        else:
+            phoneme_mask = mask.bool()
+
+        # Initialize output tensor
+        phoneme_values = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
+
+        # Process each sample in batch (vectorized inner loop)
         for b in range(batch_size):
-            curr_durations = durations[b]  # (phonemes,)
+            curr_durations = durations_clamped[b]  # (phonemes,)
             curr_values = values[b]  # (frames,)
-            curr_mask = mask[b] if mask is not None else torch.zeros_like(curr_durations).bool()
+            curr_mask = phoneme_mask[b]  # (phonemes,)
 
-            phoneme_level_values = []
-            frame_idx = 0
+            # Compute cumulative sum to get frame boundaries
+            cumsum = torch.cumsum(curr_durations, dim=0)
 
-            for p, dur in enumerate(curr_durations):
-                if curr_mask[p]:  # Skip masked phonemes
-                    phoneme_level_values.append(0.0)
-                    continue
+            # Create start and end indices for each phoneme
+            starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
+            ends = cumsum
 
-                dur_int = int(dur.item())
-                if dur_int > 0 and frame_idx < len(curr_values):
-                    # Average the values for this phoneme's frames
-                    end_idx = min(frame_idx + dur_int, len(curr_values))
-                    phoneme_value = curr_values[frame_idx:end_idx].mean()
-                    phoneme_level_values.append(phoneme_value.item())
-                    frame_idx = end_idx
+            # Clamp to valid frame range
+            max_frames = curr_values.shape[0]
+            starts = torch.clamp(starts, min=0, max=max_frames - 1)
+            ends = torch.clamp(ends, min=1, max=max_frames)
+
+            # Compute averages using scatter_add for efficiency
+            for p in range(num_phonemes):
+                if curr_mask[p] or curr_durations[p] == 0:
+                    phoneme_values[b, p] = 0.0
                 else:
-                    phoneme_level_values.append(0.0)
+                    start_idx = starts[p].item()
+                    end_idx = ends[p].item()
+                    if start_idx < end_idx and end_idx <= max_frames:
+                        phoneme_values[b, p] = curr_values[start_idx:end_idx].mean()
+                    else:
+                        phoneme_values[b, p] = 0.0
 
-            phoneme_values.append(torch.tensor(phoneme_level_values, device=device))
-
-        # Pad to same length
-        max_len = max(len(pv) for pv in phoneme_values)
-        padded_values = []
-        for pv in phoneme_values:
-            if len(pv) < max_len:
-                padding = torch.zeros(max_len - len(pv), device=device)
-                pv = torch.cat([pv, padding])
-            padded_values.append(pv)
-
-        return torch.stack(padded_values, dim=0)
+        return phoneme_values
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:

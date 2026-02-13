@@ -117,6 +117,54 @@ Examples:
         help='Run validation every N epochs (default: 1)'
     )
 
+    parser.add_argument(
+        '--dynamic-batching',
+        action='store_true',
+        default=True,
+        help='Use dynamic frame-based batching (default: True)'
+    )
+
+    parser.add_argument(
+        '--no-dynamic-batching',
+        action='store_false',
+        dest='dynamic_batching',
+        help='Disable dynamic batching, use fixed batch size'
+    )
+
+    parser.add_argument(
+        '--max-frames',
+        type=int,
+        default=20000,
+        help='Maximum mel frames per batch for dynamic batching (default: 20000)'
+    )
+
+    parser.add_argument(
+        '--min-batch-size',
+        type=int,
+        default=4,
+        help='Minimum batch size for dynamic batching (default: 4)'
+    )
+
+    parser.add_argument(
+        '--max-batch-size',
+        type=int,
+        default=32,
+        help='Maximum batch size for dynamic batching (default: 32)'
+    )
+
+    parser.add_argument(
+        '--profile-amp',
+        action='store_true',
+        help='Profile AMP benefits before training (compare speed with/without mixed precision)'
+    )
+
+    parser.add_argument(
+        '--profile-amp-batches',
+        type=int,
+        default=10,
+        help='Number of batches to use for AMP profiling (default: 10)'
+    )
+
     return parser.parse_args()
 
 
@@ -148,6 +196,11 @@ def create_config_from_args(args) -> TrainingConfig:
         f_max=8000.0,
         save_every=args.save_every,
         use_mixed_precision=True,
+        # Dynamic batching settings
+        use_dynamic_batching=args.dynamic_batching,
+        max_frames_per_batch=args.max_frames,
+        min_batch_size=args.min_batch_size,
+        max_batch_size=args.max_batch_size,
         use_mfa=use_mfa,
         mfa_alignment_dir=mfa_alignment_dir,
         num_workers=0,  # Important for MPS

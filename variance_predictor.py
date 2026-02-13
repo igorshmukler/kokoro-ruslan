@@ -90,15 +90,16 @@ class VariancePredictor(nn.Module):
             Predicted variance (batch, seq_len)
         """
         # Transpose for Conv1d: (batch, hidden_dim, seq_len)
-        x = x.transpose(1, 2)
+        # Ensure contiguous for torch.compile compatibility
+        x = x.transpose(1, 2).contiguous()
 
         # Apply conv layers
         for conv, norm in zip(self.conv_layers, self.layer_norms):
-            # Conv1d
+            # Conv1d - ensure input is contiguous
             x = conv(x)
 
             # Transpose for layer norm: (batch, seq_len, filter_size)
-            x = x.transpose(1, 2)
+            x = x.transpose(1, 2).contiguous()
 
             # Layer norm
             x = norm(x)
@@ -108,10 +109,11 @@ class VariancePredictor(nn.Module):
             x = self.dropout(x)
 
             # Transpose back for next conv: (batch, filter_size, seq_len)
-            x = x.transpose(1, 2)
+            # Ensure contiguous before next convolution
+            x = x.transpose(1, 2).contiguous()
 
         # Final transpose for linear layer
-        x = x.transpose(1, 2)  # (batch, seq_len, filter_size)
+        x = x.transpose(1, 2).contiguous()  # (batch, seq_len, filter_size)
 
         # Project to single value per timestep
         output = self.linear(x).squeeze(-1)  # (batch, seq_len)

@@ -20,7 +20,25 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-    # Learning rate scheduler
+    # Gradient accumulation for larger effective batch sizes
+    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * gradient_accumulation_steps
+
+    # Learning rate scheduler (OneCycleLR)
+    use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
+    max_lr_multiplier: float = 10.0  # Max LR = learning_rate * this value
+    pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
+
+    # Linear warmup before OneCycleLR
+    use_warmup: bool = True  # Enable linear warmup before OneCycleLR
+    warmup_steps: int = 500  # Number of optimizer steps for linear warmup (not batches!)
+    warmup_start_lr_ratio: float = 0.01  # Start LR = learning_rate * this value
+
+    # EMA (Exponential Moving Average) of model weights
+    use_ema: bool = True  # Enable EMA for better inference quality
+    ema_decay: float = 0.9999  # EMA decay rate (higher = slower update, more smoothing)
+    ema_update_every: int = 1  # Update EMA every N optimizer steps (1 = every step)
+
+    # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
     lr_T_0: int = 20
     lr_T_mult: int = 2
     lr_eta_min: float = 1e-6
@@ -35,6 +53,11 @@ class TrainingConfig:
     decoder_ff_dim: int = 2048
     encoder_dropout: float = 0.1
     max_decoder_seq_len: int = 4000
+
+    # Stochastic depth (layer dropout) for regularization
+    use_stochastic_depth: bool = True  # Enable layer dropout during training
+    stochastic_depth_rate: float = 0.1  # Maximum drop probability for last layer
+    # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
     # Loss weights
     duration_loss_weight: float = 0.1
@@ -65,6 +88,12 @@ class TrainingConfig:
     # Data loading
     num_workers: int = 2
     pin_memory: bool = False
+
+    # Dynamic batching (batch by total frames instead of fixed size)
+    use_dynamic_batching: bool = True  # Enable frame-based batching
+    max_frames_per_batch: int = 20000  # Maximum mel frames per batch
+    min_batch_size: int = 4  # Minimum samples per batch
+    max_batch_size: int = 32  # Maximum samples per batch
 
     # Checkpointing
     save_every: int = 2
@@ -111,6 +140,11 @@ class TrainingConfig:
     interbatch_report_interval: int = 100
 
     use_mixed_precision: bool = True
+
+    # torch.compile optimization (PyTorch 2.0+)
+    use_torch_compile: bool = True
+    torch_compile_mode: str = 'reduce-overhead'  # 'default', 'reduce-overhead', 'max-autotune'
+    torch_compile_dynamic: bool = True  # Handle dynamic shapes better
 
     def __post_init__(self):
         """Post-initialization to handle gradient checkpointing optimization"""

@@ -5,6 +5,7 @@ Dataset implementation for Ruslan corpus
 
 import torch
 import torchaudio
+from scipy.io import wavfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from torch.utils.data import Dataset, Sampler
@@ -305,8 +306,24 @@ class RuslanDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
 
-        # Load audio
-        audio, sr = torchaudio.load(sample['audio_path'])
+        # Load audio using scipy.io.wavfile (no C library dependencies)
+        sr, audio_np = wavfile.read(sample['audio_path'])
+
+        # Convert to float32 and normalize
+        if audio_np.dtype == np.int16:
+            audio_np = audio_np.astype(np.float32) / 32768.0
+        elif audio_np.dtype == np.int32:
+            audio_np = audio_np.astype(np.float32) / 2147483648.0
+        else:
+            audio_np = audio_np.astype(np.float32)
+
+        # Convert to torch tensor and ensure correct shape
+        audio = torch.from_numpy(audio_np).float()
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)  # Add channel dimension (1, samples)
+        elif audio.dim() == 2:
+            # Transpose if needed: scipy returns (samples, channels)
+            audio = audio.T  # Convert to (channels, samples)
 
         # Resample if necessary
         if sr != self.config.sample_rate:
@@ -550,4 +567,138 @@ class LengthBasedBatchSampler(Sampler):
             yield batch
 
     def __len__(self) -> int:
+        return len(self.batches)
+
+
+class DynamicFrameBatchSampler(Sampler):
+    """
+    Dynamic batch sampler that groups samples by total frame count.
+
+    Instead of fixed batch size, batches are created to fit within a maximum
+    frame budget, allowing longer samples to have smaller batch sizes and
+    shorter samples to have larger batch sizes for optimal GPU utilization.
+
+    Args:
+        dataset: Dataset with samples that have 'mel_length' attribute
+        max_frames: Maximum total mel frames per batch
+        min_batch_size: Minimum number of samples per batch
+        max_batch_size: Maximum number of samples per batch
+        drop_last: Drop incomplete batches
+        shuffle: Shuffle batches
+    """
+
+    def __init__(self,
+                 dataset: Dataset,
+                 max_frames: int = 20000,
+                 min_batch_size: int = 4,
+                 max_batch_size: int = 32,
+                 drop_last: bool = False,
+                 shuffle: bool = True):
+        self.dataset = dataset
+        self.max_frames = max_frames
+        self.min_batch_size = min_batch_size
+        self.max_batch_size = max_batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+        # Create batches based on frame budget
+        self.batches = self._create_batches()
+
+        # Calculate statistics
+        self._log_statistics()
+
+    def _get_sample_frames(self, idx: int) -> int:
+        """Get number of mel frames for a sample"""
+        # Access the sample's audio_length (which is mel frames)
+        sample = self.dataset.samples[idx]
+        return sample['audio_length']
+
+    def _create_batches(self) -> List[List[int]]:
+        """Create batches that fit within frame budget"""
+        batches = []
+        indices = list(range(len(self.dataset)))
+
+        if self.shuffle:
+            # Shuffle within length-similar windows to maintain some locality
+            window_size = 1000
+            num_windows = len(indices) // window_size
+            shuffled_indices = []
+
+            for i in range(num_windows):
+                window = indices[i * window_size : (i + 1) * window_size]
+                random.shuffle(window)
+                shuffled_indices.extend(window)
+
+            # Add remaining indices
+            remaining = indices[num_windows * window_size:]
+            random.shuffle(remaining)
+            shuffled_indices.extend(remaining)
+            indices = shuffled_indices
+
+        # Group samples into batches based on frame budget
+        current_batch = []
+        current_frames = 0
+
+        for idx in indices:
+            sample_frames = self._get_sample_frames(idx)
+
+            # Check if adding this sample would exceed limits
+            would_exceed_frames = (current_frames + sample_frames) > self.max_frames
+            would_exceed_max_batch = len(current_batch) >= self.max_batch_size
+
+            # Start new batch if we exceed frame budget or max batch size
+            if current_batch and (would_exceed_frames or would_exceed_max_batch):
+                # Only add batch if it meets minimum size requirement
+                if len(current_batch) >= self.min_batch_size:
+                    batches.append(current_batch)
+                elif not self.drop_last:
+                    # Add small batch if not dropping
+                    batches.append(current_batch)
+
+                current_batch = []
+                current_frames = 0
+
+            # Add sample to current batch
+            current_batch.append(idx)
+            current_frames += sample_frames
+
+        # Handle remaining samples
+        if current_batch:
+            if len(current_batch) >= self.min_batch_size or not self.drop_last:
+                batches.append(current_batch)
+
+        # Shuffle batch order
+        if self.shuffle:
+            random.shuffle(batches)
+
+        return batches
+
+    def _log_statistics(self):
+        """Log batching statistics for monitoring"""
+        if not self.batches:
+            return
+
+        batch_sizes = [len(batch) for batch in self.batches]
+        batch_frames = []
+
+        for batch in self.batches:
+            total_frames = sum(self._get_sample_frames(idx) for idx in batch)
+            batch_frames.append(total_frames)
+
+        logger.info("Dynamic Batching Statistics:")
+        logger.info(f"  Total batches: {len(self.batches)}")
+        logger.info(f"  Batch sizes - Min: {min(batch_sizes)}, Max: {max(batch_sizes)}, "
+                   f"Avg: {sum(batch_sizes)/len(batch_sizes):.1f}")
+        logger.info(f"  Frames per batch - Min: {min(batch_frames)}, Max: {max(batch_frames)}, "
+                   f"Avg: {sum(batch_frames)/len(batch_frames):.1f}")
+        logger.info(f"  Frame budget: {self.max_frames}")
+        logger.info(f"  Batch size range: [{self.min_batch_size}, {self.max_batch_size}]")
+
+    def __iter__(self):
+        """Iterate over batches"""
+        for batch in self.batches:
+            yield batch
+
+    def __len__(self) -> int:
+        """Return number of batches"""
         return len(self.batches)
