@@ -116,6 +116,17 @@ class KokoroTrainer:
             self.device_type = self.device.type
             logger.info("Mixed precision training disabled by configuration")
 
+        # Precompute features if requested
+        if getattr(config, 'precompute_features', False):
+            logger.info("Pre-computing features for all samples...")
+            from kokoro.cli.precompute_features import precompute_features
+            # Set cache directory if not already set
+            if not config.feature_cache_dir:
+                from pathlib import Path
+                config.feature_cache_dir = str(Path(config.data_dir) / ".feature_cache")
+            precompute_features(config.data_dir, config, force_recompute=False)
+            logger.info("Feature pre-computation complete")
+
         # Initialize datasets with train/validation split
         full_dataset = RuslanDataset(config.data_dir, config)
 

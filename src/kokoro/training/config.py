@@ -89,6 +89,11 @@ class TrainingConfig:
     num_workers: int = 2
     pin_memory: bool = False
 
+    # Feature caching for faster training
+    use_feature_cache: bool = True  # Cache mel spectrograms, pitch, energy to disk
+    feature_cache_dir: str = ""  # Will be set to {data_dir}/.feature_cache if empty
+    precompute_features: bool = False  # Precompute all features before training starts
+
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
     max_frames_per_batch: int = 20000  # Maximum mel frames per batch
@@ -148,6 +153,11 @@ class TrainingConfig:
 
     def __post_init__(self):
         """Post-initialization to handle gradient checkpointing optimization"""
+
+        # Set default feature cache directory if not specified
+        if not self.feature_cache_dir:
+            from pathlib import Path
+            self.feature_cache_dir = str(Path(self.data_dir) / ".feature_cache")
 
         # Validate checkpoint segments
         if self.checkpoint_segments < 1:

@@ -67,6 +67,7 @@ A Text-to-Speech (TTS) training script for Russian language using the Kokoro arc
 ## Features
 
 - **Mac MPS optimized**: Full support for Apple Silicon GPU acceleration
+- **Pre-computed feature caching**: 5-10x faster training with cached mel spectrograms
 - **No espeak dependency**: Uses rule-based Russian phoneme processing
 - **Montreal Forced Aligner integration**: Extract accurate phoneme durations for high-quality TTS
 - **Variance prediction**: Pitch and energy modeling for natural prosody (FastSpeech 2 style)
@@ -78,6 +79,7 @@ A Text-to-Speech (TTS) training script for Russian language using the Kokoro arc
 ## Documentation
 
 - **[WORKFLOW.md](WORKFLOW.md)** - Complete step-by-step guide from corpus to trained model
+- **[FEATURE_CACHING.md](docs/FEATURE_CACHING.md)** - Pre-computed features for 5-10x faster training
 - **[MFA_SETUP.md](MFA_SETUP.md)** - Detailed Montreal Forced Aligner setup and usage
 - **[VARIANCE_PREDICTOR.md](VARIANCE_PREDICTOR.md)** - Pitch and energy prediction for better prosody
 - **[VALIDATION.md](VALIDATION.md)** - Validation loop and overfitting monitoring
@@ -86,7 +88,11 @@ A Text-to-Speech (TTS) training script for Russian language using the Kokoro arc
 ## Installation
 
 ```bash
+# Install dependencies
 pip install -r requirements.txt
+
+# Install the kokoro package (enables kokoro-train, kokoro-preprocess commands)
+pip install -e .
 ```
 
 ### Optional: Montreal Forced Aligner (MFA) for High-Quality Duration Extraction
@@ -104,7 +110,7 @@ pip install montreal-forced-aligner
 pip install tgt
 
 # Verify installation
-python verify_setup.py
+python3 verify_setup.py
 ```
 
 **See [MFA_SETUP.md](MFA_SETUP.md) for detailed setup instructions.**
@@ -130,13 +136,30 @@ The metadata CSV should be formatted as: `audio_filename|transcription`
 
 ## Quick Start
 
+### Step 0: Pre-compute Features (Optional but Recommended)
+
+For 5-10x faster training, pre-compute mel spectrograms before training:
+
+```bash
+# Pre-compute all features (mel spectrograms, pitch, energy)
+kokoro-precompute --corpus ./ruslan_corpus
+
+# This caches features to disk - first epoch and all subsequent epochs will be much faster!
+# Cache location: ruslan_corpus/.feature_cache/
+```
+
+**See [FEATURE_CACHING.md](docs/FEATURE_CACHING.md) for detailed information.**
+
 ### Step 1: Prepare Phoneme Alignments (Recommended)
 
 For high-quality TTS, first run Montreal Forced Aligner to extract accurate phoneme durations:
 
 ```bash
 # Run MFA alignment on your corpus
-python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
+
+# Or using module syntax:
+python3 -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
 # This will:
 # 1. Download Russian MFA models
@@ -151,29 +174,32 @@ python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output
 
 ```bash
 # Using default settings (with MFA alignments)
-python training.py
+kokoro-train
 
 # Specify custom corpus and output directories
-python training.py --corpus /path/to/ruslan_corpus --output ./my_russian_model
+kokoro-train --corpus /path/to/ruslan_corpus --output ./my_russian_model
 
 # Without MFA (estimated durations - lower quality)
-python training.py --no-mfa
+kokoro-train --no-mfa
 
 # For Mac users with MPS issues
-PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py
+PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train
+
+# Or using module syntax:
+python3 -m kokoro.cli.training
 ```
 
 ## Training Examples
 
 ```bash
 # Custom batch size and epochs
-python training.py --batch-size 16 --epochs 50
+kokoro-train --batch-size 16 --epochs 50
 
 # Custom learning rate and save frequency
-python training.py --learning-rate 0.0001 --save-every 5
+kokoro-train --learning-rate 0.0001 --save-every 5
 
 # Full custom configuration
-python training.py \
+kokoro-train \
     --corpus ./data/ruslan_corpus \
     --output ./models/kokoro_russian \
     --batch-size 12 \
@@ -186,13 +212,13 @@ python training.py \
 
 ```bash
 # Auto-resume from latest checkpoint
-python training.py --resume auto
+kokoro-train --resume auto
 
 # Resume from specific checkpoint
-python training.py --resume ./models/checkpoint_epoch_10.pth
+kokoro-train --resume ./models/checkpoint_epoch_10.pth
 
 # Resume with different parameters
-python training.py --resume auto --batch-size 16 --epochs 200
+kokoro-train --resume auto --batch-size 16 --epochs 200
 ```
 
 ## Command Line Arguments
@@ -219,16 +245,16 @@ The training includes automatic validation to prevent overfitting:
 
 ```bash
 # Default: 10% validation split with early stopping
-python training.py --corpus ./ruslan_corpus
+kokoro-train --corpus ./ruslan_corpus
 
 # Custom validation split (20%)
-python training.py --val-split 0.2
+kokoro-train --val-split 0.2
 
 # Disable validation for final training on all data
-python training.py --no-validation
+kokoro-train --no-validation
 
 # Adjust early stopping patience
-python training.py --early-stopping-patience 15
+kokoro-train --early-stopping-patience 15
 ```
 
 **See [VALIDATION.md](VALIDATION.md) for detailed information about validation monitoring.**
@@ -391,14 +417,14 @@ INFO:__main__:Checkpoint saved: ./kokoro_russian_model/checkpoint_epoch_2.pth
 
 ```bash
 # Download and prepare Ruslan corpus, then:
-python training.py --corpus ./ruslan_corpus --epochs 10
+kokoro-train --corpus ./ruslan_corpus --epochs 10
 ```
 
 ### Production Training
 
 ```bash
 # Full training run with checkpointing
-PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py \
+PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train \
     --corpus ./data/ruslan_corpus \
     --output ./models/kokoro_russian_v1 \
     --batch-size 10 \
@@ -411,7 +437,7 @@ PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py \
 
 ```bash
 # Auto-resume from latest checkpoint
-PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py \
+PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train \
     --corpus ./data/ruslan_corpus \
     --output ./models/kokoro_russian_v1 \
     --resume auto

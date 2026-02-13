@@ -1,4 +1,5 @@
 [console_scripts]
 kokoro-infer = kokoro.cli.cli:main
+kokoro-precompute = kokoro.cli.precompute_features:main
 kokoro-preprocess = kokoro.cli.preprocess:main
 kokoro-train = kokoro.cli.training:main

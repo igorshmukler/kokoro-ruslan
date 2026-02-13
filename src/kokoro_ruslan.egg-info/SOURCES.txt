@@ -3,6 +3,7 @@ setup.py
 src/kokoro/__init__.py
 src/kokoro/cli/__init__.py
 src/kokoro/cli/cli.py
+src/kokoro/cli/precompute_features.py
 src/kokoro/cli/preprocess.py
 src/kokoro/cli/training.py
 src/kokoro/data/__init__.py
@@ -27,6 +28,7 @@ src/kokoro/training/mps_grad_scaler.py
 src/kokoro/training/trainer.py
 src/kokoro/utils/__init__.py
 src/kokoro/utils/adaptive_memory_manager.py
+src/kokoro/utils/cache_manager.py
 src/kokoro/utils/device_type.py
 src/kokoro/utils/gpu_profiler.py
 src/kokoro/utils/interbatch_profiler.py

@@ -42,6 +42,11 @@ class RuslanDataset(Dataset):
         self.use_mfa = use_mfa
         self.indices = indices  # Subset of indices for train/val split
 
+        # Pre-computed feature caching
+        self.use_feature_cache = getattr(config, 'use_feature_cache', True)
+        self.feature_cache_dir = Path(getattr(config, 'feature_cache_dir', self.data_dir / '.feature_cache'))
+        self.feature_cache = {}  # In-memory cache for this dataset instance
+
         # Check if variance prediction is enabled
         self.use_variance = getattr(config, 'use_variance_predictor', True) and VARIANCE_AVAILABLE
         if self.use_variance:
@@ -100,6 +105,13 @@ class RuslanDataset(Dataset):
         # Setup cache for audio metadata
         self.cache_dir = self.data_dir / ".cache"
         self.cache_file = self.cache_dir / "audio_metadata.pkl"
+
+        # Initialize feature cache
+        if self.use_feature_cache:
+            self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Feature caching enabled: {self.feature_cache_dir}")
+        else:
+            logger.info("Feature caching disabled - computing features on-the-fly")
 
         # Load metadata and pre-calculate lengths for batching
         self.samples = self._load_samples()
@@ -303,9 +315,59 @@ class RuslanDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _get_feature_cache_path(self, audio_file: str) -> Path:
+        """Get the path to the cached feature file"""
+        return self.feature_cache_dir / f"{audio_file}.pt"
+
+    def _load_cached_features(self, audio_file: str) -> Optional[Dict]:
+        """Load pre-computed features from cache"""
+        if not self.use_feature_cache:
+            return None
+
+        # Check in-memory cache first
+        if audio_file in self.feature_cache:
+            return self.feature_cache[audio_file]
+
+        # Check disk cache
+        cache_path = self._get_feature_cache_path(audio_file)
+        if cache_path.exists():
+            try:
+                features = torch.load(cache_path, weights_only=False)
+                # Store in memory cache for faster subsequent access
+                self.feature_cache[audio_file] = features
+                return features
+            except Exception as e:
+                logger.warning(f"Failed to load cached features for {audio_file}: {e}")
+                return None
+
+        return None
+
+    def _save_cached_features(self, audio_file: str, features: Dict):
+        """Save computed features to cache"""
+        if not self.use_feature_cache:
+            return
+
+        cache_path = self._get_feature_cache_path(audio_file)
+        try:
+            torch.save(features, cache_path)
+            # Also store in memory cache
+            self.feature_cache[audio_file] = features
+        except Exception as e:
+            logger.warning(f"Failed to save cached features for {audio_file}: {e}")
+
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
+        audio_file = sample['audio_file']
 
+        # Try to load from cache first
+        cached_features = self._load_cached_features(audio_file)
+        if cached_features is not None:
+            # Add text and metadata
+            cached_features['text'] = sample['text']
+            cached_features['audio_file'] = audio_file
+            return cached_features
+
+        # Cache miss - compute features from scratch
         # Load audio using scipy.io.wavfile (no C library dependencies)
         sr, audio_np = wavfile.read(sample['audio_path'])
 
@@ -453,7 +515,8 @@ class RuslanDataset(Dataset):
             pitch = torch.zeros(num_mel_frames)
             energy = torch.zeros(num_mel_frames)
 
-        return {
+        # Prepare feature dict
+        features = {
             'mel_spec': mel_spec,
             'phoneme_indices': phoneme_indices_tensor,
             'phoneme_durations': phoneme_durations,
@@ -461,10 +524,15 @@ class RuslanDataset(Dataset):
             'pitch': pitch,
             'energy': energy,
             'text': sample['text'],
-            'audio_file': sample['audio_file'],
+            'audio_file': audio_file,
             'mel_length': mel_spec.shape[1], # Actual length after potential clipping
             'phoneme_length': phoneme_indices_tensor.shape[0] # Actual length
         }
+
+        # Save to cache for future use
+        self._save_cached_features(audio_file, features)
+
+        return features
 
 def collate_fn(batch: List[Dict]) -> Dict:
     """Collate function for DataLoader - optimized for MPS"""
