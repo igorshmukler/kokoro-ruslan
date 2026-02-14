@@ -333,8 +333,11 @@ class PitchExtractor:
             # Weighted average frequency
             pitch = torch.sum(magnitude * freqs, dim=1) / (torch.sum(magnitude, dim=1) + 1e-8)
 
-            # Clip to valid range
+            # Normalize to [0, 1] range immediately (critical for stable training)
+            # Spectral centroid can be 0 to sample_rate/2, normalize to expected vocal range
             pitch = torch.clamp(pitch, fmin, fmax)
+            pitch = (pitch - fmin) / (fmax - fmin + 1e-8)
+            pitch = torch.clamp(pitch, 0.0, 1.0)
 
             if squeeze_output:
                 pitch = pitch.squeeze(0)
@@ -358,19 +361,26 @@ class EnergyExtractor:
     @staticmethod
     def extract_energy_from_mel(mel_spec: torch.Tensor) -> torch.Tensor:
         """
-        Extract energy from mel spectrogram
+        Extract energy from mel spectrogram, normalized to [0, 1]
 
         Args:
             mel_spec: Mel spectrogram (batch, n_mels, frames) or (n_mels, frames)
 
         Returns:
-            Energy contour (batch, frames) or (frames,)
+            Energy contour normalized to [0, 1] (batch, frames) or (frames,)
         """
         # Energy is the mean across mel bins
         if mel_spec.dim() == 2:
             energy = torch.mean(mel_spec, dim=0)
         else:
             energy = torch.mean(mel_spec, dim=1)
+
+        # Simple robust normalization to [0, 1]
+        # Mel specs are typically in range [0, 100+] after power transform
+        # Use fixed range normalization with clipping
+        energy = torch.clamp(energy, min=0.0)  # Ensure non-negative
+        energy = energy / 50.0  # Normalize assuming typical max ~50
+        energy = torch.clamp(energy, 0.0, 1.0)  # Clip to [0, 1]
 
         return energy
 

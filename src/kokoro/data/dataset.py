@@ -481,18 +481,14 @@ class RuslanDataset(Dataset):
 
         if self.use_variance:
             try:
-                # Extract pitch from audio
+                # Extract pitch from audio (returns normalized [0, 1])
                 pitch = PitchExtractor.extract_pitch(
                     audio.squeeze(0),  # Remove channel dim
                     sample_rate=self.config.sample_rate,
-                    hop_length=self.config.hop_length
+                    hop_length=self.config.hop_length,
+                    fmin=getattr(self.config, 'pitch_min', 50.0),
+                    fmax=getattr(self.config, 'pitch_max', 800.0)
                 )
-
-                # Normalize pitch from Hz to [0, 1] range for stable training
-                pitch_min = getattr(self.config, 'pitch_min', 50.0)
-                pitch_max = getattr(self.config, 'pitch_max', 800.0)
-                pitch = (pitch - pitch_min) / (pitch_max - pitch_min + 1e-8)
-                pitch = torch.clamp(pitch, 0.0, 1.0)
 
                 # Match length to mel frames
                 if len(pitch) > num_mel_frames:
@@ -501,14 +497,8 @@ class RuslanDataset(Dataset):
                     padding = torch.zeros(num_mel_frames - len(pitch), device=pitch.device)
                     pitch = torch.cat([pitch, padding])
 
-                # Extract energy from mel spectrogram
+                # Extract energy from mel spectrogram (returns normalized [0, 1])
                 energy = EnergyExtractor.extract_energy_from_mel(mel_spec)
-
-                # Normalize energy to [0, 1] range for stable training
-                energy_min = getattr(self.config, 'energy_min', 0.0)
-                energy_max = getattr(self.config, 'energy_max', 100.0)
-                energy = (energy - energy_min) / (energy_max - energy_min + 1e-8)
-                energy = torch.clamp(energy, 0.0, 1.0)
 
                 # Ensure energy matches mel frames
                 if len(energy) > num_mel_frames:
