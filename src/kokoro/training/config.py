@@ -161,22 +161,22 @@ class TrainingConfig:
 
         # MPS-specific memory optimizations
         if self.device == 'mps' or (torch.backends.mps.is_available() and self.device != 'cuda'):
-            # Reduce memory usage for MPS to prevent OOM
-            if self.max_frames_per_batch > 10000:
-                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 12000")
-                self.max_frames_per_batch = 12000
+            # Optimized for stable training with headroom (typically 3-8% memory usage)
+            if self.max_frames_per_batch > 20000:
+                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 30000")
+                self.max_frames_per_batch = 30000
 
-            if self.max_seq_length > 1500:
-                print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1500")
-                self.max_seq_length = 1500
+            if self.max_seq_length > 2000:
+                print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 2000")
+                self.max_seq_length = 2000
 
-            if self.batch_size > 8:
-                print(f"MPS detected: Reducing batch_size from {self.batch_size} to 8")
-                self.batch_size = 8
+            if self.batch_size > 12:
+                print(f"MPS detected: Reducing batch_size from {self.batch_size} to 12")
+                self.batch_size = 12
 
-            if self.max_batch_size > 16:
-                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 16")
-                self.max_batch_size = 16
+            if self.max_batch_size > 24:
+                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 24")
+                self.max_batch_size = 24
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1
             print("Warning: checkpoint_segments must be >= 1, setting to 1")
