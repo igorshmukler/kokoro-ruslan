@@ -62,8 +62,8 @@ class TrainingConfig:
     # Loss weights
     duration_loss_weight: float = 0.1
     stop_token_loss_weight: float = 1.0
-    pitch_loss_weight: float = 0.1
-    energy_loss_weight: float = 0.1
+    pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
+    energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
     # Variance predictor settings
     use_variance_predictor: bool = True
