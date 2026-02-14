@@ -507,6 +507,20 @@ class RuslanDataset(Dataset):
                     padding = torch.zeros(num_mel_frames - len(energy), device=energy.device)
                     energy = torch.cat([energy, padding])
 
+                # CRITICAL: Validate extracted values are actually normalized
+                pitch_min, pitch_max = pitch.min().item(), pitch.max().item()
+                energy_min, energy_max = energy.min().item(), energy.max().item()
+
+                if pitch_max > 1.5 or energy_max > 1.5:
+                    logger.error(f"⚠️ UNNORMALIZED VALUES DETECTED in {sample['audio_file']}")
+                    logger.error(f"   Pitch range: [{pitch_min:.3f}, {pitch_max:.3f}]")
+                    logger.error(f"   Energy range: [{energy_min:.3f}, {energy_max:.3f}]")
+                    # Force normalize as fallback
+                    if pitch_max > 1.5:
+                        pitch = torch.clamp(pitch / pitch_max, 0.0, 1.0)
+                    if energy_max > 1.5:
+                        energy = torch.clamp(energy / energy_max, 0.0, 1.0)
+
             except Exception as e:
                 logger.warning(f"Failed to extract pitch/energy for {sample['audio_file']}: {e}")
                 # Use zeros as fallback

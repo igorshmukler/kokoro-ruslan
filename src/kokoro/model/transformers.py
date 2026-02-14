@@ -131,11 +131,21 @@ class MultiHeadAttentionImproved(nn.Module):
             # Retrieve relative key embeddings (S_q, S_k, D_k)
             rel_pos_k_emb = self.relative_position_k(rel_pos_indices)
 
-            # Compute relative scores (Q * R_k) using einsum
+            # Compute relative scores (Q * R_k) using MPS-safe implementation
             # Q: (B, H, S_q, D_k)
             # rel_pos_k_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, S_k)
-            rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
+            # Use manual loop for MPS to avoid dimension overflow in einsum
+            if query.device.type == 'mps':
+                rel_scores = torch.zeros(batch_size, self.num_heads, seq_len_q, seq_len_k,
+                                        device=query.device, dtype=Q.dtype)
+                for i in range(seq_len_q):
+                    # Q[:, :, i, :] is (B, H, D_k)
+                    # rel_pos_k_emb[i, :, :] is (S_k, D_k)
+                    # Result: (B, H, S_k)
+                    rel_scores[:, :, i, :] = torch.matmul(Q[:, :, i, :], rel_pos_k_emb[i, :, :].t())
+            else:
+                rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
             scores = scores + rel_scores
 
         # 4. Apply masks
@@ -167,11 +177,21 @@ class MultiHeadAttentionImproved(nn.Module):
             # Retrieve relative value embeddings (S_q, S_k, D_k)
             rel_pos_v_emb = self.relative_position_v(rel_pos_indices)
 
-            # Compute relative context (A * R_v) using einsum
+            # Compute relative context (A * R_v) using MPS-safe implementation
             # attn_weights: (B, H, S_q, S_k)
             # rel_pos_v_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, D_k)
-            rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
+            # Use manual loop for MPS to avoid dimension overflow in einsum
+            if query.device.type == 'mps':
+                rel_context = torch.zeros(batch_size, self.num_heads, seq_len_q, self.d_k,
+                                         device=query.device, dtype=attn_weights.dtype)
+                for i in range(seq_len_q):
+                    # attn_weights[:, :, i, :] is (B, H, S_k)
+                    # rel_pos_v_emb[i, :, :] is (S_k, D_k)
+                    # Result: (B, H, D_k)
+                    rel_context[:, :, i, :] = torch.matmul(attn_weights[:, :, i, :], rel_pos_v_emb[i, :, :])
+            else:
+                rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
             context = context + rel_context
 
         # 8. Concatenate heads and apply final linear layer

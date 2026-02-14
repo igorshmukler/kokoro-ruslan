@@ -928,6 +928,20 @@ class KokoroTrainer:
         variance_diverged = False
         if loss_pitch > 10.0 or loss_energy > 10.0:
             logger.warning(f"⚠️  Variance predictor divergence detected - pitch: {loss_pitch:.2f}, energy: {loss_energy:.2f}")
+
+            # Log prediction vs target statistics for debugging
+            if predicted_pitch is not None and pitch_targets is not None:
+                pred_min, pred_max = predicted_pitch.min().item(), predicted_pitch.max().item()
+                targ_min, targ_max = pitch_targets.min().item(), pitch_targets.max().item()
+                logger.warning(f"   Pitch predictions: [{pred_min:.3f}, {pred_max:.3f}]")
+                logger.warning(f"   Pitch targets: [{targ_min:.3f}, {targ_max:.3f}]")
+
+            if predicted_energy is not None and energy_targets is not None:
+                pred_min, pred_max = predicted_energy.min().item(), predicted_energy.max().item()
+                targ_min, targ_max = energy_targets.min().item(), energy_targets.max().item()
+                logger.warning(f"   Energy predictions: [{pred_min:.3f}, {pred_max:.3f}]")
+                logger.warning(f"   Energy targets: [{targ_min:.3f}, {targ_max:.3f}]")
+
             logger.warning(f"   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
 
             # Reset variance predictor weights to initial state
@@ -1320,6 +1334,17 @@ class KokoroTrainer:
                     if max_dim > 2000:
                         logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
                         continue
+
+                    # Log variance predictor input ranges every 50 batches for debugging
+                    if batch_idx % 50 == 0 and pitches is not None and energies is not None:
+                        pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
+                        energy_min, energy_max = energies.min().item(), energies.max().item()
+                        if pitch_max > 1.5 or energy_max > 1.5:
+                            logger.error(f"⚠️ BATCH {batch_idx} - UNNORMALIZED VARIANCE INPUTS!")
+                            logger.error(f"   Pitch: [{pitch_min:.3f}, {pitch_max:.3f}]")
+                            logger.error(f"   Energy: [{energy_min:.3f}, {energy_max:.3f}]")
+                        else:
+                            logger.info(f"Batch {batch_idx} variance ranges OK - Pitch: [{pitch_min:.3f}, {pitch_max:.3f}], Energy: [{energy_min:.3f}, {energy_max:.3f}]")
 
                     pitches = batch.get('pitches', None)
                     energies = batch.get('energies', None)

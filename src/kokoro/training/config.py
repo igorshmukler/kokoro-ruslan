@@ -66,7 +66,7 @@ class TrainingConfig:
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
     # Variance predictor settings
-    use_variance_predictor: bool = True
+    use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
     variance_filter_size: int = 256
     variance_kernel_size: int = 3
     variance_dropout: float = 0.1
