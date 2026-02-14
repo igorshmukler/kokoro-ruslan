@@ -69,6 +69,9 @@ class MultiHeadAttentionImproved(nn.Module):
         self.dropout_attn = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
 
+        # Cache for relative position matrices to avoid recomputation
+        self._rel_pos_cache = {}
+
         # Better initialization for linear layers
         self._init_weights()
 
@@ -83,9 +86,13 @@ class MultiHeadAttentionImproved(nn.Module):
 
     def _get_relative_positions(self, seq_len: int, device: torch.device) -> torch.Tensor:
         """
-        Generate relative position indices for attention.
+        Generate relative position indices for attention with caching.
         Output shape: (seq_len, seq_len)
         """
+        cache_key = (seq_len, device)
+        if cache_key in self._rel_pos_cache:
+            return self._rel_pos_cache[cache_key]
+
         # Create a tensor of indices from 0 to seq_len-1
         idx = torch.arange(seq_len, device=device)
         # Create a matrix of (i - j) for all pairs (i, j)
@@ -101,6 +108,10 @@ class MultiHeadAttentionImproved(nn.Module):
         # e.g., if max_dist=32, range is -32 to 32. Adding 32 shifts to 0 to 64.
         # This maps to indices [0, 2*max_relative_distance]
         relative_pos_indices = relative_pos_indices + self.max_relative_distance
+
+        # Cache for future use (limit cache size to prevent memory growth)
+        if len(self._rel_pos_cache) < 10:
+            self._rel_pos_cache[cache_key] = relative_pos_indices
 
         return relative_pos_indices # (S, S)
 
@@ -135,17 +146,17 @@ class MultiHeadAttentionImproved(nn.Module):
             # Q: (B, H, S_q, D_k)
             # rel_pos_k_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, S_k)
-            if query.device.type == 'mps' and seq_len_q > 512:
+            if query.device.type == 'mps' and seq_len_q > 2048:
                 # MPS-safe: chunk queries to avoid large intermediate tensors
-                chunk_size = 256
-                rel_scores = []
+                # Pre-allocate output tensor for efficiency
+                chunk_size = 512
+                rel_scores = torch.empty(batch_size, self.num_heads, seq_len_q, seq_len_k,
+                                        device=query.device, dtype=Q.dtype)
                 for start_idx in range(0, seq_len_q, chunk_size):
                     end_idx = min(start_idx + chunk_size, seq_len_q)
                     q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
                     rel_chunk = rel_pos_k_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
-                    chunk_scores = torch.einsum('bhcd,csd->bhcs', q_chunk, rel_chunk)  # (B, H, chunk, S_k)
-                    rel_scores.append(chunk_scores)
-                rel_scores = torch.cat(rel_scores, dim=2)  # (B, H, S_q, S_k)
+                    rel_scores[:, :, start_idx:end_idx, :] = torch.einsum('bhcd,csd->bhcs', q_chunk, rel_chunk)
             else:
                 rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
             scores = scores + rel_scores
@@ -183,17 +194,17 @@ class MultiHeadAttentionImproved(nn.Module):
             # attn_weights: (B, H, S_q, S_k)
             # rel_pos_v_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, D_k)
-            if query.device.type == 'mps' and seq_len_q > 512:
+            if query.device.type == 'mps' and seq_len_q > 2048:
                 # MPS-safe: chunk to avoid large intermediate tensors
-                chunk_size = 256
-                rel_context_chunks = []
+                # Pre-allocate output tensor for efficiency
+                chunk_size = 512
+                rel_context = torch.empty(batch_size, self.num_heads, seq_len_q, self.d_k,
+                                         device=query.device, dtype=attn_weights.dtype)
                 for start_idx in range(0, seq_len_q, chunk_size):
                     end_idx = min(start_idx + chunk_size, seq_len_q)
                     attn_chunk = attn_weights[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
                     rel_chunk = rel_pos_v_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
-                    chunk_context = torch.einsum('bhcs,csd->bhcd', attn_chunk, rel_chunk)  # (B, H, chunk, D_k)
-                    rel_context_chunks.append(chunk_context)
-                rel_context = torch.cat(rel_context_chunks, dim=2)  # (B, H, S_q, D_k)
+                    rel_context[:, :, start_idx:end_idx, :] = torch.einsum('bhcs,csd->bhcd', attn_chunk, rel_chunk)
             else:
                 rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
             context = context + rel_context
