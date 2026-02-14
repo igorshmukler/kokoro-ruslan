@@ -488,6 +488,12 @@ class RuslanDataset(Dataset):
                     hop_length=self.config.hop_length
                 )
 
+                # Normalize pitch from Hz to [0, 1] range for stable training
+                pitch_min = getattr(self.config, 'pitch_min', 50.0)
+                pitch_max = getattr(self.config, 'pitch_max', 800.0)
+                pitch = (pitch - pitch_min) / (pitch_max - pitch_min + 1e-8)
+                pitch = torch.clamp(pitch, 0.0, 1.0)
+
                 # Match length to mel frames
                 if len(pitch) > num_mel_frames:
                     pitch = pitch[:num_mel_frames]
@@ -497,6 +503,12 @@ class RuslanDataset(Dataset):
 
                 # Extract energy from mel spectrogram
                 energy = EnergyExtractor.extract_energy_from_mel(mel_spec)
+
+                # Normalize energy to [0, 1] range for stable training
+                energy_min = getattr(self.config, 'energy_min', 0.0)
+                energy_max = getattr(self.config, 'energy_max', 100.0)
+                energy = (energy - energy_min) / (energy_max - energy_min + 1e-8)
+                energy = torch.clamp(energy, 0.0, 1.0)
 
                 # Ensure energy matches mel frames
                 if len(energy) > num_mel_frames:

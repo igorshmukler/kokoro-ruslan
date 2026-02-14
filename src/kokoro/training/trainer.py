@@ -924,12 +924,44 @@ class KokoroTrainer:
             loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
             loss_energy = (loss_energy_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
 
-        # Combine all losses
+        # Monitor and auto-recover from variance predictor divergence
+        variance_diverged = False
+        if loss_pitch > 10.0 or loss_energy > 10.0:
+            logger.warning(f"⚠️  Variance predictor divergence detected - pitch: {loss_pitch:.2f}, energy: {loss_energy:.2f}")
+            logger.warning(f"   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
+
+            # Reset variance predictor weights to initial state
+            if hasattr(self.model, 'pitch_predictor') and self.model.pitch_predictor is not None:
+                self.model.pitch_predictor._init_weights()
+            if hasattr(self.model, 'energy_predictor') and self.model.energy_predictor is not None:
+                self.model.energy_predictor._init_weights()
+
+            # Zero out these losses for this batch to prevent gradient explosion
+            loss_pitch = torch.tensor(0.0, device=self.device)
+            loss_energy = torch.tensor(0.0, device=self.device)
+            variance_diverged = True
+
+        # Clamp individual losses to prevent numerical explosion (critical for MPS stability)
+        loss_mel = torch.clamp(loss_mel, max=100.0)
+        loss_duration = torch.clamp(loss_duration, max=100.0)
+        loss_stop_token = torch.clamp(loss_stop_token, max=100.0)
+        if not variance_diverged:
+            loss_pitch = torch.clamp(loss_pitch, max=10.0)
+            loss_energy = torch.clamp(loss_energy, max=10.0)
+
+        # Combine all losses (pitch/energy normalized to [0,1], safe to use)
         total_loss = (loss_mel +
                      loss_duration * self.config.duration_loss_weight +
                      loss_stop_token * self.config.stop_token_loss_weight +
                      loss_pitch * getattr(self.config, 'pitch_loss_weight', 0.1) +
                      loss_energy * getattr(self.config, 'energy_loss_weight', 0.1))
+
+        # Final NaN/Inf check - if detected, use only mel loss as fallback
+        if not torch.isfinite(total_loss):
+            logger.warning(f"Non-finite total_loss detected! Using mel_loss fallback. "
+                          f"mel={loss_mel:.2f}, dur={loss_duration:.2f}, stop={loss_stop_token:.2f}, "
+                          f"pitch={loss_pitch:.2f}, energy={loss_energy:.2f}")
+            total_loss = loss_mel
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
 
@@ -1396,7 +1428,7 @@ class KokoroTrainer:
                         if self.device_type == 'cuda':
                             # CUDA path with built-in GradScaler
                             self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                             old_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
@@ -1423,7 +1455,7 @@ class KokoroTrainer:
 
                         else:  # MPS path with custom scaler
                             # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                             old_scale = self.scaler.get_scale()
                             step_successful = self.scaler.step(self.optimizer)
@@ -1449,7 +1481,7 @@ class KokoroTrainer:
                                 if new_scale < old_scale:
                                     self.mixed_precision_stats['scale_decreases'] += 1
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                         self.optimizer.step()
 
                         # Step scheduler with warmup immediately after optimizer step
@@ -2132,7 +2164,7 @@ class KokoroTrainer:
                         if self.device_type == 'cuda':
                             # CUDA path with built-in GradScaler
                             self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                             old_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
@@ -2152,7 +2184,7 @@ class KokoroTrainer:
 
                         else:  # MPS path with custom scaler
                             # Clip gradients before unscaling for MPS
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
 
                             old_scale = self.scaler.get_scale()
                             step_successful = self.scaler.step(self.optimizer)
@@ -2171,7 +2203,7 @@ class KokoroTrainer:
                                 if new_scale < old_scale:
                                     self.mixed_precision_stats['scale_decreases'] += 1
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                         self.optimizer.step()
 
                 self.log_memory_stats("optimizer_step")
