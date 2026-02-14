@@ -96,7 +96,7 @@ class TrainingConfig:
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
-    max_frames_per_batch: int = 20000  # Maximum mel frames per batch (auto-adjusted for MPS)
+    max_frames_per_batch: int = 30000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
     max_batch_size: int = 32  # Maximum samples per batch
 
@@ -162,9 +162,9 @@ class TrainingConfig:
         # MPS-specific memory optimizations
         if self.device == 'mps' or (torch.backends.mps.is_available() and self.device != 'cuda'):
             # Balanced settings to avoid MPS dimension overflow while maximizing throughput
-            if self.max_frames_per_batch > 20000:
-                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 20000")
-                self.max_frames_per_batch = 20000
+            if self.max_frames_per_batch > 30000:
+                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 30000")
+                self.max_frames_per_batch = 30000
 
             if self.max_seq_length > 1800:
                 print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1800")

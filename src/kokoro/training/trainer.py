@@ -164,9 +164,9 @@ class KokoroTrainer:
             logger.info("Using dynamic frame-based batching")
             self.batch_sampler = DynamicFrameBatchSampler(
                 dataset=self.dataset,
-                max_frames=getattr(config, 'max_frames_per_batch', 20000),
-                min_batch_size=getattr(config, 'min_batch_size', 4),
-                max_batch_size=getattr(config, 'max_batch_size', 32),
+                max_frames=config.max_frames_per_batch,
+                min_batch_size=config.min_batch_size,
+                max_batch_size=config.max_batch_size,
                 drop_last=True,
                 shuffle=True
             )
@@ -199,9 +199,9 @@ class KokoroTrainer:
 
                 val_batch_sampler = DynamicFrameBatchSampler(
                     dataset=self.val_dataset,
-                    max_frames=getattr(config, 'max_frames_per_batch', 20000),
-                    min_batch_size=getattr(config, 'min_batch_size', 4),
-                    max_batch_size=getattr(config, 'max_batch_size', 32),
+                    max_frames=config.max_frames_per_batch,
+                    min_batch_size=config.min_batch_size,
+                    max_batch_size=config.max_batch_size,
                     drop_last=False,  # Use all validation data
                     shuffle=False  # Don't shuffle validation
                 )
