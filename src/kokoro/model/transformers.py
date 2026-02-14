@@ -8,6 +8,11 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# MPS (Metal Performance Shaders) optimization constants
+MPS_CHUNKING_THRESHOLD = 2048  # Sequence length above which to enable chunking on MPS
+MPS_CHUNK_SIZE = 512  # Size of chunks when chunking is enabled
+REL_POS_CACHE_MAX_SIZE = 10  # Maximum number of cached relative position matrices
+
 
 def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
     """
@@ -110,7 +115,7 @@ class MultiHeadAttentionImproved(nn.Module):
         relative_pos_indices = relative_pos_indices + self.max_relative_distance
 
         # Cache for future use (limit cache size to prevent memory growth)
-        if len(self._rel_pos_cache) < 10:
+        if len(self._rel_pos_cache) < REL_POS_CACHE_MAX_SIZE:
             self._rel_pos_cache[cache_key] = relative_pos_indices
 
         return relative_pos_indices # (S, S)
@@ -146,14 +151,13 @@ class MultiHeadAttentionImproved(nn.Module):
             # Q: (B, H, S_q, D_k)
             # rel_pos_k_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, S_k)
-            if query.device.type == 'mps' and seq_len_q > 2048:
+            if query.device.type == 'mps' and seq_len_q > MPS_CHUNKING_THRESHOLD:
                 # MPS-safe: chunk queries to avoid large intermediate tensors
                 # Pre-allocate output tensor for efficiency
-                chunk_size = 512
                 rel_scores = torch.empty(batch_size, self.num_heads, seq_len_q, seq_len_k,
                                         device=query.device, dtype=Q.dtype)
-                for start_idx in range(0, seq_len_q, chunk_size):
-                    end_idx = min(start_idx + chunk_size, seq_len_q)
+                for start_idx in range(0, seq_len_q, MPS_CHUNK_SIZE):
+                    end_idx = min(start_idx + MPS_CHUNK_SIZE, seq_len_q)
                     q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
                     rel_chunk = rel_pos_k_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
                     rel_scores[:, :, start_idx:end_idx, :] = torch.einsum('bhcd,csd->bhcs', q_chunk, rel_chunk)
@@ -194,14 +198,13 @@ class MultiHeadAttentionImproved(nn.Module):
             # attn_weights: (B, H, S_q, S_k)
             # rel_pos_v_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, D_k)
-            if query.device.type == 'mps' and seq_len_q > 2048:
+            if query.device.type == 'mps' and seq_len_q > MPS_CHUNKING_THRESHOLD:
                 # MPS-safe: chunk to avoid large intermediate tensors
                 # Pre-allocate output tensor for efficiency
-                chunk_size = 512
                 rel_context = torch.empty(batch_size, self.num_heads, seq_len_q, self.d_k,
                                          device=query.device, dtype=attn_weights.dtype)
-                for start_idx in range(0, seq_len_q, chunk_size):
-                    end_idx = min(start_idx + chunk_size, seq_len_q)
+                for start_idx in range(0, seq_len_q, MPS_CHUNK_SIZE):
+                    end_idx = min(start_idx + MPS_CHUNK_SIZE, seq_len_q)
                     attn_chunk = attn_weights[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
                     rel_chunk = rel_pos_v_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
                     rel_context[:, :, start_idx:end_idx, :] = torch.einsum('bhcs,csd->bhcd', attn_chunk, rel_chunk)
