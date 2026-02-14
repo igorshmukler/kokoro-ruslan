@@ -1329,6 +1329,14 @@ class KokoroTrainer:
                     mel_lengths = transferred['mel_lengths']
                     phoneme_lengths = transferred['phoneme_lengths']
 
+                    # Optional tensors (pitch and energy) - get them first
+                    pitches = batch.get('pitches', None)
+                    energies = batch.get('energies', None)
+                    if pitches is not None:
+                        pitches = pitches.to(self.device, non_blocking=non_blocking)
+                    if energies is not None:
+                        energies = energies.to(self.device, non_blocking=non_blocking)
+
                     # Validate tensor dimensions to prevent MPS overflow
                     max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
                     if max_dim > 2000:
@@ -1345,13 +1353,6 @@ class KokoroTrainer:
                             logger.error(f"   Energy: [{energy_min:.3f}, {energy_max:.3f}]")
                         else:
                             logger.info(f"Batch {batch_idx} variance ranges OK - Pitch: [{pitch_min:.3f}, {pitch_max:.3f}], Energy: [{energy_min:.3f}, {energy_max:.3f}]")
-
-                    pitches = batch.get('pitches', None)
-                    energies = batch.get('energies', None)
-                    if pitches is not None:
-                        pitches = pitches.to(self.device, non_blocking=non_blocking)
-                    if energies is not None:
-                        energies = energies.to(self.device, non_blocking=non_blocking)
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_data_loading()
