@@ -66,7 +66,7 @@ class TrainingConfig:
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
     # Variance predictor settings
-    use_variance_predictor: bool = True
+    use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
     variance_filter_size: int = 256
     variance_kernel_size: int = 3
     variance_dropout: float = 0.1
@@ -96,7 +96,7 @@ class TrainingConfig:
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
-    max_frames_per_batch: int = 20000  # Maximum mel frames per batch (auto-adjusted for MPS)
+    max_frames_per_batch: int = 30000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
     max_batch_size: int = 32  # Maximum samples per batch
 
@@ -161,22 +161,22 @@ class TrainingConfig:
 
         # MPS-specific memory optimizations
         if self.device == 'mps' or (torch.backends.mps.is_available() and self.device != 'cuda'):
-            # Reduce memory usage for MPS to prevent OOM
-            if self.max_frames_per_batch > 10000:
-                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 12000")
-                self.max_frames_per_batch = 12000
+            # Balanced settings to avoid MPS dimension overflow while maximizing throughput
+            if self.max_frames_per_batch > 30000:
+                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 30000")
+                self.max_frames_per_batch = 30000
 
-            if self.max_seq_length > 1500:
-                print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1500")
-                self.max_seq_length = 1500
+            if self.max_seq_length > 1800:
+                print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1800")
+                self.max_seq_length = 1800
 
-            if self.batch_size > 8:
-                print(f"MPS detected: Reducing batch_size from {self.batch_size} to 8")
-                self.batch_size = 8
+            if self.batch_size > 10:
+                print(f"MPS detected: Reducing batch_size from {self.batch_size} to 10")
+                self.batch_size = 10
 
-            if self.max_batch_size > 16:
-                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 16")
-                self.max_batch_size = 16
+            if self.max_batch_size > 20:
+                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 20")
+                self.max_batch_size = 20
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1
             print("Warning: checkpoint_segments must be >= 1, setting to 1")

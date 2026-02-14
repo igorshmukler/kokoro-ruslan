@@ -134,8 +134,8 @@ Examples:
     parser.add_argument(
         '--max-frames',
         type=int,
-        default=20000,
-        help='Maximum mel frames per batch for dynamic batching (default: 20000)'
+        default=None,
+        help='Maximum mel frames per batch for dynamic batching (default: from config)'
     )
 
     parser.add_argument(
@@ -198,7 +198,7 @@ def create_config_from_args(args) -> TrainingConfig:
         use_mixed_precision=True,
         # Dynamic batching settings
         use_dynamic_batching=args.dynamic_batching,
-        max_frames_per_batch=args.max_frames,
+        max_frames_per_batch=args.max_frames if args.max_frames is not None else 30000,
         min_batch_size=args.min_batch_size,
         max_batch_size=args.max_batch_size,
         use_mfa=use_mfa,

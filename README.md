@@ -16,12 +16,12 @@ A Text-to-Speech (TTS) training script for Russian language using the Kokoro arc
 
 ## Documentation
 
-- **[WORKFLOW.md](WORKFLOW.md)** - Complete step-by-step guide from corpus to trained model
+- **[WORKFLOW.md](docs/development/WORKFLOW.md)** - Complete step-by-step guide from corpus to trained model
 - **[FEATURE_CACHING.md](docs/FEATURE_CACHING.md)** - Pre-computed features for 5-10x faster training
-- **[MFA_SETUP.md](MFA_SETUP.md)** - Detailed Montreal Forced Aligner setup and usage
-- **[VARIANCE_PREDICTOR.md](VARIANCE_PREDICTOR.md)** - Pitch and energy prediction for better prosody
-- **[VALIDATION.md](VALIDATION.md)** - Validation loop and overfitting monitoring
-- **[inference.md](inference.md)** - Model deployment and inference guide
+- **[MFA_SETUP.md](docs/setup/MFA_SETUP.md)** - Detailed Montreal Forced Aligner setup and usage
+- **[VARIANCE_PREDICTOR.md](docs/architecture/VARIANCE_PREDICTOR.md)** - Pitch and energy prediction for better prosody
+- **[VALIDATION.md](docs/development/VALIDATION.md)** - Validation loop and overfitting monitoring
+- **[inference.md](docs/setup/inference.md)** - Model deployment and inference guide
 
 ## Installation
 
@@ -51,7 +51,7 @@ pip install tgt
 python3 verify_setup.py
 ```
 
-**See [MFA_SETUP.md](MFA_SETUP.md) for detailed setup instructions.**
+**See [MFA_SETUP.md](docs/setup/MFA_SETUP.md) for detailed setup instructions.**
 
 ## Dataset Structure
 
@@ -103,7 +103,6 @@ python3 -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output
 # 1. Download Russian MFA models
 # 2. Align your corpus
 # 3. Extract phoneme durations
-# Takes ~1-2 hours for 22k files on a modern CPU
 ```
 
 **Skip this step** if you want to start quickly (will use estimated durations with lower quality).
@@ -195,7 +194,7 @@ kokoro-train --no-validation
 kokoro-train --early-stopping-patience 15
 ```
 
-**See [VALIDATION.md](VALIDATION.md) for detailed information about validation monitoring.**
+**See [VALIDATION.md](docs/development/VALIDATION.md) for detailed information about validation monitoring.**
 
 ## Model Architecture
 
@@ -218,7 +217,7 @@ The model supports two modes for phoneme durations:
 - Provides accurate, natural duration variations
 - Captures stress, speech rate, and prosodic patterns
 - **Results in 20-40% better naturalness scores**
-- See [MFA_SETUP.md](MFA_SETUP.md) for setup instructions
+- See [MFA_SETUP.md](docs/setup/MFA_SETUP.md) for setup instructions
 
 #### Estimated Durations (Fallback)
 - Distributes mel frames uniformly across phonemes

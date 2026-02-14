@@ -131,11 +131,23 @@ class MultiHeadAttentionImproved(nn.Module):
             # Retrieve relative key embeddings (S_q, S_k, D_k)
             rel_pos_k_emb = self.relative_position_k(rel_pos_indices)
 
-            # Compute relative scores (Q * R_k) using einsum
+            # Compute relative scores (Q * R_k)
             # Q: (B, H, S_q, D_k)
             # rel_pos_k_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, S_k)
-            rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
+            if query.device.type == 'mps' and seq_len_q > 512:
+                # MPS-safe: chunk queries to avoid large intermediate tensors
+                chunk_size = 256
+                rel_scores = []
+                for start_idx in range(0, seq_len_q, chunk_size):
+                    end_idx = min(start_idx + chunk_size, seq_len_q)
+                    q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
+                    rel_chunk = rel_pos_k_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
+                    chunk_scores = torch.einsum('bhcd,csd->bhcs', q_chunk, rel_chunk)  # (B, H, chunk, S_k)
+                    rel_scores.append(chunk_scores)
+                rel_scores = torch.cat(rel_scores, dim=2)  # (B, H, S_q, S_k)
+            else:
+                rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
             scores = scores + rel_scores
 
         # 4. Apply masks
@@ -167,11 +179,23 @@ class MultiHeadAttentionImproved(nn.Module):
             # Retrieve relative value embeddings (S_q, S_k, D_k)
             rel_pos_v_emb = self.relative_position_v(rel_pos_indices)
 
-            # Compute relative context (A * R_v) using einsum
+            # Compute relative context (A * R_v)
             # attn_weights: (B, H, S_q, S_k)
             # rel_pos_v_emb: (S_q, S_k, D_k)
             # Output: (B, H, S_q, D_k)
-            rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
+            if query.device.type == 'mps' and seq_len_q > 512:
+                # MPS-safe: chunk to avoid large intermediate tensors
+                chunk_size = 256
+                rel_context_chunks = []
+                for start_idx in range(0, seq_len_q, chunk_size):
+                    end_idx = min(start_idx + chunk_size, seq_len_q)
+                    attn_chunk = attn_weights[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
+                    rel_chunk = rel_pos_v_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
+                    chunk_context = torch.einsum('bhcs,csd->bhcd', attn_chunk, rel_chunk)  # (B, H, chunk, D_k)
+                    rel_context_chunks.append(chunk_context)
+                rel_context = torch.cat(rel_context_chunks, dim=2)  # (B, H, S_q, D_k)
+            else:
+                rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
             context = context + rel_context
 
         # 8. Concatenate heads and apply final linear layer
