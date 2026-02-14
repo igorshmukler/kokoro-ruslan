@@ -1315,6 +1315,12 @@ class KokoroTrainer:
                     mel_lengths = transferred['mel_lengths']
                     phoneme_lengths = transferred['phoneme_lengths']
 
+                    # Validate tensor dimensions to prevent MPS overflow
+                    max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
+                    if max_dim > 2000:
+                        logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
+                        continue
+
                     pitches = batch.get('pitches', None)
                     energies = batch.get('energies', None)
                     if pitches is not None:
@@ -2146,6 +2152,13 @@ class KokoroTrainer:
                     stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=self.device.type=='cuda')
                     mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
                     phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
+
+                    # Validate tensor dimensions to prevent MPS overflow (INT_MAX limit)
+                    max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
+                    if max_dim > 2000:  # Safety threshold
+                        logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
+                        continue
+
                 self.interbatch_profiler.end_data_loading()
 
                 self.log_memory_stats("data_loading")
