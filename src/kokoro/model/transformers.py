@@ -9,8 +9,8 @@ import logging
 logger = logging.getLogger(__name__)
 
 # MPS (Metal Performance Shaders) optimization constants
-MPS_CHUNKING_THRESHOLD = 2048  # Sequence length above which to enable chunking on MPS
-MPS_CHUNK_SIZE = 512  # Size of chunks when chunking is enabled
+MPS_CHUNKING_THRESHOLD = 1024  # Sequence length above which to enable chunking on MPS
+MPS_CHUNK_SIZE = 256  # Size of chunks when chunking is enabled
 REL_POS_CACHE_MAX_SIZE = 10  # Maximum number of cached relative position matrices
 
 
