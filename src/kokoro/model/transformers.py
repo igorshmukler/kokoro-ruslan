@@ -166,18 +166,29 @@ class MultiHeadAttentionImproved(nn.Module):
         # 3. Compute attention
         # MPS has severe memory constraints - use ultra-aggressive chunking for long sequences
         # Chunking reduces peak memory during backward pass by processing in smaller pieces
+        attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
+
         if query.device.type == 'mps' and (seq_len_q > 600 or seq_len_k > 600):
-            # Ultra-aggressive chunking for MPS to avoid OOM during backward
-            # Even with fp32, sequences of 1800 create 12GB+ allocations during backward
-            chunk_size = 128  # Ultra-small chunks to minimize memory peaks
+            # Ultra-aggressive chunking for MPS to avoid INT_MAX overflow during backward
+            # Batch 281 crash: 398M attention elements with chunk_size=128 still crashed
+            # MPS backend creates internal NDArray during backward that overflows INT_MAX
+            # Solution: Use smaller chunks for very large attention matrices
+            if attention_size > 300_000_000:
+                chunk_size = 32  # Extra aggressive for 300M+ elements
+            elif attention_size > 150_000_000:
+                chunk_size = 64  # Very aggressive for 150M+ elements
+            else:
+                chunk_size = 128  # Standard aggressive chunking
+
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
 
             # BATCH 281 LOGGING
             if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
                 elements_per_chunk = batch_size * self.num_heads * chunk_size * seq_len_k
                 logger.info(f"  [Attention] CHUNKING ACTIVATED")
+                logger.info(f"    total_attention_size: {attention_size:,} elements")
+                logger.info(f"    chunk_size: {chunk_size} (adaptive based on attention_size)")
                 logger.info(f"    total_attention_size: {attention_size:,} elements")
                 logger.info(f"    chunk_size: {chunk_size}")
                 logger.info(f"    num_chunks: {num_chunks}")
