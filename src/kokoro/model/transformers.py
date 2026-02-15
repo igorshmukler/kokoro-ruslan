@@ -160,17 +160,16 @@ class MultiHeadAttentionImproved(nn.Module):
                 attn_bias = attn_bias + padding_bias
 
         # 3. Compute attention
-        # MPS has dimension limits (INT_MAX) for large tensors
-        # For seq_len × seq_len × num_heads, need seq < sqrt(INT_MAX/8) ≈ 16384
-        # Use chunked attention on MPS for long sequences to stay well below limits
-        if query.device.type == 'mps' and (seq_len_q > 1000 or seq_len_k > 1000):
-            # Chunked attention for MPS to avoid dimension overflow
-            # Lower threshold (1000) to provide safety margin
-            chunk_size = 400  # Smaller chunks for better safety
+        # MPS has severe memory constraints - use aggressive chunking for long sequences
+        # Chunking reduces peak memory during backward pass by processing in smaller pieces
+        if query.device.type == 'mps' and (seq_len_q > 800 or seq_len_k > 800):
+            # Aggressive chunking for MPS to avoid OOM during backward
+            # Even sequences of 1800 need chunking to prevent 12GB+ allocations
+            chunk_size = 256  # Small chunks to minimize memory peaks
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
-            attn_weights_chunks = []
 
+            # Process chunks without accumulating attention weights to save memory
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
                 end_idx = min((chunk_idx + 1) * chunk_size, seq_len_q)
@@ -198,11 +197,12 @@ class MultiHeadAttentionImproved(nn.Module):
                 context_chunk = torch.matmul(attn_weights_chunk, V)  # (B, H, chunk, D_k)
 
                 context_chunks.append(context_chunk)
-                if not self.training:
-                    attn_weights_chunks.append(attn_weights_chunk.mean(dim=1))  # (B, chunk, S_k)
+
+                # Clear intermediate tensors to free memory before next chunk
+                del scores_chunk, attn_weights_chunk
 
             context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
-            attn_weights = torch.cat(attn_weights_chunks, dim=1) if (not self.training and attn_weights_chunks) else None
+            attn_weights = None  # Don't compute weights during chunked attention to save memory
 
         elif query.device.type == 'mps':
             # Manual attention implementation for MPS (normal sequences)
