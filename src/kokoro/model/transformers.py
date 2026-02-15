@@ -162,10 +162,11 @@ class MultiHeadAttentionImproved(nn.Module):
         # 3. Compute attention
         # MPS has dimension limits (INT_MAX) for large tensors
         # For seq_len × seq_len × num_heads, need seq < sqrt(INT_MAX/8) ≈ 16384
-        # Use chunked attention on MPS for very long sequences
-        if query.device.type == 'mps' and (seq_len_q > 1500 or seq_len_k > 1500):
+        # Use chunked attention on MPS for long sequences to stay well below limits
+        if query.device.type == 'mps' and (seq_len_q > 1000 or seq_len_k > 1000):
             # Chunked attention for MPS to avoid dimension overflow
-            chunk_size = 512
+            # Lower threshold (1000) to provide safety margin
+            chunk_size = 400  # Smaller chunks for better safety
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
             attn_weights_chunks = []
