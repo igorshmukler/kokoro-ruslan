@@ -1353,6 +1353,62 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("data_loading")
 
+                # DETAILED LOGGING FOR BATCH 281
+                if batch_idx == 281:
+                    logger.info("=" * 80)
+                    logger.info(f"🔍 BATCH {batch_idx} - DETAILED DIAGNOSTIC LOGGING")
+                    logger.info("=" * 80)
+
+                    # Log batch dimensions
+                    batch_size = mel_specs.shape[0]
+                    mel_len = mel_specs.shape[1]
+                    n_mels = mel_specs.shape[2]
+                    phoneme_len = phoneme_indices.shape[1]
+
+                    logger.info(f"📊 Batch dimensions:")
+                    logger.info(f"   batch_size: {batch_size}")
+                    logger.info(f"   mel_len: {mel_len}")
+                    logger.info(f"   n_mels: {n_mels}")
+                    logger.info(f"   phoneme_len: {phoneme_len}")
+
+                    # Log attention matrix calculations (based on model architecture)
+                    # Assuming 8 heads from crash log
+                    num_heads = 8
+                    attention_matrix_size = batch_size * num_heads * mel_len * mel_len
+                    int_max = 2**31 - 1
+                    percentage = (attention_matrix_size / int_max) * 100
+
+                    logger.info(f"🧮 Attention calculations:")
+                    logger.info(f"   num_heads: {num_heads}")
+                    logger.info(f"   attention_matrix_size: {attention_matrix_size:,} elements")
+                    logger.info(f"   INT_MAX: {int_max:,}")
+                    logger.info(f"   percentage of INT_MAX: {percentage:.2f}%")
+
+                    # Log stride calculations (potential overflow point)
+                    # MPS backend calculates: batch_size * num_heads * seq_len * seq_len * sizeof(float)
+                    stride_calc = attention_matrix_size * 4  # 4 bytes for float32
+                    logger.info(f"   potential stride (bytes): {stride_calc:,}")
+                    logger.info(f"   stride overflow: {stride_calc > int_max}")
+
+                    # Log variance predictor inputs if available
+                    if pitches is not None:
+                        pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
+                        pitch_mean = pitches.mean().item()
+                        logger.info(f"🎵 Pitch stats: min={pitch_min:.3f}, max={pitch_max:.3f}, mean={pitch_mean:.3f}")
+
+                    if energies is not None:
+                        energy_min, energy_max = energies.min().item(), energies.max().item()
+                        energy_mean = energies.mean().item()
+                        logger.info(f"⚡ Energy stats: min={energy_min:.3f}, max={energy_max:.3f}, mean={energy_mean:.3f}")
+
+                    # Log memory state
+                    if self.device.type == 'mps':
+                        logger.info(f"💾 Device: MPS (Apple Silicon)")
+                        logger.info(f"   dtype: {mel_specs.dtype}")
+                        logger.info(f"   gradient_checkpointing: {self.config.gradient_checkpointing}")
+
+                    logger.info("=" * 80)
+
                 # Zero gradients only at start of accumulation cycle
                 if accumulated_step == 0:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -1388,6 +1444,17 @@ class KokoroTrainer:
 
                 if is_profiling_epoch:
                     self.log_memory_stats("forward_pass")
+
+                # LOG CHECKPOINT: Forward pass completed
+                if batch_idx == 281:
+                    logger.info("✅ BATCH 281 - Forward pass completed successfully")
+                    logger.info(f"   predicted_mel shape: {predicted_mel.shape}")
+                    logger.info(f"   predicted_log_durations shape: {predicted_log_durations.shape}")
+                    logger.info(f"   predicted_stop_logits shape: {predicted_stop_logits.shape}")
+                    if predicted_pitch is not None:
+                        logger.info(f"   predicted_pitch shape: {predicted_pitch.shape}")
+                    if predicted_energy is not None:
+                        logger.info(f"   predicted_energy shape: {predicted_energy.shape}")
 
                 # Convert mel-frame level pitch/energy to phoneme level for loss calculation
                 phoneme_pitches = None
@@ -1441,10 +1508,26 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("loss_calculation")
 
+                # LOG CHECKPOINT: Loss calculation completed
+                if batch_idx == 281:
+                    logger.info("✅ BATCH 281 - Loss calculation completed successfully")
+                    logger.info(f"   total_loss: {total_loss.item():.4f}")
+                    logger.info(f"   mel_loss: {loss_mel.item():.4f}")
+                    logger.info(f"   duration_loss: {loss_duration.item():.4f}")
+                    logger.info(f"   stop_loss: {loss_stop_token.item():.4f}")
+                    if loss_pitch is not None:
+                        logger.info(f"   pitch_loss: {loss_pitch.item():.4f}")
+                    if loss_energy is not None:
+                        logger.info(f"   energy_loss: {loss_energy.item():.4f}")
+
                 # Scale loss by gradient accumulation steps for proper gradient averaging
                 scaled_total_loss = total_loss / gradient_accumulation_steps
 
                 # Backward pass with mixed precision and interbatch profiling
+                if batch_idx == 281:
+                    logger.info("🔄 BATCH 281 - Starting backward pass...")
+                    logger.info(f"   scaled_total_loss: {scaled_total_loss.item():.4f}")
+
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
 
@@ -1470,6 +1553,12 @@ class KokoroTrainer:
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_backward_pass()
+
+                # LOG CHECKPOINT: Backward pass completed
+                if batch_idx == 281:
+                    logger.info("✅ BATCH 281 - Backward pass completed successfully")
+                    logger.info("🎉 BATCH 281 - All operations completed without crash!")
+                    logger.info("=" * 80)
 
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
