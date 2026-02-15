@@ -61,21 +61,19 @@ class MultiHeadAttentionImproved(nn.Module):
         # Output linear projection
         self.w_o = nn.Linear(d_model, d_model)
 
-        # Relative positional encoding
+        # ALiBi: Attention with Linear Biases (replaces Shaw et al. relative pos)
+        # Each head gets a learned slope for distance-based bias
         if use_relative_pos:
-            self.max_relative_distance = max_relative_distance
-            # Total unique relative positions: -max_dist to +max_dist (inclusive) = 2*max_dist + 1
-            self.relative_position_k = nn.Embedding(2 * max_relative_distance + 1, self.d_k)
-            self.relative_position_v = nn.Embedding(2 * max_relative_distance + 1, self.d_k)
-            # Initialize these embeddings appropriately
-            nn.init.xavier_uniform_(self.relative_position_k.weight)
-            nn.init.xavier_uniform_(self.relative_position_v.weight)
+            # Initialize slopes following ALiBi paper: geometric sequence
+            # For 8 heads: [1/2^1, 1/2^2, ..., 1/2^8] = [0.5, 0.25, 0.125, ...]
+            slopes = torch.tensor([2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)])
+            self.register_buffer('alibi_slopes', slopes)
 
         self.dropout_attn = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
 
-        # Cache for relative position matrices to avoid recomputation
-        self._rel_pos_cache = {}
+        # Cache for distance matrices to avoid recomputation
+        self._distance_cache = {}
 
         # Better initialization for linear layers
         self._init_weights()
@@ -89,36 +87,30 @@ class MultiHeadAttentionImproved(nn.Module):
         if self.w_o.bias is not None:
             nn.init.zeros_(self.w_o.bias)
 
-    def _get_relative_positions(self, seq_len: int, device: torch.device) -> torch.Tensor:
+    def _get_alibi_bias(self, seq_len_q: int, seq_len_k: int, device: torch.device) -> torch.Tensor:
         """
-        Generate relative position indices for attention with caching.
-        Output shape: (seq_len, seq_len)
+        Generate ALiBi (Attention with Linear Biases) for attention.
+        Returns bias of shape (num_heads, seq_len_q, seq_len_k)
         """
-        cache_key = (seq_len, device)
-        if cache_key in self._rel_pos_cache:
-            return self._rel_pos_cache[cache_key]
+        cache_key = (seq_len_q, seq_len_k, device)
+        if cache_key in self._distance_cache:
+            return self._distance_cache[cache_key]
 
-        # Create a tensor of indices from 0 to seq_len-1
-        idx = torch.arange(seq_len, device=device)
-        # Create a matrix of (i - j) for all pairs (i, j)
-        # Resulting shape: (seq_len, seq_len)
-        relative_pos_indices = idx.unsqueeze(0) - idx.unsqueeze(1)
+        # Create distance matrix: relative position from each query to each key
+        # Shape: (seq_len_q, seq_len_k)
+        q_pos = torch.arange(seq_len_q, device=device).unsqueeze(1)  # (seq_len_q, 1)
+        k_pos = torch.arange(seq_len_k, device=device).unsqueeze(0)  # (1, seq_len_k)
+        distance = k_pos - q_pos  # (seq_len_q, seq_len_k), negative for past, positive for future
 
-        # Clip values to be within [-max_relative_distance, max_relative_distance]
-        relative_pos_indices = torch.clamp(
-            relative_pos_indices, -self.max_relative_distance, self.max_relative_distance
-        )
+        # Apply per-head slopes: (num_heads, 1, 1) * (1, seq_len_q, seq_len_k)
+        # Result: (num_heads, seq_len_q, seq_len_k)
+        alibi_bias = self.alibi_slopes.view(-1, 1, 1) * distance.unsqueeze(0)
 
-        # Shift values to be positive for embedding lookup
-        # e.g., if max_dist=32, range is -32 to 32. Adding 32 shifts to 0 to 64.
-        # This maps to indices [0, 2*max_relative_distance]
-        relative_pos_indices = relative_pos_indices + self.max_relative_distance
+        # Cache for future use (limit cache size)
+        if len(self._distance_cache) < REL_POS_CACHE_MAX_SIZE:
+            self._distance_cache[cache_key] = alibi_bias
 
-        # Cache for future use (limit cache size to prevent memory growth)
-        if len(self._rel_pos_cache) < REL_POS_CACHE_MAX_SIZE:
-            self._rel_pos_cache[cache_key] = relative_pos_indices
-
-        return relative_pos_indices # (S, S)
+        return alibi_bias
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 attn_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention (float('-inf'))
@@ -139,31 +131,13 @@ class MultiHeadAttentionImproved(nn.Module):
         # (B, H, S_q, D_k) @ (B, H, D_k, S_k) -> (B, H, S_q, S_k)
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
-        # 3. Add relative positional encoding scores
-        if self.use_relative_pos and seq_len_q == seq_len_k:
-            # Generate relative position indices (S_q, S_k)
-            rel_pos_indices = self._get_relative_positions(seq_len_q, query.device)
-
-            # Retrieve relative key embeddings (S_q, S_k, D_k)
-            rel_pos_k_emb = self.relative_position_k(rel_pos_indices)
-
-            # Compute relative scores (Q * R_k)
-            # Q: (B, H, S_q, D_k)
-            # rel_pos_k_emb: (S_q, S_k, D_k)
-            # Output: (B, H, S_q, S_k)
-            if query.device.type == 'mps' and seq_len_q > MPS_CHUNKING_THRESHOLD:
-                # MPS-safe: chunk queries to avoid large intermediate tensors
-                # Pre-allocate output tensor for efficiency
-                rel_scores = torch.empty(batch_size, self.num_heads, seq_len_q, seq_len_k,
-                                        device=query.device, dtype=Q.dtype)
-                for start_idx in range(0, seq_len_q, MPS_CHUNK_SIZE):
-                    end_idx = min(start_idx + MPS_CHUNK_SIZE, seq_len_q)
-                    q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
-                    rel_chunk = rel_pos_k_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
-                    rel_scores[:, :, start_idx:end_idx, :] = torch.einsum('bhcd,csd->bhcs', q_chunk, rel_chunk)
-            else:
-                rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
-            scores = scores + rel_scores
+        # 3. Add ALiBi positional bias (replaces Shaw et al. relative position)
+        # ALiBi adds a linear bias based on distance, no embedding lookup needed
+        if self.use_relative_pos:
+            # Get ALiBi bias: (num_heads, seq_len_q, seq_len_k)
+            alibi_bias = self._get_alibi_bias(seq_len_q, seq_len_k, query.device)
+            # Add to scores: (B, H, S_q, S_k) + (1, H, S_q, S_k)
+            scores = scores + alibi_bias.unsqueeze(0)
 
         # 4. Apply masks
         if attn_mask is not None:
@@ -189,30 +163,7 @@ class MultiHeadAttentionImproved(nn.Module):
         # (B, H, S_q, S_k) @ (B, H, S_k, D_k) -> (B, H, S_q, D_k)
         context = torch.matmul(attn_weights, V)
 
-        # 7. Add relative positional encoding to values (for the `A * R_v` term)
-        if self.use_relative_pos and seq_len_q == seq_len_k:
-            # Retrieve relative value embeddings (S_q, S_k, D_k)
-            rel_pos_v_emb = self.relative_position_v(rel_pos_indices)
-
-            # Compute relative context (A * R_v)
-            # attn_weights: (B, H, S_q, S_k)
-            # rel_pos_v_emb: (S_q, S_k, D_k)
-            # Output: (B, H, S_q, D_k)
-            if query.device.type == 'mps' and seq_len_q > MPS_CHUNKING_THRESHOLD:
-                # MPS-safe: chunk to avoid large intermediate tensors
-                # Pre-allocate output tensor for efficiency
-                rel_context = torch.empty(batch_size, self.num_heads, seq_len_q, self.d_k,
-                                         device=query.device, dtype=attn_weights.dtype)
-                for start_idx in range(0, seq_len_q, MPS_CHUNK_SIZE):
-                    end_idx = min(start_idx + MPS_CHUNK_SIZE, seq_len_q)
-                    attn_chunk = attn_weights[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
-                    rel_chunk = rel_pos_v_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
-                    rel_context[:, :, start_idx:end_idx, :] = torch.einsum('bhcs,csd->bhcd', attn_chunk, rel_chunk)
-            else:
-                rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
-            context = context + rel_context
-
-        # 8. Concatenate heads and apply final linear layer
+        # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
         context = context.transpose(1, 2).contiguous().view(
             batch_size, seq_len_q, self.d_model
