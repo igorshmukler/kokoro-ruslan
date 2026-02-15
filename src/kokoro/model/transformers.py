@@ -132,8 +132,15 @@ class MultiHeadAttentionImproved(nn.Module):
         scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
         # 3. Add ALiBi positional bias (replaces Shaw et al. relative position)
-        # ALiBi adds a linear bias based on distance, no embedding lookup needed
-        if self.use_relative_pos:
+        # Skip ALiBi on MPS for very long sequences to prevent dimension overflow
+        use_alibi = self.use_relative_pos
+        if use_alibi and query.device.type == 'mps':
+            # MPS crashes with large distance matrices (1800*1800*8 heads)
+            # Skip ALiBi for sequences longer than 1200 frames
+            if seq_len_q > 1200 or seq_len_k > 1200:
+                use_alibi = False
+
+        if use_alibi:
             # Get ALiBi bias: (num_heads, seq_len_q, seq_len_k)
             alibi_bias = self._get_alibi_bias(seq_len_q, seq_len_k, query.device)
             # Add to scores: (B, H, S_q, S_k) + (1, H, S_q, S_k)
