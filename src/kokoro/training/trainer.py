@@ -1359,6 +1359,12 @@ class KokoroTrainer:
                     logger.info(f"🔍 BATCH {batch_idx} - DETAILED DIAGNOSTIC LOGGING")
                     logger.info("=" * 80)
 
+                    # Log PyTorch version
+                    import torch as torch_version_check
+                    logger.info(f"🔧 Environment:")
+                    logger.info(f"   PyTorch version: {torch_version_check.__version__}")
+                    logger.info(f"   MPS built: {torch_version_check.backends.mps.is_built()}")
+
                     # Log batch dimensions
                     batch_size = mel_specs.shape[0]
                     mel_len = mel_specs.shape[1]
@@ -1409,11 +1415,21 @@ class KokoroTrainer:
 
                     logger.info("=" * 80)
 
+                    # Enable attention-level logging for batch 281
+                    logger.info("🔍 Enabling module-level logging for this batch...")
+                    for module in self.model.modules():
+                        module._batch_281_log = True
+                    # Also set on model itself
+                    self.model._batch_281_log = True
+
                 # Zero gradients only at start of accumulation cycle
                 if accumulated_step == 0:
                     self.optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass with mixed precision and interbatch profiling
+                if batch_idx == 281:
+                    logger.info("▶️  BATCH 281 - Starting forward pass...")
+
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_forward_pass()
 
@@ -1813,6 +1829,7 @@ class KokoroTrainer:
         save_phoneme_processor(self.dataset.phoneme_processor, self.config.output_dir)
 
         logger.info(f"Starting training on device: {self.device} ({self.device_type})")
+        logger.info(f"PyTorch version: {torch.__version__}")
         logger.info(f"Mixed precision training: {'Enabled' if self.use_mixed_precision else 'Disabled'}")
         if self.use_mixed_precision:
             logger.info(f"Mixed precision dtype: {self.mixed_precision_dtype}")

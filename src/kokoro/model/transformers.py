@@ -120,6 +120,10 @@ class MultiHeadAttentionImproved(nn.Module):
         seq_len_k = key.size(1)
         seq_len_v = value.size(1) # Should be same as seq_len_k
 
+        # BATCH 281 LOGGING - Track attention entry
+        if hasattr(self, '_batch_281_log') and self._batch_281_log:
+            logger.info(f"  [Attention] Forward: batch={batch_size}, seq_q={seq_len_q}, seq_k={seq_len_k}")
+
         # 1. Linear projections and reshape for multi-head attention
         Q = self.w_q(query).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_q, D_k)
         K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
@@ -169,6 +173,16 @@ class MultiHeadAttentionImproved(nn.Module):
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
 
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
+                elements_per_chunk = batch_size * self.num_heads * chunk_size * seq_len_k
+                logger.info(f"  [Attention] CHUNKING ACTIVATED")
+                logger.info(f"    total_attention_size: {attention_size:,} elements")
+                logger.info(f"    chunk_size: {chunk_size}")
+                logger.info(f"    num_chunks: {num_chunks}")
+                logger.info(f"    elements_per_chunk: {elements_per_chunk:,}")
+
             # Process chunks without accumulating attention weights to save memory
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
@@ -208,12 +222,37 @@ class MultiHeadAttentionImproved(nn.Module):
 
         elif query.device.type == 'mps':
             # Manual attention implementation for MPS (normal sequences)
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
+                logger.info(f"  [Attention] NON-CHUNKED MPS PATH")
+                logger.info(f"    attention_size: {attention_size:,} elements")
+
             scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"    scores computed: {scores.shape}")
+
             if attn_bias is not None:
                 scores = scores + attn_bias
+
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"    computing softmax...")
+
             attn_weights = F.softmax(scores, dim=-1)
+
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"    softmax done, applying dropout...")
+
             attn_weights = self.dropout_attn(attn_weights)
+
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"    computing context (attn @ V)...")
+
             context = torch.matmul(attn_weights, V)
+
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"    context computed: {context.shape}")
         else:
             # Use Flash Attention 2 on CUDA/CPU (2-4x faster)
             try:

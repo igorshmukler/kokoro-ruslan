@@ -489,6 +489,11 @@ class KokoroModel(nn.Module):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
             device = mel_specs.device
 
+            # BATCH 281 LOGGING - Track model forward entry
+            is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+            if is_batch_281:
+                logger.info(f"  [Model] forward_training: batch={batch_size}, mel_seq={mel_seq_len}")
+
             # Log at the very beginning (outside any checkpointed regions)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("training_start")
@@ -496,6 +501,8 @@ class KokoroModel(nn.Module):
             # Log gradient checkpointing status
             if self.gradient_checkpointing and self.training:
                 logger.debug("Using gradient checkpointing for forward pass")
+                if is_batch_281:
+                    logger.info(f"  [Model] Gradient checkpointing ENABLED")
 
             if text_padding_mask is None:
                 text_padding_mask = (phoneme_indices == 0).to(torch.bool)
@@ -606,6 +613,11 @@ class KokoroModel(nn.Module):
                         self.profiler.log_memory_stats("decoder_input_prep_end")
 
                 with torch.profiler.record_function("transformer_decoder_forward"):
+                    # BATCH 281 LOGGING
+                    is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+                    if is_batch_281:
+                        logger.info(f"  [Model] Calling decoder: input_shape={decoder_input_projected_with_pe.shape}, memory_shape={expanded_encoder_outputs.shape}")
+
                     # Pass through Transformer Decoder with checkpointing (logging handled internally)
                     decoder_outputs = self._checkpoint_decoder_forward(
                         decoder_input_projected_with_pe,
@@ -614,6 +626,9 @@ class KokoroModel(nn.Module):
                         memory_key_padding_mask=encoder_output_padding_mask,
                         tgt_key_padding_mask=mel_padding_mask
                     )
+
+                    if is_batch_281:
+                        logger.info(f"  [Model] Decoder completed: output_shape={decoder_outputs.shape}")
 
                 with torch.profiler.record_function("output_projections"):
                     if self.enable_profiling:
