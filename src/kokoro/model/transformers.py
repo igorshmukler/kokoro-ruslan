@@ -161,52 +161,75 @@ class MultiHeadAttentionImproved(nn.Module):
             else:
                 attn_bias = attn_bias + padding_bias
 
-        # 3. Use Flash Attention 2 (PyTorch 2.0+ scaled_dot_product_attention)
-        # 2-4x faster with better memory efficiency, works on CUDA/MPS/CPU
-        try:
-            context = F.scaled_dot_product_attention(
-                Q, K, V,
-                attn_mask=attn_bias,
-                dropout_p=self.dropout_attn.p if self.training else 0.0,
-                is_causal=False  # We handle causality through attn_bias
-            )
-            # Flash Attention doesn't return weights, only compute during eval for visualization
-            if not self.training:
-                with torch.no_grad():
-                    scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-                    if attn_bias is not None:
-                        scores = scores + attn_bias
-                    attn_weights = F.softmax(scores, dim=-1)
-            else:
-                attn_weights = None
+        # 3. Compute attention
+        # MPS has dimension limits (INT_MAX) for large tensors
+        # For seq_len × seq_len × num_heads, need seq < sqrt(INT_MAX/8) ≈ 16384
+        # Use chunked attention on MPS for very long sequences
+        if query.device.type == 'mps' and (seq_len_q > 1500 or seq_len_k > 1500):
+            # Chunked attention for MPS to avoid dimension overflow
+            chunk_size = 512
+            num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
+            context_chunks = []
+            attn_weights_chunks = []
 
-        except (RuntimeError, AttributeError) as e:
-            # Fallback to manual implementation if Flash Attention not available
-            logger.warning(f"Flash Attention failed ({e}), using manual implementation")
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min((chunk_idx + 1) * chunk_size, seq_len_q)
 
-            # Manual attention implementation
-            # MPS has dtype issues with fp16 matmul - use fp32 for attention computation
-            if query.device.type == 'mps' and Q.dtype == torch.float16:
-                Q_compute = Q.float()
-                K_compute = K.float()
-                V_compute = V.float()
-                attn_bias_compute = attn_bias.float() if attn_bias is not None else None
-            else:
-                Q_compute = Q
-                K_compute = K
-                V_compute = V
-                attn_bias_compute = attn_bias
+                Q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
 
-            scores = torch.matmul(Q_compute, K_compute.transpose(-2, -1)) / self.scale
-            if attn_bias_compute is not None:
-                scores = scores + attn_bias_compute
+                # Compute attention for this chunk
+                scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
+                if attn_bias is not None:
+                    bias_chunk = attn_bias[:, :, start_idx:end_idx, :]
+                    scores_chunk = scores_chunk + bias_chunk
+                attn_weights_chunk = F.softmax(scores_chunk, dim=-1)
+                attn_weights_chunk = self.dropout_attn(attn_weights_chunk)
+                context_chunk = torch.matmul(attn_weights_chunk, V)  # (B, H, chunk, D_k)
+
+                context_chunks.append(context_chunk)
+                if not self.training:
+                    attn_weights_chunks.append(attn_weights_chunk.mean(dim=1))  # (B, chunk, S_k)
+
+            context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
+            attn_weights = torch.cat(attn_weights_chunks, dim=1) if not self.training else None
+
+        elif query.device.type == 'mps':
+            # Manual attention implementation for MPS (normal sequences)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+            if attn_bias is not None:
+                scores = scores + attn_bias
             attn_weights = F.softmax(scores, dim=-1)
             attn_weights = self.dropout_attn(attn_weights)
-            context = torch.matmul(attn_weights, V_compute)
+            context = torch.matmul(attn_weights, V)
+        else:
+            # Use Flash Attention 2 on CUDA/CPU (2-4x faster)
+            try:
+                context = F.scaled_dot_product_attention(
+                    Q, K, V,
+                    attn_mask=attn_bias,
+                    dropout_p=self.dropout_attn.p if self.training else 0.0,
+                    is_causal=False  # We handle causality through attn_bias
+                )
+                # Flash Attention doesn't return weights, only compute during eval for visualization
+                if not self.training:
+                    with torch.no_grad():
+                        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+                        if attn_bias is not None:
+                            scores = scores + attn_bias
+                        attn_weights = F.softmax(scores, dim=-1)
+                else:
+                    attn_weights = None
 
-            # Convert back to original dtype if needed
-            if query.device.type == 'mps' and Q.dtype == torch.float16:
-                context = context.half()
+            except (RuntimeError, AttributeError) as e:
+                # Fallback to manual implementation
+                logger.warning(f"Flash Attention failed ({e}), using manual implementation")
+                scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+                if attn_bias is not None:
+                    scores = scores + attn_bias
+                attn_weights = F.softmax(scores, dim=-1)
+                attn_weights = self.dropout_attn(attn_weights)
+                context = torch.matmul(attn_weights, V)
 
         # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
