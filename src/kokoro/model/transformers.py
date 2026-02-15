@@ -160,12 +160,12 @@ class MultiHeadAttentionImproved(nn.Module):
                 attn_bias = attn_bias + padding_bias
 
         # 3. Compute attention
-        # MPS has severe memory constraints - use aggressive chunking for long sequences
+        # MPS has severe memory constraints - use ultra-aggressive chunking for long sequences
         # Chunking reduces peak memory during backward pass by processing in smaller pieces
-        if query.device.type == 'mps' and (seq_len_q > 800 or seq_len_k > 800):
-            # Aggressive chunking for MPS to avoid OOM during backward
-            # Even sequences of 1800 need chunking to prevent 12GB+ allocations
-            chunk_size = 256  # Small chunks to minimize memory peaks
+        if query.device.type == 'mps' and (seq_len_q > 600 or seq_len_k > 600):
+            # Ultra-aggressive chunking for MPS to avoid OOM during backward
+            # Even with fp32, sequences of 1800 create 12GB+ allocations during backward
+            chunk_size = 128  # Ultra-small chunks to minimize memory peaks
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
 
@@ -198,8 +198,10 @@ class MultiHeadAttentionImproved(nn.Module):
 
                 context_chunks.append(context_chunk)
 
-                # Clear intermediate tensors to free memory before next chunk
-                del scores_chunk, attn_weights_chunk
+                # Clear intermediate tensors and free MPS cache after each chunk
+                del scores_chunk, attn_weights_chunk, context_chunk
+                if chunk_idx % 4 == 0:  # Periodic cache clearing
+                    torch.mps.empty_cache()
 
             context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
             attn_weights = None  # Don't compute weights during chunked attention to save memory
