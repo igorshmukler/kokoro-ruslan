@@ -419,22 +419,15 @@ class KokoroTrainer:
         if self.device_type == DeviceType.CUDA.value:
             return torch.amp.autocast('cuda', dtype=self.mixed_precision_dtype)
         elif self.device_type == DeviceType.MPS.value:
-            # MPS autocast support varies by PyTorch version
-            # Try to use it, but fall back gracefully if not supported
-            try:
-                # Test if MPS autocast is supported
-                test_tensor = torch.randn(2, 2, device=self.device)
-                with torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype):
-                    _ = test_tensor * 2
-                # If successful, return the context
-                return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
-            except (RuntimeError, AttributeError) as e:
-                # Fall back to no autocast for MPS if not supported
-                logger.warning(f"MPS autocast not supported in this PyTorch version: {e}")
-                logger.warning("Disabling AMP for MPS - training will use full precision")
-                # Disable mixed precision for future calls
-                self.use_mixed_precision = False
-                return nullcontext()
+            # CRITICAL: MPS has a bug with fp16 matrix multiplication that causes:
+            # "Destination NDArray and Accumulator NDArray cannot have different datatype"
+            # This affects ALiBi, attention, and all linear layers with long sequences
+            # Solution: Always use fp32 on MPS (slower but stable)
+            logger.warning("Mixed precision disabled on MPS due to backend bugs with fp16")
+            logger.warning("Training will use fp32 on MPS (slower but stable)")
+            # Disable mixed precision to avoid repeated warnings
+            self.use_mixed_precision = False
+            return nullcontext()
         else:
             return nullcontext()
 

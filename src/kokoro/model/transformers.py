@@ -87,24 +87,25 @@ class MultiHeadAttentionImproved(nn.Module):
         if self.w_o.bias is not None:
             nn.init.zeros_(self.w_o.bias)
 
-    def _get_alibi_bias(self, seq_len_q: int, seq_len_k: int, device: torch.device) -> torch.Tensor:
+    def _get_alibi_bias(self, seq_len_q: int, seq_len_k: int, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """
         Generate ALiBi (Attention with Linear Biases) for attention.
         Returns bias of shape (num_heads, seq_len_q, seq_len_k)
         """
-        cache_key = (seq_len_q, seq_len_k, device)
+        cache_key = (seq_len_q, seq_len_k, device, dtype)
         if cache_key in self._distance_cache:
             return self._distance_cache[cache_key]
 
         # Create distance matrix: relative position from each query to each key
         # Shape: (seq_len_q, seq_len_k)
-        q_pos = torch.arange(seq_len_q, device=device).unsqueeze(1)  # (seq_len_q, 1)
-        k_pos = torch.arange(seq_len_k, device=device).unsqueeze(0)  # (1, seq_len_k)
+        q_pos = torch.arange(seq_len_q, device=device, dtype=dtype).unsqueeze(1)  # (seq_len_q, 1)
+        k_pos = torch.arange(seq_len_k, device=device, dtype=dtype).unsqueeze(0)  # (1, seq_len_k)
         distance = k_pos - q_pos  # (seq_len_q, seq_len_k), negative for past, positive for future
 
         # Apply per-head slopes: (num_heads, 1, 1) * (1, seq_len_q, seq_len_k)
         # Result: (num_heads, seq_len_q, seq_len_k)
-        alibi_bias = self.alibi_slopes.view(-1, 1, 1) * distance.unsqueeze(0)
+        # Convert slopes to correct dtype
+        alibi_bias = self.alibi_slopes.to(dtype).view(-1, 1, 1) * distance.unsqueeze(0)
 
         # Cache for future use (limit cache size)
         if len(self._distance_cache) < REL_POS_CACHE_MAX_SIZE:
@@ -126,49 +127,86 @@ class MultiHeadAttentionImproved(nn.Module):
         K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
         V = self.w_v(value).view(batch_size, seq_len_v, self.num_heads, self.d_k).transpose(1, 2)  # (B, H, S_v, D_k)
 
-        # 2. Scaled dot-product attention (Content-based scores)
-        # scores = Q @ K.transpose(-2, -1) / sqrt(d_k)
-        # (B, H, S_q, D_k) @ (B, H, D_k, S_k) -> (B, H, S_q, S_k)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        # 2. Prepare attention bias (ALiBi + masks) for Flash Attention
+        attn_bias = None
 
-        # 3. Add ALiBi positional bias (replaces Shaw et al. relative position)
-        # Skip ALiBi on MPS for very long sequences to prevent dimension overflow
-        use_alibi = self.use_relative_pos
-        if use_alibi and query.device.type == 'mps':
-            # MPS crashes with large distance matrices (1800*1800*8 heads)
-            # Skip ALiBi for sequences longer than 1200 frames
-            if seq_len_q > 1200 or seq_len_k > 1200:
-                use_alibi = False
+        # Add ALiBi positional bias
+        # CRITICAL: Disable ALiBi entirely on MPS due to fp16 dtype bugs in matrix multiplication
+        # MPS backend has issues with mixed dtype operations that cause crashes
+        use_alibi = self.use_relative_pos and query.device.type != 'mps'
 
         if use_alibi:
             # Get ALiBi bias: (num_heads, seq_len_q, seq_len_k)
-            alibi_bias = self._get_alibi_bias(seq_len_q, seq_len_k, query.device)
-            # Add to scores: (B, H, S_q, S_k) + (1, H, S_q, S_k)
-            scores = scores + alibi_bias.unsqueeze(0)
+            alibi_bias = self._get_alibi_bias(seq_len_q, seq_len_k, query.device, dtype=Q.dtype)
+            # Expand to (B, H, S_q, S_k)
+            attn_bias = alibi_bias.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-        # 4. Apply masks
+        # Apply causal mask
         if attn_mask is not None:
-            # attn_mask (e.g., causal mask): (S_q, S_k) float('-inf') mask
-            # Broadcast to (1, 1, S_q, S_k)
-            scores = scores.masked_fill(attn_mask == float('-inf'), float('-inf'))
+            # attn_mask: (S_q, S_k) with float('-inf') for masked positions
+            mask_bias = attn_mask.unsqueeze(0).unsqueeze(0).to(dtype=Q.dtype, device=query.device)  # (1, 1, S_q, S_k)
+            if attn_bias is None:
+                attn_bias = mask_bias
+            else:
+                attn_bias = attn_bias + mask_bias
 
+        # Apply padding mask
         if key_padding_mask is not None:
-            # key_padding_mask: (B, S_k) boolean mask (True for padded, False for not padded)
-            # Need to broadcast to (B, 1, 1, S_k) for scores
-            # Crucially, ensure key_padding_mask is boolean before using with masked_fill
+            # key_padding_mask: (B, S_k) boolean (True for padded)
             key_padding_mask = key_padding_mask.to(torch.bool)
-            scores = scores.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
+            padding_bias = torch.zeros(batch_size, 1, 1, seq_len_k, device=query.device, dtype=Q.dtype)
+            padding_bias = padding_bias.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            if attn_bias is None:
+                attn_bias = padding_bias
+            else:
+                attn_bias = attn_bias + padding_bias
+
+        # 3. Use Flash Attention 2 (PyTorch 2.0+ scaled_dot_product_attention)
+        # 2-4x faster with better memory efficiency, works on CUDA/MPS/CPU
+        try:
+            context = F.scaled_dot_product_attention(
+                Q, K, V,
+                attn_mask=attn_bias,
+                dropout_p=self.dropout_attn.p if self.training else 0.0,
+                is_causal=False  # We handle causality through attn_bias
             )
+            # Flash Attention doesn't return weights, only compute during eval for visualization
+            if not self.training:
+                with torch.no_grad():
+                    scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+                    if attn_bias is not None:
+                        scores = scores + attn_bias
+                    attn_weights = F.softmax(scores, dim=-1)
+            else:
+                attn_weights = None
 
-        # 5. Softmax to get attention probabilities
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout_attn(attn_weights)
+        except (RuntimeError, AttributeError) as e:
+            # Fallback to manual implementation if Flash Attention not available
+            logger.warning(f"Flash Attention failed ({e}), using manual implementation")
 
-        # 6. Apply attention weights to values (Content-based context)
-        # context = attn_weights @ V
-        # (B, H, S_q, S_k) @ (B, H, S_k, D_k) -> (B, H, S_q, D_k)
-        context = torch.matmul(attn_weights, V)
+            # Manual attention implementation
+            # MPS has dtype issues with fp16 matmul - use fp32 for attention computation
+            if query.device.type == 'mps' and Q.dtype == torch.float16:
+                Q_compute = Q.float()
+                K_compute = K.float()
+                V_compute = V.float()
+                attn_bias_compute = attn_bias.float() if attn_bias is not None else None
+            else:
+                Q_compute = Q
+                K_compute = K
+                V_compute = V
+                attn_bias_compute = attn_bias
+
+            scores = torch.matmul(Q_compute, K_compute.transpose(-2, -1)) / self.scale
+            if attn_bias_compute is not None:
+                scores = scores + attn_bias_compute
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout_attn(attn_weights)
+            context = torch.matmul(attn_weights, V_compute)
+
+            # Convert back to original dtype if needed
+            if query.device.type == 'mps' and Q.dtype == torch.float16:
+                context = context.half()
 
         # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
@@ -177,7 +215,8 @@ class MultiHeadAttentionImproved(nn.Module):
         )
         output = self.w_o(context)
 
-        return output, attn_weights.mean(dim=1) # Return mean attention weights for visualization/debugging
+        # Return output and attention weights (None during training with Flash Attention)
+        return output, attn_weights.mean(dim=1) if attn_weights is not None else None
 
 
 class ImprovedTransformerEncoderBlock(nn.Module):
