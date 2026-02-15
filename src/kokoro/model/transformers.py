@@ -170,13 +170,15 @@ class MultiHeadAttentionImproved(nn.Module):
 
         if query.device.type == 'mps' and (seq_len_q > 600 or seq_len_k > 600):
             # Ultra-aggressive chunking for MPS to avoid INT_MAX overflow during backward
-            # Batch 281 crash: 398M attention elements with chunk_size=128 still crashed
+            # Batch 281 crash: 398M attention elements crashed with chunk_size=32 (8M elements/chunk)
             # MPS backend creates internal NDArray during backward that overflows INT_MAX
-            # Solution: Use smaller chunks for very large attention matrices
+            # Solution: Use even smaller chunks - 16 creates ~4M element chunks
             if attention_size > 300_000_000:
-                chunk_size = 32  # Extra aggressive for 300M+ elements
+                chunk_size = 16  # Ultra-aggressive for 300M+ elements (4M elements/chunk)
             elif attention_size > 150_000_000:
-                chunk_size = 64  # Very aggressive for 150M+ elements
+                chunk_size = 32  # Extra aggressive for 150M+ elements (8M elements/chunk)
+            elif attention_size > 50_000_000:
+                chunk_size = 64  # Very aggressive for 50M+ elements
             else:
                 chunk_size = 128  # Standard aggressive chunking
 
