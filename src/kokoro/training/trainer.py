@@ -788,6 +788,13 @@ class KokoroTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
+    def _has_nonfinite_gradients(self) -> bool:
+        """Check whether any model gradient contains NaN/Inf values."""
+        for param in self.model.parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                return True
+        return False
+
     def _average_pitch_energy_by_duration(self,
                                           values: torch.Tensor,
                                           durations: torch.Tensor,
@@ -894,37 +901,51 @@ class KokoroTrainer:
         phoneme_mask_2d = torch.arange(max_phoneme_len, device=self.device).unsqueeze(0) < phoneme_lengths.unsqueeze(1)
 
         # Pre-compute mask normalization factors (reused across losses)
-        mel_mask_count = mel_mask_2d.sum()
-        phoneme_mask_count = phoneme_mask_2d.sum()
+        mel_mask_count = mel_mask_2d.sum().clamp(min=1)
+        phoneme_mask_count = phoneme_mask_2d.sum().clamp(min=1)
 
-        # Mel Spectrogram Loss - expand mask only along feature dim when needed
-        # Use unsqueeze + in-place broadcasting instead of expand_as for efficiency
+        # Mel Spectrogram Loss
         loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        # Broadcast 2D mask to 3D: (batch, time, 1) * (batch, time, n_mels) using view
-        mel_mask_3d = mel_mask_2d.unsqueeze(-1)  # (batch, time, 1)
-        loss_mel = (loss_mel_unreduced * mel_mask_3d).sum() / (mel_mask_count * n_mels)
+        mel_mask_3d = mel_mask_2d.unsqueeze(-1).expand_as(loss_mel_unreduced)
+        mel_valid = mel_mask_3d & torch.isfinite(loss_mel_unreduced)
+        if mel_valid.any():
+            loss_mel = loss_mel_unreduced[mel_valid].mean()
+        else:
+            loss_mel = torch.tensor(0.0, device=self.device)
 
         # Duration Loss - convert to float once
         phoneme_mask_float = phoneme_mask_2d.float()
         target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
         loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-        loss_duration = (loss_duration_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
+        duration_valid = phoneme_mask_2d & torch.isfinite(loss_duration_unreduced)
+        if duration_valid.any():
+            loss_duration = loss_duration_unreduced[duration_valid].mean()
+        else:
+            loss_duration = torch.tensor(0.0, device=self.device)
 
         # Stop Token Loss - reuse mel_mask_2d directly (no need to slice from 3D)
         loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
-        loss_stop_token = (loss_stop_token_unreduced * mel_mask_2d).sum() / mel_mask_count
+        stop_valid = mel_mask_2d & torch.isfinite(loss_stop_token_unreduced)
+        if stop_valid.any():
+            loss_stop_token = loss_stop_token_unreduced[stop_valid].mean()
+        else:
+            loss_stop_token = torch.tensor(0.0, device=self.device)
 
         # Pitch Loss (if variance predictor enabled) - reuse phoneme mask
         loss_pitch = torch.tensor(0.0, device=self.device)
         if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
             loss_pitch_unreduced = self.criterion_pitch(predicted_pitch, pitch_targets)
-            loss_pitch = (loss_pitch_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
+            pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
+            if pitch_valid.any():
+                loss_pitch = loss_pitch_unreduced[pitch_valid].mean()
 
         # Energy Loss (if variance predictor enabled) - reuse phoneme mask
         loss_energy = torch.tensor(0.0, device=self.device)
         if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
             loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
-            loss_energy = (loss_energy_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
+            energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
+            if energy_valid.any():
+                loss_energy = loss_energy_unreduced[energy_valid].mean()
 
         # Monitor and auto-recover from variance predictor divergence
         variance_diverged = False
@@ -972,12 +993,11 @@ class KokoroTrainer:
                      loss_pitch * getattr(self.config, 'pitch_loss_weight', 0.1) +
                      loss_energy * getattr(self.config, 'energy_loss_weight', 0.1))
 
-        # Final NaN/Inf check - if detected, use only mel loss as fallback
+        # Final NaN/Inf check (caller decides whether to skip the batch)
         if not torch.isfinite(total_loss):
-            logger.warning(f"Non-finite total_loss detected! Using mel_loss fallback. "
+            logger.warning(f"Non-finite total_loss detected! "
                           f"mel={loss_mel:.2f}, dur={loss_duration:.2f}, stop={loss_stop_token:.2f}, "
                           f"pitch={loss_pitch:.2f}, energy={loss_energy:.2f}")
-            total_loss = loss_mel
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
 
@@ -1486,6 +1506,31 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("forward_pass")
 
+                outputs_are_finite = torch.isfinite(predicted_mel).all() and \
+                    torch.isfinite(predicted_log_durations).all() and \
+                    torch.isfinite(predicted_stop_logits).all() and \
+                    (predicted_pitch is None or torch.isfinite(predicted_pitch).all()) and \
+                    (predicted_energy is None or torch.isfinite(predicted_energy).all())
+
+                if not outputs_are_finite:
+                    logger.warning(
+                        f"Skipping batch {batch_idx} due to non-finite model outputs "
+                        f"(mel={torch.isfinite(predicted_mel).all().item()}, "
+                        f"dur={torch.isfinite(predicted_log_durations).all().item()}, "
+                        f"stop={torch.isfinite(predicted_stop_logits).all().item()}, "
+                        f"pitch={True if predicted_pitch is None else torch.isfinite(predicted_pitch).all().item()}, "
+                        f"energy={True if predicted_energy is None else torch.isfinite(predicted_energy).all().item()})"
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_step = 0
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    if enable_interbatch_profiling or is_profiling_epoch:
+                        self.interbatch_profiler.end_batch(mel_specs.size(0))
+                    continue
+
                 # LOG CHECKPOINT: Forward pass completed
                 if batch_idx == 281:
                     logger.info("✅ BATCH 281 - Forward pass completed successfully")
@@ -1548,6 +1593,29 @@ class KokoroTrainer:
 
                 if is_profiling_epoch:
                     self.log_memory_stats("loss_calculation")
+
+                finite_losses = (
+                    torch.isfinite(total_loss) and
+                    torch.isfinite(loss_mel) and
+                    torch.isfinite(loss_duration) and
+                    torch.isfinite(loss_stop_token) and
+                    (loss_pitch is None or torch.isfinite(loss_pitch)) and
+                    (loss_energy is None or torch.isfinite(loss_energy))
+                )
+
+                if not finite_losses:
+                    logger.warning(
+                        f"Skipping batch {batch_idx} due to non-finite loss values "
+                        f"(total={total_loss}, mel={loss_mel}, dur={loss_duration}, "
+                        f"stop={loss_stop_token}, pitch={loss_pitch}, energy={loss_energy})"
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_step = 0
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    continue
 
                 # LOG CHECKPOINT: Loss calculation completed
                 if batch_idx == 281:
@@ -1621,6 +1689,18 @@ class KokoroTrainer:
                 # Determine if we should step the optimizer (accumulation complete or last batch)
                 is_last_batch = (batch_idx == num_batches - 1)
                 should_step = (accumulated_step >= gradient_accumulation_steps) or is_last_batch
+
+                if should_step and self._has_nonfinite_gradients():
+                    logger.warning(
+                        f"Skipping optimizer step at batch {batch_idx} due to non-finite gradients"
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_step = 0
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    continue
 
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
