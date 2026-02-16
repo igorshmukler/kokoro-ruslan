@@ -21,14 +21,14 @@ from kokoro.training.config import TrainingConfig
 from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 from kokoro.data.mfa_integration import MFAIntegration
 
+logger = logging.getLogger(__name__)
+
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
     VARIANCE_AVAILABLE = True
 except ImportError:
     VARIANCE_AVAILABLE = False
     logger.warning("Variance predictor module not available, pitch/energy extraction disabled")
-
-logger = logging.getLogger(__name__)
 
 
 class RuslanDataset(Dataset):
