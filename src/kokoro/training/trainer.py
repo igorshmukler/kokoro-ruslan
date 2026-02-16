@@ -1539,18 +1539,19 @@ class KokoroTrainer:
                 if risk_ratio > 1.0:
                     adaptive_loss_scale = max(0.25, 1.0 / risk_ratio)
                     adaptive_clip_norm = max(0.05, 0.5 / (risk_ratio ** 0.5))
-                    logger.warning(f"\n{'='*80}")
-                    logger.warning(f"⚠️  BATCH {batch_idx} - HIGH-RISK BATCH (stabilizing, not skipping)")
-                    logger.warning(f"{'='*80}")
-                    logger.warning(
-                        f"mel_len={mel_length} (threshold={max_mel_length}), "
-                        f"max_duration={max_duration_in_batch:.0f} (threshold={max_duration_value})"
-                    )
-                    logger.warning(
-                        f"Applying adaptive stabilization: "
-                        f"loss_scale={adaptive_loss_scale:.3f}, clip_norm={adaptive_clip_norm:.3f}"
-                    )
-                    logger.warning(f"{'='*80}\n")
+                    if getattr(self.config, 'verbose', False):
+                        logger.warning(f"\n{'='*80}")
+                        logger.warning(f"⚠️  BATCH {batch_idx} - HIGH-RISK BATCH (stabilizing, not skipping)")
+                        logger.warning(f"{'='*80}")
+                        logger.warning(
+                            f"mel_len={mel_length} (threshold={max_mel_length}), "
+                            f"max_duration={max_duration_in_batch:.0f} (threshold={max_duration_value})"
+                        )
+                        logger.warning(
+                            f"Applying adaptive stabilization: "
+                            f"loss_scale={adaptive_loss_scale:.3f}, clip_norm={adaptive_clip_norm:.3f}"
+                        )
+                        logger.warning(f"{'='*80}\n")
 
                 # Zero gradients only at start of accumulation cycle
                 if accumulated_step == 0:

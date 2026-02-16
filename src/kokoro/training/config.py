@@ -139,6 +139,7 @@ class TrainingConfig:
     profile_warmup_steps: int = 1 # Number of steps to warm up the profiler
     profile_steps: int = 5        # Number of active steps to profile
     run_standalone_profiling: bool = False  # Run standalone profiling before training
+    verbose: bool = False  # Enable verbose training diagnostics
 
     # Interbatch profiling
     enable_interbatch_profiling: bool = False
