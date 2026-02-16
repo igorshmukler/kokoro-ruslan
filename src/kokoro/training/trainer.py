@@ -1437,7 +1437,7 @@ class KokoroTrainer:
 
                 # Forward pass with mixed precision and interbatch profiling
                 crash_context = None
-                if self.device.type == 'mps':
+                if self.device.type == DeviceType.MPS.value:
                     crash_context = (
                         f"[CrashCorrelation] epoch={epoch+1} batch={batch_idx}/{num_batches} "
                         f"opt_step={self.current_optimizer_step} "
@@ -1445,13 +1445,12 @@ class KokoroTrainer:
                         f"mel_len={mel_specs.shape[1]} phoneme_len={phoneme_indices.shape[1]} "
                         f"batch_size={mel_specs.shape[0]}"
                     )
-                    logger.info(crash_context)
 
                 if batch_idx == 281:
                     logger.info("▶️  BATCH 281 - Starting forward pass...")
 
                 # Attach context to modules so attention-level logs can include same ID
-                if crash_context is not None and getattr(self.model, '_batch_281_log', False):
+                if crash_context is not None:
                     self.model._crash_context = crash_context
                     for module in self.model.modules():
                         module._crash_context = crash_context
@@ -1592,6 +1591,9 @@ class KokoroTrainer:
                             scaled_loss.backward()
                     else:
                         scaled_total_loss.backward()
+
+                # Advance gradient accumulation cycle after successful backward
+                accumulated_step += 1
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_backward_pass()

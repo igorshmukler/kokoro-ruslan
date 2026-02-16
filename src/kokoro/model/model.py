@@ -12,14 +12,14 @@ from kokoro.model.positional_encoding import PositionalEncoding
 from kokoro.model.transformers import TransformerDecoder, TransformerEncoderBlock
 from kokoro.utils.gpu_profiler import GPUProfiler
 
+logger = logging.getLogger(__name__)
+
 try:
     from kokoro.model.variance_predictor import VarianceAdaptor
     VARIANCE_AVAILABLE = True
 except ImportError:
     VARIANCE_AVAILABLE = False
     logger.warning("Variance predictor not available")
-
-logger = logging.getLogger(__name__)
 
 
 class KokoroModel(nn.Module):
@@ -233,7 +233,7 @@ class KokoroModel(nn.Module):
 
             return result
 
-        # Log before checkpointed decoder (outside checkpoint)
+        # Log before checkpointed decoder path
         if self.enable_profiling:
             self.profiler.log_memory_stats("decoder_checkpoint_start")
 
@@ -242,24 +242,15 @@ class KokoroModel(nn.Module):
         if is_batch_281:
             logger.info(f"  [GradCheckpoint] Starting decoder checkpoint: input={decoder_input.shape}, memory={memory.shape}")
 
-        def create_decoder_forward():
-            def decoder_forward(tgt, mem, t_mask, mem_mask, tgt_mask_pad):
-                # NO LOGGING INSIDE CHECKPOINTED REGION
-                return self.decoder(
-                    tgt=tgt,
-                    memory=mem,
-                    tgt_mask=t_mask,
-                    memory_key_padding_mask=mem_mask,
-                    tgt_key_padding_mask=tgt_mask_pad
-                )
-            return decoder_forward
-
-        decoder_forward_fn = create_decoder_forward()
-
-        result = checkpoint(
-            decoder_forward_fn,
-            decoder_input, memory, tgt_mask, memory_key_padding_mask, tgt_key_padding_mask,
-            use_reentrant=False
+        # IMPORTANT: Do not wrap the entire decoder in checkpoint here.
+        # `ImprovedTransformerDecoder.forward` already applies per-layer checkpointing,
+        # and nesting checkpoint wrappers causes excessive recomputation in backward.
+        result = self.decoder(
+            tgt=decoder_input,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask
         )
 
         # BATCH 281 LOGGING
