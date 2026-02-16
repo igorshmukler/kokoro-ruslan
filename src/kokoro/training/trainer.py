@@ -1483,7 +1483,7 @@ class KokoroTrainer:
                     logger.info(f"  shape: {phoneme_durations.shape}")
                     logger.info(f"  min: {phoneme_durations.min().item():.2f}")
                     logger.info(f"  max: {phoneme_durations.max().item():.2f}")
-                    logger.info(f"  mean: {phoneme_durations.mean().item():.2f}")
+                    logger.info(f"  mean: {phoneme_durations.float().mean().item():.2f}")
                     logger.info(f"  sum per sample: {phoneme_durations.sum(dim=1).tolist()}")
 
                     # Variance predictor inputs
@@ -1523,6 +1523,34 @@ class KokoroTrainer:
                         logger.info(f"  all_same_value: {all_same}")
 
                     logger.info(f"{'='*80}\n")
+
+                # Adaptive stabilization for extreme sequence/duration batches (no hard skipping)
+                max_mel_length = 1600  # Batch 59 had 1785, caused instability
+                max_duration_value = 200  # Batch 59 had 240, very extreme
+                adaptive_loss_scale = 1.0
+                adaptive_clip_norm = 0.5
+
+                mel_length = mel_specs.shape[1]
+                max_duration_in_batch = phoneme_durations.max().item()
+                mel_risk_ratio = mel_length / max_mel_length
+                duration_risk_ratio = max_duration_in_batch / max_duration_value
+                risk_ratio = max(mel_risk_ratio, duration_risk_ratio)
+
+                if risk_ratio > 1.0:
+                    adaptive_loss_scale = max(0.25, 1.0 / risk_ratio)
+                    adaptive_clip_norm = max(0.05, 0.5 / (risk_ratio ** 0.5))
+                    logger.warning(f"\n{'='*80}")
+                    logger.warning(f"⚠️  BATCH {batch_idx} - HIGH-RISK BATCH (stabilizing, not skipping)")
+                    logger.warning(f"{'='*80}")
+                    logger.warning(
+                        f"mel_len={mel_length} (threshold={max_mel_length}), "
+                        f"max_duration={max_duration_in_batch:.0f} (threshold={max_duration_value})"
+                    )
+                    logger.warning(
+                        f"Applying adaptive stabilization: "
+                        f"loss_scale={adaptive_loss_scale:.3f}, clip_norm={adaptive_clip_norm:.3f}"
+                    )
+                    logger.warning(f"{'='*80}\n")
 
                 # Zero gradients only at start of accumulation cycle
                 if accumulated_step == 0:
@@ -1778,7 +1806,8 @@ class KokoroTrainer:
                         logger.info(f"   energy_loss: {loss_energy.item():.4f}")
 
                 # Scale loss by gradient accumulation steps for proper gradient averaging
-                scaled_total_loss = total_loss / gradient_accumulation_steps
+                # Also apply adaptive scaling for high-risk batches
+                scaled_total_loss = (total_loss / gradient_accumulation_steps) * adaptive_loss_scale
 
                 # Backward pass with mixed precision and interbatch profiling
                 if batch_idx == 281:
@@ -1822,6 +1851,39 @@ class KokoroTrainer:
 
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
+
+                # Check for gradient explosion before optimizer step
+                # This catches extreme gradients that will cause non-finite values
+                total_grad_norm = 0.0
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2).item()
+                        total_grad_norm += param_norm ** 2
+                total_grad_norm = total_grad_norm ** 0.5
+
+                # Threshold for gradient explosion (empirically determined)
+                gradient_explosion_threshold = 1000.0
+
+                if total_grad_norm > gradient_explosion_threshold:
+                    logger.error(f"\n{'='*80}")
+                    logger.error(f"❌ BATCH {batch_idx} - GRADIENT EXPLOSION DETECTED")
+                    logger.error(f"{'='*80}")
+                    logger.error(f"Total gradient norm: {total_grad_norm:.2f} (threshold: {gradient_explosion_threshold})")
+                    logger.error(f"Applying emergency clipping instead of skipping this batch")
+
+                    # Log which components have large gradients
+                    encoder_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
+                                           if 'encoder' in n and p.grad is not None)**0.5
+                    decoder_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
+                                           if 'decoder' in n and p.grad is not None)**0.5
+                    logger.error(f"  encoder grad norm: {encoder_grad_norm:.2f}")
+                    logger.error(f"  decoder grad norm: {decoder_grad_norm:.2f}")
+
+                    logger.error(f"{'='*80}\n")
+
+                    adaptive_clip_norm = min(adaptive_clip_norm, 0.05)
+                    logger.error(f"Emergency clip norm set to {adaptive_clip_norm:.3f}")
+                    logger.error(f"{'='*80}\n")
 
                 # MPS cache clearing - only when needed based on memory pressure
                 if self.device_type == DeviceType.MPS.value:
@@ -1961,7 +2023,7 @@ class KokoroTrainer:
                         if self.device_type == 'cuda':
                             # CUDA path with built-in GradScaler
                             self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
 
                             old_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
@@ -1988,7 +2050,7 @@ class KokoroTrainer:
 
                         else:  # MPS path with custom scaler
                             # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
 
                             old_scale = self.scaler.get_scale()
                             step_successful = self.scaler.step(self.optimizer)
@@ -2014,7 +2076,7 @@ class KokoroTrainer:
                                 if new_scale < old_scale:
                                     self.mixed_precision_stats['scale_decreases'] += 1
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
                         self.optimizer.step()
 
                         # Step scheduler with warmup immediately after optimizer step
