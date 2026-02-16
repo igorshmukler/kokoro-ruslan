@@ -1439,7 +1439,7 @@ class KokoroTrainer:
                 crash_context = None
                 if self.device.type == 'mps':
                     crash_context = (
-                        f"[CrashCorrelation] epoch={epoch+1} batch={batch_idx}/{num_batches-1} "
+                        f"[CrashCorrelation] epoch={epoch+1} batch={batch_idx}/{num_batches} "
                         f"opt_step={self.current_optimizer_step} "
                         f"accum={accumulated_step+1}/{gradient_accumulation_steps} "
                         f"mel_len={mel_specs.shape[1]} phoneme_len={phoneme_indices.shape[1]} "
