@@ -71,10 +71,10 @@ class TrainingConfig:
     variance_kernel_size: int = 3
     variance_dropout: float = 0.1
     n_variance_bins: int = 256
-    pitch_min: float = 50.0
-    pitch_max: float = 800.0
+    pitch_min: float = 0.0  # Normalized range (extractors output [0, 1])
+    pitch_max: float = 1.0  # Normalized range (extractors output [0, 1])
     energy_min: float = 0.0
-    energy_max: float = 100.0
+    energy_max: float = 1.0  # Normalized range (extractors output [0, 1])
 
     # Audio processing
     max_seq_length: int = 2500
