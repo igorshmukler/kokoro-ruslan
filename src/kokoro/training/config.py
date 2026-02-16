@@ -21,16 +21,16 @@ class TrainingConfig:
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
-    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * gradient_accumulation_steps
+    gradient_accumulation_steps: int = 2  # Effective batch size = batch_size * gradient_accumulation_steps
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 5.0  # Max LR = learning_rate * this value
-    pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
+    max_lr_multiplier: float = 3.0  # Max LR = learning_rate * this value
+    pct_start: float = 0.4  # Percentage of cycle spent increasing LR (warmup)
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
-    warmup_steps: int = 500  # Number of optimizer steps for linear warmup (not batches!)
+    warmup_steps: int = 1200  # Number of optimizer steps for linear warmup (not batches!)
     warmup_start_lr_ratio: float = 0.01  # Start LR = learning_rate * this value
 
     # EMA (Exponential Moving Average) of model weights
@@ -77,7 +77,7 @@ class TrainingConfig:
     energy_max: float = 1.0  # Normalized range (extractors output [0, 1])
 
     # Audio processing
-    max_seq_length: int = 2500
+    max_seq_length: int = 1800
     sample_rate: int = 22050
     hop_length: int = 256
     win_length: int = 1024
@@ -96,9 +96,16 @@ class TrainingConfig:
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
-    max_frames_per_batch: int = 30000  # Maximum mel frames per batch (auto-adjusted for MPS)
+    max_frames_per_batch: int = 20000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
-    max_batch_size: int = 32  # Maximum samples per batch
+    max_batch_size: int = 16  # Maximum samples per batch
+
+    # Gradient stability safeguards
+    projection_spike_clip_norm: float = 30.0
+    attention_spike_clip_norm: float = 20.0
+    grad_explosion_warmup_steps: int = 400
+    grad_explosion_warmup_floor: float = 8000.0
+    grad_explosion_min_ema_steps: int = 100
 
     # Checkpointing
     save_every: int = 2
@@ -163,9 +170,9 @@ class TrainingConfig:
         # MPS-specific memory optimizations
         if self.device == 'mps' or (torch.backends.mps.is_available() and self.device != 'cuda'):
             # Balanced settings to avoid MPS dimension overflow while maximizing throughput
-            if self.max_frames_per_batch > 30000:
-                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 30000")
-                self.max_frames_per_batch = 30000
+            if self.max_frames_per_batch > 20000:
+                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 20000")
+                self.max_frames_per_batch = 20000
 
             if self.max_seq_length > 1800:
                 print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1800")
@@ -175,9 +182,9 @@ class TrainingConfig:
                 print(f"MPS detected: Reducing batch_size from {self.batch_size} to 10")
                 self.batch_size = 10
 
-            if self.max_batch_size > 20:
-                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 20")
-                self.max_batch_size = 20
+            if self.max_batch_size > 12:
+                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 12")
+                self.max_batch_size = 12
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1
             print("Warning: checkpoint_segments must be >= 1, setting to 1")

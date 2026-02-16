@@ -432,6 +432,7 @@ class KokoroTrainer:
 
         # Localized gradient spike mitigation for mel projection layers
         self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
+        self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
 
         # Optimizer-step counter independent of scheduler mode
         self.optimizer_steps_completed = 0
@@ -831,8 +832,8 @@ class KokoroTrainer:
         return threshold, dynamic_abs_floor, ema_ready
 
     def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
-        """Clip localized spikes in mel projection gradients before global norm checks."""
-        if self.projection_spike_clip_norm <= 0:
+        """Clip localized spikes in mel projection/attention gradients before global norm checks."""
+        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0:
             return {}
 
         projection_params = {
@@ -842,11 +843,32 @@ class KokoroTrainer:
             'mel_projection_out.bias',
         }
 
+        attention_name_fragments = (
+            '.self_attn.w_q.weight',
+            '.self_attn.w_k.weight',
+            '.self_attn.w_v.weight',
+            '.self_attn.w_o.weight',
+            '.cross_attn.w_q.weight',
+            '.cross_attn.w_k.weight',
+            '.cross_attn.w_v.weight',
+            '.cross_attn.w_o.weight',
+        )
+
         clipped: Dict[str, Tuple[float, float]] = {}
-        max_norm = float(self.projection_spike_clip_norm)
+        projection_max_norm = float(self.projection_spike_clip_norm)
+        attention_max_norm = float(self.attention_spike_clip_norm)
 
         for name, param in self.model.named_parameters():
-            if name not in projection_params or param.grad is None:
+            if param.grad is None:
+                continue
+
+            max_norm = None
+            if name in projection_params and projection_max_norm > 0:
+                max_norm = projection_max_norm
+            elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
+                max_norm = attention_max_norm
+
+            if max_norm is None:
                 continue
 
             grad = param.grad.data
@@ -1450,8 +1472,8 @@ class KokoroTrainer:
 
 
                 # Adaptive stabilization for sequence/duration outliers (no hard skipping)
-                max_mel_length = 1600  # Batch 59 had 1785, caused instability
-                max_duration_value = 200  # Batch 59 had 240, very extreme
+                max_mel_length = 1400  # Earlier guard for long batches
+                max_duration_value = 150  # Earlier guard for extreme durations
                 adaptive_loss_scale = 1.0
                 adaptive_clip_norm = 0.5
 
@@ -1459,12 +1481,12 @@ class KokoroTrainer:
                 max_duration_in_batch = phoneme_durations.max().item()
 
                 # Soft stabilization starts earlier to reduce projection-layer gradient spikes
-                soft_mel_length = 1200
-                soft_duration_value = 120
+                soft_mel_length = 900
+                soft_duration_value = 80
                 soft_risk_ratio = max(mel_length / soft_mel_length, max_duration_in_batch / soft_duration_value)
                 if soft_risk_ratio > 1.0:
-                    adaptive_loss_scale = min(adaptive_loss_scale, max(0.6, 1.0 / (soft_risk_ratio ** 0.5)))
-                    adaptive_clip_norm = min(adaptive_clip_norm, max(0.2, 0.5 / (soft_risk_ratio ** 0.25)))
+                    adaptive_loss_scale = min(adaptive_loss_scale, max(0.5, 1.0 / (soft_risk_ratio ** 0.65)))
+                    adaptive_clip_norm = min(adaptive_clip_norm, max(0.1, 0.4 / (soft_risk_ratio ** 0.35)))
 
                 mel_risk_ratio = mel_length / max_mel_length
                 duration_risk_ratio = max_duration_in_batch / max_duration_value
