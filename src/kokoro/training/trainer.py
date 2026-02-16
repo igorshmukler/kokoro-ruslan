@@ -15,6 +15,7 @@ import torch.profiler
 import datetime
 import gc
 import copy
+import faulthandler
 
 from typing import Tuple, Dict, Any, Optional
 from dataclasses import dataclass
@@ -70,6 +71,14 @@ class KokoroTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.device = torch.device(config.device)
+
+        # Ensure fatal signals (including SIGABRT) dump Python stacks for crash triage
+        try:
+            if not faulthandler.is_enabled():
+                faulthandler.enable(all_threads=True)
+                logger.info("faulthandler enabled (all_threads=True)")
+        except Exception as e:
+            logger.warning(f"Could not enable faulthandler: {e}")
 
         # Initialize adaptive memory manager
         self.memory_manager = AdaptiveMemoryManager(self.device, config)
@@ -1427,8 +1436,25 @@ class KokoroTrainer:
                     self.optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass with mixed precision and interbatch profiling
+                crash_context = None
+                if self.device.type == 'mps':
+                    crash_context = (
+                        f"[CrashCorrelation] epoch={epoch+1} batch={batch_idx}/{num_batches-1} "
+                        f"opt_step={self.current_optimizer_step} "
+                        f"accum={accumulated_step+1}/{gradient_accumulation_steps} "
+                        f"mel_len={mel_specs.shape[1]} phoneme_len={phoneme_indices.shape[1]} "
+                        f"batch_size={mel_specs.shape[0]}"
+                    )
+                    logger.info(crash_context)
+
                 if batch_idx == 281:
                     logger.info("▶️  BATCH 281 - Starting forward pass...")
+
+                # Attach context to modules so attention-level logs can include same ID
+                if crash_context is not None and getattr(self.model, '_batch_281_log', False):
+                    self.model._crash_context = crash_context
+                    for module in self.model.modules():
+                        module._crash_context = crash_context
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_forward_pass()
