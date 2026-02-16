@@ -424,7 +424,17 @@ class KokoroTrainer:
         self.grad_explosion_ema_alpha = getattr(config, 'grad_explosion_ema_alpha', 0.95)
         self.grad_explosion_abs_floor = getattr(config, 'grad_explosion_abs_floor', 1000.0)
         self.grad_explosion_multiplier = getattr(config, 'grad_explosion_multiplier', 3.0)
+        self.grad_explosion_warmup_steps = getattr(config, 'grad_explosion_warmup_steps', 250)
+        self.grad_explosion_warmup_floor = getattr(config, 'grad_explosion_warmup_floor', 5000.0)
+        self.grad_explosion_min_ema_steps = getattr(config, 'grad_explosion_min_ema_steps', 50)
+        self.grad_explosion_ema_steps = 0
         self.grad_explosion_streak = 0
+
+        # Localized gradient spike mitigation for mel projection layers
+        self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
+
+        # Optimizer-step counter independent of scheduler mode
+        self.optimizer_steps_completed = 0
 
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
@@ -802,6 +812,54 @@ class KokoroTrainer:
             if param.grad is not None and not torch.isfinite(param.grad).all():
                 return True
         return False
+
+    def _compute_grad_explosion_threshold(self) -> Tuple[float, float, bool]:
+        """Compute dynamic gradient explosion threshold with early-step warmup handling."""
+        warmup_steps = max(0, self.grad_explosion_warmup_steps)
+
+        if warmup_steps > 0 and self.optimizer_steps_completed < warmup_steps:
+            progress = self.optimizer_steps_completed / float(warmup_steps)
+            warmup_floor = self.grad_explosion_warmup_floor
+            dynamic_abs_floor = warmup_floor - (warmup_floor - self.grad_explosion_abs_floor) * progress
+        else:
+            dynamic_abs_floor = self.grad_explosion_abs_floor
+
+        ema_ready = self.grad_explosion_ema_steps >= self.grad_explosion_min_ema_steps
+        ema_threshold = 0.0 if self.grad_explosion_norm_ema is None else self.grad_explosion_norm_ema * self.grad_explosion_multiplier
+
+        threshold = dynamic_abs_floor if not ema_ready else max(dynamic_abs_floor, ema_threshold)
+        return threshold, dynamic_abs_floor, ema_ready
+
+    def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
+        """Clip localized spikes in mel projection gradients before global norm checks."""
+        if self.projection_spike_clip_norm <= 0:
+            return {}
+
+        projection_params = {
+            'mel_projection_in.weight',
+            'mel_projection_in.bias',
+            'mel_projection_out.weight',
+            'mel_projection_out.bias',
+        }
+
+        clipped: Dict[str, Tuple[float, float]] = {}
+        max_norm = float(self.projection_spike_clip_norm)
+
+        for name, param in self.model.named_parameters():
+            if name not in projection_params or param.grad is None:
+                continue
+
+            grad = param.grad.data
+            if not torch.isfinite(grad).all():
+                continue
+
+            grad_norm = grad.norm(2).item()
+            if grad_norm > max_norm:
+                scale = max_norm / (grad_norm + 1e-12)
+                grad.mul_(scale)
+                clipped[name] = (grad_norm, max_norm)
+
+        return clipped
 
     def _average_pitch_energy_by_duration(self,
                                           values: torch.Tensor,
@@ -1531,7 +1589,7 @@ class KokoroTrainer:
 
                     logger.info(f"{'='*80}\n")
 
-                # Adaptive stabilization for extreme sequence/duration batches (no hard skipping)
+                # Adaptive stabilization for sequence/duration outliers (no hard skipping)
                 max_mel_length = 1600  # Batch 59 had 1785, caused instability
                 max_duration_value = 200  # Batch 59 had 240, very extreme
                 adaptive_loss_scale = 1.0
@@ -1539,6 +1597,15 @@ class KokoroTrainer:
 
                 mel_length = mel_specs.shape[1]
                 max_duration_in_batch = phoneme_durations.max().item()
+
+                # Soft stabilization starts earlier to reduce projection-layer gradient spikes
+                soft_mel_length = 1200
+                soft_duration_value = 120
+                soft_risk_ratio = max(mel_length / soft_mel_length, max_duration_in_batch / soft_duration_value)
+                if soft_risk_ratio > 1.0:
+                    adaptive_loss_scale = min(adaptive_loss_scale, max(0.6, 1.0 / (soft_risk_ratio ** 0.5)))
+                    adaptive_clip_norm = min(adaptive_clip_norm, max(0.2, 0.5 / (soft_risk_ratio ** 0.25)))
+
                 mel_risk_ratio = mel_length / max_mel_length
                 duration_risk_ratio = max_duration_in_batch / max_duration_value
                 risk_ratio = max(mel_risk_ratio, duration_risk_ratio)
@@ -1877,6 +1944,14 @@ class KokoroTrainer:
 
                 # Gradient explosion detection only at optimizer-step boundaries
                 if should_step:
+                    clipped_projection_grads = self._preclip_projection_spikes()
+                    if clipped_projection_grads and getattr(self.config, 'verbose', False):
+                        clipped_msg = ', '.join(
+                            f"{name}: {before:.2f}→{after:.2f}"
+                            for name, (before, after) in clipped_projection_grads.items()
+                        )
+                        logger.warning(f"Pre-clipped projection gradient spikes: {clipped_msg}")
+
                     total_grad_norm = 0.0
                     grad_norms_by_param = []
                     for name, param in self.model.named_parameters():
@@ -1887,10 +1962,7 @@ class KokoroTrainer:
                     total_grad_norm = total_grad_norm ** 0.5
 
                     grad_norm_ema_for_threshold = self.grad_explosion_norm_ema if self.grad_explosion_norm_ema is not None else 0.0
-                    gradient_explosion_threshold = max(
-                        self.grad_explosion_abs_floor,
-                        grad_norm_ema_for_threshold * self.grad_explosion_multiplier,
-                    )
+                    gradient_explosion_threshold, dynamic_abs_floor, ema_ready = self._compute_grad_explosion_threshold()
 
                     has_nonfinite_grads = self._has_nonfinite_gradients()
                     is_exploding = total_grad_norm > gradient_explosion_threshold
@@ -1905,6 +1977,8 @@ class KokoroTrainer:
                             f"Total gradient norm: {total_grad_norm:.2f} "
                             f"(threshold: {gradient_explosion_threshold:.2f}, "
                             f"ema: {grad_norm_ema_for_threshold:.2f}, "
+                            f"dynamic_floor: {dynamic_abs_floor:.2f}, "
+                            f"ema_ready: {ema_ready}, "
                             f"multiplier: {self.grad_explosion_multiplier:.2f})"
                         )
                         log_fn("Applying emergency clipping instead of skipping this batch")
@@ -1925,6 +1999,7 @@ class KokoroTrainer:
                     else:
                         alpha = self.grad_explosion_ema_alpha
                         self.grad_explosion_norm_ema = alpha * self.grad_explosion_norm_ema + (1 - alpha) * total_grad_norm
+                    self.grad_explosion_ema_steps += 1
 
                 # DEBUG: Check gradients in detail for batches around problem area
                 if should_step and (batch_idx >= 55 and batch_idx <= 65):
@@ -2111,6 +2186,8 @@ class KokoroTrainer:
 
                         # Update EMA model weights
                         self._update_ema()
+
+                    self.optimizer_steps_completed += 1
 
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
