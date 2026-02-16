@@ -270,7 +270,9 @@ class MultiHeadAttentionImproved(nn.Module):
 
         # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
-        context = context.transpose(1, 2).contiguous().view(
+        # MPS FIX: Avoid .contiguous() which triggers INT_MAX bug during backward
+        # Use reshape instead of view to avoid explicit contiguous() call
+        context = context.transpose(1, 2).reshape(
             batch_size, seq_len_q, self.d_model
         )
         output = self.w_o(context)
