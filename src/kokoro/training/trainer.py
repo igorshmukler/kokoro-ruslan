@@ -322,7 +322,7 @@ class KokoroTrainer:
             optimizer_steps_per_epoch = (steps_per_epoch + gradient_accumulation_steps - 1) // gradient_accumulation_steps
             total_steps = config.num_epochs * optimizer_steps_per_epoch
 
-            max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 10.0)
+            max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 5.0)
             pct_start = getattr(config, 'pct_start', 0.3)
 
             # Warmup configuration
@@ -1431,8 +1431,8 @@ class KokoroTrainer:
                         logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
                         continue
 
-                    # Log variance predictor input ranges every 50 batches for debugging
-                    if batch_idx % 50 == 0 and pitches is not None and energies is not None:
+                    # Log variance predictor ranges periodically only in verbose mode
+                    if getattr(self.config, 'verbose', False) and batch_idx % 50 == 0 and pitches is not None and energies is not None:
                         pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
                         energy_min, energy_max = energies.min().item(), energies.max().item()
                         if pitch_max > 1.5 or energy_max > 1.5:
@@ -1448,146 +1448,6 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("data_loading")
 
-                # DETAILED LOGGING FOR BATCH 281
-                if batch_idx == 281:
-                    logger.info("=" * 80)
-                    logger.info(f"🔍 BATCH {batch_idx} - DETAILED DIAGNOSTIC LOGGING")
-                    logger.info("=" * 80)
-
-                    # Log PyTorch version
-                    import torch as torch_version_check
-                    logger.info(f"🔧 Environment:")
-                    logger.info(f"   PyTorch version: {torch_version_check.__version__}")
-                    logger.info(f"   MPS built: {torch_version_check.backends.mps.is_built()}")
-
-                    # Log batch dimensions
-                    batch_size = mel_specs.shape[0]
-                    mel_len = mel_specs.shape[1]
-                    n_mels = mel_specs.shape[2]
-                    phoneme_len = phoneme_indices.shape[1]
-
-                    logger.info(f"📊 Batch dimensions:")
-                    logger.info(f"   batch_size: {batch_size}")
-                    logger.info(f"   mel_len: {mel_len}")
-                    logger.info(f"   n_mels: {n_mels}")
-                    logger.info(f"   phoneme_len: {phoneme_len}")
-
-                    # Log attention matrix calculations (based on model architecture)
-                    # Assuming 8 heads from crash log
-                    num_heads = 8
-                    attention_matrix_size = batch_size * num_heads * mel_len * mel_len
-                    int_max = 2**31 - 1
-                    percentage = (attention_matrix_size / int_max) * 100
-
-                    logger.info(f"🧮 Attention calculations:")
-                    logger.info(f"   num_heads: {num_heads}")
-                    logger.info(f"   attention_matrix_size: {attention_matrix_size:,} elements")
-                    logger.info(f"   INT_MAX: {int_max:,}")
-                    logger.info(f"   percentage of INT_MAX: {percentage:.2f}%")
-
-                    # Log stride calculations (potential overflow point)
-                    # MPS backend calculates: batch_size * num_heads * seq_len * seq_len * sizeof(float)
-                    stride_calc = attention_matrix_size * 4  # 4 bytes for float32
-                    logger.info(f"   potential stride (bytes): {stride_calc:,}")
-                    logger.info(f"   stride overflow: {stride_calc > int_max}")
-
-                    # Log variance predictor inputs if available
-                    if pitches is not None:
-                        pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
-                        pitch_mean = pitches.mean().item()
-                        logger.info(f"🎵 Pitch stats: min={pitch_min:.3f}, max={pitch_max:.3f}, mean={pitch_mean:.3f}")
-
-                    if energies is not None:
-                        energy_min, energy_max = energies.min().item(), energies.max().item()
-                        energy_mean = energies.mean().item()
-                        logger.info(f"⚡ Energy stats: min={energy_min:.3f}, max={energy_max:.3f}, mean={energy_mean:.3f}")
-
-                    # Log memory state
-                    if self.device.type == 'mps':
-                        logger.info(f"💾 Device: MPS (Apple Silicon)")
-                        logger.info(f"   dtype: {mel_specs.dtype}")
-                        logger.info(f"   gradient_checkpointing: {self.config.gradient_checkpointing}")
-
-                    logger.info("=" * 80)
-
-                    # Enable attention-level logging for batch 281
-                    logger.info("🔍 Enabling module-level logging for this batch...")
-                    for module in self.model.modules():
-                        module._batch_281_log = True
-                    # Also set on model itself
-                    self.model._batch_281_log = True
-
-                # DEBUG: Log input data statistics for batches around problem area (batch 59)
-                if batch_idx >= 55 and batch_idx <= 65:
-                    logger.info(f"\n{'='*80}")
-                    logger.info(f"🔍 DEBUG BATCH {batch_idx} - Input Validation")
-                    logger.info(f"{'='*80}")
-
-                    # Check for non-finite inputs
-                    mel_finite = torch.isfinite(mel_specs).all().item()
-                    phoneme_finite = torch.isfinite(phoneme_indices.float()).all().item()
-                    dur_finite = torch.isfinite(phoneme_durations).all().item()
-                    stop_finite = torch.isfinite(stop_token_targets).all().item()
-
-                    logger.info(f"Input Finiteness Check:")
-                    logger.info(f"  mel_specs: {'✓ finite' if mel_finite else '✗ NON-FINITE'}")
-                    logger.info(f"  phoneme_indices: {'✓ finite' if phoneme_finite else '✗ NON-FINITE'}")
-                    logger.info(f"  phoneme_durations: {'✓ finite' if dur_finite else '✗ NON-FINITE'}")
-                    logger.info(f"  stop_token_targets: {'✓ finite' if stop_finite else '✗ NON-FINITE'}")
-
-                    # Detailed mel_specs statistics
-                    logger.info(f"\nMel Spectrogram Stats:")
-                    logger.info(f"  shape: {mel_specs.shape}")
-                    logger.info(f"  min: {mel_specs.min().item():.6f}")
-                    logger.info(f"  max: {mel_specs.max().item():.6f}")
-                    logger.info(f"  mean: {mel_specs.mean().item():.6f}")
-                    logger.info(f"  std: {mel_specs.std().item():.6f}")
-
-                    # Duration statistics
-                    logger.info(f"\nDuration Stats:")
-                    logger.info(f"  shape: {phoneme_durations.shape}")
-                    logger.info(f"  min: {phoneme_durations.min().item():.2f}")
-                    logger.info(f"  max: {phoneme_durations.max().item():.2f}")
-                    logger.info(f"  mean: {phoneme_durations.float().mean().item():.2f}")
-                    logger.info(f"  sum per sample: {phoneme_durations.sum(dim=1).tolist()}")
-
-                    # Variance predictor inputs
-                    if pitches is not None:
-                        pitch_finite = torch.isfinite(pitches).all().item()
-                        logger.info(f"\nPitch Stats:")
-                        logger.info(f"  finite: {'✓' if pitch_finite else '✗ NON-FINITE'}")
-                        logger.info(f"  shape: {pitches.shape}")
-                        logger.info(f"  min: {pitches.min().item():.6f}")
-                        logger.info(f"  max: {pitches.max().item():.6f}")
-                        logger.info(f"  mean: {pitches.mean().item():.6f}")
-                        logger.info(f"  in [0,1]: {((pitches >= 0) & (pitches <= 1)).all().item()}")
-
-                        # Check for unusual patterns
-                        all_zeros = (pitches == 0).all().item()
-                        all_ones = (pitches == 1).all().item()
-                        all_same = (pitches.std() < 1e-7).item()
-                        logger.info(f"  all_zeros: {all_zeros}")
-                        logger.info(f"  all_ones: {all_ones}")
-                        logger.info(f"  all_same_value: {all_same}")
-
-                    if energies is not None:
-                        energy_finite = torch.isfinite(energies).all().item()
-                        logger.info(f"\nEnergy Stats:")
-                        logger.info(f"  finite: {'✓' if energy_finite else '✗ NON-FINITE'}")
-                        logger.info(f"  shape: {energies.shape}")
-                        logger.info(f"  min: {energies.min().item():.6f}")
-                        logger.info(f"  max: {energies.max().item():.6f}")
-                        logger.info(f"  mean: {energies.mean().item():.6f}")
-                        logger.info(f"  in [0,1]: {((energies >= 0) & (energies <= 1)).all().item()}")
-
-                        all_zeros = (energies == 0).all().item()
-                        all_ones = (energies == 1).all().item()
-                        all_same = (energies.std() < 1e-7).item()
-                        logger.info(f"  all_zeros: {all_zeros}")
-                        logger.info(f"  all_ones: {all_ones}")
-                        logger.info(f"  all_same_value: {all_same}")
-
-                    logger.info(f"{'='*80}\n")
 
                 # Adaptive stabilization for sequence/duration outliers (no hard skipping)
                 max_mel_length = 1600  # Batch 59 had 1785, caused instability
@@ -1641,9 +1501,6 @@ class KokoroTrainer:
                         f"mel_len={mel_specs.shape[1]} phoneme_len={phoneme_indices.shape[1]} "
                         f"batch_size={mel_specs.shape[0]}"
                     )
-
-                if batch_idx == 281:
-                    logger.info("▶️  BATCH 281 - Starting forward pass...")
 
                 # Attach context to modules so attention-level logs can include same ID
                 if crash_context is not None:
@@ -1722,51 +1579,6 @@ class KokoroTrainer:
                         self.interbatch_profiler.end_batch(mel_specs.size(0))
                     continue
 
-                # DEBUG: Log output statistics for batches around problem area
-                if batch_idx >= 55 and batch_idx <= 65:
-                    logger.info(f"\n{'='*80}")
-                    logger.info(f"🔍 DEBUG BATCH {batch_idx} - Model Output Statistics")
-                    logger.info(f"{'='*80}")
-
-                    logger.info(f"predicted_mel:")
-                    logger.info(f"  shape: {predicted_mel.shape}")
-                    logger.info(f"  min: {predicted_mel.min().item():.6f}")
-                    logger.info(f"  max: {predicted_mel.max().item():.6f}")
-                    logger.info(f"  mean: {predicted_mel.mean().item():.6f}")
-                    logger.info(f"  std: {predicted_mel.std().item():.6f}")
-
-                    logger.info(f"\npredicted_log_durations:")
-                    logger.info(f"  shape: {predicted_log_durations.shape}")
-                    logger.info(f"  min: {predicted_log_durations.min().item():.6f}")
-                    logger.info(f"  max: {predicted_log_durations.max().item():.6f}")
-                    logger.info(f"  mean: {predicted_log_durations.mean().item():.6f}")
-
-                    if predicted_pitch is not None:
-                        logger.info(f"\npredicted_pitch:")
-                        logger.info(f"  shape: {predicted_pitch.shape}")
-                        logger.info(f"  min: {predicted_pitch.min().item():.6f}")
-                        logger.info(f"  max: {predicted_pitch.max().item():.6f}")
-                        logger.info(f"  mean: {predicted_pitch.mean().item():.6f}")
-
-                    if predicted_energy is not None:
-                        logger.info(f"\npredicted_energy:")
-                        logger.info(f"  shape: {predicted_energy.shape}")
-                        logger.info(f"  min: {predicted_energy.min().item():.6f}")
-                        logger.info(f"  max: {predicted_energy.max().item():.6f}")
-                        logger.info(f"  mean: {predicted_energy.mean().item():.6f}")
-
-                    logger.info(f"{'='*80}\n")
-
-                # LOG CHECKPOINT: Forward pass completed
-                if batch_idx == 281:
-                    logger.info("✅ BATCH 281 - Forward pass completed successfully")
-                    logger.info(f"   predicted_mel shape: {predicted_mel.shape}")
-                    logger.info(f"   predicted_log_durations shape: {predicted_log_durations.shape}")
-                    logger.info(f"   predicted_stop_logits shape: {predicted_stop_logits.shape}")
-                    if predicted_pitch is not None:
-                        logger.info(f"   predicted_pitch shape: {predicted_pitch.shape}")
-                    if predicted_energy is not None:
-                        logger.info(f"   predicted_energy shape: {predicted_energy.shape}")
 
                 # Convert mel-frame level pitch/energy to phoneme level for loss calculation
                 phoneme_pitches = None
@@ -1820,20 +1632,6 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("loss_calculation")
 
-                # DEBUG: Log loss values for batches around problem area
-                if batch_idx >= 55 and batch_idx <= 65:
-                    logger.info(f"\n{'='*80}")
-                    logger.info(f"🔍 DEBUG BATCH {batch_idx} - Loss Values")
-                    logger.info(f"{'='*80}")
-                    logger.info(f"loss_mel: {loss_mel.item():.6f}")
-                    logger.info(f"loss_duration: {loss_duration.item():.6f}")
-                    logger.info(f"loss_stop_token: {loss_stop_token.item():.6f}")
-                    if loss_pitch is not None:
-                        logger.info(f"loss_pitch: {loss_pitch.item():.6f}")
-                    if loss_energy is not None:
-                        logger.info(f"loss_energy: {loss_energy.item():.6f}")
-                    logger.info(f"total_loss: {total_loss.item():.6f}")
-                    logger.info(f"{'='*80}\n")
 
                 finite_losses = (
                     torch.isfinite(total_loss) and
@@ -1868,26 +1666,12 @@ class KokoroTrainer:
                         self.clear_device_cache()
                     continue
 
-                # LOG CHECKPOINT: Loss calculation completed
-                if batch_idx == 281:
-                    logger.info("✅ BATCH 281 - Loss calculation completed successfully")
-                    logger.info(f"   total_loss: {total_loss.item():.4f}")
-                    logger.info(f"   mel_loss: {loss_mel.item():.4f}")
-                    logger.info(f"   duration_loss: {loss_duration.item():.4f}")
-                    logger.info(f"   stop_loss: {loss_stop_token.item():.4f}")
-                    if loss_pitch is not None:
-                        logger.info(f"   pitch_loss: {loss_pitch.item():.4f}")
-                    if loss_energy is not None:
-                        logger.info(f"   energy_loss: {loss_energy.item():.4f}")
 
                 # Scale loss by gradient accumulation steps for proper gradient averaging
                 # Also apply adaptive scaling for high-risk batches
                 scaled_total_loss = (total_loss / gradient_accumulation_steps) * adaptive_loss_scale
 
                 # Backward pass with mixed precision and interbatch profiling
-                if batch_idx == 281:
-                    logger.info("🔄 BATCH 281 - Starting backward pass...")
-                    logger.info(f"   scaled_total_loss: {scaled_total_loss.item():.4f}")
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
@@ -1917,12 +1701,6 @@ class KokoroTrainer:
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_backward_pass()
-
-                # LOG CHECKPOINT: Backward pass completed
-                if batch_idx == 281:
-                    logger.info("✅ BATCH 281 - Backward pass completed successfully")
-                    logger.info("🎉 BATCH 281 - All operations completed without crash!")
-                    logger.info("=" * 80)
 
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
@@ -2000,65 +1778,6 @@ class KokoroTrainer:
                         alpha = self.grad_explosion_ema_alpha
                         self.grad_explosion_norm_ema = alpha * self.grad_explosion_norm_ema + (1 - alpha) * total_grad_norm
                     self.grad_explosion_ema_steps += 1
-
-                # DEBUG: Check gradients in detail for batches around problem area
-                if should_step and (batch_idx >= 55 and batch_idx <= 65):
-                    logger.info(f"\n{'='*80}")
-                    logger.info(f"🔍 DEBUG BATCH {batch_idx} - Gradient Inspection (before optimizer step)")
-                    logger.info(f"{'='*80}")
-
-                    # Check for non-finite gradients and collect stats
-                    non_finite_params = []
-                    large_grad_params = []
-                    grad_stats = {}
-
-                    for name, param in self.model.named_parameters():
-                        if param.grad is not None:
-                            grad = param.grad
-                            has_nan = torch.isnan(grad).any().item()
-                            has_inf = torch.isinf(grad).any().item()
-                            grad_norm = grad.norm().item() if torch.isfinite(grad).all() else float('nan')
-
-                            if has_nan or has_inf:
-                                non_finite_params.append(name)
-                                grad_stats[name] = {
-                                    'has_nan': has_nan,
-                                    'has_inf': has_inf,
-                                    'nan_count': torch.isnan(grad).sum().item(),
-                                    'inf_count': torch.isinf(grad).sum().item()
-                                }
-                            elif grad_norm > 100:  # Large gradient threshold
-                                large_grad_params.append((name, grad_norm))
-
-                    logger.info(f"Non-finite gradient params: {len(non_finite_params)}")
-                    if non_finite_params:
-                        logger.error(f"  ❌ Parameters with non-finite gradients:")
-                        for param_name in non_finite_params[:10]:  # Show first 10
-                            stats = grad_stats[param_name]
-                            logger.error(f"    {param_name}: NaN={stats['nan_count']}, Inf={stats['inf_count']}")
-
-                    logger.info(f"\nLarge gradient params: {len(large_grad_params)}")
-                    if large_grad_params:
-                        logger.warning(f"  ⚠️  Parameters with large gradients (>100):")
-                        for param_name, grad_norm in sorted(large_grad_params, key=lambda x: x[1], reverse=True)[:10]:
-                            logger.warning(f"    {param_name}: norm={grad_norm:.2f}")
-
-                    # Log gradient norms for key components
-                    encoder_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
-                                           if 'encoder' in n and p.grad is not None and torch.isfinite(p.grad).all())**0.5
-                    decoder_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
-                                           if 'decoder' in n and p.grad is not None and torch.isfinite(p.grad).all())**0.5
-
-                    logger.info(f"\nGradient norms by component:")
-                    logger.info(f"  encoder: {encoder_grad_norm:.4f}")
-                    logger.info(f"  decoder: {decoder_grad_norm:.4f}")
-
-                    if self.model.use_variance_predictor:
-                        variance_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
-                                                if 'variance_adaptor' in n and p.grad is not None and torch.isfinite(p.grad).all())**0.5
-                        logger.info(f"  variance_adaptor: {variance_grad_norm:.4f}")
-
-                    logger.info(f"{'='*80}\n")
 
                 if should_step and self._has_nonfinite_gradients():
                     logger.error(f"\n{'='*80}")
@@ -2366,7 +2085,7 @@ class KokoroTrainer:
         logger.info(f"Model vocabulary size: {self.dataset.phoneme_processor.get_vocab_size()}")
         logger.info(f"Initial learning rate: {self.config.learning_rate}")
         if self.scheduler_per_batch:
-            logger.info(f"Scheduler: OneCycleLR (steps per batch, max_lr={self.config.learning_rate * getattr(self.config, 'max_lr_multiplier', 10.0):.2e})")
+            logger.info(f"Scheduler: OneCycleLR (steps per batch, max_lr={self.config.learning_rate * getattr(self.config, 'max_lr_multiplier', 5.0):.2e})")
         else:
             logger.info(f"Scheduler: CosineAnnealingWarmRestarts (steps per epoch, T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult})")
         logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")

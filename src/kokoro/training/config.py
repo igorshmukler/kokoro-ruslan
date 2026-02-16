@@ -25,7 +25,7 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 10.0  # Max LR = learning_rate * this value
+    max_lr_multiplier: float = 5.0  # Max LR = learning_rate * this value
     pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
 
     # Linear warmup before OneCycleLR
