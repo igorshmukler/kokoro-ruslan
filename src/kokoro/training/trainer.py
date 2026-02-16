@@ -419,6 +419,13 @@ class KokoroTrainer:
         self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
         self.memory_report_interval = getattr(config, 'memory_report_interval', 500)
 
+        # Gradient explosion tracking (adaptive threshold)
+        self.grad_explosion_norm_ema = None
+        self.grad_explosion_ema_alpha = getattr(config, 'grad_explosion_ema_alpha', 0.95)
+        self.grad_explosion_abs_floor = getattr(config, 'grad_explosion_abs_floor', 1000.0)
+        self.grad_explosion_multiplier = getattr(config, 'grad_explosion_multiplier', 3.0)
+        self.grad_explosion_streak = 0
+
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
         from contextlib import nullcontext
@@ -1853,39 +1860,6 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("backward_pass")
 
-                # Check for gradient explosion before optimizer step
-                # This catches extreme gradients that will cause non-finite values
-                total_grad_norm = 0.0
-                for param in self.model.parameters():
-                    if param.grad is not None:
-                        param_norm = param.grad.data.norm(2).item()
-                        total_grad_norm += param_norm ** 2
-                total_grad_norm = total_grad_norm ** 0.5
-
-                # Threshold for gradient explosion (empirically determined)
-                gradient_explosion_threshold = 1000.0
-
-                if total_grad_norm > gradient_explosion_threshold:
-                    logger.error(f"\n{'='*80}")
-                    logger.error(f"❌ BATCH {batch_idx} - GRADIENT EXPLOSION DETECTED")
-                    logger.error(f"{'='*80}")
-                    logger.error(f"Total gradient norm: {total_grad_norm:.2f} (threshold: {gradient_explosion_threshold})")
-                    logger.error(f"Applying emergency clipping instead of skipping this batch")
-
-                    # Log which components have large gradients
-                    encoder_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
-                                           if 'encoder' in n and p.grad is not None)**0.5
-                    decoder_grad_norm = sum(p.grad.norm().item()**2 for n, p in self.model.named_parameters()
-                                           if 'decoder' in n and p.grad is not None)**0.5
-                    logger.error(f"  encoder grad norm: {encoder_grad_norm:.2f}")
-                    logger.error(f"  decoder grad norm: {decoder_grad_norm:.2f}")
-
-                    logger.error(f"{'='*80}\n")
-
-                    adaptive_clip_norm = min(adaptive_clip_norm, 0.05)
-                    logger.error(f"Emergency clip norm set to {adaptive_clip_norm:.3f}")
-                    logger.error(f"{'='*80}\n")
-
                 # MPS cache clearing - only when needed based on memory pressure
                 if self.device_type == DeviceType.MPS.value:
                     # Only clear if memory pressure is moderate or higher
@@ -1900,6 +1874,57 @@ class KokoroTrainer:
                 # Determine if we should step the optimizer (accumulation complete or last batch)
                 is_last_batch = (batch_idx == num_batches - 1)
                 should_step = (accumulated_step >= gradient_accumulation_steps) or is_last_batch
+
+                # Gradient explosion detection only at optimizer-step boundaries
+                if should_step:
+                    total_grad_norm = 0.0
+                    grad_norms_by_param = []
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.data.norm(2).item()
+                            total_grad_norm += grad_norm ** 2
+                            grad_norms_by_param.append((name, grad_norm))
+                    total_grad_norm = total_grad_norm ** 0.5
+
+                    grad_norm_ema_for_threshold = self.grad_explosion_norm_ema if self.grad_explosion_norm_ema is not None else 0.0
+                    gradient_explosion_threshold = max(
+                        self.grad_explosion_abs_floor,
+                        grad_norm_ema_for_threshold * self.grad_explosion_multiplier,
+                    )
+
+                    has_nonfinite_grads = self._has_nonfinite_gradients()
+                    is_exploding = total_grad_norm > gradient_explosion_threshold
+
+                    if is_exploding:
+                        self.grad_explosion_streak += 1
+                        log_fn = logger.error if has_nonfinite_grads else (logger.warning if self.grad_explosion_streak > 1 else logger.error)
+                        log_fn(f"\n{'='*80}")
+                        log_fn(f"❌ BATCH {batch_idx} - GRADIENT EXPLOSION DETECTED")
+                        log_fn(f"{'='*80}")
+                        log_fn(
+                            f"Total gradient norm: {total_grad_norm:.2f} "
+                            f"(threshold: {gradient_explosion_threshold:.2f}, "
+                            f"ema: {grad_norm_ema_for_threshold:.2f}, "
+                            f"multiplier: {self.grad_explosion_multiplier:.2f})"
+                        )
+                        log_fn("Applying emergency clipping instead of skipping this batch")
+
+                        top10 = sorted(grad_norms_by_param, key=lambda x: x[1], reverse=True)[:10]
+                        log_fn("Top 10 parameter gradient norms (global):")
+                        for param_name, param_norm in top10:
+                            log_fn(f"  {param_name}: {param_norm:.2f}")
+
+                        adaptive_clip_norm = min(adaptive_clip_norm, 0.05)
+                        log_fn(f"Emergency clip norm set to {adaptive_clip_norm:.3f}")
+                        log_fn(f"{'='*80}\n")
+                    else:
+                        self.grad_explosion_streak = 0
+
+                    if self.grad_explosion_norm_ema is None:
+                        self.grad_explosion_norm_ema = total_grad_norm
+                    else:
+                        alpha = self.grad_explosion_ema_alpha
+                        self.grad_explosion_norm_ema = alpha * self.grad_explosion_norm_ema + (1 - alpha) * total_grad_norm
 
                 # DEBUG: Check gradients in detail for batches around problem area
                 if should_step and (batch_idx >= 55 and batch_idx <= 65):

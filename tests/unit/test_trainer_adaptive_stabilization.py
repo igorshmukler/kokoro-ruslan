@@ -44,6 +44,11 @@ def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> Kokor
     trainer.memory_report_interval = 1000
     trainer.current_optimizer_step = 0
     trainer.profiler = None
+    trainer.grad_explosion_norm_ema = None
+    trainer.grad_explosion_ema_alpha = 0.95
+    trainer.grad_explosion_abs_floor = 1000.0
+    trainer.grad_explosion_multiplier = 3.0
+    trainer.grad_explosion_streak = 0
     trainer.mixed_precision_stats = {
         "scale_updates": 0,
         "scale_decreases": 0,
