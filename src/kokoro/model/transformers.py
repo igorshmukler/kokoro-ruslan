@@ -370,16 +370,34 @@ class ImprovedTransformerEncoderBlock(nn.Module):
             attn_output, _ = self.self_attn(src_norm, src_norm, src_norm,
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] After self_attn: {attn_output.shape}")
+
             # Apply stochastic depth to attention output
             attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
             src = src + self.dropout1(attn_output) # Residual connection + Dropout
 
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] After residual: {src.shape}, starting FFN...")
+
             # Feed-forward sub-layer
             src_norm = self.norm2(src) # Apply LayerNorm BEFORE FFN
             ff_output = self._ff_block(src_norm)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] After FFN: {ff_output.shape}")
+
             # Apply stochastic depth to FFN output
             ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
             src = src + self.dropout2(ff_output) # Residual connection + Dropout
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] Block complete: {src.shape}")
         else:
             # Post-normalization (Original Transformer)
             # Self-attention sub-layer
@@ -477,6 +495,10 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                             key_padding_mask=tgt_key_padding_mask)
             tgt = tgt + self.dropout1(attn_output)
 
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [DecoderBlock] After self_attn: {tgt.shape}")
+
             # Cross-attention sub-layer
             tgt_norm = self.norm2(tgt)
             # Query is from decoder (tgt_norm), Key/Value from encoder (memory)
@@ -485,10 +507,23 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                    key_padding_mask=memory_key_padding_mask)
             tgt = tgt + self.dropout2(cross_attn_output)
 
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [DecoderBlock] After cross_attn: {tgt.shape}, starting FFN...")
+
             # Feed-forward sub-layer
             tgt_norm = self.norm3(tgt)
             ff_output = self._ff_block(tgt_norm)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [DecoderBlock] After FFN: {ff_output.shape}")
+
             tgt = tgt + self.dropout3(ff_output)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [DecoderBlock] Block complete: {tgt.shape}")
         else:
             # Post-normalization
             # Self-attention sub-layer
