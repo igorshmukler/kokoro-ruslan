@@ -495,11 +495,22 @@ class ImprovedTransformerDecoderBlock(nn.Module):
             cross_attn_output, _ = self.cross_attn(tgt_norm, memory, memory,
                                                    attn_mask=memory_mask, # Usually None
                                                    key_padding_mask=memory_key_padding_mask)
-            tgt = tgt + self.dropout2(cross_attn_output)
+
+            # BATCH 281 LOGGING - Before residual
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [DecoderBlock] Cross-attn returned: {cross_attn_output.shape}, applying dropout2...")
+
+            dropped_output = self.dropout2(cross_attn_output)
+
+            # BATCH 281 LOGGING - Before addition
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [DecoderBlock] After dropout2, adding to tgt: {tgt.shape} + {dropped_output.shape}")
+
+            tgt = tgt + dropped_output
 
             # BATCH 281 LOGGING
             if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [DecoderBlock] After cross_attn: {tgt.shape}, starting FFN...")
+                logger.info(f"  [DecoderBlock] After cross_attn residual: {tgt.shape}, starting FFN...")
 
             # Feed-forward sub-layer
             tgt_norm = self.norm3(tgt)
