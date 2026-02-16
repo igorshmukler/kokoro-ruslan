@@ -237,6 +237,11 @@ class KokoroModel(nn.Module):
         if self.enable_profiling:
             self.profiler.log_memory_stats("decoder_checkpoint_start")
 
+        # BATCH 281 LOGGING
+        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+        if is_batch_281:
+            logger.info(f"  [GradCheckpoint] Starting decoder checkpoint: input={decoder_input.shape}, memory={memory.shape}")
+
         def create_decoder_forward():
             def decoder_forward(tgt, mem, t_mask, mem_mask, tgt_mask_pad):
                 # NO LOGGING INSIDE CHECKPOINTED REGION
@@ -256,6 +261,10 @@ class KokoroModel(nn.Module):
             decoder_input, memory, tgt_mask, memory_key_padding_mask, tgt_key_padding_mask,
             use_reentrant=False
         )
+
+        # BATCH 281 LOGGING
+        if is_batch_281:
+            logger.info(f"  [GradCheckpoint] Decoder checkpoint complete: result={result.shape}")
 
         # Log after checkpointed decoder (outside checkpoint)
         if self.enable_profiling:

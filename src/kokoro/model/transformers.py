@@ -270,24 +270,10 @@ class MultiHeadAttentionImproved(nn.Module):
 
         # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
-
-        # BATCH 281 LOGGING - Track reshape operation
-        if hasattr(self, '_batch_281_log') and self._batch_281_log:
-            logger.info(f"  [Attention] Reshaping context: {context.shape}")
-
         context = context.transpose(1, 2).contiguous().view(
             batch_size, seq_len_q, self.d_model
         )
-
-        # BATCH 281 LOGGING - Track output projection
-        if hasattr(self, '_batch_281_log') and self._batch_281_log:
-            logger.info(f"  [Attention] Reshaped to: {context.shape}, applying w_o projection...")
-
         output = self.w_o(context)
-
-        # BATCH 281 LOGGING - Confirm completion
-        if hasattr(self, '_batch_281_log') and self._batch_281_log:
-            logger.info(f"  [Attention] Output projection complete: {output.shape}")
 
         # Return output and attention weights (None during training with Flash Attention)
         return output, attn_weights.mean(dim=1) if attn_weights is not None else None
@@ -485,6 +471,10 @@ class ImprovedTransformerDecoderBlock(nn.Module):
             tgt_key_padding_mask = tgt_key_padding_mask.to(torch.bool)
         if memory_key_padding_mask is not None:
             memory_key_padding_mask = memory_key_padding_mask.to(torch.bool)
+
+        # BATCH 281 LOGGING - Entry point
+        if hasattr(self, '_batch_281_log') and self._batch_281_log:
+            logger.info(f"  [DecoderBlock] Entry: tgt={tgt.shape}, memory={memory.shape}")
 
         if self.use_prenorm:
             # Pre-normalization
