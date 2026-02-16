@@ -4,6 +4,7 @@ venv
 # misc
 .DS_Store
 ruslan_corpus/
+data/processed_data
 
 # MFA output files
 mfa_output/

@@ -120,13 +120,6 @@ class MultiHeadAttentionImproved(nn.Module):
         seq_len_k = key.size(1)
         seq_len_v = value.size(1) # Should be same as seq_len_k
 
-        # BATCH 281 LOGGING - Track attention entry with call counter
-        if hasattr(self, '_batch_281_log') and self._batch_281_log:
-            if not hasattr(self, '_batch_281_call_count'):
-                self._batch_281_call_count = 0
-            self._batch_281_call_count += 1
-            logger.info(f"  [Attention #{self._batch_281_call_count}] Forward: batch={batch_size}, seq_q={seq_len_q}, seq_k={seq_len_k}")
-
         # 1. Linear projections and reshape for multi-head attention
         Q = self.w_q(query).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_q, D_k)
         K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
@@ -188,40 +181,21 @@ class MultiHeadAttentionImproved(nn.Module):
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
 
-            # BATCH 281 LOGGING
+            # BATCH 281 LOGGING - Show fix is active
             if hasattr(self, '_batch_281_log') and self._batch_281_log:
                 elements_per_chunk = batch_size * self.num_heads * chunk_size * seq_len_k
-                call_num = getattr(self, '_batch_281_call_count', 0)
-                logger.info(f"  [Attention #{call_num}] CHUNKING ACTIVATED")
-                logger.info(f"    total_attention_size: {attention_size:,} elements")
-                logger.info(f"    chunk_size: {chunk_size} (adaptive based on attention_size)")
-                logger.info(f"    total_attention_size: {attention_size:,} elements")
-                logger.info(f"    chunk_size: {chunk_size}")
-                logger.info(f"    num_chunks: {num_chunks}")
-                logger.info(f"    elements_per_chunk: {elements_per_chunk:,}")
+                logger.info(f"  [Attention] MPS Chunking activated (fix for INT_MAX bug)")
+                logger.info(f"    attention_size: {attention_size:,} elements, chunk_size: {chunk_size}, chunks: {num_chunks}")
 
             # Process chunks without accumulating attention weights to save memory
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
                 end_idx = min((chunk_idx + 1) * chunk_size, seq_len_q)
 
-                # BATCH 281 LOGGING - Track each chunk
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] start_idx={start_idx}, end_idx={end_idx}")
-
                 Q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
-
-                # BATCH 281 LOGGING
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] Q_chunk shape: {Q_chunk.shape}")
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] Computing scores via matmul(Q_chunk, K.T)...")
 
                 # Compute attention for this chunk
                 scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
-
-                # BATCH 281 LOGGING
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] scores_chunk computed: {scores_chunk.shape}")
                 if attn_bias is not None:
                     # Only slice bias along query dim if it's actually expanded to full seq_len
                     # Padding masks have shape [B, 1, 1, S_k] and should broadcast as-is
@@ -236,44 +210,9 @@ class MultiHeadAttentionImproved(nn.Module):
                         # Unexpected shape - log and skip
                         logger.error(f"Unexpected attn_bias shape: {attn_bias.shape}, expected dim 2 to be 1 or {seq_len_q}")
 
-                # BATCH 281 LOGGING
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] Computing softmax...")
-
-                try:
-                    attn_weights_chunk = F.softmax(scores_chunk, dim=-1)
-                except Exception as e:
-                    if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                        call_num = getattr(self, '_batch_281_call_count', 0)
-                        logger.error(f"    ❌ [Attention #{call_num}] [Chunk {chunk_idx+1}/{num_chunks}] CRASH during softmax!")
-                        logger.error(f"       Error: {type(e).__name__}: {e}")
-                        logger.error(f"       scores_chunk.shape: {scores_chunk.shape}")
-                    raise
-
-                # BATCH 281 LOGGING
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] Softmax done, shape: {attn_weights_chunk.shape}")
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] Applying dropout...")
-
+                attn_weights_chunk = F.softmax(scores_chunk, dim=-1)
                 attn_weights_chunk = self.dropout_attn(attn_weights_chunk)
-
-                # BATCH 281 LOGGING
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] Computing context via matmul(attn_weights, V)...")
-
-                try:
-                    context_chunk = torch.matmul(attn_weights_chunk, V)  # (B, H, chunk, D_k)
-                except Exception as e:
-                    if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                        call_num = getattr(self, '_batch_281_call_count', 0)
-                        logger.error(f"    ❌ [Attention #{call_num}] [Chunk {chunk_idx+1}/{num_chunks}] CRASH during matmul(attn_weights, V)!")
-                        logger.error(f"       Error: {type(e).__name__}: {e}")
-                        logger.error(f"       attn_weights_chunk.shape: {attn_weights_chunk.shape}, V.shape: {V.shape}")
-                    raise
-
-                # BATCH 281 LOGGING
-                if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                    logger.info(f"    [Chunk {chunk_idx+1}/{num_chunks}] context_chunk computed: {context_chunk.shape}")
+                context_chunk = torch.matmul(attn_weights_chunk, V)  # (B, H, chunk, D_k)
 
                 context_chunks.append(context_chunk)
 
@@ -282,52 +221,24 @@ class MultiHeadAttentionImproved(nn.Module):
                 if chunk_idx % 4 == 0:  # Periodic cache clearing
                     torch.mps.empty_cache()
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    All {num_chunks} chunks processed successfully, concatenating...")
-
             context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
 
-            # BATCH 281 LOGGING
+            # BATCH 281 LOGGING - Confirm fix worked
             if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    Concatenation complete, final context shape: {context.shape}")
+                logger.info(f"  [Attention] Chunked processing complete: {context.shape}")
 
             attn_weights = None  # Don't compute weights during chunked attention to save memory
 
         elif query.device.type == 'mps':
             # Manual attention implementation for MPS (normal sequences)
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
-                call_num = getattr(self, '_batch_281_call_count', 0)
-                logger.info(f"  [Attention #{call_num}] NON-CHUNKED MPS PATH")
-                logger.info(f"    attention_size: {attention_size:,} elements")
-
             scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    scores computed: {scores.shape}")
 
             if attn_bias is not None:
                 scores = scores + attn_bias
 
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    computing softmax...")
-
             attn_weights = F.softmax(scores, dim=-1)
-
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    softmax done, applying dropout...")
-
             attn_weights = self.dropout_attn(attn_weights)
-
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    computing context (attn @ V)...")
-
             context = torch.matmul(attn_weights, V)
-
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"    context computed: {context.shape}")
         else:
             # Use Flash Attention 2 on CUDA/CPU (2-4x faster)
             try:
@@ -359,10 +270,24 @@ class MultiHeadAttentionImproved(nn.Module):
 
         # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
+
+        # BATCH 281 LOGGING - Track reshape operation
+        if hasattr(self, '_batch_281_log') and self._batch_281_log:
+            logger.info(f"  [Attention] Reshaping context: {context.shape}")
+
         context = context.transpose(1, 2).contiguous().view(
             batch_size, seq_len_q, self.d_model
         )
+
+        # BATCH 281 LOGGING - Track output projection
+        if hasattr(self, '_batch_281_log') and self._batch_281_log:
+            logger.info(f"  [Attention] Reshaped to: {context.shape}, applying w_o projection...")
+
         output = self.w_o(context)
+
+        # BATCH 281 LOGGING - Confirm completion
+        if hasattr(self, '_batch_281_log') and self._batch_281_log:
+            logger.info(f"  [Attention] Output projection complete: {output.shape}")
 
         # Return output and attention weights (None during training with Flash Attention)
         return output, attn_weights.mean(dim=1) if attn_weights is not None else None
