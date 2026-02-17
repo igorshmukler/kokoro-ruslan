@@ -120,13 +120,13 @@ python -m kokoro.cli.training --corpus ./ruslan_corpus
 | `--profile-amp-batches` |  | `10` | Number of AMP profiling batches |
 | `--fused-adamw` |  | `False` | Force-enable fused AdamW optimizer (experimental on non-CUDA backends) |
 | `--no-fused-adamw` |  | `False` | Force-disable fused AdamW optimizer |
-| `--try-fused-adamw-mps` |  | `False` | Explicitly try fused AdamW on MPS (experimental, auto-fallback if unsupported) |
+| `--try-fused-adamw-mps` |  | `True` | Try fused AdamW on MPS (experimental, enabled by default, auto-fallback if unsupported) |
 | `--verbose` | `-v` | `False` | Enable verbose stabilization diagnostics |
 
 Optimizer flag behavior:
 - If neither `--fused-adamw` nor `--no-fused-adamw` is passed, optimizer selection is automatic.
 - `--fused-adamw` takes priority unless `--no-fused-adamw` is also passed (which forces disable).
-- `--try-fused-adamw-mps` only affects MPS and attempts fused AdamW experimentally.
+- `--try-fused-adamw-mps` only affects MPS and is enabled by default.
 
 ## Training Defaults (Current)
 
@@ -155,7 +155,7 @@ kokoro-train --corpus ./ruslan_corpus --max-frames 18000 --min-batch-size 4 --ma
 kokoro-train --corpus ./ruslan_corpus --fused-adamw
 kokoro-train --corpus ./ruslan_corpus --no-fused-adamw
 
-# Try fused AdamW on MPS (experimental)
+# Fused AdamW on MPS is enabled by default (experimental)
 kokoro-train --corpus ./ruslan_corpus --try-fused-adamw-mps
 
 # Inference from final model or latest checkpoint in a model directory

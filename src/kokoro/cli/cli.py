@@ -180,7 +180,8 @@ Examples:
     parser.add_argument(
         '--try-fused-adamw-mps',
         action='store_true',
-        help='Explicitly try fused AdamW on MPS (experimental, falls back automatically if unsupported)'
+        default=True,
+        help='Try fused AdamW on MPS (experimental, enabled by default; falls back automatically if unsupported)'
     )
 
     parser.add_argument(
