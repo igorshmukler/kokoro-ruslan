@@ -71,6 +71,9 @@ class TrainingConfig:
     variance_kernel_size: int = 3
     variance_dropout: float = 0.1
     n_variance_bins: int = 256
+    # Pitch extraction range in Hz (used to extract F0 targets before normalization)
+    pitch_extract_fmin: float = 50.0
+    pitch_extract_fmax: float = 800.0
     pitch_min: float = 0.0  # Normalized range (extractors output [0, 1])
     pitch_max: float = 1.0  # Normalized range (extractors output [0, 1])
     energy_min: float = 0.0
@@ -131,7 +134,7 @@ class TrainingConfig:
     checkpoint_segments: int = 2
 
     # Auto-optimize checkpoint segments based on available GPU memory
-    auto_optimize_checkpointing: bool = True
+    auto_optimize_checkpointing: bool = False
 
     # Target memory usage percentage (0.0-1.0) for auto-optimization
     target_memory_usage: float = 0.8
@@ -157,8 +160,8 @@ class TrainingConfig:
     # Optimizer behavior
     # None = auto (enabled on CUDA, disabled otherwise)
     use_fused_adamw: Optional[bool] = None
-    # Explicitly try fused AdamW on MPS (experimental, may fall back)
-    try_fused_adamw_on_mps: bool = False
+    # Try fused AdamW on MPS by default (experimental, may fall back)
+    try_fused_adamw_on_mps: bool = True
 
     # torch.compile optimization (PyTorch 2.0+)
     use_torch_compile: bool = True

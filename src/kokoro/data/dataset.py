@@ -23,6 +23,8 @@ from kokoro.data.mfa_integration import MFAIntegration
 
 logger = logging.getLogger(__name__)
 
+FEATURE_CACHE_VERSION = 2
+
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
     VARIANCE_AVAILABLE = True
@@ -326,13 +328,18 @@ class RuslanDataset(Dataset):
 
         # Check in-memory cache first
         if audio_file in self.feature_cache:
-            return self.feature_cache[audio_file]
+            cached = self.feature_cache[audio_file]
+            if cached.get('_cache_version') == FEATURE_CACHE_VERSION:
+                return cached
+            self.feature_cache.pop(audio_file, None)
 
         # Check disk cache
         cache_path = self._get_feature_cache_path(audio_file)
         if cache_path.exists():
             try:
                 features = torch.load(cache_path, weights_only=False)
+                if features.get('_cache_version') != FEATURE_CACHE_VERSION:
+                    return None
                 # Store in memory cache for faster subsequent access
                 self.feature_cache[audio_file] = features
                 return features
@@ -407,10 +414,10 @@ class RuslanDataset(Dataset):
             # logger.debug(f"Padded audio in __getitem__. New length: {audio.shape[1]}")
 
         # Extract mel spectrogram using pre-created transform
-        mel_spec = self.mel_transform(audio).squeeze(0)  # Remove channel dimension
+        mel_spec_linear = self.mel_transform(audio).squeeze(0)  # Remove channel dimension
 
         # Convert to log scale and normalize
-        mel_spec = torch.log(mel_spec + 1e-9)  # Add small epsilon to avoid log(0)
+        mel_spec = torch.log(mel_spec_linear + 1e-9)  # Add small epsilon to avoid log(0)
 
         # Clip extremely long sequences to prevent memory issues
         max_frames = self.config.max_seq_length
@@ -486,8 +493,8 @@ class RuslanDataset(Dataset):
                     audio.squeeze(0),  # Remove channel dim
                     sample_rate=self.config.sample_rate,
                     hop_length=self.config.hop_length,
-                    fmin=getattr(self.config, 'pitch_min', 50.0),
-                    fmax=getattr(self.config, 'pitch_max', 800.0)
+                    fmin=getattr(self.config, 'pitch_extract_fmin', 50.0),
+                    fmax=getattr(self.config, 'pitch_extract_fmax', 800.0)
                 )
 
                 # Match length to mel frames
@@ -497,8 +504,8 @@ class RuslanDataset(Dataset):
                     padding = torch.zeros(num_mel_frames - len(pitch), device=pitch.device)
                     pitch = torch.cat([pitch, padding])
 
-                # Extract energy from mel spectrogram (returns normalized [0, 1])
-                energy = EnergyExtractor.extract_energy_from_mel(mel_spec)
+                # Extract energy from linear mel spectrogram (returns normalized [0, 1])
+                energy = EnergyExtractor.extract_energy_from_mel(mel_spec_linear)
 
                 # Ensure energy matches mel frames
                 if len(energy) > num_mel_frames:
@@ -542,7 +549,8 @@ class RuslanDataset(Dataset):
             'text': sample['text'],
             'audio_file': audio_file,
             'mel_length': mel_spec.shape[1], # Actual length after potential clipping
-            'phoneme_length': phoneme_indices_tensor.shape[0] # Actual length
+            'phoneme_length': phoneme_indices_tensor.shape[0], # Actual length
+            '_cache_version': FEATURE_CACHE_VERSION
         }
 
         # Save to cache for future use

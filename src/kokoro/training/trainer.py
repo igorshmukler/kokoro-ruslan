@@ -294,7 +294,7 @@ class KokoroTrainer:
         else:
             use_fused = bool(forced_use_fused)
 
-        if self.device_type == 'mps' and getattr(config, 'try_fused_adamw_on_mps', False):
+        if self.device_type == 'mps' and forced_use_fused is None and getattr(config, 'try_fused_adamw_on_mps', False):
             use_fused = True
 
         fused_source = (

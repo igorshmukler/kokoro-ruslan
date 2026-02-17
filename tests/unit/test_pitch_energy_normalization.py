@@ -1,122 +1,108 @@
-#!/usr/bin/env python3
-"""
-Test to verify pitch/energy normalization is actually working
-"""
-import sys
-sys.path.insert(0, 'src')
-
-import pytest
+import numpy as np
 import torch
+from scipy.io import wavfile
+
 from kokoro.data.dataset import RuslanDataset
+from kokoro.model.variance_predictor import EnergyExtractor, PitchExtractor
 from kokoro.training.config import TrainingConfig
-from torch.utils.data import DataLoader
-from kokoro.data.dataset import collate_fn, DynamicFrameBatchSampler
 
 
-def test_pitch_energy_normalization():
-    print("\n" + "="*80)
-    print("TESTING PITCH/ENERGY NORMALIZATION")
-    print("="*80)
+def _create_minimal_corpus(tmp_path):
+    corpus_dir = tmp_path / "corpus"
+    wavs_dir = corpus_dir / "wavs"
+    wavs_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load config
-    config = TrainingConfig()
-    config.data_dir = "/Users/ishmukle/Projects/kokoro-ruslan/ruslan_corpus"
-    config.use_mfa = True
+    sample_rate = 22050
+    duration_seconds = 0.15
+    t = np.linspace(0, duration_seconds, int(sample_rate * duration_seconds), endpoint=False)
+    waveform = (0.15 * np.sin(2 * np.pi * 220.0 * t)).astype(np.float32)
 
-    print("\nLoading dataset...")
-    dataset = RuslanDataset(
-        data_dir=config.data_dir,
-        config=config,
-        use_mfa=True
+    wav_path = wavs_dir / "000000_RUSLAN.wav"
+    wavfile.write(wav_path, sample_rate, (waveform * 32767.0).astype(np.int16))
+
+    metadata = corpus_dir / "metadata_RUSLAN_22200.csv"
+    metadata.write_text("000000_RUSLAN|тест\n", encoding="utf-8")
+
+    return corpus_dir
+
+
+def test_dataset_uses_extractor_pitch_hz_bounds_not_normalized_bins(tmp_path, monkeypatch):
+    corpus_dir = _create_minimal_corpus(tmp_path)
+
+    config = TrainingConfig(
+        data_dir=str(corpus_dir),
+        use_mfa=False,
+        use_feature_cache=False,
+        use_variance_predictor=True,
     )
 
-    # Create dataloader
-    batch_sampler = DynamicFrameBatchSampler(
-        dataset=dataset,
-        max_frames=config.max_frames_per_batch,
-        min_batch_size=config.min_batch_size,
-        max_batch_size=config.max_batch_size,
-        drop_last=True,
-        shuffle=False
+    config.pitch_extract_fmin = 70.0
+    config.pitch_extract_fmax = 420.0
+    config.pitch_min = 0.0
+    config.pitch_max = 1.0
+
+    observed = {}
+
+    def _mock_pitch(waveform, sample_rate, hop_length, fmin, fmax):
+        observed["fmin"] = fmin
+        observed["fmax"] = fmax
+        length = max(1, int(np.ceil(waveform.shape[-1] / hop_length)))
+        return torch.full((length,), 0.5, dtype=torch.float32)
+
+    monkeypatch.setattr(PitchExtractor, "extract_pitch", staticmethod(_mock_pitch))
+
+    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
+    sample = dataset[0]
+
+    assert observed["fmin"] == config.pitch_extract_fmin
+    assert observed["fmax"] == config.pitch_extract_fmax
+    assert float(sample["pitch"].min()) >= 0.0
+    assert float(sample["pitch"].max()) <= 1.0
+
+
+def test_dataset_passes_linear_mel_to_energy_extractor(tmp_path, monkeypatch):
+    corpus_dir = _create_minimal_corpus(tmp_path)
+
+    config = TrainingConfig(
+        data_dir=str(corpus_dir),
+        use_mfa=False,
+        use_feature_cache=False,
+        use_variance_predictor=True,
     )
 
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        collate_fn=collate_fn,
-        num_workers=0
+    monkeypatch.setattr(
+        PitchExtractor,
+        "extract_pitch",
+        staticmethod(lambda waveform, sample_rate, hop_length, fmin, fmax: torch.zeros(max(1, int(np.ceil(waveform.shape[-1] / hop_length))))),
     )
 
-    print("\n" + "-"*80)
-    print("Checking pitch/energy values in batches...")
-    print("-"*80)
+    observed = {}
 
-    unnormalized_count = 0
-    batch_count = 0
-    max_pitch_seen = 0.0
-    max_energy_seen = 0.0
+    def _mock_energy(mel_spec):
+        observed["min"] = float(mel_spec.min())
+        observed["max"] = float(mel_spec.max())
+        return torch.zeros(mel_spec.shape[-1], dtype=torch.float32)
 
-    # Check first 10 batches and batch 281, 816
-    target_batches = list(range(10)) + [281, 816] if len(dataloader) > 816 else list(range(10)) + [281]
+    monkeypatch.setattr(EnergyExtractor, "extract_energy_from_mel", staticmethod(_mock_energy))
 
-    for batch_idx, batch in enumerate(dataloader):
-        if batch_idx not in target_batches:
-            if batch_idx > max(target_batches):
-                break
-            continue
+    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
+    _ = dataset[0]
 
-        batch_count += 1
-
-        pitches = batch['pitches']
-        energies = batch['energies']
-
-        pitch_min = pitches.min().item()
-        pitch_max = pitches.max().item()
-        energy_min = energies.min().item()
-        energy_max = energies.max().item()
-
-        max_pitch_seen = max(max_pitch_seen, pitch_max)
-        max_energy_seen = max(max_energy_seen, energy_max)
-
-        print(f"\nBatch {batch_idx}:")
-        print(f"  Pitch:  min={pitch_min:.4f}, max={pitch_max:.4f}, mean={pitches.mean().item():.4f}")
-        print(f"  Energy: min={energy_min:.4f}, max={energy_max:.4f}, mean={energies.mean().item():.4f}")
-
-        # Check if values are properly normalized [0, 1]
-        if pitch_max > 1.5 or energy_max > 1.5:
-            print(f"  ❌ UNNORMALIZED! Pitch max={pitch_max:.2f}, Energy max={energy_max:.2f}")
-            unnormalized_count += 1
-        elif pitch_max > 1.0 or energy_max > 1.0:
-            print(f"  ⚠️  Values slightly exceed 1.0 (expected range [0, 1])")
-        else:
-            print(f"  ✅ Properly normalized to [0, 1]")
-
-    print("\n" + "="*80)
-    print("SUMMARY")
-    print("="*80)
-    print(f"Batches checked: {batch_count}")
-    print(f"Maximum pitch value seen: {max_pitch_seen:.4f}")
-    print(f"Maximum energy value seen: {max_energy_seen:.4f}")
-
-    if unnormalized_count > 0:
-        print(f"\n❌ PROBLEM FOUND: {unnormalized_count} batches have UNNORMALIZED values!")
-        print("   This will cause loss explosion and INT_MAX crash!")
-        print("\n   FIX NEEDED: Ensure PitchExtractor and EnergyExtractor normalize to [0, 1]")
-        pytest.fail(
-            f"Found {unnormalized_count} batches with unnormalized pitch/energy values"
-        )
-    elif max_pitch_seen > 1.0 or max_energy_seen > 1.0:
-        print(f"\n⚠️  WARNING: Values slightly exceed 1.0")
-        print(f"   Max pitch: {max_pitch_seen:.4f}, Max energy: {max_energy_seen:.4f}")
-        print("   Should be clamped to [0, 1] range")
-        pytest.fail(
-            f"Pitch/Energy values exceed normalized range: pitch={max_pitch_seen:.4f}, energy={max_energy_seen:.4f}"
-        )
-    else:
-        print(f"\n✅ SUCCESS: All values properly normalized to [0, 1]")
-        print("   No risk of loss explosion or INT_MAX crash")
+    assert observed["min"] >= 0.0
+    assert observed["max"] > 0.0
 
 
-if __name__ == "__main__":
-    success = test_pitch_energy_normalization()
-    sys.exit(0 if success else 1)
+def test_energy_extractor_normalizes_linear_and_log_mel_to_unit_interval():
+    torch.manual_seed(7)
+    linear_mel = torch.rand(80, 300) * 20.0
+    log_mel = torch.log(linear_mel + 1e-9)
+
+    energy_linear = EnergyExtractor.extract_energy_from_mel(linear_mel)
+    energy_log = EnergyExtractor.extract_energy_from_mel(log_mel)
+
+    assert float(energy_linear.min()) >= 0.0
+    assert float(energy_linear.max()) <= 1.0
+    assert float(energy_log.min()) >= 0.0
+    assert float(energy_log.max()) <= 1.0
+
+    assert torch.allclose(energy_linear, energy_log, atol=1e-5)
