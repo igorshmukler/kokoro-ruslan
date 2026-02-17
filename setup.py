@@ -23,12 +23,12 @@ if readme_file.exists():
 
 setup(
     name="kokoro-ruslan",
-    version="0.0.4",
+    version="0.0.5",
     author="Igor Shmukler",
     description="Transformer-based Russian Text-to-Speech System",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/kokoro-ruslan",
+    url="https://github.com/igorshmukler/kokoro-ruslan",
     package_dir={"": "src"},
     packages=find_packages(where="src"),
     install_requires=requirements,
@@ -69,7 +69,7 @@ setup(
     ],
     keywords="tts text-to-speech russian transformer pytorch",
     project_urls={
-        "Bug Reports": "https://github.com/yourusername/kokoro-ruslan/issues",
-        "Source": "https://github.com/yourusername/kokoro-ruslan",
+        "Bug Reports": "https://github.com/igorshmukler/kokoro-ruslan/issues",
+        "Source": "https://github.com/igorshmukler/kokoro-ruslan",
     },
 )
