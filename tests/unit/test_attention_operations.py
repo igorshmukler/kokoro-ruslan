@@ -9,13 +9,24 @@ import torch
 import torch.nn.functional as F
 
 
+def _test_device():
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def _maybe_clear_mps_cache(device):
+    if device.type == 'mps' and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
 def test_matmul_operations():
     """Test matmul operations with batch 281 dimensions"""
     print("\n" + "="*80)
     print("TEST 1: Matrix Multiplication Operations")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     num_heads = 8
     seq_len = 304
@@ -74,7 +85,7 @@ def test_softmax_operation():
     print("TEST 2: Softmax Operation")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     num_heads = 8
     seq_len = 304
@@ -108,7 +119,7 @@ def test_scaled_attention():
     print("TEST 3: Scaled Dot-Product Attention")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     num_heads = 8
     seq_len = 304
@@ -147,7 +158,7 @@ def test_with_causal_mask():
     print("TEST 4: Attention with Causal Mask")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     num_heads = 8
     seq_len = 304
@@ -189,7 +200,7 @@ def test_gradient_checkpointing():
     print("TEST 5: With Gradient Checkpointing")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     num_heads = 8
     seq_len = 304
@@ -232,7 +243,7 @@ def test_different_batch_sizes():
     print("TEST 6: Different Batch Sizes")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     num_heads = 8
     seq_len = 304
     d_k = 64
@@ -257,7 +268,7 @@ def test_different_batch_sizes():
             print(f"  ✅ Success: {total_elements:,} elements in attention matrix")
 
             del Q, K, V, scores, attn_weights, output, loss
-            torch.mps.empty_cache()
+            _maybe_clear_mps_cache(device)
 
         except RuntimeError as e:
             if "INT_MAX" in str(e):

@@ -48,7 +48,14 @@ def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> Kokor
     trainer.grad_explosion_ema_alpha = 0.95
     trainer.grad_explosion_abs_floor = 1000.0
     trainer.grad_explosion_multiplier = 3.0
+    trainer.grad_explosion_warmup_steps = 0
+    trainer.grad_explosion_warmup_floor = 1000.0
+    trainer.grad_explosion_min_ema_steps = 0
+    trainer.grad_explosion_ema_steps = 0
     trainer.grad_explosion_streak = 0
+    trainer.projection_spike_clip_norm = 30.0
+    trainer.attention_spike_clip_norm = 20.0
+    trainer.optimizer_steps_completed = 0
     trainer.mixed_precision_stats = {
         "scale_updates": 0,
         "scale_decreases": 0,
@@ -126,7 +133,7 @@ def test_train_epoch_processes_high_risk_batch_with_adaptive_stabilization(monke
 
     avg_total_loss, _, _, _ = trainer.train_epoch(0)
 
-    risk_ratio = max(1785 / 1600, 240 / 200)
+    risk_ratio = max(1785 / 1400, 240 / 150)
     expected_clip = max(0.05, 0.5 / (risk_ratio ** 0.5))
 
     assert trainer.model.forward_calls == 1

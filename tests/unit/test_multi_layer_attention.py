@@ -10,13 +10,24 @@ import torch.nn as nn
 from kokoro.model.transformers import MultiHeadAttentionImproved, ImprovedTransformerDecoderBlock
 
 
+def _test_device():
+    if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return torch.device('mps')
+    return torch.device('cpu')
+
+
+def _maybe_clear_mps_cache(device):
+    if device.type == 'mps' and torch.backends.mps.is_available():
+        torch.mps.empty_cache()
+
+
 def test_single_attention_layer():
     """Test single attention layer"""
     print("\n" + "="*80)
     print("TEST 1: Single MultiHeadAttentionImproved Layer")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     seq_len = 304
     d_model = 512
@@ -50,7 +61,7 @@ def test_decoder_block():
     print("TEST 2: Full Decoder Block")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     tgt_len = 304
     src_len = 56  # encoder length from batch 281
@@ -91,7 +102,7 @@ def test_multiple_decoder_blocks():
     print("TEST 3: Multiple Decoder Blocks (6 layers)")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     tgt_len = 304
     src_len = 56
@@ -136,7 +147,7 @@ def test_with_gradient_checkpointing():
     print("TEST 4: With Gradient Checkpointing")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     tgt_len = 304
     src_len = 56
@@ -189,7 +200,7 @@ def test_accumulated_gradients():
     print("TEST 5: Gradient Accumulation (4 steps)")
     print("="*80)
 
-    device = torch.device('mps')
+    device = _test_device()
     batch_size = 20
     seq_len = 304
     d_model = 512
@@ -210,7 +221,7 @@ def test_accumulated_gradients():
             print(f"  ✅ Step {step+1} complete")
 
             del x, output, loss
-            torch.mps.empty_cache()
+            _maybe_clear_mps_cache(device)
 
         return True
     except RuntimeError as e:
