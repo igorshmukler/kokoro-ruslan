@@ -5,6 +5,7 @@ Targeted unit tests for attention operations to find INT_MAX crash
 import sys
 sys.path.insert(0, 'src')
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -55,7 +56,8 @@ def test_matmul_operations():
         print(f"  ❌ CRASH: {e}")
         if "INT_MAX" in str(e):
             print(f"  🎯 INT_MAX crash in Q @ K^T operation")
-            return False
+            pytest.fail("INT_MAX crash in Q @ K^T operation")
+        pytest.fail(f"Unexpected RuntimeError in Q @ K^T operation: {e}")
 
     # Test 1b: Attention @ V
     print(f"\nTest 1b: Attention @ V")
@@ -74,9 +76,8 @@ def test_matmul_operations():
         print(f"  ❌ CRASH: {e}")
         if "INT_MAX" in str(e):
             print(f"  🎯 INT_MAX crash in Attention @ V operation")
-            return False
-
-    return True
+            pytest.fail("INT_MAX crash in Attention @ V operation")
+        pytest.fail(f"Unexpected RuntimeError in Attention @ V operation: {e}")
 
 
 def test_softmax_operation():
@@ -108,9 +109,8 @@ def test_softmax_operation():
         print(f"  ❌ CRASH: {e}")
         if "INT_MAX" in str(e):
             print(f"  🎯 INT_MAX crash in softmax operation")
-            return False
-
-    return True
+            pytest.fail("INT_MAX crash in softmax operation")
+        pytest.fail(f"Unexpected RuntimeError in softmax operation: {e}")
 
 
 def test_scaled_attention():
@@ -147,9 +147,8 @@ def test_scaled_attention():
         print(f"  ❌ CRASH: {e}")
         if "INT_MAX" in str(e):
             print(f"  🎯 INT_MAX crash in scaled attention")
-            return False
-
-    return True
+            pytest.fail("INT_MAX crash in scaled attention")
+        pytest.fail(f"Unexpected RuntimeError in scaled attention: {e}")
 
 
 def test_with_causal_mask():
@@ -189,9 +188,8 @@ def test_with_causal_mask():
         print(f"  ❌ CRASH: {e}")
         if "INT_MAX" in str(e):
             print(f"  🎯 INT_MAX crash with causal mask")
-            return False
-
-    return True
+            pytest.fail("INT_MAX crash with causal mask")
+        pytest.fail(f"Unexpected RuntimeError with causal mask: {e}")
 
 
 def test_gradient_checkpointing():
@@ -232,9 +230,8 @@ def test_gradient_checkpointing():
         print(f"  ❌ CRASH: {e}")
         if "INT_MAX" in str(e):
             print(f"  🎯 INT_MAX crash with gradient checkpointing")
-            return False
-
-    return True
+            pytest.fail("INT_MAX crash with gradient checkpointing")
+        pytest.fail(f"Unexpected RuntimeError with gradient checkpointing: {e}")
 
 
 def test_different_batch_sizes():
@@ -274,12 +271,10 @@ def test_different_batch_sizes():
             if "INT_MAX" in str(e):
                 print(f"  ❌ CRASH at batch_size={batch_size}")
                 print(f"  🎯 Threshold found: crashes when batch_size >= {batch_size}")
-                return False
+                pytest.fail(f"INT_MAX crash at batch_size={batch_size}")
             else:
                 print(f"  ❌ Different error: {e}")
-                return False
-
-    return True
+                pytest.fail(f"Unexpected RuntimeError at batch_size={batch_size}: {e}")
 
 
 def main():

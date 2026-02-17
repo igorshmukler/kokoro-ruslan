@@ -5,6 +5,7 @@ Test to verify pitch/energy normalization is actually working
 import sys
 sys.path.insert(0, 'src')
 
+import pytest
 import torch
 from kokoro.data.dataset import RuslanDataset
 from kokoro.training.config import TrainingConfig
@@ -101,16 +102,19 @@ def test_pitch_energy_normalization():
         print(f"\n❌ PROBLEM FOUND: {unnormalized_count} batches have UNNORMALIZED values!")
         print("   This will cause loss explosion and INT_MAX crash!")
         print("\n   FIX NEEDED: Ensure PitchExtractor and EnergyExtractor normalize to [0, 1]")
-        return False
+        pytest.fail(
+            f"Found {unnormalized_count} batches with unnormalized pitch/energy values"
+        )
     elif max_pitch_seen > 1.0 or max_energy_seen > 1.0:
         print(f"\n⚠️  WARNING: Values slightly exceed 1.0")
         print(f"   Max pitch: {max_pitch_seen:.4f}, Max energy: {max_energy_seen:.4f}")
         print("   Should be clamped to [0, 1] range")
-        return False
+        pytest.fail(
+            f"Pitch/Energy values exceed normalized range: pitch={max_pitch_seen:.4f}, energy={max_energy_seen:.4f}"
+        )
     else:
         print(f"\n✅ SUCCESS: All values properly normalized to [0, 1]")
         print("   No risk of loss explosion or INT_MAX crash")
-        return True
 
 
 if __name__ == "__main__":
