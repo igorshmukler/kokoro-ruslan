@@ -7,10 +7,16 @@ Handles multiple audio saving backends with fallbacks
 import torch
 import torchaudio
 import numpy as np
-import soundfile as sf
 import logging
 from pathlib import Path
 from typing import Optional
+
+try:
+    import soundfile as sf
+    SOUND_FILE_AVAILABLE = True
+except (ImportError, OSError):
+    sf = None
+    SOUND_FILE_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +76,10 @@ class AudioUtils:
 
     def _save_with_soundfile(self, audio: torch.Tensor, output_path: Path) -> bool:
         """Try saving with soundfile"""
+        if not SOUND_FILE_AVAILABLE:
+            logger.debug("soundfile backend unavailable, skipping")
+            return False
+
         try:
             audio_np = audio.numpy()
             sf.write(str(output_path), audio_np, self.sample_rate)

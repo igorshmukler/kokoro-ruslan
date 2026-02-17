@@ -118,7 +118,15 @@ python -m kokoro.cli.training --corpus ./ruslan_corpus
 | `--max-batch-size` |  | `32` | Max dynamic batch size (may be auto-capped on MPS) |
 | `--profile-amp` |  | `False` | Run AMP speed profiling before training |
 | `--profile-amp-batches` |  | `10` | Number of AMP profiling batches |
+| `--fused-adamw` |  | `False` | Force-enable fused AdamW optimizer (experimental on non-CUDA backends) |
+| `--no-fused-adamw` |  | `False` | Force-disable fused AdamW optimizer |
+| `--try-fused-adamw-mps` |  | `False` | Explicitly try fused AdamW on MPS (experimental, auto-fallback if unsupported) |
 | `--verbose` | `-v` | `False` | Enable verbose stabilization diagnostics |
+
+Optimizer flag behavior:
+- If neither `--fused-adamw` nor `--no-fused-adamw` is passed, optimizer selection is automatic.
+- `--fused-adamw` takes priority unless `--no-fused-adamw` is also passed (which forces disable).
+- `--try-fused-adamw-mps` only affects MPS and attempts fused AdamW experimentally.
 
 ## Training Defaults (Current)
 
@@ -142,6 +150,19 @@ kokoro-train --corpus ./ruslan_corpus --no-mfa
 
 # Train with explicit dynamic batching bounds
 kokoro-train --corpus ./ruslan_corpus --max-frames 18000 --min-batch-size 4 --max-batch-size 12
+
+# Force fused AdamW (or force-disable it)
+kokoro-train --corpus ./ruslan_corpus --fused-adamw
+kokoro-train --corpus ./ruslan_corpus --no-fused-adamw
+
+# Try fused AdamW on MPS (experimental)
+kokoro-train --corpus ./ruslan_corpus --try-fused-adamw-mps
+
+# Inference from final model or latest checkpoint in a model directory
+python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps
+
+# Inference tuning (helps early checkpoints avoid very short outputs)
+python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps --stop-threshold 0.6 --min-len-ratio 0.9 --max-len 1600
 
 # Run focused unit tests
 python -m pytest tests/unit/test_attention_operations.py tests/unit/test_multi_layer_attention.py tests/unit/test_trainer_adaptive_stabilization.py -q

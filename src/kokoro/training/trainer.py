@@ -1184,10 +1184,17 @@ class KokoroTrainer:
             checkpoint_path, self.model, self.optimizer, self.scheduler, self.config.output_dir
         )
 
+        checkpoint = None
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        except Exception as e:
+            logger.warning(f"Could not load raw checkpoint metadata: {e}")
+
         # Load scaler state if available
         if self.use_mixed_precision and self.scaler:
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if checkpoint is None:
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device)
                 if 'scaler' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler'])
                     logger.info(f"Loaded {self.device_type.upper()} scaler state from checkpoint")
@@ -1199,7 +1206,8 @@ class KokoroTrainer:
         # Load EMA model state if available
         if self.use_ema and self.ema_model is not None:
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if checkpoint is None:
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device)
                 if 'ema_model_state_dict' in checkpoint:
                     self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
                     if 'ema_updates' in checkpoint:
@@ -1210,6 +1218,19 @@ class KokoroTrainer:
                     self.ema_model.load_state_dict(self.model.state_dict())
             except Exception as e:
                 logger.warning(f"Could not load EMA state: {e}")
+
+        if checkpoint is not None:
+            if 'current_optimizer_step' in checkpoint:
+                self.current_optimizer_step = int(checkpoint['current_optimizer_step'])
+                logger.info(f"Restored current_optimizer_step={self.current_optimizer_step}")
+            else:
+                logger.info("No current_optimizer_step found in checkpoint, using default counter state")
+
+            if 'optimizer_steps_completed' in checkpoint:
+                self.optimizer_steps_completed = int(checkpoint['optimizer_steps_completed'])
+                logger.info(f"Restored optimizer_steps_completed={self.optimizer_steps_completed}")
+            else:
+                logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
         self.dataset.phoneme_processor = phoneme_processor
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
@@ -1348,6 +1369,8 @@ class KokoroTrainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'current_optimizer_step': self.current_optimizer_step,
+            'optimizer_steps_completed': self.optimizer_steps_completed,
             'loss': loss,
             'config': self.config,
         }
@@ -2171,6 +2194,12 @@ class KokoroTrainer:
             self.profile_training_steps(self.config.profile_steps)
 
         for epoch in range(self.start_epoch, self.config.num_epochs):
+            epoch_start_time = time.time()
+            if self.enable_adaptive_memory:
+                epoch_cleanup_count_start = self.memory_manager.cleanup_count
+                epoch_cleanup_time_start = self.memory_manager.total_cleanup_time
+                epoch_memory_history_start = len(self.memory_manager.memory_history)
+
             avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
 
             # Step scheduler per epoch only if NOT using OneCycleLR (which steps per batch)
@@ -2216,11 +2245,26 @@ class KokoroTrainer:
             # Log memory management stats for this epoch
             if self.enable_adaptive_memory:
                 memory_report = self.memory_manager.get_memory_report()
+                epoch_cleanup_count = self.memory_manager.cleanup_count - epoch_cleanup_count_start
+                epoch_cleanup_time = self.memory_manager.total_cleanup_time - epoch_cleanup_time_start
+                epoch_duration = max(1e-6, time.time() - epoch_start_time)
+                epoch_cleanup_overhead_percent = (epoch_cleanup_time / epoch_duration) * 100
+
+                epoch_memory_history = self.memory_manager.memory_history[epoch_memory_history_start:]
+                epoch_memory_trend = 0.0
+                if len(epoch_memory_history) >= 10:
+                    recent = epoch_memory_history[-10:]
+                    old_avg = sum(m['usage_percent'] for m in recent[:5]) / 5
+                    new_avg = sum(m['usage_percent'] for m in recent[5:]) / 5
+                    epoch_memory_trend = new_avg - old_avg
+                elif len(epoch_memory_history) >= 2:
+                    epoch_memory_trend = epoch_memory_history[-1]['usage_percent'] - epoch_memory_history[0]['usage_percent']
+
                 logger.info(f"Memory Management Summary - Epoch {epoch+1}:")
                 logger.info(f"  Current Pressure: {memory_report['current_pressure']}")
-                logger.info(f"  Cleanups This Epoch: {memory_report['cleanup_count']}")
-                logger.info(f"  Memory Trend: {memory_report['memory_trend']:+.2f}%")
-                logger.info(f"  Cleanup Overhead: {memory_report['cleanup_overhead_percent']:.2f}%")
+                logger.info(f"  Cleanups This Epoch: {epoch_cleanup_count}")
+                logger.info(f"  Epoch Memory Trend: {epoch_memory_trend:+.2f}%")
+                logger.info(f"  Cleanup Overhead: {epoch_cleanup_overhead_percent:.2f}%")
 
             # Save periodic checkpoints (only if not using validation or if validation isn't better)
             if (epoch + 1) % self.config.save_every == 0:
