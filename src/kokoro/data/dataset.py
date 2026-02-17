@@ -8,6 +8,7 @@ import torchaudio
 from scipy.io import wavfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from collections import OrderedDict
 from torch.utils.data import Dataset, Sampler
 from torch.nn.utils.rnn import pad_sequence
 import logging
@@ -47,7 +48,20 @@ class RuslanDataset(Dataset):
         # Pre-computed feature caching
         self.use_feature_cache = getattr(config, 'use_feature_cache', True)
         self.feature_cache_dir = Path(getattr(config, 'feature_cache_dir', self.data_dir / '.feature_cache'))
-        self.feature_cache = {}  # In-memory cache for this dataset instance
+        # In-memory bounded LRU cache for this dataset instance
+        self.feature_cache = OrderedDict()
+        self.feature_cache_total_bytes = 0
+        self.feature_cache_max_entries = int(getattr(config, 'feature_cache_max_entries', 1024))
+        self.feature_cache_max_mb = float(getattr(config, 'feature_cache_max_mb', 512.0))
+        self.feature_cache_max_bytes = int(max(0.0, self.feature_cache_max_mb) * 1024 * 1024)
+        self.verbose_cache_logging = bool(getattr(config, 'verbose', False))
+        self.feature_cache_log_interval = int(getattr(config, 'feature_cache_log_interval', 500))
+        self.feature_cache_requests = 0
+        self.feature_cache_mem_hits = 0
+        self.feature_cache_disk_hits = 0
+        self.feature_cache_misses = 0
+        # Cache Resample transforms by source sample rate to avoid per-item re-instantiation
+        self.resampler_cache = {}
 
         # Check if variance prediction is enabled
         self.use_variance = getattr(config, 'use_variance_predictor', True) and VARIANCE_AVAILABLE
@@ -112,6 +126,14 @@ class RuslanDataset(Dataset):
         if self.use_feature_cache:
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Feature caching enabled: {self.feature_cache_dir}")
+            logger.info(
+                f"In-memory feature cache limits: entries={self.feature_cache_max_entries}, "
+                f"size={self.feature_cache_max_mb:.1f} MB"
+            )
+            if self.verbose_cache_logging:
+                logger.info(
+                    f"Feature cache runtime logging enabled (interval={self.feature_cache_log_interval} requests)"
+                )
         else:
             logger.info("Feature caching disabled - computing features on-the-fly")
 
@@ -321,6 +343,76 @@ class RuslanDataset(Dataset):
         """Get the path to the cached feature file"""
         return self.feature_cache_dir / f"{audio_file}.pt"
 
+    def _estimate_feature_size_bytes(self, features: Dict) -> int:
+        """Estimate in-memory footprint for cached feature payload."""
+        total_bytes = 0
+        for value in features.values():
+            if isinstance(value, torch.Tensor):
+                total_bytes += value.numel() * value.element_size()
+            elif isinstance(value, str):
+                total_bytes += len(value.encode('utf-8'))
+        return total_bytes
+
+    def _evict_feature_cache_if_needed(self):
+        """Evict least-recently-used entries to satisfy cache limits."""
+        while self.feature_cache:
+            over_entries = self.feature_cache_max_entries > 0 and len(self.feature_cache) > self.feature_cache_max_entries
+            over_bytes = self.feature_cache_max_bytes > 0 and self.feature_cache_total_bytes > self.feature_cache_max_bytes
+            if not over_entries and not over_bytes:
+                break
+
+            _, evicted = self.feature_cache.popitem(last=False)
+            self.feature_cache_total_bytes -= evicted.get('_cache_mem_bytes', 0)
+
+    def _put_feature_in_memory_cache(self, audio_file: str, features: Dict):
+        """Insert/update feature payload in bounded LRU memory cache."""
+        if audio_file in self.feature_cache:
+            previous = self.feature_cache.pop(audio_file)
+            self.feature_cache_total_bytes -= previous.get('_cache_mem_bytes', 0)
+
+        feature_size = self._estimate_feature_size_bytes(features)
+        self.feature_cache[audio_file] = {
+            'features': features,
+            '_cache_mem_bytes': feature_size,
+        }
+        self.feature_cache_total_bytes += feature_size
+        self.feature_cache.move_to_end(audio_file)
+        self._evict_feature_cache_if_needed()
+
+    def _get_resampler(self, source_sample_rate: int) -> torchaudio.transforms.Resample:
+        """Get cached Resample transform for a source sample rate."""
+        resampler = self.resampler_cache.get(source_sample_rate)
+        if resampler is None:
+            resampler = torchaudio.transforms.Resample(source_sample_rate, self.config.sample_rate)
+            self.resampler_cache[source_sample_rate] = resampler
+        return resampler
+
+    def _maybe_log_feature_cache_stats(self):
+        """Log cache hit/miss stats at a fixed request interval when verbose is enabled."""
+        if not (self.use_feature_cache and self.verbose_cache_logging):
+            return
+        if self.feature_cache_log_interval <= 0:
+            return
+        if self.feature_cache_requests == 0 or self.feature_cache_requests % self.feature_cache_log_interval != 0:
+            return
+
+        total_hits = self.feature_cache_mem_hits + self.feature_cache_disk_hits
+        hit_rate = (total_hits / self.feature_cache_requests) * 100.0
+        in_mem_mb = self.feature_cache_total_bytes / (1024 * 1024)
+
+        logger.info(
+            "Feature cache stats: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% "
+            "in_mem_entries=%d in_mem_size=%.1fMB",
+            self.feature_cache_requests,
+            total_hits,
+            self.feature_cache_mem_hits,
+            self.feature_cache_disk_hits,
+            self.feature_cache_misses,
+            hit_rate,
+            len(self.feature_cache),
+            in_mem_mb,
+        )
+
     def _load_cached_features(self, audio_file: str) -> Optional[Dict]:
         """Load pre-computed features from cache"""
         if not self.use_feature_cache:
@@ -328,9 +420,14 @@ class RuslanDataset(Dataset):
 
         # Check in-memory cache first
         if audio_file in self.feature_cache:
-            cached = self.feature_cache[audio_file]
-            if cached.get('_cache_version') == FEATURE_CACHE_VERSION:
-                return cached
+            cached = self.feature_cache.pop(audio_file)
+            self.feature_cache[audio_file] = cached
+            payload = cached['features']
+            self.feature_cache.move_to_end(audio_file)
+            if payload.get('_cache_version') == FEATURE_CACHE_VERSION:
+                self.feature_cache_mem_hits += 1
+                return payload
+            self.feature_cache_total_bytes -= cached.get('_cache_mem_bytes', 0)
             self.feature_cache.pop(audio_file, None)
 
         # Check disk cache
@@ -341,7 +438,8 @@ class RuslanDataset(Dataset):
                 if features.get('_cache_version') != FEATURE_CACHE_VERSION:
                     return None
                 # Store in memory cache for faster subsequent access
-                self.feature_cache[audio_file] = features
+                self._put_feature_in_memory_cache(audio_file, features)
+                self.feature_cache_disk_hits += 1
                 return features
             except Exception as e:
                 logger.warning(f"Failed to load cached features for {audio_file}: {e}")
@@ -358,21 +456,26 @@ class RuslanDataset(Dataset):
         try:
             torch.save(features, cache_path)
             # Also store in memory cache
-            self.feature_cache[audio_file] = features
+            self._put_feature_in_memory_cache(audio_file, features)
         except Exception as e:
             logger.warning(f"Failed to save cached features for {audio_file}: {e}")
 
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
         audio_file = sample['audio_file']
+        self.feature_cache_requests += 1
 
         # Try to load from cache first
         cached_features = self._load_cached_features(audio_file)
         if cached_features is not None:
-            # Add text and metadata
-            cached_features['text'] = sample['text']
-            cached_features['audio_file'] = audio_file
-            return cached_features
+            # Return a copy to avoid mutating shared in-memory cache payload
+            cached_copy = dict(cached_features)
+            cached_copy['text'] = sample['text']
+            cached_copy['audio_file'] = audio_file
+            self._maybe_log_feature_cache_stats()
+            return cached_copy
+
+        self.feature_cache_misses += 1
 
         # Cache miss - compute features from scratch
         # Load audio using scipy.io.wavfile (no C library dependencies)
@@ -396,7 +499,7 @@ class RuslanDataset(Dataset):
 
         # Resample if necessary
         if sr != self.config.sample_rate:
-            resampler = torchaudio.transforms.Resample(sr, self.config.sample_rate)
+            resampler = self._get_resampler(sr)
             audio = resampler(audio)
 
         # Convert to mono if stereo
@@ -555,6 +658,7 @@ class RuslanDataset(Dataset):
 
         # Save to cache for future use
         self._save_cached_features(audio_file, features)
+        self._maybe_log_feature_cache_stats()
 
         return features
 
