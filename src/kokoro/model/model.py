@@ -663,9 +663,18 @@ class KokoroModel(nn.Module):
                     logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
                 raise e
 
-    def forward_inference(self, phoneme_indices: torch.Tensor, max_len: int = 4000,
-                         stop_threshold: float = 0.5,
-                         text_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward_inference(
+        self,
+        phoneme_indices: torch.Tensor,
+        max_len: int = 4000,
+        stop_threshold: float = 0.5,
+        text_padding_mask: Optional[torch.Tensor] = None,
+        min_len_ratio: float = 0.7,
+        min_len_floor: int = 12,
+        max_len_ratio: float = 3.0,
+        max_len_cap: int = 1600,
+        post_expected_stop_threshold: float = 0.2,
+    ) -> torch.Tensor:
         """
         Inference mode (gradient checkpointing automatically disabled)
         """
@@ -721,8 +730,14 @@ class KokoroModel(nn.Module):
                     if self.enable_profiling:
                         self.profiler.log_memory_stats("inference_pre_generation")
 
-                    min_expected_length = max(10, expected_length // 3)
-                    max_expected_length = min(max_len, expected_length * 2, 800)
+                    min_expected_length = max(min_len_floor, int(expected_length * min_len_ratio))
+                    max_expected_length = min(
+                        max_len,
+                        max(expected_length + 80, int(expected_length * max_len_ratio)),
+                        max_len_cap
+                    )
+                    if max_expected_length <= min_expected_length:
+                        max_expected_length = min(max_len, min_expected_length + 1)
 
                     logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
 
@@ -769,12 +784,15 @@ class KokoroModel(nn.Module):
                                 stop_probability = torch.sigmoid(stop_token_logit_t).item()
 
                                 if t >= min_expected_length:
-                                    if stop_probability > stop_threshold:
-                                        logger.info(f"Stopping at frame {t} (stop_prob: {stop_probability:.4f})")
-                                        break
-
-                                    if t >= expected_length and stop_probability > 0.1:
-                                        logger.info(f"Stopping at expected length {t} (stop_prob: {stop_probability:.4f})")
+                                    effective_stop_threshold = (
+                                        stop_threshold if t < expected_length
+                                        else min(stop_threshold, post_expected_stop_threshold)
+                                    )
+                                    if stop_probability > effective_stop_threshold:
+                                        logger.info(
+                                            f"Stopping at frame {t} "
+                                            f"(stop_prob: {stop_probability:.4f}, threshold: {effective_stop_threshold:.4f})"
+                                        )
                                         break
 
                                 decoder_input_mel = mel_pred_t

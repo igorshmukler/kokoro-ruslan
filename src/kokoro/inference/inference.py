@@ -24,7 +24,17 @@ logger = logging.getLogger(__name__)
 class KokoroTTS:
     """Main TTS inference class with neural vocoder support."""
 
-    def __init__(self, model_dir: str, device: str = None, vocoder_type: str = "hifigan", vocoder_path: str = None):
+    def __init__(
+        self,
+        model_dir: str,
+        device: str = None,
+        vocoder_type: str = "hifigan",
+        vocoder_path: str = None,
+        inference_max_len: int = 1200,
+        inference_stop_threshold: float = 0.45,
+        inference_min_len_ratio: float = 0.7,
+        inference_min_len_floor: int = 12,
+    ):
         self.model_dir = Path(model_dir)
 
         # Determine device
@@ -39,6 +49,12 @@ class KokoroTTS:
         self.n_mels = 80
         self.f_min = 0.0
         self.f_max = 8000.0
+
+        # Inference generation controls
+        self.inference_max_len = inference_max_len
+        self.inference_stop_threshold = inference_stop_threshold
+        self.inference_min_len_ratio = inference_min_len_ratio
+        self.inference_min_len_floor = inference_min_len_floor
 
         # Initialize utility classes
         self.audio_utils = AudioUtils(self.sample_rate)
@@ -169,7 +185,15 @@ class KokoroTTS:
         logger.info(f"Model '{model_path.name}' loaded successfully with vocab_size={vocab_size}.")
         return model
 
-    def text_to_speech(self, text: str, output_path: Optional[str] = None) -> torch.Tensor:
+    def text_to_speech(
+        self,
+        text: str,
+        output_path: Optional[str] = None,
+        stop_threshold: Optional[float] = None,
+        max_len: Optional[int] = None,
+        min_len_ratio: Optional[float] = None,
+        min_len_floor: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Updated text_to_speech with better parameters and error handling.
         """
@@ -200,12 +224,18 @@ class KokoroTTS:
             phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
 
             # Step 3: Generate mel spectrogram with updated parameters
+            effective_stop_threshold = self.inference_stop_threshold if stop_threshold is None else stop_threshold
+            effective_max_len = self.inference_max_len if max_len is None else max_len
+            effective_min_len_ratio = self.inference_min_len_ratio if min_len_ratio is None else min_len_ratio
+            effective_min_len_floor = self.inference_min_len_floor if min_len_floor is None else min_len_floor
+
             with torch.no_grad():
-                # Use more conservative parameters for broken models
                 mel_spec = self.model.forward_inference(
                     phoneme_indices=phoneme_tensor,
-                    max_len=400,  # Reduced from potential 10000
-                    stop_threshold=0.01,  # Much lower threshold
+                    max_len=effective_max_len,
+                    stop_threshold=effective_stop_threshold,
+                    min_len_ratio=effective_min_len_ratio,
+                    min_len_floor=effective_min_len_floor,
                     text_padding_mask=None
                 )
 
@@ -322,6 +352,34 @@ Examples:
         help='Path to a custom HiFi-GAN vocoder model checkpoint (.pt or .pth) if not using the default or if a specific one is required.'
     )
 
+    parser.add_argument(
+        '--stop-threshold',
+        type=float,
+        default=0.45,
+        help='Stop-token threshold for autoregressive decoding (default: 0.45).'
+    )
+
+    parser.add_argument(
+        '--max-len',
+        type=int,
+        default=1200,
+        help='Maximum number of mel frames to generate (default: 1200).'
+    )
+
+    parser.add_argument(
+        '--min-len-ratio',
+        type=float,
+        default=0.7,
+        help='Minimum generated length ratio vs expected duration-based length (default: 0.7).'
+    )
+
+    parser.add_argument(
+        '--min-len-floor',
+        type=int,
+        default=12,
+        help='Minimum generated frames floor before allowing stop-token termination (default: 12).'
+    )
+
     return parser.parse_args()
 
 def main():
@@ -333,7 +391,11 @@ def main():
             model_dir=args.model,
             device=args.device,
             vocoder_type=args.vocoder,
-            vocoder_path=args.vocoder_path
+            vocoder_path=args.vocoder_path,
+            inference_max_len=args.max_len,
+            inference_stop_threshold=args.stop_threshold,
+            inference_min_len_ratio=args.min_len_ratio,
+            inference_min_len_floor=args.min_len_floor,
         )
     except Exception as e:
         logger.critical(f"Fatal error during TTS system initialization: {e}")
