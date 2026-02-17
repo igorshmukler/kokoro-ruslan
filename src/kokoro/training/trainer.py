@@ -2200,13 +2200,7 @@ class KokoroTrainer:
                     logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
 
                     # Save best model
-                    if self.use_mixed_precision:
-                        self.save_checkpoint_with_scaler(epoch, val_total_loss)
-                    else:
-                        save_checkpoint(
-                            self.model, self.optimizer, self.scheduler,
-                            epoch, val_total_loss, self.config, self.config.output_dir
-                        )
+                    self.save_checkpoint_with_scaler(epoch, val_total_loss)
                 else:
                     self.epochs_without_improvement += 1
                     logger.info(f"⚠ No validation improvement for {self.epochs_without_improvement} epoch(s) "
@@ -2234,13 +2228,7 @@ class KokoroTrainer:
                 should_save_periodic = (self.val_dataloader is None or
                                        self.epochs_without_improvement > 0)
                 if should_save_periodic:
-                    if self.use_mixed_precision:
-                        self.save_checkpoint_with_scaler(epoch, avg_total_loss)
-                    else:
-                        save_checkpoint(
-                            self.model, self.optimizer, self.scheduler,
-                            epoch, avg_total_loss, self.config, self.config.output_dir
-                        )
+                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
                     logger.info(f"Periodic checkpoint saved for epoch {epoch+1}")
 
             # Strategic memory cleanup at epoch end
