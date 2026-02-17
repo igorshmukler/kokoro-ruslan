@@ -1184,10 +1184,17 @@ class KokoroTrainer:
             checkpoint_path, self.model, self.optimizer, self.scheduler, self.config.output_dir
         )
 
+        checkpoint = None
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        except Exception as e:
+            logger.warning(f"Could not load raw checkpoint metadata: {e}")
+
         # Load scaler state if available
         if self.use_mixed_precision and self.scaler:
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if checkpoint is None:
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device)
                 if 'scaler' in checkpoint:
                     self.scaler.load_state_dict(checkpoint['scaler'])
                     logger.info(f"Loaded {self.device_type.upper()} scaler state from checkpoint")
@@ -1199,7 +1206,8 @@ class KokoroTrainer:
         # Load EMA model state if available
         if self.use_ema and self.ema_model is not None:
             try:
-                checkpoint = torch.load(checkpoint_path, map_location=self.device)
+                if checkpoint is None:
+                    checkpoint = torch.load(checkpoint_path, map_location=self.device)
                 if 'ema_model_state_dict' in checkpoint:
                     self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
                     if 'ema_updates' in checkpoint:
@@ -1210,6 +1218,19 @@ class KokoroTrainer:
                     self.ema_model.load_state_dict(self.model.state_dict())
             except Exception as e:
                 logger.warning(f"Could not load EMA state: {e}")
+
+        if checkpoint is not None:
+            if 'current_optimizer_step' in checkpoint:
+                self.current_optimizer_step = int(checkpoint['current_optimizer_step'])
+                logger.info(f"Restored current_optimizer_step={self.current_optimizer_step}")
+            else:
+                logger.info("No current_optimizer_step found in checkpoint, using default counter state")
+
+            if 'optimizer_steps_completed' in checkpoint:
+                self.optimizer_steps_completed = int(checkpoint['optimizer_steps_completed'])
+                logger.info(f"Restored optimizer_steps_completed={self.optimizer_steps_completed}")
+            else:
+                logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
         self.dataset.phoneme_processor = phoneme_processor
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
@@ -1348,6 +1369,8 @@ class KokoroTrainer:
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
+            'current_optimizer_step': self.current_optimizer_step,
+            'optimizer_steps_completed': self.optimizer_steps_completed,
             'loss': loss,
             'config': self.config,
         }
