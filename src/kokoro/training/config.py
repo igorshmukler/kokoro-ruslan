@@ -134,7 +134,7 @@ class TrainingConfig:
     checkpoint_segments: int = 2
 
     # Auto-optimize checkpoint segments based on available GPU memory
-    auto_optimize_checkpointing: bool = True
+    auto_optimize_checkpointing: bool = False
 
     # Target memory usage percentage (0.0-1.0) for auto-optimization
     target_memory_usage: float = 0.8
