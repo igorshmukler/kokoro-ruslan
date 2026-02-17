@@ -375,10 +375,10 @@ class KokoroTrainer:
                 total_steps=onecycle_steps,
                 pct_start=pct_start,
                 anneal_strategy='cos',
-                cycle_momentum=True,
+                cycle_momentum=False,
                 base_momentum=0.85,
                 max_momentum=0.95,
-                div_factor=25.0,  # initial_lr = max_lr / div_factor
+                div_factor=3.0,  # initial_lr = max_lr / div_factor (aligns with warmup target LR)
                 final_div_factor=10000.0,  # min_lr = initial_lr / final_div_factor
                 last_epoch=-1  # Start from beginning
             )
