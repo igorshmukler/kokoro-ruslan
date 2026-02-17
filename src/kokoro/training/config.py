@@ -71,6 +71,9 @@ class TrainingConfig:
     variance_kernel_size: int = 3
     variance_dropout: float = 0.1
     n_variance_bins: int = 256
+    # Pitch extraction range in Hz (used to extract F0 targets before normalization)
+    pitch_extract_fmin: float = 50.0
+    pitch_extract_fmax: float = 800.0
     pitch_min: float = 0.0  # Normalized range (extractors output [0, 1])
     pitch_max: float = 1.0  # Normalized range (extractors output [0, 1])
     energy_min: float = 0.0

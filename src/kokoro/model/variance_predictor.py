@@ -257,15 +257,10 @@ class VarianceAdaptor(nn.Module):
         # Predict energy
         energy_pred = self.energy_predictor(encoder_output, mask)
 
-        # Use targets during training, predictions during inference
-        if self.training:
-            # Use ground truth for embedding lookup
-            pitch_quantized = self.quantize_pitch(pitch_target) if pitch_target is not None else self.quantize_pitch(pitch_pred)
-            energy_quantized = self.quantize_energy(energy_target) if energy_target is not None else self.quantize_energy(energy_pred)
-        else:
-            # Use predictions during inference
-            pitch_quantized = self.quantize_pitch(pitch_pred)
-            energy_quantized = self.quantize_energy(energy_pred)
+        # Use provided targets whenever available for teacher-forced alignment.
+        # Inference naturally falls back to predictions when targets are None.
+        pitch_quantized = self.quantize_pitch(pitch_target) if pitch_target is not None else self.quantize_pitch(pitch_pred)
+        energy_quantized = self.quantize_energy(energy_target) if energy_target is not None else self.quantize_energy(energy_pred)
 
         # Get embeddings
         pitch_embed = self.pitch_embedding(pitch_quantized)
@@ -375,18 +370,33 @@ class EnergyExtractor:
         Returns:
             Energy contour normalized to [0, 1] (batch, frames) or (frames,)
         """
-        # Energy is the mean across mel bins
-        if mel_spec.dim() == 2:
-            energy = torch.mean(mel_spec, dim=0)
+        # Convert to linear domain if input appears to be log-mel
+        if mel_spec.min() < 0:
+            mel_linear = torch.exp(mel_spec)
         else:
-            energy = torch.mean(mel_spec, dim=1)
+            mel_linear = mel_spec
 
-        # Simple robust normalization to [0, 1]
-        # Mel specs are typically in range [0, 100+] after power transform
-        # Use fixed range normalization with clipping
-        energy = torch.clamp(energy, min=0.0)  # Ensure non-negative
-        energy = energy / 50.0  # Normalize assuming typical max ~50
-        energy = torch.clamp(energy, 0.0, 1.0)  # Clip to [0, 1]
+        # Energy is frame-level mean across mel bins
+        if mel_linear.dim() == 2:
+            energy = torch.mean(mel_linear, dim=0)
+        else:
+            energy = torch.mean(mel_linear, dim=1)
+
+        # Dynamic range compression and robust per-utterance normalization
+        energy = torch.log1p(torch.clamp(energy, min=0.0))
+
+        if energy.dim() == 1:
+            floor = torch.quantile(energy, 0.05)
+            ceil = torch.quantile(energy, 0.95)
+            denom = torch.clamp(ceil - floor, min=1e-8)
+            energy = (energy - floor) / denom
+        else:
+            floor = torch.quantile(energy, 0.05, dim=1, keepdim=True)
+            ceil = torch.quantile(energy, 0.95, dim=1, keepdim=True)
+            denom = torch.clamp(ceil - floor, min=1e-8)
+            energy = (energy - floor) / denom
+
+        energy = torch.clamp(energy, 0.0, 1.0)
 
         return energy
 
