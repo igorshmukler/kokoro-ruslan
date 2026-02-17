@@ -29,19 +29,19 @@ early_stopping_min_delta: float = 0.001  # Minimum improvement to count
 
 ```bash
 # Train with 10% validation split (default)
-python training.py --corpus ./ruslan_corpus --output ./my_model
+kokoro-train --corpus ./ruslan_corpus --output ./my_model
 
 # Train with 20% validation split
-python training.py --corpus ./ruslan_corpus --val-split 0.2
+kokoro-train --corpus ./ruslan_corpus --val-split 0.2
 
 # Disable validation completely (use all data for training)
-python training.py --corpus ./ruslan_corpus --no-validation
+kokoro-train --corpus ./ruslan_corpus --no-validation
 
 # Custom early stopping patience
-python training.py --corpus ./ruslan_corpus --early-stopping-patience 15
+kokoro-train --corpus ./ruslan_corpus --early-stopping-patience 15
 
 # Run validation every 2 epochs instead of every epoch
-python training.py --corpus ./ruslan_corpus --validation-interval 2
+kokoro-train --corpus ./ruslan_corpus --validation-interval 2
 ```
 
 ## How It Works
@@ -223,7 +223,7 @@ Train Loss: 1.50, Val Loss: 2.50  → Gap: 66.7%
 Once you've tuned hyperparameters with validation, you can train a final model on all data:
 
 ```bash
-python training.py --corpus ./ruslan_corpus --no-validation --epochs 100
+kokoro-train --corpus ./ruslan_corpus --no-validation --epochs 100
 ```
 
 ### Resume with Validation
@@ -231,7 +231,7 @@ python training.py --corpus ./ruslan_corpus --no-validation --epochs 100
 When resuming training, validation state is preserved:
 
 ```bash
-python training.py --corpus ./ruslan_corpus --resume auto
+kokoro-train --corpus ./ruslan_corpus --resume auto
 ```
 
 The trainer will:
@@ -274,7 +274,7 @@ With proper validation monitoring, you should see:
 
 ```bash
 # Start training with validation
-python training.py --corpus ./ruslan_corpus --output ./my_model --val-split 0.1
+kokoro-train --corpus ./ruslan_corpus --output ./my_model --val-split 0.1
 
 # Logs show:
 # Dataset split: 19998 training, 2222 validation samples

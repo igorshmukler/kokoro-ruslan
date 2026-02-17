@@ -138,7 +138,7 @@ Created `test_pitch_energy_conversion.py` to verify:
 
 Run training to verify the fix:
 ```bash
-python training.py --corpus ./ruslan_corpus --val-split 0.1
+kokoro-train --corpus ./ruslan_corpus --val-split 0.1
 ```
 
 Expected behavior:

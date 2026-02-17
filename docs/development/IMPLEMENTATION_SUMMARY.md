@@ -111,25 +111,25 @@ if epochs_without_improvement >= patience:
 ### Basic Usage
 ```bash
 # Default: 10% validation, early stopping after 10 epochs
-python training.py --corpus ./ruslan_corpus
+kokoro-train --corpus ./ruslan_corpus
 
 # Custom validation split
-python training.py --val-split 0.2
+kokoro-train --val-split 0.2
 
 # Disable validation
-python training.py --no-validation
+kokoro-train --no-validation
 ```
 
 ### Advanced Usage
 ```bash
 # Strict early stopping
-python training.py --val-split 0.15 --early-stopping-patience 5
+kokoro-train --val-split 0.15 --early-stopping-patience 5
 
 # Less frequent validation (every 2 epochs)
-python training.py --validation-interval 2
+kokoro-train --validation-interval 2
 
 # Large dataset with small validation
-python training.py --val-split 0.05 --validation-interval 2
+kokoro-train --val-split 0.05 --validation-interval 2
 ```
 
 ## Key Features
@@ -214,13 +214,13 @@ To test the validation system:
 
 ```bash
 # 1. Quick test with small dataset
-python training.py --corpus ./ruslan_corpus --epochs 5 --val-split 0.2
+kokoro-train --corpus ./ruslan_corpus --epochs 5 --val-split 0.2
 
 # 2. Test early stopping
-python training.py --early-stopping-patience 2 --epochs 20
+kokoro-train --early-stopping-patience 2 --epochs 20
 
 # 3. Test without validation
-python training.py --no-validation --epochs 5
+kokoro-train --no-validation --epochs 5
 
 # 4. Run example configurations
 python examples_validation.py
