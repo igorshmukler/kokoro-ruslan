@@ -142,6 +142,9 @@ From `TrainingConfig` in `src/kokoro/training/config.py`:
 ## Useful Commands
 
 ```bash
+# Verify feature cache health before training
+python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
+
 # Resume automatically from latest checkpoint
 kokoro-train --corpus ./ruslan_corpus --output ./models/kokoro_russian --resume auto
 
