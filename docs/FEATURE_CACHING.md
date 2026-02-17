@@ -42,8 +42,8 @@ kokoro-train --corpus ./ruslan_corpus
 ### Option 3: Disable Caching
 
 ```bash
-# Disable feature caching (compute on-the-fly every time)
-kokoro-train --corpus ./ruslan_corpus --no-feature-cache
+# Disable feature caching in TrainingConfig (no dedicated train CLI flag)
+python -c "from kokoro.training.config import TrainingConfig; print(TrainingConfig(use_feature_cache=False))"
 ```
 
 ## Commands
@@ -65,6 +65,12 @@ kokoro-precompute --corpus ./ruslan_corpus --no-variance
 
 # With MFA alignments
 kokoro-precompute --corpus ./ruslan_corpus --use-mfa --mfa-alignment-dir ./mfa_output/alignments
+```
+
+Module form:
+
+```bash
+python -m kokoro.cli.precompute_features --corpus ./ruslan_corpus
 ```
 
 ### Check Cache Status
@@ -228,8 +234,8 @@ If running out of disk space:
 # Clear cache
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --clear
 
-# Disable caching
-kokoro-train --corpus ./ruslan_corpus --no-feature-cache
+# Disable caching through config (example)
+python -c "from kokoro.training.config import TrainingConfig; cfg=TrainingConfig(use_feature_cache=False); print('use_feature_cache=', cfg.use_feature_cache)"
 
 # Or use external drive for cache
 kokoro-precompute --corpus ./ruslan_corpus --cache-dir /external/cache

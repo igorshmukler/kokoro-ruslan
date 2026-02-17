@@ -5,6 +5,7 @@ Comprehensive test with gradient accumulation to reproduce any remaining issues
 import sys
 sys.path.insert(0, 'src')
 
+import pytest
 import torch
 import torch.nn as nn
 from kokoro.data.dataset import RuslanDataset, collate_fn, DynamicFrameBatchSampler
@@ -169,12 +170,12 @@ def test_with_gradient_accumulation():
                 print(f"  Accumulated batches: {accumulated_batches}")
                 import traceback
                 traceback.print_exc()
-                return False
+                pytest.fail(f"INT_MAX/NDArray crash at batch {batch_idx}: {e}")
             else:
                 print("\n⚠️  Different error")
                 import traceback
                 traceback.print_exc()
-                return False
+                pytest.fail(f"Unexpected RuntimeError at batch {batch_idx}: {e}")
 
     # Final optimizer step if there are remaining gradients
     if len(accumulated_batches) > 0:
@@ -188,8 +189,6 @@ def test_with_gradient_accumulation():
     print(f"✅ Gradient checkpointing enabled and working")
     print(f"✅ No INT_MAX or OOM errors detected")
     print(f"\nConclusion: The problem has been FIXED!")
-
-    return True
 
 
 if __name__ == "__main__":

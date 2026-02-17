@@ -38,14 +38,13 @@ Use the standalone script to align your corpus:
 
 ```bash
 # Basic usage
-python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
 # With custom settings
-python mfa_integration.py \
-    --corpus ./ruslan_corpus \
-    --output ./mfa_output \
-    --metadata metadata_RUSLAN_22200.csv \
-    --jobs 8  # Use 8 parallel jobs
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output --metadata metadata_RUSLAN_22200.csv --jobs 8
+
+# Module form
+python -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 8
 ```
 
 **What this does:**
@@ -60,16 +59,16 @@ Once alignment is complete, training automatically uses the alignments:
 
 ```bash
 # MFA is enabled by default
-python training.py --corpus ./ruslan_corpus --output ./my_model
+kokoro-train --corpus ./ruslan_corpus --output ./my_model
 
 # Specify custom alignment directory
-python training.py \
+kokoro-train \
     --corpus ./ruslan_corpus \
     --output ./my_model \
     --mfa-alignments ./mfa_output/alignments
 
 # Disable MFA (use estimated durations)
-python training.py --corpus ./ruslan_corpus --output ./my_model --no-mfa
+kokoro-train --corpus ./ruslan_corpus --output ./my_model --no-mfa
 ```
 
 ## Expected Output
@@ -151,7 +150,7 @@ The system automatically handles these mismatches.
 ### Using Custom MFA Models
 
 ```python
-from mfa_integration import MFAIntegration
+from kokoro.data.mfa_integration import MFAIntegration
 
 mfa = MFAIntegration(
     corpus_dir="./ruslan_corpus",
@@ -164,7 +163,7 @@ mfa = MFAIntegration(
 ### Extracting Phoneme Alignments Programmatically
 
 ```python
-from mfa_integration import MFAIntegration
+from kokoro.data.mfa_integration import MFAIntegration
 
 mfa = MFAIntegration("./ruslan_corpus", "./mfa_output")
 
@@ -186,11 +185,11 @@ For very large datasets:
 
 ```bash
 # Use more parallel jobs
-python mfa_integration.py --corpus ./large_corpus --output ./mfa_output --jobs 16
+kokoro-preprocess --corpus ./large_corpus --output ./mfa_output --jobs 16
 
 # Or split into batches and process separately
-python mfa_integration.py --corpus ./batch1 --output ./mfa_output_1 --jobs 8
-python mfa_integration.py --corpus ./batch2 --output ./mfa_output_2 --jobs 8
+kokoro-preprocess --corpus ./batch1 --output ./mfa_output_1 --jobs 8
+kokoro-preprocess --corpus ./batch2 --output ./mfa_output_2 --jobs 8
 ```
 
 ## Performance Notes

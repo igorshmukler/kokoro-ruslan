@@ -136,22 +136,22 @@ stats = mfa.validate_alignments(metadata_file)
 ### Simple Workflow
 ```bash
 # 1. Run MFA alignment
-python preprocess.py --corpus ./ruslan_corpus
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
 # 2. Train with alignments
-python training.py
+kokoro-train --corpus ./ruslan_corpus
 ```
 
 ### Advanced Workflow
 ```bash
 # Preprocessing with custom settings
-python preprocess.py \
+kokoro-preprocess \
     --corpus ./ruslan_corpus \
     --output ./custom_mfa \
     --jobs 16
 
 # Training with custom alignment path
-python training.py \
+kokoro-train \
     --corpus ./ruslan_corpus \
     --mfa-alignments ./custom_mfa/alignments \
     --batch-size 16
@@ -160,13 +160,13 @@ python training.py \
 ### Validation Only
 ```bash
 # Check existing alignments
-python preprocess.py --corpus ./ruslan_corpus --validate-only
+kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 ```
 
 ### Skip MFA (Quick Start)
 ```bash
 # Train without MFA
-python training.py --no-mfa
+kokoro-train --corpus ./ruslan_corpus --no-mfa
 ```
 
 ## Technical Implementation Details
@@ -231,10 +231,10 @@ The implementation is **backward compatible**:
 conda install -c conda-forge montreal-forced-aligner
 
 # Run preprocessing
-python preprocess.py --corpus ./ruslan_corpus
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
 # Start training
-python training.py
+kokoro-train --corpus ./ruslan_corpus
 ```
 
 ### Future Enhancements (Optional)

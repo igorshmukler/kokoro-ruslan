@@ -39,10 +39,10 @@ ruslan_corpus/
 
 ```bash
 # Option A: Use the preprocessing script (recommended)
-python preprocess.py --corpus ./ruslan_corpus --jobs 8
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 8
 
-# Option B: Run MFA directly
-python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output --jobs 8
+# Option B: Module form
+python -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 8
 
 # Option C: Skip MFA and use estimated durations (faster but lower quality)
 # No preprocessing needed, just go to Step 3 with --no-mfa flag
@@ -60,22 +60,22 @@ python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output --jobs 
 
 ```bash
 # Basic training with MFA alignments
-python training.py
+kokoro-train --corpus ./ruslan_corpus --output ./my_model
 
 # Full custom configuration
-python training.py \
+kokoro-train \
     --corpus ./ruslan_corpus \
     --output ./my_model \
-    --batch-size 16 \
+    --batch-size 10 \
     --epochs 100 \
     --learning-rate 1e-4 \
     --save-every 2
 
 # Without MFA (estimated durations - lower quality)
-python training.py --no-mfa
+kokoro-train --corpus ./ruslan_corpus --output ./my_model --no-mfa
 
 # Resume from checkpoint
-python training.py --resume auto
+kokoro-train --corpus ./ruslan_corpus --output ./my_model --resume auto
 ```
 
 ### Step 4: Monitor Training
@@ -100,7 +100,7 @@ During training, periodically run inference to check quality:
 
 ```bash
 # Generate test samples
-python inference.py \
+python -m kokoro.inference.inference \
     --model ./my_model \
     --text "Привет, как дела?" \
     --output test.wav
@@ -129,7 +129,7 @@ If you want to start quickly without waiting for alignment:
 pip install -r requirements.txt
 
 # Start training immediately with estimated durations
-python training.py --no-mfa
+kokoro-train --corpus ./ruslan_corpus --no-mfa
 
 # Quality will be lower, but you can test the pipeline
 ```
@@ -138,10 +138,10 @@ Later, you can run MFA and restart training with better data:
 
 ```bash
 # Run MFA alignment
-python preprocess.py --corpus ./ruslan_corpus
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
 # Restart training with MFA alignments
-python training.py --resume auto
+kokoro-train --corpus ./ruslan_corpus --resume auto
 ```
 
 ## Common Workflows
@@ -150,7 +150,7 @@ python training.py --resume auto
 
 ```bash
 # Small subset for testing (create subset first)
-python training.py \
+kokoro-train \
     --corpus ./ruslan_corpus_subset \
     --epochs 10 \
     --batch-size 4 \
@@ -161,13 +161,13 @@ python training.py \
 
 ```bash
 # Step 1: Full preprocessing
-python preprocess.py --corpus ./ruslan_corpus --jobs 16
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 16
 
 # Step 2: Train with optimal settings
-python training.py \
+kokoro-train \
     --corpus ./ruslan_corpus \
     --output ./production_model \
-    --batch-size 16 \
+    --batch-size 10 \
     --epochs 200 \
     --learning-rate 1e-4 \
     --save-every 5
@@ -177,10 +177,10 @@ python training.py \
 
 ```bash
 # Auto-resume from latest checkpoint
-python training.py --resume auto
+kokoro-train --corpus ./ruslan_corpus --resume auto
 
 # Resume from specific checkpoint
-python training.py --resume ./my_model/checkpoint_epoch_50.pth
+kokoro-train --corpus ./ruslan_corpus --resume ./my_model/checkpoint_epoch_50.pth
 ```
 
 ## Troubleshooting
@@ -189,20 +189,20 @@ python training.py --resume ./my_model/checkpoint_epoch_50.pth
 
 ```bash
 # Validate corpus first
-python preprocess.py --corpus ./ruslan_corpus --validate-only
+kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 
 # Check MFA installation
 mfa version
 
 # Try with fewer jobs if memory issues
-python preprocess.py --corpus ./ruslan_corpus --jobs 2
+kokoro-preprocess --corpus ./ruslan_corpus --jobs 2
 ```
 
 ### Training Out of Memory
 
 ```bash
 # Reduce batch size
-python training.py --batch-size 4
+kokoro-train --corpus ./ruslan_corpus --batch-size 4
 
 # Or reduce sequence length in config.py
 # max_seq_length: int = 1500  # Reduce from 2500
@@ -221,7 +221,7 @@ python training.py --batch-size 4
 
 ```bash
 # Enable MPS fallback
-PYTORCH_ENABLE_MPS_FALLBACK=1 python training.py
+PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train --corpus ./ruslan_corpus
 ```
 
 ## Expected Timeline
@@ -245,4 +245,4 @@ After successful training:
 3. **Optimize** for faster inference
 4. **Deploy** with your vocoder of choice
 
-See [inference.md](inference.md) for deployment options.
+See [inference.md](../setup/inference.md) for deployment options.

@@ -65,10 +65,10 @@ variance_filter_size: int = 256
 variance_kernel_size: int = 3
 variance_dropout: float = 0.1
 n_variance_bins: int = 256
-pitch_min: float = 50.0    # Hz
-pitch_max: float = 800.0   # Hz
+pitch_min: float = 0.0
+pitch_max: float = 1.0
 energy_min: float = 0.0
-energy_max: float = 100.0
+energy_max: float = 1.0
 
 # Loss weights
 pitch_loss_weight: float = 0.1
@@ -82,10 +82,10 @@ Variance prediction is enabled by default:
 
 ```bash
 # Standard training with variance predictors
-python training.py
+kokoro-train --corpus ./ruslan_corpus
 
 # Disable variance predictors if needed
-# (modify config.py: use_variance_predictor = False)
+# (set TrainingConfig(use_variance_predictor=False))
 ```
 
 ### How It Works

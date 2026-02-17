@@ -74,7 +74,7 @@ Dynamic batching is **enabled by default** in the latest version:
 
 ```bash
 # Uses default settings (max_frames=20000)
-python training.py --corpus ./ruslan_corpus
+kokoro-train --corpus ./ruslan_corpus
 ```
 
 ### Custom Frame Budget
@@ -83,13 +83,13 @@ Adjust the frame budget based on your GPU memory:
 
 ```bash
 # For GPUs with more memory (e.g., A100, V100)
-python training.py --max-frames 30000
+kokoro-train --max-frames 30000
 
 # For GPUs with less memory (e.g., GTX 1080, RTX 3060)
-python training.py --max-frames 15000
+kokoro-train --max-frames 15000
 
 # For very limited memory
-python training.py --max-frames 10000
+kokoro-train --max-frames 10000
 ```
 
 ### Custom Batch Size Limits
@@ -97,7 +97,7 @@ python training.py --max-frames 10000
 Control the range of batch sizes:
 
 ```bash
-python training.py \
+kokoro-train \
     --max-frames 20000 \
     --min-batch-size 8 \
     --max-batch-size 64
@@ -108,7 +108,7 @@ python training.py \
 Use fixed batch size if preferred:
 
 ```bash
-python training.py --no-dynamic-batching --batch-size 16
+kokoro-train --no-dynamic-batching --batch-size 16
 ```
 
 ## Configuration
@@ -154,22 +154,22 @@ This will:
 
 **16GB VRAM** (RTX 4080, V100):
 ```bash
-python training.py --max-frames 25000 --max-batch-size 48
+kokoro-train --max-frames 25000 --max-batch-size 48
 ```
 
 **12GB VRAM** (RTX 3080, RTX 4070):
 ```bash
-python training.py --max-frames 20000 --max-batch-size 32
+kokoro-train --max-frames 20000 --max-batch-size 32
 ```
 
 **8GB VRAM** (RTX 3060, RTX 4060):
 ```bash
-python training.py --max-frames 15000 --max-batch-size 24
+kokoro-train --max-frames 15000 --max-batch-size 24
 ```
 
 **6GB VRAM** (GTX 1060, RTX 3050):
 ```bash
-python training.py --max-frames 10000 --max-batch-size 16
+kokoro-train --max-frames 10000 --max-batch-size 16
 ```
 
 ### Step 3: Monitor Training
@@ -259,13 +259,13 @@ Begin with smaller `max_frames` and increase gradually:
 
 ```bash
 # Start here
-python training.py --max-frames 15000
+kokoro-train --max-frames 15000
 
 # If no OOM, try
-python training.py --max-frames 20000
+kokoro-train --max-frames 20000
 
 # If still stable, try
-python training.py --max-frames 25000
+kokoro-train --max-frames 25000
 ```
 
 ### 2. Match to Your Dataset
@@ -313,7 +313,7 @@ A: No. The model sees the same data, just grouped differently. Convergence is no
 
 A: Reduce `max_frames` by 20-30% and try again:
 ```bash
-python training.py --max-frames 15000
+kokoro-train --max-frames 15000
 ```
 
 **Q: Can I use it for inference?**
@@ -328,7 +328,7 @@ A: Dynamic batching is for training only. Inference typically uses single sample
 
 **Solution:**
 ```bash
-python training.py --max-frames 25000  # Increase budget
+kokoro-train --max-frames 25000  # Increase budget
 ```
 
 ### Issue: "Batches vary too much (4 to 32)"
@@ -337,7 +337,7 @@ python training.py --max-frames 25000  # Increase budget
 
 **Solution:** Tighten the batch size range:
 ```bash
-python training.py --min-batch-size 8 --max-batch-size 24
+kokoro-train --min-batch-size 8 --max-batch-size 24
 ```
 
 ### Issue: "Out of memory"
@@ -346,7 +346,7 @@ python training.py --min-batch-size 8 --max-batch-size 24
 
 **Solution:** Reduce frame budget:
 ```bash
-python training.py --max-frames 15000  # Reduce by 25%
+kokoro-train --max-frames 15000  # Reduce by 25%
 ```
 
 ### Issue: "Training slower than fixed batching"
@@ -355,7 +355,7 @@ python training.py --max-frames 15000  # Reduce by 25%
 
 **Solution:** Use fixed batching for very uniform datasets:
 ```bash
-python training.py --no-dynamic-batching --batch-size 16
+kokoro-train --no-dynamic-batching --batch-size 16
 ```
 
 ## See Also

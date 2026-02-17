@@ -66,14 +66,15 @@ kokoro-train \
     --epochs 100 \
     --mfa-alignments ./mfa_output/alignments
 ```
- (using Python module)
-python3 -m kokoro.data.mfa_integration
+
+### Programmatic MFA utilities
+
 ```bash
+# Python module utilities
+python3 -m kokoro.data.mfa_integration
+
 # Direct MFA integration script
-python mfa_integration.py \
-    --corpus ./ruslan_corpus \
-    --output ./mfa_output \
-    --jobs 8
+kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 8
 ```
 
 ## File Locations
@@ -182,7 +183,7 @@ kokoro-preprocess --corpus ./ruslan_corpus --jobs 2
 
 ### Custom MFA Models
 ```python
-from mfa_integration import MFAIntegration
+from kokoro.data.mfa_integration import MFAIntegration
 
 mfa = MFAIntegration(
     corpus_dir="./corpus",

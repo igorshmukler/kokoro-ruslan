@@ -4,11 +4,11 @@ This guide explains how to use your trained Kokoro Russian TTS model to convert 
 
 ## Overview
 
-The inference script (`inference.py`) loads your trained Kokoro model and converts Russian text into speech using the same phoneme processing and model architecture used during training.
+The inference module (`python -m kokoro.inference.inference`) loads your trained Kokoro model and converts Russian text into speech using the same phoneme processing and model architecture used during training.
 
 ## Requirements
 
-- Python 3.7+
+- Python 3.9+
 - PyTorch with MPS/CUDA support (optional)
 - torchaudio
 - numpy
@@ -31,7 +31,7 @@ kokoro_russian_model/
 Convert a single Russian text to speech:
 
 ```shell
-python inference.py --model ./kokoro_russian_model --text "Привет, как дела?"
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет, как дела?"
 ```
 
 This will generate `output.wav` in the current directory.
@@ -41,7 +41,7 @@ This will generate `output.wav` in the current directory.
 Specify a custom output file:
 
 ```shell
-python inference.py --model ./kokoro_russian_model --text "Привет мир" --output hello.wav
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет мир" --output hello.wav
 ```
 
 ### 3. Convert from Text File
@@ -49,7 +49,7 @@ python inference.py --model ./kokoro_russian_model --text "Привет мир" 
 Read text from a file and convert to speech:
 
 ```shell
-python inference.py --model ./kokoro_russian_model --text-file input.txt --output output.wav
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text-file input.txt --output output.wav
 ```
 
 Create `input.txt` with your Russian text:
@@ -62,7 +62,7 @@ Create `input.txt` with your Russian text:
 Enter text interactively for quick testing:
 
 ```shell
-python inference.py --model ./kokoro_russian_model --interactive
+python -m kokoro.inference.inference --model ./kokoro_russian_model --interactive
 ```
 
 Type Russian text and press Enter. Type `quit` to exit.
@@ -73,13 +73,23 @@ Force specific device usage:
 
 ```shell
 # Use MPS (Mac Metal)
-python inference.py --model ./kokoro_russian_model --text "Тест" --device mps
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Тест" --device mps
 
 # Use CUDA (NVIDIA GPU)
-python inference.py --model ./kokoro_russian_model --text "Тест" --device cuda
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Тест" --device cuda
 
 # Use CPU
-python inference.py --model ./kokoro_russian_model --text "Тест" --device cpu
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Тест" --device cpu
+```
+
+### 6. Choose Vocoder
+
+```shell
+# Default neural vocoder (HiFi-GAN)
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет" --vocoder hifigan
+
+# Griffin-Lim fallback (no neural vocoder checkpoint required)
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет" --vocoder griffin_lim
 ```
 
 ## Command Line Arguments
@@ -92,6 +102,8 @@ python inference.py --model ./kokoro_russian_model --text "Тест" --device cp
 | `--output` | `-o` | Output audio file path (default: output.wav) | No |
 | `--interactive` | `-i` | Interactive mode | No* |
 | `--device` | | Device: cpu/cuda/mps (auto-detected) | No |
+| `--vocoder` | | Vocoder: `hifigan` or `griffin_lim` | No |
+| `--vocoder-path` | | Custom HiFi-GAN checkpoint path | No |
 
 *At least one of `--text`, `--text-file`, or `--interactive` is required.
 
@@ -122,12 +134,14 @@ The script uses the same Russian phoneme mapping as training:
 1. **Text → Phonemes**: Russian text converted to phoneme sequence
 2. **Phonemes → Indices**: Phonemes mapped to numerical indices
 3. **Model Inference**: Neural network generates mel spectrogram
-4. **Mel → Audio**: Griffin-Lim algorithm converts spectrogram to waveform
+4. **Mel → Audio**: Vocoder converts spectrogram to waveform (`hifigan` by default)
 5. **Output**: Normalized WAV file at 22,050 Hz
 
 ## Improving Audio Quality
 
-The current implementation uses Griffin-Lim for mel-to-audio conversion. For higher quality audio, consider:
+Default inference uses HiFi-GAN for mel-to-audio conversion. If a HiFi-GAN checkpoint is unavailable, use `--vocoder griffin_lim`.
+
+For further quality improvements, consider:
 
 1. **Neural Vocoders**: Replace Griffin-Lim with HiFi-GAN, WaveGlow, or WaveNet
 2. **Post-processing**: Apply noise reduction or audio enhancement

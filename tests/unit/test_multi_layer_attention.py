@@ -5,6 +5,7 @@ Test multi-layer attention to reproduce INT_MAX crash
 import sys
 sys.path.insert(0, 'src')
 
+import pytest
 import torch
 import torch.nn as nn
 from kokoro.model.transformers import MultiHeadAttentionImproved, ImprovedTransformerDecoderBlock
@@ -47,12 +48,11 @@ def test_single_attention_layer():
         loss = output.sum()
         loss.backward()
         print(f"  ✅ Backward: {x.grad.shape}")
-        return True
     except RuntimeError as e:
         if "INT_MAX" in str(e):
             print(f"  ❌ INT_MAX CRASH in single attention layer")
         print(f"  Error: {e}")
-        return False
+        pytest.fail(f"RuntimeError in single attention layer test: {e}")
 
 
 def test_decoder_block():
@@ -86,14 +86,13 @@ def test_decoder_block():
         loss = output.sum()
         loss.backward()
         print(f"  ✅ Backward: tgt.grad={tgt.grad.shape}, memory.grad={memory.grad.shape}")
-        return True
     except RuntimeError as e:
         if "INT_MAX" in str(e):
             print(f"  ❌ INT_MAX CRASH in decoder block")
         print(f"  Error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"RuntimeError in decoder block test: {e}")
 
 
 def test_multiple_decoder_blocks():
@@ -131,14 +130,13 @@ def test_multiple_decoder_blocks():
         loss = x.sum()
         loss.backward()
         print(f"  ✅ Backward: tgt.grad={tgt.grad.shape}")
-        return True
     except RuntimeError as e:
         if "INT_MAX" in str(e):
             print(f"  ❌ INT_MAX CRASH in multi-layer decoder")
         print(f"  Error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"RuntimeError in multi-layer decoder test: {e}")
 
 
 def test_with_gradient_checkpointing():
@@ -184,14 +182,13 @@ def test_with_gradient_checkpointing():
         loss = x.sum()
         loss.backward()
         print(f"  ✅ Backward: tgt.grad={tgt.grad.shape}")
-        return True
     except RuntimeError as e:
         if "INT_MAX" in str(e):
             print(f"  ❌ INT_MAX CRASH with gradient checkpointing")
         print(f"  Error: {e}")
         import traceback
         traceback.print_exc()
-        return False
+        pytest.fail(f"RuntimeError in checkpointing test: {e}")
 
 
 def test_accumulated_gradients():
@@ -222,13 +219,11 @@ def test_accumulated_gradients():
 
             del x, output, loss
             _maybe_clear_mps_cache(device)
-
-        return True
     except RuntimeError as e:
         if "INT_MAX" in str(e):
             print(f"  ❌ INT_MAX CRASH during gradient accumulation step {step+1}")
         print(f"  Error: {e}")
-        return False
+        pytest.fail(f"RuntimeError during gradient accumulation test: {e}")
 
 
 def main():

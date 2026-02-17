@@ -451,10 +451,14 @@ class KokoroTrainer:
             # "Destination NDArray and Accumulator NDArray cannot have different datatype"
             # This affects ALiBi, attention, and all linear layers with long sequences
             # Solution: Always use fp32 on MPS (slower but stable)
-            logger.warning("Mixed precision disabled on MPS due to backend bugs with fp16")
-            logger.warning("Training will use fp32 on MPS (slower but stable)")
+
             # Disable mixed precision to avoid repeated warnings
             self.use_mixed_precision = False
+
+            if not self.use_mixed_precision:
+                logger.warning("Mixed precision disabled on MPS due to backend bugs with fp16")
+                logger.warning("Training will use fp32 on MPS (slower but stable)")
+
             return nullcontext()
         else:
             return nullcontext()
@@ -2594,11 +2598,7 @@ class KokoroTrainer:
                 self.interbatch_profiler.start_backward_pass()
                 with torch.profiler.record_function("Backward_Pass"):
                     if self.use_mixed_precision:
-                        if self.device_type == DeviceType.CUDA.value:
-                            self.scaler.scale(total_loss).backward()
-                        else:  # MPS
-                            scaled_loss = self.scaler.scale(total_loss)
-                            scaled_loss.backward()
+                        self.scaler.scale(total_loss).backward()
                     else:
                         total_loss.backward()
                 self.interbatch_profiler.end_backward_pass()
