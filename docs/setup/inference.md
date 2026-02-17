@@ -6,6 +6,10 @@ This guide explains how to use your trained Kokoro Russian TTS model to convert 
 
 The inference module (`python -m kokoro.inference.inference`) loads your trained Kokoro model and converts Russian text into speech using the same phoneme processing and model architecture used during training.
 
+Model loading priority:
+1. `kokoro_russian_final.pth` (if present)
+2. Latest `checkpoint_epoch_*.pth`
+
 ## Requirements
 
 - Python 3.9+
@@ -92,6 +96,24 @@ python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Пр
 python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет" --vocoder griffin_lim
 ```
 
+### 7. Quality-Focused Generation Controls
+
+The inference CLI now includes controls for stop-token behavior and generation bounds:
+
+```shell
+# Higher quality defaults (already applied if you don't pass these)
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет" \
+    --stop-threshold 0.45 --max-len 1200 --min-len-ratio 0.7 --min-len-floor 12
+
+# Early checkpoint preset (avoid very short/early-stop outputs)
+python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Привет" \
+    --stop-threshold 0.6 --min-len-ratio 0.9 --max-len 1600
+```
+
+Recommended presets:
+- Early checkpoints (noisy/short output): `--stop-threshold 0.55-0.65`, `--min-len-ratio 0.85-0.95`
+- Converged checkpoints (natural stopping): `--stop-threshold 0.35-0.5`, `--min-len-ratio 0.6-0.8`
+
 ## Command Line Arguments
 
 | Argument | Short | Description | Required |
@@ -104,6 +126,10 @@ python -m kokoro.inference.inference --model ./kokoro_russian_model --text "Пр
 | `--device` | | Device: cpu/cuda/mps (auto-detected) | No |
 | `--vocoder` | | Vocoder: `hifigan` or `griffin_lim` | No |
 | `--vocoder-path` | | Custom HiFi-GAN checkpoint path | No |
+| `--stop-threshold` | | Stop-token threshold for autoregressive decode (default: `0.45`) | No |
+| `--max-len` | | Maximum generated mel frames (default: `1200`) | No |
+| `--min-len-ratio` | | Minimum generated length ratio vs expected duration length (default: `0.7`) | No |
+| `--min-len-floor` | | Minimum generated frame floor before stop is allowed (default: `12`) | No |
 
 *At least one of `--text`, `--text-file`, or `--interactive` is required.
 
@@ -137,6 +163,11 @@ The script uses the same Russian phoneme mapping as training:
 4. **Mel → Audio**: Vocoder converts spectrogram to waveform (`hifigan` by default)
 5. **Output**: Normalized WAV file at 22,050 Hz
 
+Stop behavior details:
+- Generation enforces a minimum length window before stop-token termination is allowed.
+- If generation passes expected duration-based length, stop criterion is relaxed to avoid unnatural run-on speech.
+- If output still sounds too short, increase `--stop-threshold` and/or `--min-len-ratio`.
+
 ## Improving Audio Quality
 
 Default inference uses HiFi-GAN for mel-to-audio conversion. If a HiFi-GAN checkpoint is unavailable, use `--vocoder griffin_lim`.
@@ -159,6 +190,11 @@ For further quality improvements, consider:
 - Model may need more training epochs
 - Consider using a neural vocoder instead of Griffin-Lim
 - Verify training data quality
+- If output is too short/chirpy, raise `--stop-threshold` (e.g. `0.6`) and `--min-len-ratio` (e.g. `0.9`)
+
+**`soundfile`/`libsndfile` issues**:
+- Inference now treats `soundfile` as optional and falls back to `torchaudio`/`scipy` save backends.
+- You can still fix your environment for `soundfile` by installing compatible `libsndfile` dependencies.
 
 **Memory errors**:
 - Use CPU device: `--device cpu`
