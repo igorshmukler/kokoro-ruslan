@@ -154,6 +154,12 @@ class TrainingConfig:
 
     use_mixed_precision: bool = True
 
+    # Optimizer behavior
+    # None = auto (enabled on CUDA, disabled otherwise)
+    use_fused_adamw: Optional[bool] = None
+    # Explicitly try fused AdamW on MPS (experimental, may fall back)
+    try_fused_adamw_on_mps: bool = False
+
     # torch.compile optimization (PyTorch 2.0+)
     use_torch_compile: bool = True
     torch_compile_mode: str = 'reduce-overhead'  # 'default', 'reduce-overhead', 'max-autotune'
