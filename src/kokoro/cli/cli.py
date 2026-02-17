@@ -166,6 +166,24 @@ Examples:
     )
 
     parser.add_argument(
+        '--fused-adamw',
+        action='store_true',
+        help='Force-enable fused AdamW optimizer (experimental on non-CUDA backends)'
+    )
+
+    parser.add_argument(
+        '--no-fused-adamw',
+        action='store_true',
+        help='Force-disable fused AdamW optimizer'
+    )
+
+    parser.add_argument(
+        '--try-fused-adamw-mps',
+        action='store_true',
+        help='Explicitly try fused AdamW on MPS (experimental, falls back automatically if unsupported)'
+    )
+
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Enable verbose training diagnostics (including high-risk batch stabilization logs)'
@@ -215,5 +233,7 @@ def create_config_from_args(args) -> TrainingConfig:
         validation_split=validation_split,
         validation_interval=args.validation_interval,
         early_stopping_patience=args.early_stopping_patience,
+        use_fused_adamw=(False if args.no_fused_adamw else True if args.fused_adamw else None),
+        try_fused_adamw_on_mps=args.try_fused_adamw_mps,
         verbose=args.verbose,
     )

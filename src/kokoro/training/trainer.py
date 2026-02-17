@@ -286,18 +286,48 @@ class KokoroTrainer:
         logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
 
         # Initialize optimizer and loss functions
-        # Use fused optimizer for better performance on CUDA
-        use_fused = self.device_type == 'cuda' and torch.__version__ >= '2.0'
-        self.optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=config.learning_rate,
-            weight_decay=getattr(config, 'weight_decay', 0.01),
-            eps=getattr(config, 'adam_eps', 1e-8),
-            betas=getattr(config, 'adam_betas', (0.9, 0.999)),
-            fused=use_fused
+        default_use_fused = self.device_type == 'cuda' and torch.__version__ >= '2.0'
+        forced_use_fused = getattr(config, 'use_fused_adamw', None)
+
+        if forced_use_fused is None:
+            use_fused = default_use_fused
+        else:
+            use_fused = bool(forced_use_fused)
+
+        if self.device_type == 'mps' and getattr(config, 'try_fused_adamw_on_mps', False):
+            use_fused = True
+
+        fused_source = (
+            'mps-opt-in' if (self.device_type == 'mps' and getattr(config, 'try_fused_adamw_on_mps', False))
+            else 'auto' if forced_use_fused is None
+            else 'forced'
         )
-        if use_fused:
-            logger.info("Using fused AdamW optimizer for CUDA")
+        logger.info(f"AdamW fused setting: effective={use_fused} (source={fused_source}, device={self.device_type})")
+
+        optimizer_kwargs = {
+            'lr': config.learning_rate,
+            'weight_decay': getattr(config, 'weight_decay', 0.01),
+            'eps': getattr(config, 'adam_eps', 1e-8),
+            'betas': getattr(config, 'adam_betas', (0.9, 0.999)),
+            'fused': use_fused,
+        }
+
+        try:
+            self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
+            if use_fused:
+                logger.info(f"Using fused AdamW optimizer on {self.device_type.upper()} (experimental on non-CUDA backends)")
+            else:
+                logger.info("Using standard AdamW optimizer")
+        except (TypeError, ValueError, RuntimeError) as e:
+            if use_fused:
+                logger.warning(
+                    f"Fused AdamW not available/supported on {self.device_type}: {e}. Falling back to standard AdamW."
+                )
+                optimizer_kwargs['fused'] = False
+                self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
+                logger.info("Using standard AdamW optimizer (fallback)")
+            else:
+                raise
 
         self.criterion_mel = nn.L1Loss(reduction='none')
         self.criterion_duration = nn.MSELoss(reduction='none')
