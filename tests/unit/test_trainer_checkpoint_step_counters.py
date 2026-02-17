@@ -96,3 +96,41 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
     assert trainer.current_optimizer_step == 777
     assert trainer.optimizer_steps_completed == 888
     assert trainer.reset_called is True
+
+
+def test_setup_checkpoint_resumption_keeps_defaults_when_counter_keys_missing(monkeypatch, tmp_path):
+    checkpoint_path = tmp_path / "checkpoint_epoch_2.pth"
+    torch.save({"some_other_key": 1}, checkpoint_path)
+
+    trainer = KokoroTrainer.__new__(KokoroTrainer)
+    trainer.config = SimpleNamespace(
+        resume_checkpoint=str(checkpoint_path),
+        output_dir=str(tmp_path),
+    )
+    trainer.model = object()
+    trainer.optimizer = object()
+    trainer.scheduler = object()
+    trainer.dataset = SimpleNamespace(phoneme_processor=None)
+    trainer.device = torch.device("cpu")
+    trainer.device_type = "cpu"
+
+    trainer.use_mixed_precision = False
+    trainer.scaler = None
+    trainer.use_ema = False
+    trainer.ema_model = None
+
+    trainer.current_optimizer_step = 11
+    trainer.optimizer_steps_completed = 22
+
+    def _fake_load_checkpoint(path, model, optimizer, scheduler, output_dir):
+        assert path == str(checkpoint_path)
+        assert output_dir == str(tmp_path)
+        return 2, 5.0973, "dummy_processor"
+
+    monkeypatch.setattr(trainer_module, "load_checkpoint", _fake_load_checkpoint)
+    trainer._reset_variance_predictors = lambda: None
+
+    KokoroTrainer.setup_checkpoint_resumption(trainer)
+
+    assert trainer.current_optimizer_step == 11
+    assert trainer.optimizer_steps_completed == 22
