@@ -695,7 +695,17 @@ class KokoroModel(nn.Module):
 
                     with torch.profiler.record_function("inference_predict_durations"):
                         # Duration prediction (no checkpointing in eval mode, logging handled internally)
-                        predicted_log_durations = self._predict_durations(text_encoded)
+                        if self.use_variance_predictor:
+                            _, predicted_log_durations, _, _ = self.variance_adaptor(
+                                text_encoded,
+                                mask=text_padding_mask,
+                                pitch_target=None,
+                                energy_target=None,
+                                duration_target=None
+                            )
+                        else:
+                            predicted_log_durations = self._predict_durations(text_encoded)
+
                         durations_for_length_regulate = torch.exp(predicted_log_durations)
                         durations_for_length_regulate = torch.clamp(durations_for_length_regulate, min=1.0).long()
 

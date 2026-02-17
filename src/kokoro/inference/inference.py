@@ -209,6 +209,12 @@ class KokoroTTS:
                     text_padding_mask=None
                 )
 
+            if mel_spec.numel() == 0 or mel_spec.shape[1] == 0:
+                raise RuntimeError(
+                    "Model generated an empty mel spectrogram. "
+                    "Check model checkpoint compatibility and inference duration path."
+                )
+
             # Remove batch dimension and move to CPU for vocoder
             mel_spec = mel_spec.squeeze(0).cpu()
 
