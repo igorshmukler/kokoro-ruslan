@@ -2194,6 +2194,12 @@ class KokoroTrainer:
             self.profile_training_steps(self.config.profile_steps)
 
         for epoch in range(self.start_epoch, self.config.num_epochs):
+            epoch_start_time = time.time()
+            if self.enable_adaptive_memory:
+                epoch_cleanup_count_start = self.memory_manager.cleanup_count
+                epoch_cleanup_time_start = self.memory_manager.total_cleanup_time
+                epoch_memory_history_start = len(self.memory_manager.memory_history)
+
             avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
 
             # Step scheduler per epoch only if NOT using OneCycleLR (which steps per batch)
@@ -2239,11 +2245,26 @@ class KokoroTrainer:
             # Log memory management stats for this epoch
             if self.enable_adaptive_memory:
                 memory_report = self.memory_manager.get_memory_report()
+                epoch_cleanup_count = self.memory_manager.cleanup_count - epoch_cleanup_count_start
+                epoch_cleanup_time = self.memory_manager.total_cleanup_time - epoch_cleanup_time_start
+                epoch_duration = max(1e-6, time.time() - epoch_start_time)
+                epoch_cleanup_overhead_percent = (epoch_cleanup_time / epoch_duration) * 100
+
+                epoch_memory_history = self.memory_manager.memory_history[epoch_memory_history_start:]
+                epoch_memory_trend = 0.0
+                if len(epoch_memory_history) >= 10:
+                    recent = epoch_memory_history[-10:]
+                    old_avg = sum(m['usage_percent'] for m in recent[:5]) / 5
+                    new_avg = sum(m['usage_percent'] for m in recent[5:]) / 5
+                    epoch_memory_trend = new_avg - old_avg
+                elif len(epoch_memory_history) >= 2:
+                    epoch_memory_trend = epoch_memory_history[-1]['usage_percent'] - epoch_memory_history[0]['usage_percent']
+
                 logger.info(f"Memory Management Summary - Epoch {epoch+1}:")
                 logger.info(f"  Current Pressure: {memory_report['current_pressure']}")
-                logger.info(f"  Cleanups This Epoch: {memory_report['cleanup_count']}")
-                logger.info(f"  Memory Trend: {memory_report['memory_trend']:+.2f}%")
-                logger.info(f"  Cleanup Overhead: {memory_report['cleanup_overhead_percent']:.2f}%")
+                logger.info(f"  Cleanups This Epoch: {epoch_cleanup_count}")
+                logger.info(f"  Epoch Memory Trend: {epoch_memory_trend:+.2f}%")
+                logger.info(f"  Cleanup Overhead: {epoch_cleanup_overhead_percent:.2f}%")
 
             # Save periodic checkpoints (only if not using validation or if validation isn't better)
             if (epoch + 1) % self.config.save_every == 0:
