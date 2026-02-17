@@ -12,14 +12,14 @@ from kokoro.model.positional_encoding import PositionalEncoding
 from kokoro.model.transformers import TransformerDecoder, TransformerEncoderBlock
 from kokoro.utils.gpu_profiler import GPUProfiler
 
+logger = logging.getLogger(__name__)
+
 try:
     from kokoro.model.variance_predictor import VarianceAdaptor
     VARIANCE_AVAILABLE = True
 except ImportError:
     VARIANCE_AVAILABLE = False
     logger.warning("Variance predictor not available")
-
-logger = logging.getLogger(__name__)
 
 
 class KokoroModel(nn.Module):
@@ -233,29 +233,29 @@ class KokoroModel(nn.Module):
 
             return result
 
-        # Log before checkpointed decoder (outside checkpoint)
+        # Log before checkpointed decoder path
         if self.enable_profiling:
             self.profiler.log_memory_stats("decoder_checkpoint_start")
 
-        def create_decoder_forward():
-            def decoder_forward(tgt, mem, t_mask, mem_mask, tgt_mask_pad):
-                # NO LOGGING INSIDE CHECKPOINTED REGION
-                return self.decoder(
-                    tgt=tgt,
-                    memory=mem,
-                    tgt_mask=t_mask,
-                    memory_key_padding_mask=mem_mask,
-                    tgt_key_padding_mask=tgt_mask_pad
-                )
-            return decoder_forward
+        # BATCH 281 LOGGING
+        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+        if is_batch_281:
+            logger.info(f"  [GradCheckpoint] Starting decoder checkpoint: input={decoder_input.shape}, memory={memory.shape}")
 
-        decoder_forward_fn = create_decoder_forward()
-
-        result = checkpoint(
-            decoder_forward_fn,
-            decoder_input, memory, tgt_mask, memory_key_padding_mask, tgt_key_padding_mask,
-            use_reentrant=False
+        # IMPORTANT: Do not wrap the entire decoder in checkpoint here.
+        # `ImprovedTransformerDecoder.forward` already applies per-layer checkpointing,
+        # and nesting checkpoint wrappers causes excessive recomputation in backward.
+        result = self.decoder(
+            tgt=decoder_input,
+            memory=memory,
+            tgt_mask=tgt_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            tgt_key_padding_mask=tgt_key_padding_mask
         )
+
+        # BATCH 281 LOGGING
+        if is_batch_281:
+            logger.info(f"  [GradCheckpoint] Decoder checkpoint complete: result={result.shape}")
 
         # Log after checkpointed decoder (outside checkpoint)
         if self.enable_profiling:
@@ -489,6 +489,11 @@ class KokoroModel(nn.Module):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
             device = mel_specs.device
 
+            # BATCH 281 LOGGING - Track model forward entry
+            is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+            if is_batch_281:
+                logger.info(f"  [Model] forward_training: batch={batch_size}, mel_seq={mel_seq_len}")
+
             # Log at the very beginning (outside any checkpointed regions)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("training_start")
@@ -496,6 +501,8 @@ class KokoroModel(nn.Module):
             # Log gradient checkpointing status
             if self.gradient_checkpointing and self.training:
                 logger.debug("Using gradient checkpointing for forward pass")
+                if is_batch_281:
+                    logger.info(f"  [Model] Gradient checkpointing ENABLED")
 
             if text_padding_mask is None:
                 text_padding_mask = (phoneme_indices == 0).to(torch.bool)
@@ -606,6 +613,11 @@ class KokoroModel(nn.Module):
                         self.profiler.log_memory_stats("decoder_input_prep_end")
 
                 with torch.profiler.record_function("transformer_decoder_forward"):
+                    # BATCH 281 LOGGING
+                    is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+                    if is_batch_281:
+                        logger.info(f"  [Model] Calling decoder: input_shape={decoder_input_projected_with_pe.shape}, memory_shape={expanded_encoder_outputs.shape}")
+
                     # Pass through Transformer Decoder with checkpointing (logging handled internally)
                     decoder_outputs = self._checkpoint_decoder_forward(
                         decoder_input_projected_with_pe,
@@ -614,6 +626,9 @@ class KokoroModel(nn.Module):
                         memory_key_padding_mask=encoder_output_padding_mask,
                         tgt_key_padding_mask=mel_padding_mask
                     )
+
+                    if is_batch_281:
+                        logger.info(f"  [Model] Decoder completed: output_shape={decoder_outputs.shape}")
 
                 with torch.profiler.record_function("output_projections"):
                     if self.enable_profiling:

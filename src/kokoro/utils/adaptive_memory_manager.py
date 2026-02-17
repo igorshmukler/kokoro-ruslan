@@ -12,6 +12,13 @@ from typing import Dict, Any, Optional
 from dataclasses import dataclass
 from enum import Enum
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    psutil = None
+
 from kokoro.utils.device_type import DeviceType
 
 logger = logging.getLogger(__name__)
@@ -196,7 +203,10 @@ class AdaptiveMemoryManager:
             except:
                 return 8192  # Default 8GB estimate for Apple Silicon
         else:  # CPU
-            return psutil.virtual_memory().total / 1024**2
+            if PSUTIL_AVAILABLE:
+                return psutil.virtual_memory().total / 1024**2
+            else:
+                return 16384  # Default 16GB estimate for CPU when psutil unavailable
 
     def get_current_memory_stats(self) -> Dict[str, float]:
         """Get current memory statistics"""
@@ -212,10 +222,14 @@ class AdaptiveMemoryManager:
             except:
                 current = reserved = peak = 0.0
         else:  # CPU
-            memory = psutil.virtual_memory()
-            current = (memory.total - memory.available) / 1024**2
-            reserved = current
-            peak = current
+            if PSUTIL_AVAILABLE:
+                memory = psutil.virtual_memory()
+                current = (memory.total - memory.available) / 1024**2
+                reserved = current
+                peak = current
+            else:
+                # Fallback when psutil not available
+                current = reserved = peak = 0.0
 
         return {
             'current_mb': current,

@@ -165,6 +165,12 @@ Examples:
         help='Number of batches to use for AMP profiling (default: 10)'
     )
 
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose training diagnostics (including high-risk batch stabilization logs)'
+    )
+
     return parser.parse_args()
 
 
@@ -208,5 +214,6 @@ def create_config_from_args(args) -> TrainingConfig:
         resume_checkpoint=args.resume,
         validation_split=validation_split,
         validation_interval=args.validation_interval,
-        early_stopping_patience=args.early_stopping_patience
+        early_stopping_patience=args.early_stopping_patience,
+        verbose=args.verbose,
     )

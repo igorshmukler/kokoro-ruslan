@@ -15,6 +15,8 @@ import torch.profiler
 import datetime
 import gc
 import copy
+import faulthandler
+from pathlib import Path
 
 from typing import Tuple, Dict, Any, Optional
 from dataclasses import dataclass
@@ -70,6 +72,14 @@ class KokoroTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.device = torch.device(config.device)
+
+        # Ensure fatal signals (including SIGABRT) dump Python stacks for crash triage
+        try:
+            if not faulthandler.is_enabled():
+                faulthandler.enable(all_threads=True)
+                logger.info("faulthandler enabled (all_threads=True)")
+        except Exception as e:
+            logger.warning(f"Could not enable faulthandler: {e}")
 
         # Initialize adaptive memory manager
         self.memory_manager = AdaptiveMemoryManager(self.device, config)
@@ -312,7 +322,7 @@ class KokoroTrainer:
             optimizer_steps_per_epoch = (steps_per_epoch + gradient_accumulation_steps - 1) // gradient_accumulation_steps
             total_steps = config.num_epochs * optimizer_steps_per_epoch
 
-            max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 10.0)
+            max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 5.0)
             pct_start = getattr(config, 'pct_start', 0.3)
 
             # Warmup configuration
@@ -409,6 +419,24 @@ class KokoroTrainer:
         self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
         self.memory_report_interval = getattr(config, 'memory_report_interval', 500)
 
+        # Gradient explosion tracking (adaptive threshold)
+        self.grad_explosion_norm_ema = None
+        self.grad_explosion_ema_alpha = getattr(config, 'grad_explosion_ema_alpha', 0.95)
+        self.grad_explosion_abs_floor = getattr(config, 'grad_explosion_abs_floor', 1000.0)
+        self.grad_explosion_multiplier = getattr(config, 'grad_explosion_multiplier', 3.0)
+        self.grad_explosion_warmup_steps = getattr(config, 'grad_explosion_warmup_steps', 250)
+        self.grad_explosion_warmup_floor = getattr(config, 'grad_explosion_warmup_floor', 5000.0)
+        self.grad_explosion_min_ema_steps = getattr(config, 'grad_explosion_min_ema_steps', 50)
+        self.grad_explosion_ema_steps = 0
+        self.grad_explosion_streak = 0
+
+        # Localized gradient spike mitigation for mel projection layers
+        self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
+        self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
+
+        # Optimizer-step counter independent of scheduler mode
+        self.optimizer_steps_completed = 0
+
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
         from contextlib import nullcontext
@@ -419,22 +447,15 @@ class KokoroTrainer:
         if self.device_type == DeviceType.CUDA.value:
             return torch.amp.autocast('cuda', dtype=self.mixed_precision_dtype)
         elif self.device_type == DeviceType.MPS.value:
-            # MPS autocast support varies by PyTorch version
-            # Try to use it, but fall back gracefully if not supported
-            try:
-                # Test if MPS autocast is supported
-                test_tensor = torch.randn(2, 2, device=self.device)
-                with torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype):
-                    _ = test_tensor * 2
-                # If successful, return the context
-                return torch.autocast(device_type='mps', dtype=self.mixed_precision_dtype)
-            except (RuntimeError, AttributeError) as e:
-                # Fall back to no autocast for MPS if not supported
-                logger.warning(f"MPS autocast not supported in this PyTorch version: {e}")
-                logger.warning("Disabling AMP for MPS - training will use full precision")
-                # Disable mixed precision for future calls
-                self.use_mixed_precision = False
-                return nullcontext()
+            # CRITICAL: MPS has a bug with fp16 matrix multiplication that causes:
+            # "Destination NDArray and Accumulator NDArray cannot have different datatype"
+            # This affects ALiBi, attention, and all linear layers with long sequences
+            # Solution: Always use fp32 on MPS (slower but stable)
+            logger.warning("Mixed precision disabled on MPS due to backend bugs with fp16")
+            logger.warning("Training will use fp32 on MPS (slower but stable)")
+            # Disable mixed precision to avoid repeated warnings
+            self.use_mixed_precision = False
+            return nullcontext()
         else:
             return nullcontext()
 
@@ -786,6 +807,82 @@ class KokoroTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
+    def _has_nonfinite_gradients(self) -> bool:
+        """Check whether any model gradient contains NaN/Inf values."""
+        for param in self.model.parameters():
+            if param.grad is not None and not torch.isfinite(param.grad).all():
+                return True
+        return False
+
+    def _compute_grad_explosion_threshold(self) -> Tuple[float, float, bool]:
+        """Compute dynamic gradient explosion threshold with early-step warmup handling."""
+        warmup_steps = max(0, self.grad_explosion_warmup_steps)
+
+        if warmup_steps > 0 and self.optimizer_steps_completed < warmup_steps:
+            progress = self.optimizer_steps_completed / float(warmup_steps)
+            warmup_floor = self.grad_explosion_warmup_floor
+            dynamic_abs_floor = warmup_floor - (warmup_floor - self.grad_explosion_abs_floor) * progress
+        else:
+            dynamic_abs_floor = self.grad_explosion_abs_floor
+
+        ema_ready = self.grad_explosion_ema_steps >= self.grad_explosion_min_ema_steps
+        ema_threshold = 0.0 if self.grad_explosion_norm_ema is None else self.grad_explosion_norm_ema * self.grad_explosion_multiplier
+
+        threshold = dynamic_abs_floor if not ema_ready else max(dynamic_abs_floor, ema_threshold)
+        return threshold, dynamic_abs_floor, ema_ready
+
+    def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
+        """Clip localized spikes in mel projection/attention gradients before global norm checks."""
+        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0:
+            return {}
+
+        projection_params = {
+            'mel_projection_in.weight',
+            'mel_projection_in.bias',
+            'mel_projection_out.weight',
+            'mel_projection_out.bias',
+        }
+
+        attention_name_fragments = (
+            '.self_attn.w_q.weight',
+            '.self_attn.w_k.weight',
+            '.self_attn.w_v.weight',
+            '.self_attn.w_o.weight',
+            '.cross_attn.w_q.weight',
+            '.cross_attn.w_k.weight',
+            '.cross_attn.w_v.weight',
+            '.cross_attn.w_o.weight',
+        )
+
+        clipped: Dict[str, Tuple[float, float]] = {}
+        projection_max_norm = float(self.projection_spike_clip_norm)
+        attention_max_norm = float(self.attention_spike_clip_norm)
+
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+
+            max_norm = None
+            if name in projection_params and projection_max_norm > 0:
+                max_norm = projection_max_norm
+            elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
+                max_norm = attention_max_norm
+
+            if max_norm is None:
+                continue
+
+            grad = param.grad.data
+            if not torch.isfinite(grad).all():
+                continue
+
+            grad_norm = grad.norm(2).item()
+            if grad_norm > max_norm:
+                scale = max_norm / (grad_norm + 1e-12)
+                grad.mul_(scale)
+                clipped[name] = (grad_norm, max_norm)
+
+        return clipped
+
     def _average_pitch_energy_by_duration(self,
                                           values: torch.Tensor,
                                           durations: torch.Tensor,
@@ -892,37 +989,51 @@ class KokoroTrainer:
         phoneme_mask_2d = torch.arange(max_phoneme_len, device=self.device).unsqueeze(0) < phoneme_lengths.unsqueeze(1)
 
         # Pre-compute mask normalization factors (reused across losses)
-        mel_mask_count = mel_mask_2d.sum()
-        phoneme_mask_count = phoneme_mask_2d.sum()
+        mel_mask_count = mel_mask_2d.sum().clamp(min=1)
+        phoneme_mask_count = phoneme_mask_2d.sum().clamp(min=1)
 
-        # Mel Spectrogram Loss - expand mask only along feature dim when needed
-        # Use unsqueeze + in-place broadcasting instead of expand_as for efficiency
+        # Mel Spectrogram Loss
         loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        # Broadcast 2D mask to 3D: (batch, time, 1) * (batch, time, n_mels) using view
-        mel_mask_3d = mel_mask_2d.unsqueeze(-1)  # (batch, time, 1)
-        loss_mel = (loss_mel_unreduced * mel_mask_3d).sum() / (mel_mask_count * n_mels)
+        mel_mask_3d = mel_mask_2d.unsqueeze(-1).expand_as(loss_mel_unreduced)
+        mel_valid = mel_mask_3d & torch.isfinite(loss_mel_unreduced)
+        if mel_valid.any():
+            loss_mel = loss_mel_unreduced[mel_valid].mean()
+        else:
+            loss_mel = torch.tensor(0.0, device=self.device)
 
         # Duration Loss - convert to float once
         phoneme_mask_float = phoneme_mask_2d.float()
         target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
         loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-        loss_duration = (loss_duration_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
+        duration_valid = phoneme_mask_2d & torch.isfinite(loss_duration_unreduced)
+        if duration_valid.any():
+            loss_duration = loss_duration_unreduced[duration_valid].mean()
+        else:
+            loss_duration = torch.tensor(0.0, device=self.device)
 
         # Stop Token Loss - reuse mel_mask_2d directly (no need to slice from 3D)
         loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
-        loss_stop_token = (loss_stop_token_unreduced * mel_mask_2d).sum() / mel_mask_count
+        stop_valid = mel_mask_2d & torch.isfinite(loss_stop_token_unreduced)
+        if stop_valid.any():
+            loss_stop_token = loss_stop_token_unreduced[stop_valid].mean()
+        else:
+            loss_stop_token = torch.tensor(0.0, device=self.device)
 
         # Pitch Loss (if variance predictor enabled) - reuse phoneme mask
         loss_pitch = torch.tensor(0.0, device=self.device)
         if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
             loss_pitch_unreduced = self.criterion_pitch(predicted_pitch, pitch_targets)
-            loss_pitch = (loss_pitch_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
+            pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
+            if pitch_valid.any():
+                loss_pitch = loss_pitch_unreduced[pitch_valid].mean()
 
         # Energy Loss (if variance predictor enabled) - reuse phoneme mask
         loss_energy = torch.tensor(0.0, device=self.device)
         if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
             loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
-            loss_energy = (loss_energy_unreduced * phoneme_mask_float).sum() / phoneme_mask_count
+            energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
+            if energy_valid.any():
+                loss_energy = loss_energy_unreduced[energy_valid].mean()
 
         # Monitor and auto-recover from variance predictor divergence
         variance_diverged = False
@@ -970,12 +1081,11 @@ class KokoroTrainer:
                      loss_pitch * getattr(self.config, 'pitch_loss_weight', 0.1) +
                      loss_energy * getattr(self.config, 'energy_loss_weight', 0.1))
 
-        # Final NaN/Inf check - if detected, use only mel loss as fallback
+        # Final NaN/Inf check (caller decides whether to skip the batch)
         if not torch.isfinite(total_loss):
-            logger.warning(f"Non-finite total_loss detected! Using mel_loss fallback. "
+            logger.warning(f"Non-finite total_loss detected! "
                           f"mel={loss_mel:.2f}, dur={loss_duration:.2f}, stop={loss_stop_token:.2f}, "
                           f"pitch={loss_pitch:.2f}, energy={loss_energy:.2f}")
-            total_loss = loss_mel
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
 
@@ -1343,8 +1453,8 @@ class KokoroTrainer:
                         logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
                         continue
 
-                    # Log variance predictor input ranges every 50 batches for debugging
-                    if batch_idx % 50 == 0 and pitches is not None and energies is not None:
+                    # Log variance predictor ranges periodically only in verbose mode
+                    if getattr(self.config, 'verbose', False) and batch_idx % 50 == 0 and pitches is not None and energies is not None:
                         pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
                         energy_min, energy_max = energies.min().item(), energies.max().item()
                         if pitch_max > 1.5 or energy_max > 1.5:
@@ -1360,11 +1470,66 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("data_loading")
 
+
+                # Adaptive stabilization for sequence/duration outliers (no hard skipping)
+                max_mel_length = 1400  # Earlier guard for long batches
+                max_duration_value = 150  # Earlier guard for extreme durations
+                adaptive_loss_scale = 1.0
+                adaptive_clip_norm = 0.5
+
+                mel_length = mel_specs.shape[1]
+                max_duration_in_batch = phoneme_durations.max().item()
+
+                # Soft stabilization starts earlier to reduce projection-layer gradient spikes
+                soft_mel_length = 900
+                soft_duration_value = 80
+                soft_risk_ratio = max(mel_length / soft_mel_length, max_duration_in_batch / soft_duration_value)
+                if soft_risk_ratio > 1.0:
+                    adaptive_loss_scale = min(adaptive_loss_scale, max(0.5, 1.0 / (soft_risk_ratio ** 0.65)))
+                    adaptive_clip_norm = min(adaptive_clip_norm, max(0.1, 0.4 / (soft_risk_ratio ** 0.35)))
+
+                mel_risk_ratio = mel_length / max_mel_length
+                duration_risk_ratio = max_duration_in_batch / max_duration_value
+                risk_ratio = max(mel_risk_ratio, duration_risk_ratio)
+
+                if risk_ratio > 1.0:
+                    adaptive_loss_scale = max(0.25, 1.0 / risk_ratio)
+                    adaptive_clip_norm = max(0.05, 0.5 / (risk_ratio ** 0.5))
+                    if getattr(self.config, 'verbose', False):
+                        logger.warning(f"\n{'='*80}")
+                        logger.warning(f"⚠️  BATCH {batch_idx} - HIGH-RISK BATCH (stabilizing, not skipping)")
+                        logger.warning(f"{'='*80}")
+                        logger.warning(
+                            f"mel_len={mel_length} (threshold={max_mel_length}), "
+                            f"max_duration={max_duration_in_batch:.0f} (threshold={max_duration_value})"
+                        )
+                        logger.warning(
+                            f"Applying adaptive stabilization: "
+                            f"loss_scale={adaptive_loss_scale:.3f}, clip_norm={adaptive_clip_norm:.3f}"
+                        )
+                        logger.warning(f"{'='*80}\n")
+
                 # Zero gradients only at start of accumulation cycle
                 if accumulated_step == 0:
                     self.optimizer.zero_grad(set_to_none=True)
 
                 # Forward pass with mixed precision and interbatch profiling
+                crash_context = None
+                if self.device.type == DeviceType.MPS.value:
+                    crash_context = (
+                        f"[CrashCorrelation] epoch={epoch+1} batch={batch_idx}/{num_batches} "
+                        f"opt_step={self.current_optimizer_step} "
+                        f"accum={accumulated_step+1}/{gradient_accumulation_steps} "
+                        f"mel_len={mel_specs.shape[1]} phoneme_len={phoneme_indices.shape[1]} "
+                        f"batch_size={mel_specs.shape[0]}"
+                    )
+
+                # Attach context to modules so attention-level logs can include same ID
+                if crash_context is not None:
+                    self.model._crash_context = crash_context
+                    for module in self.model.modules():
+                        module._crash_context = crash_context
+
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_forward_pass()
 
@@ -1395,6 +1560,47 @@ class KokoroTrainer:
 
                 if is_profiling_epoch:
                     self.log_memory_stats("forward_pass")
+
+                outputs_are_finite = torch.isfinite(predicted_mel).all() and \
+                    torch.isfinite(predicted_log_durations).all() and \
+                    torch.isfinite(predicted_stop_logits).all() and \
+                    (predicted_pitch is None or torch.isfinite(predicted_pitch).all()) and \
+                    (predicted_energy is None or torch.isfinite(predicted_energy).all())
+
+                if not outputs_are_finite:
+                    logger.error(f"\n{'='*80}")
+                    logger.error(f"❌ BATCH {batch_idx} - NON-FINITE MODEL OUTPUTS DETECTED")
+                    logger.error(f"{'='*80}")
+                    logger.error(
+                        f"Output Finiteness: "
+                        f"mel={torch.isfinite(predicted_mel).all().item()}, "
+                        f"dur={torch.isfinite(predicted_log_durations).all().item()}, "
+                        f"stop={torch.isfinite(predicted_stop_logits).all().item()}, "
+                        f"pitch={True if predicted_pitch is None else torch.isfinite(predicted_pitch).all().item()}, "
+                        f"energy={True if predicted_energy is None else torch.isfinite(predicted_energy).all().item()}"
+                    )
+
+                    # Detailed output statistics
+                    if not torch.isfinite(predicted_mel).all():
+                        logger.error(f"predicted_mel: {torch.isnan(predicted_mel).sum()} NaNs, {torch.isinf(predicted_mel).sum()} Infs")
+                    if not torch.isfinite(predicted_log_durations).all():
+                        logger.error(f"predicted_log_durations: {torch.isnan(predicted_log_durations).sum()} NaNs, {torch.isinf(predicted_log_durations).sum()} Infs")
+                    if predicted_pitch is not None and not torch.isfinite(predicted_pitch).all():
+                        logger.error(f"predicted_pitch: {torch.isnan(predicted_pitch).sum()} NaNs, {torch.isinf(predicted_pitch).sum()} Infs")
+                    if predicted_energy is not None and not torch.isfinite(predicted_energy).all():
+                        logger.error(f"predicted_energy: {torch.isnan(predicted_energy).sum()} NaNs, {torch.isinf(predicted_energy).sum()} Infs")
+                    logger.error(f"{'='*80}\n")
+
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_step = 0
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    if enable_interbatch_profiling or is_profiling_epoch:
+                        self.interbatch_profiler.end_batch(mel_specs.size(0))
+                    continue
+
 
                 # Convert mel-frame level pitch/energy to phoneme level for loss calculation
                 phoneme_pitches = None
@@ -1448,10 +1654,47 @@ class KokoroTrainer:
                 if is_profiling_epoch:
                     self.log_memory_stats("loss_calculation")
 
+
+                finite_losses = (
+                    torch.isfinite(total_loss) and
+                    torch.isfinite(loss_mel) and
+                    torch.isfinite(loss_duration) and
+                    torch.isfinite(loss_stop_token) and
+                    (loss_pitch is None or torch.isfinite(loss_pitch)) and
+                    (loss_energy is None or torch.isfinite(loss_energy))
+                )
+
+                if not finite_losses:
+                    logger.error(f"\n{'='*80}")
+                    logger.error(f"❌ BATCH {batch_idx} - NON-FINITE LOSS DETECTED")
+                    logger.error(f"{'='*80}")
+                    logger.error(
+                        f"Loss finiteness: "
+                        f"total={torch.isfinite(total_loss).item()}, "
+                        f"mel={torch.isfinite(loss_mel).item()}, "
+                        f"dur={torch.isfinite(loss_duration).item()}, "
+                        f"stop={torch.isfinite(loss_stop_token).item()}, "
+                        f"pitch={True if loss_pitch is None else torch.isfinite(loss_pitch).item()}, "
+                        f"energy={True if loss_energy is None else torch.isfinite(loss_energy).item()}"
+                    )
+                    logger.error(f"Loss values: total={total_loss}, mel={loss_mel}, dur={loss_duration}, "
+                                f"stop={loss_stop_token}, pitch={loss_pitch}, energy={loss_energy}")
+                    logger.error(f"{'='*80}\n")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_step = 0
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    continue
+
+
                 # Scale loss by gradient accumulation steps for proper gradient averaging
-                scaled_total_loss = total_loss / gradient_accumulation_steps
+                # Also apply adaptive scaling for high-risk batches
+                scaled_total_loss = (total_loss / gradient_accumulation_steps) * adaptive_loss_scale
 
                 # Backward pass with mixed precision and interbatch profiling
+
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
 
@@ -1475,6 +1718,9 @@ class KokoroTrainer:
                     else:
                         scaled_total_loss.backward()
 
+                # Advance gradient accumulation cycle after successful backward
+                accumulated_step += 1
+
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_backward_pass()
 
@@ -1496,13 +1742,130 @@ class KokoroTrainer:
                 is_last_batch = (batch_idx == num_batches - 1)
                 should_step = (accumulated_step >= gradient_accumulation_steps) or is_last_batch
 
+                # Gradient explosion detection only at optimizer-step boundaries
+                if should_step:
+                    clipped_projection_grads = self._preclip_projection_spikes()
+                    if clipped_projection_grads and getattr(self.config, 'verbose', False):
+                        clipped_msg = ', '.join(
+                            f"{name}: {before:.2f}→{after:.2f}"
+                            for name, (before, after) in clipped_projection_grads.items()
+                        )
+                        logger.warning(f"Pre-clipped projection gradient spikes: {clipped_msg}")
+
+                    total_grad_norm = 0.0
+                    grad_norms_by_param = []
+                    for name, param in self.model.named_parameters():
+                        if param.grad is not None:
+                            grad_norm = param.grad.data.norm(2).item()
+                            total_grad_norm += grad_norm ** 2
+                            grad_norms_by_param.append((name, grad_norm))
+                    total_grad_norm = total_grad_norm ** 0.5
+
+                    grad_norm_ema_for_threshold = self.grad_explosion_norm_ema if self.grad_explosion_norm_ema is not None else 0.0
+                    gradient_explosion_threshold, dynamic_abs_floor, ema_ready = self._compute_grad_explosion_threshold()
+
+                    has_nonfinite_grads = self._has_nonfinite_gradients()
+                    is_exploding = total_grad_norm > gradient_explosion_threshold
+
+                    if is_exploding:
+                        self.grad_explosion_streak += 1
+                        log_fn = logger.error if has_nonfinite_grads else (logger.warning if self.grad_explosion_streak > 1 else logger.error)
+                        log_fn(f"\n{'='*80}")
+                        log_fn(f"❌ BATCH {batch_idx} - GRADIENT EXPLOSION DETECTED")
+                        log_fn(f"{'='*80}")
+                        log_fn(
+                            f"Total gradient norm: {total_grad_norm:.2f} "
+                            f"(threshold: {gradient_explosion_threshold:.2f}, "
+                            f"ema: {grad_norm_ema_for_threshold:.2f}, "
+                            f"dynamic_floor: {dynamic_abs_floor:.2f}, "
+                            f"ema_ready: {ema_ready}, "
+                            f"multiplier: {self.grad_explosion_multiplier:.2f})"
+                        )
+                        log_fn("Applying emergency clipping instead of skipping this batch")
+
+                        top10 = sorted(grad_norms_by_param, key=lambda x: x[1], reverse=True)[:10]
+                        log_fn("Top 10 parameter gradient norms (global):")
+                        for param_name, param_norm in top10:
+                            log_fn(f"  {param_name}: {param_norm:.2f}")
+
+                        adaptive_clip_norm = min(adaptive_clip_norm, 0.05)
+                        log_fn(f"Emergency clip norm set to {adaptive_clip_norm:.3f}")
+                        log_fn(f"{'='*80}\n")
+                    else:
+                        self.grad_explosion_streak = 0
+
+                    if self.grad_explosion_norm_ema is None:
+                        self.grad_explosion_norm_ema = total_grad_norm
+                    else:
+                        alpha = self.grad_explosion_ema_alpha
+                        self.grad_explosion_norm_ema = alpha * self.grad_explosion_norm_ema + (1 - alpha) * total_grad_norm
+                    self.grad_explosion_ema_steps += 1
+
+                if should_step and self._has_nonfinite_gradients():
+                    logger.error(f"\n{'='*80}")
+                    logger.error(f"❌ BATCH {batch_idx} - NON-FINITE GRADIENTS DETECTED")
+                    logger.error(f"{'='*80}")
+                    logger.error(f"Skipping optimizer step at batch {batch_idx}")
+                    logger.error(f"Accumulated step: {accumulated_step}/{gradient_accumulation_steps}")
+                    logger.error(f"Optimizer step number: {self.current_optimizer_step}")
+
+                    # Save problematic batch data for debugging
+                    try:
+                        debug_path = Path(self.config.output_dir) / f"debug_batch_{batch_idx}_epoch_{epoch}.pt"
+                        debug_data = {
+                            'batch_idx': batch_idx,
+                            'epoch': epoch,
+                            'optimizer_step': self.current_optimizer_step,
+                            'accumulated_step': accumulated_step,
+                            'batch_data': {
+                                'phoneme_indices': phoneme_indices.cpu(),
+                                'mel_specs': mel_specs.cpu(),
+                                'phoneme_durations': phoneme_durations.cpu(),
+                                'stop_token_targets': stop_token_targets.cpu(),
+                                'mel_lengths': mel_lengths.cpu(),
+                                'phoneme_lengths': phoneme_lengths.cpu(),
+                            },
+                            'outputs': {
+                                'predicted_mel': predicted_mel.detach().cpu() if predicted_mel is not None else None,
+                                'predicted_log_durations': predicted_log_durations.detach().cpu() if predicted_log_durations is not None else None,
+                                'predicted_pitch': predicted_pitch.detach().cpu() if predicted_pitch is not None else None,
+                                'predicted_energy': predicted_energy.detach().cpu() if predicted_energy is not None else None,
+                            },
+                            'losses': {
+                                'total_loss': total_loss.item(),
+                                'mel_loss': loss_mel.item(),
+                                'duration_loss': loss_duration.item(),
+                                'stop_loss': loss_stop_token.item(),
+                                'pitch_loss': loss_pitch.item() if loss_pitch is not None else None,
+                                'energy_loss': loss_energy.item() if loss_energy is not None else None,
+                            }
+                        }
+                        if pitches is not None:
+                            debug_data['batch_data']['pitches'] = pitches.cpu()
+                        if energies is not None:
+                            debug_data['batch_data']['energies'] = energies.cpu()
+
+                        torch.save(debug_data, debug_path)
+                        logger.error(f"💾 Saved problematic batch data to: {debug_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to save debug data: {e}")
+
+                    logger.error(f"{'='*80}\n")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    accumulated_step = 0
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    continue
+
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
                     if self.use_mixed_precision:
                         if self.device_type == 'cuda':
                             # CUDA path with built-in GradScaler
                             self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
 
                             old_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
@@ -1529,7 +1892,7 @@ class KokoroTrainer:
 
                         else:  # MPS path with custom scaler
                             # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
 
                             old_scale = self.scaler.get_scale()
                             step_successful = self.scaler.step(self.optimizer)
@@ -1555,7 +1918,7 @@ class KokoroTrainer:
                                 if new_scale < old_scale:
                                     self.mixed_precision_stats['scale_decreases'] += 1
                     else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
                         self.optimizer.step()
 
                         # Step scheduler with warmup immediately after optimizer step
@@ -1564,6 +1927,8 @@ class KokoroTrainer:
 
                         # Update EMA model weights
                         self._update_ema()
+
+                    self.optimizer_steps_completed += 1
 
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
@@ -1731,6 +2096,7 @@ class KokoroTrainer:
         save_phoneme_processor(self.dataset.phoneme_processor, self.config.output_dir)
 
         logger.info(f"Starting training on device: {self.device} ({self.device_type})")
+        logger.info(f"PyTorch version: {torch.__version__}")
         logger.info(f"Mixed precision training: {'Enabled' if self.use_mixed_precision else 'Disabled'}")
         if self.use_mixed_precision:
             logger.info(f"Mixed precision dtype: {self.mixed_precision_dtype}")
@@ -1741,7 +2107,7 @@ class KokoroTrainer:
         logger.info(f"Model vocabulary size: {self.dataset.phoneme_processor.get_vocab_size()}")
         logger.info(f"Initial learning rate: {self.config.learning_rate}")
         if self.scheduler_per_batch:
-            logger.info(f"Scheduler: OneCycleLR (steps per batch, max_lr={self.config.learning_rate * getattr(self.config, 'max_lr_multiplier', 10.0):.2e})")
+            logger.info(f"Scheduler: OneCycleLR (steps per batch, max_lr={self.config.learning_rate * getattr(self.config, 'max_lr_multiplier', 5.0):.2e})")
         else:
             logger.info(f"Scheduler: CosineAnnealingWarmRestarts (steps per epoch, T_0={self.config.lr_T_0}, T_mult={self.config.lr_T_mult})")
         logger.info(f"Loss weights: Mel={1.0}, Duration={self.config.duration_loss_weight}, StopToken={self.config.stop_token_loss_weight}")

@@ -12,6 +12,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Default architecture constants
+DEFAULT_HIDDEN_DIM = 512
+DEFAULT_FILTER_SIZE = 256
+DEFAULT_N_BINS = 256
+DEFAULT_HOP_LENGTH = 256
+
 
 class VariancePredictor(nn.Module):
     """
@@ -20,8 +26,8 @@ class VariancePredictor(nn.Module):
     """
 
     def __init__(self,
-                 hidden_dim: int = 512,
-                 filter_size: int = 256,
+                 hidden_dim: int = DEFAULT_HIDDEN_DIM,
+                 filter_size: int = DEFAULT_FILTER_SIZE,
                  kernel_size: int = 3,
                  dropout: float = 0.1,
                  num_layers: int = 2):
@@ -132,11 +138,11 @@ class VarianceAdaptor(nn.Module):
     """
 
     def __init__(self,
-                 hidden_dim: int = 512,
-                 filter_size: int = 256,
+                 hidden_dim: int = DEFAULT_HIDDEN_DIM,
+                 filter_size: int = DEFAULT_FILTER_SIZE,
                  kernel_size: int = 3,
                  dropout: float = 0.1,
-                 n_bins: int = 256,
+                 n_bins: int = DEFAULT_N_BINS,
                  pitch_min: float = 50.0,
                  pitch_max: float = 800.0,
                  energy_min: float = 0.0,
@@ -280,7 +286,7 @@ class PitchExtractor:
     @staticmethod
     def extract_pitch(waveform: torch.Tensor,
                      sample_rate: int = 22050,
-                     hop_length: int = 256,
+                     hop_length: int = DEFAULT_HOP_LENGTH,
                      fmin: float = 50.0,
                      fmax: float = 800.0) -> torch.Tensor:
         """
@@ -386,7 +392,7 @@ class EnergyExtractor:
 
     @staticmethod
     def extract_energy_from_waveform(waveform: torch.Tensor,
-                                    hop_length: int = 256,
+                                    hop_length: int = DEFAULT_HOP_LENGTH,
                                     win_length: int = 1024) -> torch.Tensor:
         """
         Extract RMS energy from waveform
@@ -462,15 +468,15 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
     # Test variance predictor
-    predictor = VariancePredictor(hidden_dim=512, filter_size=256)
-    x = torch.randn(4, 100, 512)  # (batch, seq_len, hidden_dim)
+    predictor = VariancePredictor(hidden_dim=DEFAULT_HIDDEN_DIM, filter_size=DEFAULT_FILTER_SIZE)
+    x = torch.randn(4, 100, DEFAULT_HIDDEN_DIM)  # (batch, seq_len, hidden_dim)
     mask = torch.zeros(4, 100).bool()
 
     output = predictor(x, mask)
     print(f"VariancePredictor output shape: {output.shape}")  # Should be (4, 100)
 
     # Test variance adaptor
-    adaptor = VarianceAdaptor(hidden_dim=512, n_bins=256)
+    adaptor = VarianceAdaptor(hidden_dim=DEFAULT_HIDDEN_DIM, n_bins=DEFAULT_N_BINS)
     pitch_target = torch.randn(4, 100) * 100 + 200  # Pitch in Hz
     energy_target = torch.randn(4, 100) * 10 + 50   # Energy
     duration_target = torch.randint(1, 20, (4, 100)).float()
@@ -486,7 +492,7 @@ if __name__ == "__main__":
 
     # Test pitch extractor
     waveform = torch.randn(1, 22050)  # 1 second of audio
-    pitch = PitchExtractor.extract_pitch(waveform, sample_rate=22050, hop_length=256)
+    pitch = PitchExtractor.extract_pitch(waveform, sample_rate=22050, hop_length=DEFAULT_HOP_LENGTH)
     print(f"Pitch shape: {pitch.shape}")
 
     # Test energy extractor

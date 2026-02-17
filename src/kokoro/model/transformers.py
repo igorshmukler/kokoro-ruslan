@@ -8,6 +8,9 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+# Cache size for relative position matrices
+REL_POS_CACHE_MAX_SIZE = 10
+
 
 def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -> torch.Tensor:
     """
@@ -56,21 +59,57 @@ class MultiHeadAttentionImproved(nn.Module):
         # Output linear projection
         self.w_o = nn.Linear(d_model, d_model)
 
-        # Relative positional encoding
+        # ALiBi: Attention with Linear Biases (replaces Shaw et al. relative pos)
+        # Each head gets a learned slope for distance-based bias
         if use_relative_pos:
-            self.max_relative_distance = max_relative_distance
-            # Total unique relative positions: -max_dist to +max_dist (inclusive) = 2*max_dist + 1
-            self.relative_position_k = nn.Embedding(2 * max_relative_distance + 1, self.d_k)
-            self.relative_position_v = nn.Embedding(2 * max_relative_distance + 1, self.d_k)
-            # Initialize these embeddings appropriately
-            nn.init.xavier_uniform_(self.relative_position_k.weight)
-            nn.init.xavier_uniform_(self.relative_position_v.weight)
+            # Initialize slopes following ALiBi paper: geometric sequence
+            # For 8 heads: [1/2^1, 1/2^2, ..., 1/2^8] = [0.5, 0.25, 0.125, ...]
+            slopes = torch.tensor([2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)])
+            self.register_buffer('alibi_slopes', slopes)
 
         self.dropout_attn = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
 
+        # Cache for distance matrices to avoid recomputation
+        self._distance_cache = {}
+
         # Better initialization for linear layers
         self._init_weights()
+
+    @staticmethod
+    def _tensor_layout_metrics(tensor: torch.Tensor) -> str:
+        shape = tuple(tensor.shape)
+        stride = tensor.stride()
+        numel = tensor.numel()
+        elem_size = tensor.element_size()
+        est_bytes = numel * elem_size
+        max_offset = 0
+        for size, step in zip(shape, stride):
+            if size > 0:
+                max_offset += (size - 1) * abs(step)
+        return (
+            f"shape={shape} stride={stride} contiguous={tensor.is_contiguous()} "
+            f"numel={numel:,} elem_size={elem_size} est_bytes={est_bytes:,} "
+            f"max_linear_offset={max_offset:,} dtype={tensor.dtype} device={tensor.device}"
+        )
+
+    def _log_phase(self, context_prefix: str, phase: str, tensor: Optional[torch.Tensor] = None):
+        if tensor is None:
+            logger.info(f"{context_prefix}  [AttentionPhase] {phase}")
+            return
+        logger.info(f"{context_prefix}  [AttentionPhase] {phase}: {self._tensor_layout_metrics(tensor)}")
+
+    def _register_debug_grad_hook(self, tensor: torch.Tensor, hook_name: str, context_prefix: str):
+        if not tensor.requires_grad:
+            return
+
+        def _hook(grad: Optional[torch.Tensor]):
+            if grad is None:
+                logger.info(f"{context_prefix}  [AttentionBW] {hook_name}: grad=None")
+                return
+            logger.info(f"{context_prefix}  [AttentionBW] {hook_name}: {self._tensor_layout_metrics(grad)}")
+
+        tensor.register_hook(_hook)
 
     def _init_weights(self):
         # Glorot (Xavier) uniform for weight matrices
@@ -81,28 +120,31 @@ class MultiHeadAttentionImproved(nn.Module):
         if self.w_o.bias is not None:
             nn.init.zeros_(self.w_o.bias)
 
-    def _get_relative_positions(self, seq_len: int, device: torch.device) -> torch.Tensor:
+    def _get_alibi_bias(self, seq_len_q: int, seq_len_k: int, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """
-        Generate relative position indices for attention.
-        Output shape: (seq_len, seq_len)
+        Generate ALiBi (Attention with Linear Biases) for attention.
+        Returns bias of shape (num_heads, seq_len_q, seq_len_k)
         """
-        # Create a tensor of indices from 0 to seq_len-1
-        idx = torch.arange(seq_len, device=device)
-        # Create a matrix of (i - j) for all pairs (i, j)
-        # Resulting shape: (seq_len, seq_len)
-        relative_pos_indices = idx.unsqueeze(0) - idx.unsqueeze(1)
+        cache_key = (seq_len_q, seq_len_k, device, dtype)
+        if cache_key in self._distance_cache:
+            return self._distance_cache[cache_key]
 
-        # Clip values to be within [-max_relative_distance, max_relative_distance]
-        relative_pos_indices = torch.clamp(
-            relative_pos_indices, -self.max_relative_distance, self.max_relative_distance
-        )
+        # Create distance matrix: relative position from each query to each key
+        # Shape: (seq_len_q, seq_len_k)
+        q_pos = torch.arange(seq_len_q, device=device, dtype=dtype).unsqueeze(1)  # (seq_len_q, 1)
+        k_pos = torch.arange(seq_len_k, device=device, dtype=dtype).unsqueeze(0)  # (1, seq_len_k)
+        distance = k_pos - q_pos  # (seq_len_q, seq_len_k), negative for past, positive for future
 
-        # Shift values to be positive for embedding lookup
-        # e.g., if max_dist=32, range is -32 to 32. Adding 32 shifts to 0 to 64.
-        # This maps to indices [0, 2*max_relative_distance]
-        relative_pos_indices = relative_pos_indices + self.max_relative_distance
+        # Apply per-head slopes: (num_heads, 1, 1) * (1, seq_len_q, seq_len_k)
+        # Result: (num_heads, seq_len_q, seq_len_k)
+        # Convert slopes to correct dtype
+        alibi_bias = self.alibi_slopes.to(dtype).view(-1, 1, 1) * distance.unsqueeze(0)
 
-        return relative_pos_indices # (S, S)
+        # Cache for future use (limit cache size)
+        if len(self._distance_cache) < REL_POS_CACHE_MAX_SIZE:
+            self._distance_cache[cache_key] = alibi_bias
+
+        return alibi_bias
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 attn_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention (float('-inf'))
@@ -112,100 +154,222 @@ class MultiHeadAttentionImproved(nn.Module):
         batch_size, seq_len_q, _ = query.size()
         seq_len_k = key.size(1)
         seq_len_v = value.size(1) # Should be same as seq_len_k
+        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
+        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
+
+        if is_batch_281:
+            logger.info(
+                f"{context_prefix}  [Attention] Entry: device={query.device}, dtype={query.dtype}, "
+                f"query={tuple(query.shape)}, key={tuple(key.shape)}, value={tuple(value.shape)}"
+            )
+            logger.info(
+                f"{context_prefix}    heads={self.num_heads}, d_k={self.d_k}, "
+                f"attention_elements={batch_size * self.num_heads * seq_len_q * seq_len_k:,}"
+            )
+            self._log_phase(context_prefix, "entry_query", query)
 
         # 1. Linear projections and reshape for multi-head attention
         Q = self.w_q(query).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_q, D_k)
         K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
         V = self.w_v(value).view(batch_size, seq_len_v, self.num_heads, self.d_k).transpose(1, 2)  # (B, H, S_v, D_k)
 
-        # 2. Scaled dot-product attention (Content-based scores)
-        # scores = Q @ K.transpose(-2, -1) / sqrt(d_k)
-        # (B, H, S_q, D_k) @ (B, H, D_k, S_k) -> (B, H, S_q, S_k)
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
-
-        # 3. Add relative positional encoding scores
-        if self.use_relative_pos and seq_len_q == seq_len_k:
-            # Generate relative position indices (S_q, S_k)
-            rel_pos_indices = self._get_relative_positions(seq_len_q, query.device)
-
-            # Retrieve relative key embeddings (S_q, S_k, D_k)
-            rel_pos_k_emb = self.relative_position_k(rel_pos_indices)
-
-            # Compute relative scores (Q * R_k)
-            # Q: (B, H, S_q, D_k)
-            # rel_pos_k_emb: (S_q, S_k, D_k)
-            # Output: (B, H, S_q, S_k)
-            if query.device.type == 'mps' and seq_len_q > 512:
-                # MPS-safe: chunk queries to avoid large intermediate tensors
-                chunk_size = 256
-                rel_scores = []
-                for start_idx in range(0, seq_len_q, chunk_size):
-                    end_idx = min(start_idx + chunk_size, seq_len_q)
-                    q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
-                    rel_chunk = rel_pos_k_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
-                    chunk_scores = torch.einsum('bhcd,csd->bhcs', q_chunk, rel_chunk)  # (B, H, chunk, S_k)
-                    rel_scores.append(chunk_scores)
-                rel_scores = torch.cat(rel_scores, dim=2)  # (B, H, S_q, S_k)
-            else:
-                rel_scores = torch.einsum('bhid,ijd->bhij', Q, rel_pos_k_emb)
-            scores = scores + rel_scores
-
-        # 4. Apply masks
-        if attn_mask is not None:
-            # attn_mask (e.g., causal mask): (S_q, S_k) float('-inf') mask
-            # Broadcast to (1, 1, S_q, S_k)
-            scores = scores.masked_fill(attn_mask == float('-inf'), float('-inf'))
-
-        if key_padding_mask is not None:
-            # key_padding_mask: (B, S_k) boolean mask (True for padded, False for not padded)
-            # Need to broadcast to (B, 1, 1, S_k) for scores
-            # Crucially, ensure key_padding_mask is boolean before using with masked_fill
-            key_padding_mask = key_padding_mask.to(torch.bool)
-            scores = scores.masked_fill(
-                key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf')
+        if is_batch_281:
+            logger.info(
+                f"{context_prefix}    Q={tuple(Q.shape)} K={tuple(K.shape)} V={tuple(V.shape)} "
+                f"(numel: Q={Q.numel():,}, K={K.numel():,}, V={V.numel():,})"
             )
 
-        # 5. Softmax to get attention probabilities
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = self.dropout_attn(attn_weights)
+        # 2. Prepare attention bias (ALiBi + masks) for Flash Attention
+        attn_bias = None
 
-        # 6. Apply attention weights to values (Content-based context)
-        # context = attn_weights @ V
-        # (B, H, S_q, S_k) @ (B, H, S_k, D_k) -> (B, H, S_q, D_k)
-        context = torch.matmul(attn_weights, V)
+        # Add ALiBi positional bias
+        # CRITICAL: Disable ALiBi entirely on MPS due to fp16 dtype bugs in matrix multiplication
+        # MPS backend has issues with mixed dtype operations that cause crashes
+        use_alibi = self.use_relative_pos and query.device.type != 'mps'
 
-        # 7. Add relative positional encoding to values (for the `A * R_v` term)
-        if self.use_relative_pos and seq_len_q == seq_len_k:
-            # Retrieve relative value embeddings (S_q, S_k, D_k)
-            rel_pos_v_emb = self.relative_position_v(rel_pos_indices)
+        if use_alibi:
+            # Get ALiBi bias: (num_heads, seq_len_q, seq_len_k)
+            alibi_bias = self._get_alibi_bias(seq_len_q, seq_len_k, query.device, dtype=Q.dtype)
+            # Expand to (B, H, S_q, S_k)
+            attn_bias = alibi_bias.unsqueeze(0).expand(batch_size, -1, -1, -1)
 
-            # Compute relative context (A * R_v)
-            # attn_weights: (B, H, S_q, S_k)
-            # rel_pos_v_emb: (S_q, S_k, D_k)
-            # Output: (B, H, S_q, D_k)
-            if query.device.type == 'mps' and seq_len_q > 512:
-                # MPS-safe: chunk to avoid large intermediate tensors
-                chunk_size = 256
-                rel_context_chunks = []
-                for start_idx in range(0, seq_len_q, chunk_size):
-                    end_idx = min(start_idx + chunk_size, seq_len_q)
-                    attn_chunk = attn_weights[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
-                    rel_chunk = rel_pos_v_emb[start_idx:end_idx, :, :]  # (chunk, S_k, D_k)
-                    chunk_context = torch.einsum('bhcs,csd->bhcd', attn_chunk, rel_chunk)  # (B, H, chunk, D_k)
-                    rel_context_chunks.append(chunk_context)
-                rel_context = torch.cat(rel_context_chunks, dim=2)  # (B, H, S_q, D_k)
+        # Apply causal mask
+        if attn_mask is not None:
+            # attn_mask: (S_q, S_k) with float('-inf') for masked positions
+            mask_bias = attn_mask.unsqueeze(0).unsqueeze(0).to(dtype=Q.dtype, device=query.device)  # (1, 1, S_q, S_k)
+            if attn_bias is None:
+                attn_bias = mask_bias
             else:
-                rel_context = torch.einsum('bhij,ijd->bhid', attn_weights, rel_pos_v_emb)
-            context = context + rel_context
+                attn_bias = attn_bias + mask_bias
 
-        # 8. Concatenate heads and apply final linear layer
+        # Apply padding mask
+        if key_padding_mask is not None:
+            # key_padding_mask: (B, S_k) boolean (True for padded)
+            key_padding_mask = key_padding_mask.to(torch.bool)
+            padding_bias = torch.zeros(batch_size, 1, 1, seq_len_k, device=query.device, dtype=Q.dtype)
+            padding_bias = padding_bias.masked_fill(key_padding_mask.unsqueeze(1).unsqueeze(2), float('-inf'))
+            if attn_bias is None:
+                attn_bias = padding_bias
+            else:
+                attn_bias = attn_bias + padding_bias
+
+        # 3. Compute attention
+        # MPS has severe memory constraints - use ultra-aggressive chunking for long sequences
+        # Chunking reduces peak memory during backward pass by processing in smaller pieces
+        attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
+
+        if query.device.type == 'mps' and (seq_len_q > 600 or seq_len_k > 600):
+            if is_batch_281:
+                self._log_phase(context_prefix, "pre_attention_chunked")
+            # Ultra-aggressive chunking for MPS to avoid INT_MAX overflow during backward
+            # Batch 281 crash: 398M attention elements crashed with chunk_size=32 (8M elements/chunk)
+            # MPS backend creates internal NDArray during backward that overflows INT_MAX
+            # Solution: Use even smaller chunks - 16 creates ~4M element chunks
+            if attention_size > 300_000_000:
+                chunk_size = 16  # Ultra-aggressive for 300M+ elements (4M elements/chunk)
+            elif attention_size > 150_000_000:
+                chunk_size = 32  # Extra aggressive for 150M+ elements (8M elements/chunk)
+            elif attention_size > 50_000_000:
+                chunk_size = 64  # Very aggressive for 50M+ elements
+            else:
+                chunk_size = 128  # Standard aggressive chunking
+
+            num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
+            context_chunks = []
+
+            # BATCH 281 LOGGING - Show fix is active
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                elements_per_chunk = batch_size * self.num_heads * chunk_size * seq_len_k
+                logger.info(f"{context_prefix}  [Attention] MPS Chunking activated (fix for INT_MAX bug)")
+                logger.info(f"{context_prefix}    attention_size: {attention_size:,} elements, chunk_size: {chunk_size}, chunks: {num_chunks}")
+
+            # Process chunks without accumulating attention weights to save memory
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * chunk_size
+                end_idx = min((chunk_idx + 1) * chunk_size, seq_len_q)
+
+                Q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
+
+                # Compute attention for this chunk
+                scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
+                if attn_bias is not None:
+                    # Only slice bias along query dim if it's actually expanded to full seq_len
+                    # Padding masks have shape [B, 1, 1, S_k] and should broadcast as-is
+                    if attn_bias.shape[2] == seq_len_q:
+                        # Full bias tensor - slice it
+                        bias_chunk = attn_bias[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
+                        scores_chunk = scores_chunk + bias_chunk
+                    elif attn_bias.shape[2] == 1:
+                        # Broadcast bias (e.g., padding mask) - use as-is
+                        scores_chunk = scores_chunk + attn_bias
+                    else:
+                        # Unexpected shape - log and skip
+                        logger.error(f"Unexpected attn_bias shape: {attn_bias.shape}, expected dim 2 to be 1 or {seq_len_q}")
+
+                attn_weights_chunk = F.softmax(scores_chunk, dim=-1)
+                attn_weights_chunk = self.dropout_attn(attn_weights_chunk)
+                context_chunk = torch.matmul(attn_weights_chunk, V)  # (B, H, chunk, D_k)
+
+                context_chunks.append(context_chunk)
+
+                # Clear intermediate tensors and free MPS cache after each chunk
+                del scores_chunk, attn_weights_chunk, context_chunk
+                if chunk_idx % 4 == 0:  # Periodic cache clearing
+                    torch.mps.empty_cache()
+
+            context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
+
+            # BATCH 281 LOGGING - Confirm fix worked
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [Attention] Chunked processing complete: {context.shape}")
+
+            attn_weights = None  # Don't compute weights during chunked attention to save memory
+
+        elif query.device.type == 'mps':
+            if is_batch_281:
+                self._log_phase(context_prefix, "pre_attention_dense")
+            # Manual attention implementation for MPS (normal sequences)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+
+            if attn_bias is not None:
+                scores = scores + attn_bias
+
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.dropout_attn(attn_weights)
+            context = torch.matmul(attn_weights, V)
+        else:
+            # Use Flash Attention 2 on CUDA/CPU (2-4x faster)
+            try:
+                context = F.scaled_dot_product_attention(
+                    Q, K, V,
+                    attn_mask=attn_bias,
+                    dropout_p=self.dropout_attn.p if self.training else 0.0,
+                    is_causal=False  # We handle causality through attn_bias
+                )
+                # Flash Attention doesn't return weights, only compute during eval for visualization
+                if not self.training:
+                    with torch.no_grad():
+                        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+                        if attn_bias is not None:
+                            scores = scores + attn_bias
+                        attn_weights = F.softmax(scores, dim=-1)
+                else:
+                    attn_weights = None
+
+            except (RuntimeError, AttributeError) as e:
+                # Fallback to manual implementation
+                logger.warning(f"Flash Attention failed ({e}), using manual implementation")
+                scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+                if attn_bias is not None:
+                    scores = scores + attn_bias
+                attn_weights = F.softmax(scores, dim=-1)
+                attn_weights = self.dropout_attn(attn_weights)
+                context = torch.matmul(attn_weights, V)
+
+        # 7. Concatenate heads and apply final linear layer
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
-        context = context.transpose(1, 2).contiguous().view(
-            batch_size, seq_len_q, self.d_model
-        )
+        context_t = context.transpose(1, 2)
+
+        if is_batch_281:
+            self._log_phase(context_prefix, "pre_contiguous_view_context_t", context_t)
+            self._register_debug_grad_hook(context_t, "bw_context_t", context_prefix)
+            logger.info(
+                f"{context_prefix}  [Attention] Pre-projection: context={tuple(context.shape)}, "
+                f"transposed={tuple(context_t.shape)}, transposed_stride={context_t.stride()}, "
+                f"transposed_contiguous={context_t.is_contiguous()}, numel={context_t.numel():,}"
+            )
+
+        try:
+            context = context_t.contiguous().view(
+                batch_size, seq_len_q, self.d_model
+            )
+        except RuntimeError as e:
+            logger.error(
+                f"{context_prefix}  [Attention] Failed at contiguous/view: context_t_shape={tuple(context_t.shape)}, "
+                f"stride={context_t.stride()}, contiguous={context_t.is_contiguous()}, error={e}"
+            )
+            raise
+
+        if is_batch_281:
+            self._log_phase(context_prefix, "post_contiguous_view_context", context)
+            self._register_debug_grad_hook(context, "bw_context_post_view", context_prefix)
+            logger.info(
+                f"{context_prefix}  [Attention] Post-view: context={tuple(context.shape)}, "
+                f"contiguous={context.is_contiguous()}, stride={context.stride()}"
+            )
+
+        if is_batch_281:
+            self._log_phase(context_prefix, "pre_w_o", context)
+
         output = self.w_o(context)
 
-        return output, attn_weights.mean(dim=1) # Return mean attention weights for visualization/debugging
+        if is_batch_281:
+            self._register_debug_grad_hook(output, "bw_output", context_prefix)
+            self._log_phase(context_prefix, "post_w_o", output)
+            logger.info(f"{context_prefix}  [Attention] Output projection complete: output={tuple(output.shape)}")
+
+        # Return output and attention weights (None during training with Flash Attention)
+        return output, attn_weights.mean(dim=1) if attn_weights is not None else None
 
 
 class ImprovedTransformerEncoderBlock(nn.Module):
@@ -285,16 +449,34 @@ class ImprovedTransformerEncoderBlock(nn.Module):
             attn_output, _ = self.self_attn(src_norm, src_norm, src_norm,
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] After self_attn: {attn_output.shape}")
+
             # Apply stochastic depth to attention output
             attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
             src = src + self.dropout1(attn_output) # Residual connection + Dropout
 
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] After residual: {src.shape}, starting FFN...")
+
             # Feed-forward sub-layer
             src_norm = self.norm2(src) # Apply LayerNorm BEFORE FFN
             ff_output = self._ff_block(src_norm)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] After FFN: {ff_output.shape}")
+
             # Apply stochastic depth to FFN output
             ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
             src = src + self.dropout2(ff_output) # Residual connection + Dropout
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"  [EncoderBlock] Block complete: {src.shape}")
         else:
             # Post-normalization (Original Transformer)
             # Self-attention sub-layer
@@ -383,6 +565,12 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         if memory_key_padding_mask is not None:
             memory_key_padding_mask = memory_key_padding_mask.to(torch.bool)
 
+        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
+
+        # BATCH 281 LOGGING - Entry point
+        if hasattr(self, '_batch_281_log') and self._batch_281_log:
+            logger.info(f"{context_prefix}  [DecoderBlock] Entry: tgt={tgt.shape}, memory={memory.shape}")
+
         if self.use_prenorm:
             # Pre-normalization
             # Self-attention sub-layer
@@ -392,18 +580,46 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                             key_padding_mask=tgt_key_padding_mask)
             tgt = tgt + self.dropout1(attn_output)
 
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [DecoderBlock] After self_attn: {tgt.shape}")
+
             # Cross-attention sub-layer
             tgt_norm = self.norm2(tgt)
             # Query is from decoder (tgt_norm), Key/Value from encoder (memory)
             cross_attn_output, _ = self.cross_attn(tgt_norm, memory, memory,
                                                    attn_mask=memory_mask, # Usually None
                                                    key_padding_mask=memory_key_padding_mask)
-            tgt = tgt + self.dropout2(cross_attn_output)
+
+            # BATCH 281 LOGGING - Before residual
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [DecoderBlock] Cross-attn returned: {cross_attn_output.shape}, applying dropout2...")
+
+            dropped_output = self.dropout2(cross_attn_output)
+
+            # BATCH 281 LOGGING - Before addition
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [DecoderBlock] After dropout2, adding to tgt: {tgt.shape} + {dropped_output.shape}")
+
+            tgt = tgt + dropped_output
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [DecoderBlock] After cross_attn residual: {tgt.shape}, starting FFN...")
 
             # Feed-forward sub-layer
             tgt_norm = self.norm3(tgt)
             ff_output = self._ff_block(tgt_norm)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [DecoderBlock] After FFN: {ff_output.shape}")
+
             tgt = tgt + self.dropout3(ff_output)
+
+            # BATCH 281 LOGGING
+            if hasattr(self, '_batch_281_log') and self._batch_281_log:
+                logger.info(f"{context_prefix}  [DecoderBlock] Block complete: {tgt.shape}")
         else:
             # Post-normalization
             # Self-attention sub-layer
