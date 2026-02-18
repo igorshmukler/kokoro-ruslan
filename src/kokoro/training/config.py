@@ -160,7 +160,7 @@ class TrainingConfig:
     # Optimizer behavior
     # None = auto (enabled on CUDA, disabled otherwise)
     use_fused_adamw: Optional[bool] = None
-    # Try fused AdamW on MPS by default (experimental, may fall back)
+    # Try fused AdamW on MPS by default (may fall back)
     try_fused_adamw_on_mps: bool = True
 
     # torch.compile optimization (PyTorch 2.0+)
