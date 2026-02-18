@@ -1322,10 +1322,6 @@ class KokoroTrainer:
         self.dataset.phoneme_processor = phoneme_processor
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
-        # CRITICAL: Reset variance predictors after loading checkpoint
-        # Must happen AFTER checkpoint load to override old weights
-        self._reset_variance_predictors()
-
     def validate_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """
         Run validation loop to monitor overfitting.
