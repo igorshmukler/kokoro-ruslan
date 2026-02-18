@@ -156,7 +156,8 @@ class TrainingConfig:
     enable_interbatch_profiling: bool = False
     interbatch_report_interval: int = 100
 
-    use_mixed_precision: bool = True
+    # Disabled for MPS, for now, due to multiple issues, still unresolved
+    use_mixed_precision: bool = False
 
     # Optimizer behavior
     # None = auto (enabled on CUDA, disabled otherwise)
