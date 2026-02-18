@@ -230,11 +230,11 @@ For 22k samples on modern hardware:
 
 | Task | Duration | Can Run Overnight? |
 |------|----------|-------------------|
-| MFA Alignment | 1-3 hours | ✓ |
-| Training (100 epochs) | 12-24 hours | ✓ |
-| Inference (per sample) | 1-2 seconds | N/A |
+| MFA Alignment | 0.5-1 hours | ✓ |
+| Training (10 epochs) | 24-48 hours | ✓ |
+| Inference (per sample) | 2-4 seconds | N/A |
 
-**Recommendation:** Run MFA overnight, then start training the next day.
+**Recommendation:** Run MFA, then start training.
 
 ## Next Steps
 
