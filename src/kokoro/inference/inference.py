@@ -8,7 +8,7 @@ import torch
 import argparse
 import pickle
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Any, Dict
 import logging
 
 # Import our training configuration, model and phoneme processor
@@ -30,10 +30,10 @@ class KokoroTTS:
         device: str = None,
         vocoder_type: str = "hifigan",
         vocoder_path: str = None,
-        inference_max_len: int = 1200,
-        inference_stop_threshold: float = 0.45,
-        inference_min_len_ratio: float = 0.7,
-        inference_min_len_floor: int = 12,
+        inference_max_len: Optional[int] = None,
+        inference_stop_threshold: Optional[float] = None,
+        inference_min_len_ratio: Optional[float] = None,
+        inference_min_len_floor: Optional[int] = None,
     ):
         self.model_dir = Path(model_dir)
 
@@ -50,11 +50,17 @@ class KokoroTTS:
         self.f_min = 0.0
         self.f_max = 8000.0
 
-        # Inference generation controls
+        # Inference generation controls (auto-tuned from checkpoint unless explicitly provided)
         self.inference_max_len = inference_max_len
         self.inference_stop_threshold = inference_stop_threshold
         self.inference_min_len_ratio = inference_min_len_ratio
         self.inference_min_len_floor = inference_min_len_floor
+
+        # Keep explicit override flags so checkpoint-tuning does not override user intent
+        self._explicit_inference_max_len = inference_max_len is not None
+        self._explicit_inference_stop_threshold = inference_stop_threshold is not None
+        self._explicit_inference_min_len_ratio = inference_min_len_ratio is not None
+        self._explicit_inference_min_len_floor = inference_min_len_floor is not None
 
         # Initialize utility classes
         self.audio_utils = AudioUtils(self.sample_rate)
@@ -137,6 +143,8 @@ class KokoroTTS:
         metadata = checkpoint.get('model_metadata') if isinstance(checkpoint, dict) else None
         architecture = metadata.get('architecture', {}) if isinstance(metadata, dict) else {}
 
+        self._apply_checkpoint_inference_controls(checkpoint)
+
         vocab_size_from_processor = len(self.phoneme_processor.phoneme_to_id)
         if architecture:
             required_fields = [
@@ -211,6 +219,82 @@ class KokoroTTS:
         logger.info(f"Model '{model_path.name}' loaded successfully with vocab_size={vocab_size_from_processor}.")
         return model
 
+    def _safe_float(self, value: Any, default: float, min_value: float, max_value: float) -> float:
+        """Coerce a float control into a safe bounded range."""
+        try:
+            value_f = float(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, min(max_value, value_f))
+
+    def _safe_int(self, value: Any, default: int, min_value: int) -> int:
+        """Coerce an int control into a safe bounded range."""
+        try:
+            value_i = int(value)
+        except (TypeError, ValueError):
+            return default
+        return max(min_value, value_i)
+
+    def _apply_checkpoint_inference_controls(self, checkpoint: Dict[str, Any]):
+        """Auto-tune inference controls from checkpoint metadata/config unless user-overridden."""
+        default_controls = {
+            'max_len': 1200,
+            'stop_threshold': 0.45,
+            'min_len_ratio': 0.7,
+            'min_len_floor': 12,
+        }
+
+        explicit_max_len = bool(getattr(self, '_explicit_inference_max_len', False))
+        explicit_stop_threshold = bool(getattr(self, '_explicit_inference_stop_threshold', False))
+        explicit_min_len_ratio = bool(getattr(self, '_explicit_inference_min_len_ratio', False))
+        explicit_min_len_floor = bool(getattr(self, '_explicit_inference_min_len_floor', False))
+
+        metadata = checkpoint.get('model_metadata', {}) if isinstance(checkpoint, dict) else {}
+        metadata_controls = metadata.get('inference_controls', {}) if isinstance(metadata, dict) else {}
+
+        config_controls = {}
+        config_obj = checkpoint.get('config') if isinstance(checkpoint, dict) else None
+        if config_obj is not None:
+            config_controls = {
+                'max_len': getattr(config_obj, 'inference_max_len', None),
+                'stop_threshold': getattr(config_obj, 'inference_stop_threshold', None),
+                'min_len_ratio': getattr(config_obj, 'inference_min_len_ratio', None),
+                'min_len_floor': getattr(config_obj, 'inference_min_len_floor', None),
+            }
+
+        # Priority for auto-tuned values: metadata inference_controls -> config fields -> defaults
+        chosen_max_len = metadata_controls.get('max_len', config_controls.get('max_len', default_controls['max_len']))
+        chosen_stop_threshold = metadata_controls.get(
+            'stop_threshold', config_controls.get('stop_threshold', default_controls['stop_threshold'])
+        )
+        chosen_min_len_ratio = metadata_controls.get(
+            'min_len_ratio', config_controls.get('min_len_ratio', default_controls['min_len_ratio'])
+        )
+        chosen_min_len_floor = metadata_controls.get(
+            'min_len_floor', config_controls.get('min_len_floor', default_controls['min_len_floor'])
+        )
+
+        if not explicit_max_len:
+            self.inference_max_len = self._safe_int(chosen_max_len, default_controls['max_len'], min_value=64)
+        if not explicit_stop_threshold:
+            self.inference_stop_threshold = self._safe_float(
+                chosen_stop_threshold, default_controls['stop_threshold'], min_value=0.05, max_value=0.99
+            )
+        if not explicit_min_len_ratio:
+            self.inference_min_len_ratio = self._safe_float(
+                chosen_min_len_ratio, default_controls['min_len_ratio'], min_value=0.1, max_value=1.5
+            )
+        if not explicit_min_len_floor:
+            self.inference_min_len_floor = self._safe_int(chosen_min_len_floor, default_controls['min_len_floor'], min_value=1)
+
+        logger.info(
+            "Inference controls: max_len=%d stop_threshold=%.3f min_len_ratio=%.3f min_len_floor=%d",
+            int(self.inference_max_len),
+            float(self.inference_stop_threshold),
+            float(self.inference_min_len_ratio),
+            int(self.inference_min_len_floor),
+        )
+
     def text_to_speech(
         self,
         text: str,
@@ -250,7 +334,9 @@ class KokoroTTS:
             phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
 
             # Step 3: Generate mel spectrogram with updated parameters
-            effective_stop_threshold = self.inference_stop_threshold if stop_threshold is None else stop_threshold
+            effective_stop_threshold = (
+                self.inference_stop_threshold if stop_threshold is None else stop_threshold
+            )
             effective_max_len = self.inference_max_len if max_len is None else max_len
             effective_min_len_ratio = self.inference_min_len_ratio if min_len_ratio is None else min_len_ratio
             effective_min_len_floor = self.inference_min_len_floor if min_len_floor is None else min_len_floor
@@ -381,29 +467,29 @@ Examples:
     parser.add_argument(
         '--stop-threshold',
         type=float,
-        default=0.45,
-        help='Stop-token threshold for autoregressive decoding (default: 0.45).'
+        default=None,
+        help='Stop-token threshold for autoregressive decoding (default: auto from checkpoint).'
     )
 
     parser.add_argument(
         '--max-len',
         type=int,
-        default=1200,
-        help='Maximum number of mel frames to generate (default: 1200).'
+        default=None,
+        help='Maximum number of mel frames to generate (default: auto from checkpoint).'
     )
 
     parser.add_argument(
         '--min-len-ratio',
         type=float,
-        default=0.7,
-        help='Minimum generated length ratio vs expected duration-based length (default: 0.7).'
+        default=None,
+        help='Minimum generated length ratio vs expected duration-based length (default: auto from checkpoint).'
     )
 
     parser.add_argument(
         '--min-len-floor',
         type=int,
-        default=12,
-        help='Minimum generated frames floor before allowing stop-token termination (default: 12).'
+        default=None,
+        help='Minimum generated frames floor before allowing stop-token termination (default: auto from checkpoint).'
     )
 
     return parser.parse_args()

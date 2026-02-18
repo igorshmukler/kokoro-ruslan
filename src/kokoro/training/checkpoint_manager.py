@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module] = None) -> Dict[str, Any]:
     """Build explicit architecture metadata for robust strict loading."""
     metadata = {
-        'schema_version': 1,
+        'schema_version': 2,
         'architecture': {
             'mel_dim': int(getattr(config, 'n_mels', 80)),
             'hidden_dim': int(getattr(config, 'hidden_dim', 512)),
@@ -41,7 +41,13 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
             'energy_max': float(getattr(config, 'energy_max', 1.0)),
             'use_stochastic_depth': bool(getattr(config, 'use_stochastic_depth', True)),
             'stochastic_depth_rate': float(getattr(config, 'stochastic_depth_rate', 0.1)),
-        }
+        },
+        'inference_controls': {
+            'max_len': int(getattr(config, 'inference_max_len', 1200)),
+            'stop_threshold': float(getattr(config, 'inference_stop_threshold', 0.45)),
+            'min_len_ratio': float(getattr(config, 'inference_min_len_ratio', 0.7)),
+            'min_len_floor': int(getattr(config, 'inference_min_len_floor', 12)),
+        },
     }
 
     if model is not None:

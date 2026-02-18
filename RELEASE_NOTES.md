@@ -2,6 +2,12 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.10 (2026-02-17)
+- Make DataLoader workers configurable via `TrainingConfig.num_workers` and wire `prefetch_factor`/`persistent_workers` appropriately.
+- Auto-tune inference controls per-checkpoint (`stop_threshold`, `min_len_ratio`, `max_len`, `min_len_floor`) from `model_metadata.inference_controls` with safe bounds and explicit-override behavior.
+- Add epoch-level feature-cache hit/miss delta summaries and a final cumulative "FEATURE CACHE SUMMARY" at training completion for improved observability.
+- Add/adjust unit tests covering metadata strictness, inference auto-tuning, and cache telemetry.
+
 ## 0.0.9 (2026-02-17)
 - Save and restore model metadata with checkpoints. **BREAKING CHANGE**
 
