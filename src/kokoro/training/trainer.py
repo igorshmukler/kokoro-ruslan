@@ -319,7 +319,7 @@ class KokoroTrainer:
         try:
             self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
             if use_fused:
-                logger.info(f"Using fused AdamW optimizer on {self.device_type.upper()} (experimental on non-CUDA backends)")
+                logger.info(f"Using fused AdamW optimizer on {self.device_type.upper()}")
             else:
                 logger.info("Using standard AdamW optimizer")
         except (TypeError, ValueError, RuntimeError) as e:

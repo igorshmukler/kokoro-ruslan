@@ -168,7 +168,7 @@ Examples:
     parser.add_argument(
         '--fused-adamw',
         action='store_true',
-        help='Force-enable fused AdamW optimizer (experimental on non-CUDA backends)'
+        help='Force-enable fused AdamW optimizer'
     )
 
     parser.add_argument(
@@ -181,7 +181,7 @@ Examples:
         '--try-fused-adamw-mps',
         action='store_true',
         default=True,
-        help='Try fused AdamW on MPS (experimental, enabled by default; falls back automatically if unsupported)'
+        help='Try fused AdamW on MPS (enabled by default; falls back automatically if unsupported)'
     )
 
     parser.add_argument(
