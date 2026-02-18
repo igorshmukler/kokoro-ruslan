@@ -39,6 +39,44 @@ from kokoro.utils.adaptive_memory_manager import AdaptiveMemoryManager
 logger = logging.getLogger(__name__)
 
 
+# def recommended_ema_decay(n_train: int, batch_size: int, k: float = 1.0) -> float:
+#     """
+#     Calculate recommended EMA decay based on dataset size.
+
+#     Alpha is chosen so the EMA half-life equals k epochs,
+#     meaning weights from k epochs ago contribute k% to the current EMA.
+#     Formula: alpha = k ** (batch_size / (k * n_train))
+#     """
+#     # Guard against division by zero
+#     if n_train <= 0 or batch_size <= 0:
+#         return 0.9999
+#     return k ** (batch_size / (k * n_train))
+
+
+import math
+
+def recommended_ema_decay(n_train: int, batch_size: int, k: float) -> float:
+    """
+    Calculate EMA decay so that the 'center of mass' or smoothing
+    window aligns with k epochs.
+    """
+    if n_train <= 0 or batch_size <= 0:
+        return 0.9999
+
+    # 1. Calculate total steps per epoch
+    steps_per_epoch = n_train / batch_size
+
+    # 2. Total steps in the desired window (k epochs)
+    total_steps = steps_per_epoch * k
+
+    # 3. Standard EMA decay formula:
+    # Often expressed as alpha = (window - 1) / (window + 1)
+    # or alpha = exp(-1 / total_steps) for a precise half-life
+    decay = (total_steps - 1) / (total_steps + 1)
+
+    # Clip to a sensible range for TTS (usually between 0.99 and 0.9999)
+    return max(0.9, min(decay, 0.9999))
+
 def check_mps_mixed_precision_support():
     """Check if MPS supports mixed precision training"""
     if not torch.backends.mps.is_available():
@@ -411,13 +449,48 @@ class KokoroTrainer:
 
         # EMA (Exponential Moving Average) of model weights
         self.use_ema = getattr(config, 'use_ema', True)
-        self.ema_decay = getattr(config, 'ema_decay', 0.9999)
+        # Compute EMA decay if not provided in config
+        cfg_ema = getattr(config, 'ema_decay', None)
         self.ema_update_every = getattr(config, 'ema_update_every', 1)
+
+        if cfg_ema is None and self.use_ema:
+            # Use training dataset size and effective batch size (including grad accumulation)
+            try:
+                n_train = len(self.dataset)
+            except Exception:
+                n_train = 0
+
+            effective_batch = int(getattr(config, 'batch_size', 1) * getattr(config, 'gradient_accumulation_steps', 1))
+            k = float(getattr(config, 'ema_half_life_epochs', 1.0))
+            computed = recommended_ema_decay(n_train=n_train, batch_size=effective_batch, k=k)
+            self.ema_decay = computed
+            # Persist back to config for visibility
+            try:
+                config.ema_decay = computed
+            except Exception:
+                pass
+
+            # Record computed metadata for richer startup logging
+            self.ema_decay_source = 'computed'
+            self.ema_n_train = n_train
+            self.ema_effective_batch = effective_batch
+            self.ema_half_life_epochs = k
+
+            logger.info(f"Computed EMA decay: {self.ema_decay:.6f} (n_train={n_train}, eff_batch={effective_batch}, k={k})")
+        else:
+            self.ema_decay = float(cfg_ema) if cfg_ema is not None else 0.9999
+            self.ema_decay_source = 'config' if cfg_ema is not None else 'default'
+            self.ema_n_train = None
+            self.ema_effective_batch = None
+            self.ema_half_life_epochs = getattr(config, 'ema_half_life_epochs', 1.0)
         self.ema_updates = 0  # Track number of EMA updates
 
         if self.use_ema:
             # Initialize EMA model as a deep copy of the current model
             # This ensures all model parameters and configuration are correctly copied
+            # If model gets very large, this will become a problem
+            # One option is to move the model to CPU before copying and then back to device
+            # That adds some complexity and overhead
             self.ema_model = copy.deepcopy(self.model).to(self.device)
             self.ema_model.eval()  # EMA model is always in eval mode
 
@@ -425,7 +498,18 @@ class KokoroTrainer:
             for param in self.ema_model.parameters():
                 param.requires_grad = False
 
-            logger.info(f"EMA initialized: decay={self.ema_decay}, update_every={self.ema_update_every}")
+            # Detailed logging: show source of decay and relevant computed values
+            if getattr(self, 'ema_decay_source', None) == 'computed':
+                logger.info(
+                    f"EMA initialized: decay={self.ema_decay:.6f} (computed from n_train={self.ema_n_train}, "
+                    f"eff_batch={self.ema_effective_batch}, half_life_epochs={self.ema_half_life_epochs}), "
+                    f"update_every={self.ema_update_every}"
+                )
+            else:
+                logger.info(
+                    f"EMA initialized: decay={self.ema_decay:.6f} (source={self.ema_decay_source}), "
+                    f"half_life_epochs={self.ema_half_life_epochs}, update_every={self.ema_update_every}"
+                )
         else:
             self.ema_model = None
             logger.info("EMA disabled")

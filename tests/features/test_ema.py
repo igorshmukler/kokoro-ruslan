@@ -11,6 +11,9 @@ def test_ema_configuration():
 
     config = TrainingConfig()
 
+    # If config.ema_decay is None, fall back to a sensible default for these tests.
+    decay = config.ema_decay if config.ema_decay is not None else 0.9999
+
     print("="*70)
     print("EMA Configuration Test")
     print("="*70)
@@ -22,15 +25,15 @@ def test_ema_configuration():
     print(f"\n{'='*70}")
     print("EMA Decay Behavior:")
     print(f"{'='*70}")
-    print(f"Decay rate: {config.ema_decay}")
+    print(f"Decay rate: {config.ema_decay} (using {decay} for calculations)")
     print(f"At each update:")
-    print(f"  ema_weight = {config.ema_decay} × ema_weight + {1 - config.ema_decay} × current_weight")
-    print(f"  New weight contribution: {(1 - config.ema_decay) * 100:.2f}%")
-    print(f"  EMA history contribution: {config.ema_decay * 100:.2f}%")
+    print(f"  ema_weight = {decay} × ema_weight + {1 - decay} × current_weight")
+    print(f"  New weight contribution: {(1 - decay) * 100:.2f}%")
+    print(f"  EMA history contribution: {decay * 100:.2f}%")
 
     # Calculate effective averaging window
     # EMA decay of 0.9999 means ~10,000 step history
-    effective_window = 1 / (1 - config.ema_decay)
+    effective_window = 1 / (1 - decay)
     print(f"\nEffective averaging window: ~{effective_window:.0f} optimizer steps")
 
     # With gradient accumulation
@@ -87,7 +90,7 @@ def simulate_ema_updates():
     print("EMA Weight Update Simulation")
     print(f"{'='*70}\n")
 
-    decay = config.ema_decay
+    decay = config.ema_decay if config.ema_decay is not None else 0.9999
 
     # Simulate weight evolution
     current_weight = 1.0  # Example weight value

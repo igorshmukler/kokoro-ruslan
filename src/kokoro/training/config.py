@@ -35,7 +35,8 @@ class TrainingConfig:
 
     # EMA (Exponential Moving Average) of model weights
     use_ema: bool = True  # Enable EMA for better inference quality
-    ema_decay: float = 0.9999  # EMA decay rate (higher = slower update, more smoothing)
+    ema_decay: Optional[float] = None  # EMA decay rate; if None, trainer will compute a recommended value
+    ema_half_life_epochs: float = 1.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
     ema_update_every: int = 1  # Update EMA every N optimizer steps (1 = every step)
 
     # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
