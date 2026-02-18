@@ -17,6 +17,7 @@ import numpy as np
 from tqdm import tqdm
 import pickle
 import os
+import time
 
 from kokoro.training.config import TrainingConfig
 from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
@@ -57,6 +58,11 @@ class RuslanDataset(Dataset):
         self.feature_cache_max_entries = int(getattr(config, 'feature_cache_max_entries', 30000))
         self.feature_cache_max_mb = float(getattr(config, 'feature_cache_max_mb', 8192.0))
         self.feature_cache_max_bytes = int(max(0.0, self.feature_cache_max_mb) * 1024 * 1024)
+        # Latency profiling (ns)
+        self.feature_cache_mem_latency_ns = 0
+        self.feature_cache_mem_latency_count = 0
+        self.feature_cache_disk_latency_ns = 0
+        self.feature_cache_disk_latency_count = 0
         self.verbose_cache_logging = bool(getattr(config, 'verbose', False))
         self.feature_cache_log_interval = int(getattr(config, 'feature_cache_log_interval', 500))
         self.feature_cache_requests = 0
@@ -402,10 +408,13 @@ class RuslanDataset(Dataset):
         total_hits = self.feature_cache_mem_hits + self.feature_cache_disk_hits
         hit_rate = (total_hits / self.feature_cache_requests) * 100.0
         in_mem_mb = self.feature_cache_total_bytes / (1024 * 1024)
+        # Compute average latencies in ms for logging
+        mem_latency_ms = (self.feature_cache_mem_latency_ns / self.feature_cache_mem_latency_count / 1e6) if self.feature_cache_mem_latency_count > 0 else 0.0
+        disk_latency_ms = (self.feature_cache_disk_latency_ns / self.feature_cache_disk_latency_count / 1e6) if self.feature_cache_disk_latency_count > 0 else 0.0
 
         logger.info(
             "Feature cache stats: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% "
-            "in_mem_entries=%d in_mem_size=%.1fMB",
+            "in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%.3f disk_lat_ms=%.3f",
             self.feature_cache_requests,
             total_hits,
             self.feature_cache_mem_hits,
@@ -414,6 +423,8 @@ class RuslanDataset(Dataset):
             hit_rate,
             len(self.feature_cache),
             in_mem_mb,
+            mem_latency_ms,
+            disk_latency_ms,
         )
 
     def get_feature_cache_stats(self) -> Dict[str, float]:
@@ -422,6 +433,8 @@ class RuslanDataset(Dataset):
         requests = self.feature_cache_requests
         hit_rate = (total_hits / requests) * 100.0 if requests > 0 else 0.0
         in_mem_mb = self.feature_cache_total_bytes / (1024 * 1024)
+        mem_latency_ms = (self.feature_cache_mem_latency_ns / self.feature_cache_mem_latency_count / 1e6) if self.feature_cache_mem_latency_count > 0 else 0.0
+        disk_latency_ms = (self.feature_cache_disk_latency_ns / self.feature_cache_disk_latency_count / 1e6) if self.feature_cache_disk_latency_count > 0 else 0.0
 
         return {
             'enabled': bool(self.use_feature_cache),
@@ -433,6 +446,13 @@ class RuslanDataset(Dataset):
             'hit_rate': float(hit_rate),
             'in_mem_entries': int(len(self.feature_cache)),
             'in_mem_mb': float(in_mem_mb),
+            'mem_latency_ms_avg': float(mem_latency_ms),
+            'disk_latency_ms_avg': float(disk_latency_ms),
+            # Expose raw cumulative counters so callers can compute epoch deltas
+            'mem_latency_ns_total': int(self.feature_cache_mem_latency_ns),
+            'mem_latency_count': int(self.feature_cache_mem_latency_count),
+            'disk_latency_ns_total': int(self.feature_cache_disk_latency_ns),
+            'disk_latency_count': int(self.feature_cache_disk_latency_count),
         }
 
     def _load_cached_features(self, audio_file: str) -> Optional[Dict]:
@@ -442,10 +462,14 @@ class RuslanDataset(Dataset):
 
         # Check in-memory cache first
         if audio_file in self.feature_cache:
+            start_ns = time.monotonic_ns()
             cached = self.feature_cache.pop(audio_file)
             self.feature_cache[audio_file] = cached
             payload = cached['features']
             self.feature_cache.move_to_end(audio_file)
+            elapsed = time.monotonic_ns() - start_ns
+            self.feature_cache_mem_latency_ns += elapsed
+            self.feature_cache_mem_latency_count += 1
             if payload.get('_cache_version') == FEATURE_CACHE_VERSION:
                 self.feature_cache_mem_hits += 1
                 return payload
@@ -456,7 +480,11 @@ class RuslanDataset(Dataset):
         cache_path = self._get_feature_cache_path(audio_file)
         if cache_path.exists():
             try:
+                start_ns = time.monotonic_ns()
                 features = torch.load(cache_path, weights_only=False)
+                elapsed = time.monotonic_ns() - start_ns
+                self.feature_cache_disk_latency_ns += elapsed
+                self.feature_cache_disk_latency_count += 1
                 if features.get('_cache_version') != FEATURE_CACHE_VERSION:
                     return None
                 # Store in memory cache for faster subsequent access
