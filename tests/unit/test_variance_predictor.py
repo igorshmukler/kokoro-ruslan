@@ -1,0 +1,103 @@
+import torch
+from kokoro.model.variance_predictor import VarianceAdaptor
+
+
+def test_hz_to_normalized_and_back():
+    adaptor = VarianceAdaptor(n_bins=5, pitch_min=50.0, pitch_max=800.0)
+
+    # Normalized sample values and corresponding Hz values
+    norm = torch.tensor([0.0, 0.2, 0.5, 1.0])
+    hz = norm * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
+
+    # Using internal helper to convert Hz -> normalized
+    norm_from_hz = adaptor._hz_to_normalized(hz)
+
+    assert torch.allclose(norm, norm_from_hz, atol=1e-6)
+
+
+def test_maybe_normalize_and_quantize_consistency():
+    adaptor = VarianceAdaptor(n_bins=5, pitch_min=50.0, pitch_max=800.0)
+
+    # Create some normalized values spanning the range
+    norm_vals = torch.tensor([0.0, 0.2, 0.5, 0.9])
+    hz_vals = norm_vals * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
+
+    # Quantize normalized directly
+    q_norm = adaptor.quantize_pitch(norm_vals)
+
+    # Quantize after converting from Hz using the helper
+    q_hz_manual = adaptor.quantize_pitch(adaptor._hz_to_normalized(hz_vals))
+
+    # Using the heuristic normalizer should yield the same result
+    q_hz_maybe = adaptor.quantize_pitch(adaptor._maybe_normalize_pitch(hz_vals))
+
+    assert torch.equal(q_norm, q_hz_manual)
+    assert torch.equal(q_norm, q_hz_maybe)
+
+
+def test_forward_accepts_hz_targets():
+    adaptor = VarianceAdaptor(n_bins=8, pitch_min=50.0, pitch_max=800.0)
+
+    batch = 2
+    seq_len = 6
+    hidden = adaptor.hidden_dim
+
+    encoder_output = torch.randn(batch, seq_len, hidden)
+
+    # Create pitch targets in Hz and normalized - forward should accept either
+    base_norm = torch.linspace(0.1, 0.9, steps=seq_len)
+    hz_targets = base_norm * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
+    pitch_target_hz = hz_targets.unsqueeze(0).repeat(batch, 1)
+
+    adapted, dur_pred, pitch_pred, energy_pred = adaptor(
+        encoder_output, None, pitch_target=pitch_target_hz, energy_target=None, duration_target=None
+    )
+
+    assert adapted.shape == encoder_output.shape
+    assert dur_pred.shape == (batch, seq_len)
+    assert pitch_pred.shape == (batch, seq_len)
+    assert energy_pred.shape == (batch, seq_len)
+
+
+def test_energy_normalization_and_quantize():
+    adaptor = VarianceAdaptor(n_bins=6, pitch_min=50.0, pitch_max=800.0, energy_min=0.0, energy_max=100.0)
+
+    # Create normalized energy and corresponding 'raw' energy values
+    norm = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0])
+    hz = norm * (adaptor.energy_max - adaptor.energy_min) + adaptor.energy_min
+
+    q_norm = adaptor.quantize_energy(norm)
+    q_from_hz = adaptor.quantize_energy(adaptor._energy_to_normalized(hz))
+
+    assert torch.equal(q_norm, q_from_hz)
+
+
+def test_mask_zeroing_embeddings():
+    adaptor = VarianceAdaptor(n_bins=8, pitch_min=50.0, pitch_max=800.0, energy_min=0.0, energy_max=100.0)
+
+    batch = 2
+    seq_len = 5
+    hidden = adaptor.hidden_dim
+
+    # Use zero encoder so adapted - encoder == embeddings
+    encoder_output = torch.zeros(batch, seq_len, hidden)
+
+    # pitch and energy targets in Hz
+    base_norm = torch.linspace(0.1, 0.9, steps=seq_len)
+    pitch_hz = base_norm * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
+    energy_raw = base_norm * (adaptor.energy_max - adaptor.energy_min) + adaptor.energy_min
+
+    pitch_target = pitch_hz.unsqueeze(0).repeat(batch, 1)
+    energy_target = energy_raw.unsqueeze(0).repeat(batch, 1)
+
+    # mask: mark the last position as padding
+    mask = torch.zeros(batch, seq_len).bool()
+    mask[:, -1] = True
+
+    adapted, *_ = adaptor(encoder_output, mask, pitch_target=pitch_target, energy_target=energy_target)
+
+    delta = adapted - encoder_output
+    # For masked positions, delta must be zero
+    assert torch.allclose(delta[mask], torch.zeros_like(delta[mask]))
+    # For unmasked positions, expect non-zero embeddings
+    assert torch.any(delta[~mask])

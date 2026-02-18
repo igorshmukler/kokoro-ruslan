@@ -378,61 +378,98 @@ class PitchExtractor:
         Returns:
             Pitch contour (batch, frames) or (frames,)
         """
+        # Robust, dependency-free F0 estimator using frame-wise autocorrelation (FFT-based)
+        # Returns normalized pitch in [0,1] using provided fmin/fmax bounds.
         try:
-            import torchaudio
-
-            # Ensure 2D
+            # Ensure 2D: (batch, samples)
             if waveform.dim() == 1:
                 waveform = waveform.unsqueeze(0)
                 squeeze_output = True
             else:
                 squeeze_output = False
 
-            # Use torchaudio's pitch detection
-            pitch_transform = torchaudio.transforms.PitchShift(
-                sample_rate=sample_rate,
-                n_steps=0  # No shift, just extract pitch
-            )
+            device = waveform.device
+            dtype = waveform.dtype
 
-            # Alternative: Use spectral centroid as proxy for pitch
-            # This is more stable but less accurate
-            n_fft = 2048
-            spectrogram = torch.stft(
-                waveform,
-                n_fft=n_fft,
-                hop_length=hop_length,
-                win_length=n_fft,
-                window=torch.hann_window(n_fft, device=waveform.device),
-                return_complex=True
-            )
+            # Parameters
+            win_length = int(2048)
+            hop = int(hop_length)
 
-            magnitude = torch.abs(spectrogram)
+            # Pad signal so that we have at least one full frame
+            if waveform.size(1) < win_length:
+                pad_len = win_length - waveform.size(1)
+                waveform = torch.nn.functional.pad(waveform, (0, pad_len))
 
-            # Calculate spectral centroid as pitch proxy
-            freqs = torch.linspace(0, sample_rate / 2, n_fft // 2 + 1, device=waveform.device)
-            freqs = freqs.unsqueeze(0).unsqueeze(-1)  # (1, freq_bins, 1)
+            # Framing: (batch, n_frames, win_length)
+            frames = waveform.unfold(1, win_length, hop).contiguous()
+            batch_size, n_frames, _ = frames.shape
 
-            # Weighted average frequency
-            pitch = torch.sum(magnitude * freqs, dim=1) / (torch.sum(magnitude, dim=1) + 1e-8)
+            # Windowing
+            window = torch.hann_window(win_length, device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)
+            frames = frames * window
 
-            # Normalize to [0, 1] range immediately (critical for stable training)
-            # Spectral centroid can be 0 to sample_rate/2, normalize to expected vocal range
-            pitch = torch.clamp(pitch, fmin, fmax)
-            pitch = (pitch - fmin) / (fmax - fmin + 1e-8)
-            pitch = torch.clamp(pitch, 0.0, 1.0)
+            # FFT size (use 2*win_length for proper autocorrelation length)
+            nfft = win_length * 2
 
+            # Compute autocorrelation via Wiener-Khinchin: irfft(|rfft(x)|^2)
+            spec = torch.fft.rfft(frames, n=nfft)
+            power = (spec.abs() ** 2)
+            acf = torch.fft.irfft(power, n=nfft)
+
+            # Keep positive lags up to win_length
+            acf = acf[..., :win_length]
+
+            # Normalize ACF by zero-lag to get comparable peaks
+            zero_lag = acf[..., 0:1].clamp(min=1e-8)
+            acf_norm = acf / zero_lag
+
+            # Determine search lag range corresponding to fmin..fmax
+            lag_min = max(2, int(sample_rate / fmax))
+            lag_max = min(win_length - 1, max(lag_min + 1, int(sample_rate / fmin)))
+
+            lags = torch.arange(lag_min, lag_max + 1, device=device)
+
+            # Gather ACF values at candidate lags: shape (B, n_frames, n_lags)
+            ac_lags = acf_norm[..., lags]
+
+            # Confidence: max ACF peak in the search region
+            ac_max_vals, _ = ac_lags.max(dim=-1)
+
+            # Energy per frame to suppress unvoiced frames
+            frame_energy = frames.pow(2).mean(dim=-1)
+            energy_thresh = torch.clamp(frame_energy.mean(dim=-1, keepdim=True) * 0.1, min=1e-9)
+
+            # Best lag index within candidate lags
+            best_idx = torch.argmax(ac_lags, dim=-1)  # (B, n_frames)
+
+            # Map best indices to actual lag values
+            lag_values = lags.unsqueeze(0).unsqueeze(0).expand(batch_size, n_frames, -1)
+            best_lags = torch.gather(lag_values, -1, best_idx.unsqueeze(-1)).squeeze(-1).float()
+
+            # Convert lag to frequency
+            freqs = sample_rate / best_lags
+
+            # Mask unvoiced frames (low ACF peak or low energy)
+            unvoiced = (ac_max_vals < 0.1) | (frame_energy < energy_thresh)
+            freqs = freqs.masked_fill(unvoiced, 0.0)
+
+            # Normalize to [0,1] using fmin/fmax
+            freqs_norm = torch.clamp((freqs - fmin) / (fmax - fmin + 1e-8), min=0.0, max=1.0)
+
+            # Return shape compatibility
             if squeeze_output:
-                pitch = pitch.squeeze(0)
-
-            return pitch
+                return freqs_norm.squeeze(0)
+            return freqs_norm
 
         except Exception as e:
             logger.warning(f"Pitch extraction failed: {e}, using zeros")
-            # Fallback: return zeros
+            # Fallback: return zeros with conservative shape
             if waveform.dim() == 1:
-                return torch.zeros(waveform.shape[0] // hop_length, device=waveform.device)
+                n_frames = max(1, waveform.shape[0] // hop_length)
+                return torch.zeros(n_frames, device=waveform.device)
             else:
-                return torch.zeros(waveform.shape[0], waveform.shape[1] // hop_length, device=waveform.device)
+                n_frames = max(1, waveform.shape[1] // hop_length)
+                return torch.zeros(waveform.shape[0], n_frames, device=waveform.device)
 
 
 class EnergyExtractor:

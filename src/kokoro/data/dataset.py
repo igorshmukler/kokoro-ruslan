@@ -412,9 +412,12 @@ class RuslanDataset(Dataset):
         mem_latency_ms = (self.feature_cache_mem_latency_ns / self.feature_cache_mem_latency_count / 1e6) if self.feature_cache_mem_latency_count > 0 else 0.0
         disk_latency_ms = (self.feature_cache_disk_latency_ns / self.feature_cache_disk_latency_count / 1e6) if self.feature_cache_disk_latency_count > 0 else 0.0
 
+        mem_lat_display = "N/A" if self.feature_cache_mem_hits == 0 or mem_latency_ms == 0.0 else f"{mem_latency_ms:.3f}"
+        disk_lat_display = "N/A" if self.feature_cache_disk_hits == 0 or disk_latency_ms == 0.0 else f"{disk_latency_ms:.3f}"
+
         logger.info(
             "Feature cache stats: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% "
-            "in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%.3f disk_lat_ms=%.3f",
+            "in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%s disk_lat_ms=%s",
             self.feature_cache_requests,
             total_hits,
             self.feature_cache_mem_hits,
@@ -423,8 +426,8 @@ class RuslanDataset(Dataset):
             hit_rate,
             len(self.feature_cache),
             in_mem_mb,
-            mem_latency_ms,
-            disk_latency_ms,
+            mem_lat_display,
+            disk_lat_display,
         )
 
     def get_feature_cache_stats(self) -> Dict[str, float]:

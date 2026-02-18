@@ -2351,8 +2351,12 @@ class KokoroTrainer:
             mem_epoch_ms = 0.0
             disk_epoch_ms = 0.0
 
+        # Show 'N/A' for mem/disk latency when there were no in-memory/disk hits
+        mem_lat_display = "N/A" if mem_count_delta == 0 or mem_hits == 0 else f"{mem_epoch_ms:.3f}"
+        disk_lat_display = "N/A" if disk_count_delta == 0 or disk_hits == 0 else f"{disk_epoch_ms:.3f}"
+
         logger.info(
-            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% mem_lat_ms=%.3f disk_lat_ms=%.3f",
+            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% mem_lat_ms=%s disk_lat_ms=%s",
             epoch + 1,
             split_name,
             requests,
@@ -2361,8 +2365,8 @@ class KokoroTrainer:
             disk_hits,
             misses,
             hit_rate,
-            mem_epoch_ms,
-            disk_epoch_ms,
+            mem_lat_display,
+            disk_lat_display,
         )
 
     def train(self):
@@ -2548,8 +2552,16 @@ class KokoroTrainer:
                 logger.info("=" * 60)
                 cache_logged = True
 
+            # Display 'N/A' for mem latency when there are no in-memory entries/hits
+            mem_hits = int(stats.get('mem_hits', 0))
+            mem_latency = stats.get('mem_latency_ms_avg', 0.0)
+            mem_lat_display = "N/A" if mem_hits == 0 or mem_latency == 0.0 else f"{mem_latency:.3f}"
+            disk_hits = int(stats.get('disk_hits', 0))
+            disk_latency = stats.get('disk_latency_ms_avg', 0.0)
+            disk_lat_display = "N/A" if disk_hits == 0 or disk_latency == 0.0 else f"{disk_latency:.3f}"
+
             logger.info(
-                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%.3f disk_lat_ms=%.3f",
+                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%s disk_lat_ms=%s",
                 split_name,
                 stats['requests'],
                 stats['hits'],
@@ -2559,8 +2571,8 @@ class KokoroTrainer:
                 stats['hit_rate'],
                 stats['in_mem_entries'],
                 stats['in_mem_mb'],
-                stats.get('mem_latency_ms_avg', 0.0),
-                stats.get('disk_latency_ms_avg', 0.0),
+                mem_lat_display,
+                disk_lat_display,
             )
 
         if cache_logged:
