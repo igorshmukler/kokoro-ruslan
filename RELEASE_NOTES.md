@@ -2,6 +2,13 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.12 (2026-02-18)
+- Fixed pitch and energy normalization bugs
+
+## 0.0.11 (2026-02-18)
+- Improved feature cache (more work needed)
+- Added auto EMA decay calculation
+
 ## 0.0.10 (2026-02-17)
 - Make DataLoader workers configurable via `TrainingConfig.num_workers` and wire `prefetch_factor`/`persistent_workers` appropriately.
 - Auto-tune inference controls per-checkpoint (`stop_threshold`, `min_len_ratio`, `max_len`, `min_len_floor`) from `model_metadata.inference_controls` with safe bounds and explicit-override behavior.

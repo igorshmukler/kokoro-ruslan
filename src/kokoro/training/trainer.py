@@ -1320,11 +1320,14 @@ class KokoroTrainer:
                 logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
         self.dataset.phoneme_processor = phoneme_processor
-        logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
+        # Ensure variance predictors are reset to match any preprocessing/normalization
+        # metadata loaded with the checkpoint (defensive, avoids divergence).
+        try:
+            self._reset_variance_predictors()
+        except Exception:
+            logger.debug("_reset_variance_predictors raised during checkpoint resumption; continuing")
 
-        # CRITICAL: Reset variance predictors after loading checkpoint
-        # Must happen AFTER checkpoint load to override old weights
-        self._reset_variance_predictors()
+        logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
     def validate_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """

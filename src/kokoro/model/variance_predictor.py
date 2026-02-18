@@ -165,6 +165,11 @@ class VarianceAdaptor(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.n_bins = n_bins
+        # Store pitch and energy ranges for normalization helpers
+        self.pitch_min = pitch_min
+        self.pitch_max = pitch_max
+        self.energy_min = energy_min
+        self.energy_max = energy_max
 
         # Duration predictor (already exists in model, but we can add here for completeness)
         self.duration_predictor = VariancePredictor(
@@ -181,16 +186,19 @@ class VarianceAdaptor(nn.Module):
             hidden_dim, filter_size, kernel_size, dropout, num_layers=2
         )
 
-        # Pitch quantization bins
+        # Pitch quantization bins (normalized 0..1)
+        # The pitch extractor and any inputs to quantize_pitch must provide
+        # pitch values normalized into the [0, 1] range.
         self.register_buffer(
             'pitch_bins',
-            torch.linspace(pitch_min, pitch_max, n_bins - 1)
+            torch.linspace(0.0, 1.0, n_bins - 1)
         )
 
-        # Energy quantization bins
+        # Energy quantization bins (normalized 0..1)
+        # Energy inputs should be normalized to [0,1] before quantization.
         self.register_buffer(
             'energy_bins',
-            torch.linspace(energy_min, energy_max, n_bins - 1)
+            torch.linspace(0.0, 1.0, n_bins - 1)
         )
 
         # Pitch embedding
@@ -203,10 +211,15 @@ class VarianceAdaptor(nn.Module):
 
     def quantize_pitch(self, pitch: torch.Tensor) -> torch.Tensor:
         """
-        Quantize continuous pitch values to bins
+        Quantize normalized pitch values to bin indices.
+
+        Notes:
+        - Expects `pitch` to be normalized to the [0, 1] range (matching
+          `self.pitch_bins`). If your extractor returns Hz, convert to
+          normalized form before calling this method.
 
         Args:
-            pitch: Continuous pitch values (batch, seq_len)
+            pitch: Normalized pitch values in [0, 1] (batch, seq_len)
 
         Returns:
             Quantized pitch indices (batch, seq_len)
@@ -214,6 +227,39 @@ class VarianceAdaptor(nn.Module):
         # Use torch.bucketize for efficient quantization
         pitch_quantized = torch.bucketize(pitch, self.pitch_bins)
         return pitch_quantized.long()
+
+    def _hz_to_normalized(self, f0: torch.Tensor) -> torch.Tensor:
+        """
+        Convert Hz-valued F0 to normalized [0, 1] using adaptor pitch_min/pitch_max.
+
+        Args:
+            f0: Tensor of frequencies in Hz
+
+        Returns:
+            Tensor of normalized values in [0,1]
+        """
+        return torch.clamp((f0 - self.pitch_min) / (self.pitch_max - self.pitch_min + 1e-8), 0.0, 1.0)
+
+    def _maybe_normalize_pitch(self, pitch: torch.Tensor, device: Optional[torch.device] = None) -> torch.Tensor:
+        """
+        Heuristic: if `pitch` appears to be in Hz (values outside [0,1]),
+        convert to normalized [0,1]. Otherwise, assume already normalized.
+        """
+        if pitch is None:
+            return pitch
+
+        # Work on a tensor copy to avoid in-place surprises
+        if not torch.is_tensor(pitch):
+            pitch = torch.tensor(pitch)
+
+        if device is not None:
+            pitch = pitch.to(device)
+
+        # If any value outside [0,1], treat as Hz and convert
+        if pitch.numel() > 0 and (torch.max(pitch) > 1.0 or torch.min(pitch) < 0.0):
+            return self._hz_to_normalized(pitch)
+
+        return pitch
 
     def quantize_energy(self, energy: torch.Tensor) -> torch.Tensor:
         """
@@ -228,6 +274,30 @@ class VarianceAdaptor(nn.Module):
         # Use torch.bucketize for efficient quantization
         energy_quantized = torch.bucketize(energy, self.energy_bins)
         return energy_quantized.long()
+
+    def _energy_to_normalized(self, energy: torch.Tensor) -> torch.Tensor:
+        """
+        Convert energy to normalized [0, 1] using adaptor energy_min/energy_max.
+        """
+        return torch.clamp((energy - self.energy_min) / (self.energy_max - self.energy_min + 1e-8), 0.0, 1.0)
+
+    def _maybe_normalize_energy(self, energy: torch.Tensor, device: Optional[torch.device] = None) -> torch.Tensor:
+        """
+        Heuristic: if `energy` appears to be outside [0,1], convert to normalized.
+        """
+        if energy is None:
+            return energy
+
+        if not torch.is_tensor(energy):
+            energy = torch.tensor(energy)
+
+        if device is not None:
+            energy = energy.to(device)
+
+        if energy.numel() > 0 and (torch.max(energy) > 1.0 or torch.min(energy) < 0.0):
+            return self._energy_to_normalized(energy)
+
+        return energy
 
     def forward(self,
                 encoder_output: torch.Tensor,
@@ -257,14 +327,25 @@ class VarianceAdaptor(nn.Module):
         # Predict energy
         energy_pred = self.energy_predictor(encoder_output, mask)
 
-        # Use provided targets whenever available for teacher-forced alignment.
+        # Normalize targets/predictions to [0,1] before quantization.
         # Inference naturally falls back to predictions when targets are None.
-        pitch_quantized = self.quantize_pitch(pitch_target) if pitch_target is not None else self.quantize_pitch(pitch_pred)
-        energy_quantized = self.quantize_energy(energy_target) if energy_target is not None else self.quantize_energy(energy_pred)
+        pitch_to_quantize = pitch_target if pitch_target is not None else pitch_pred
+        pitch_to_quantize = self._maybe_normalize_pitch(pitch_to_quantize, device=encoder_output.device)
+        pitch_quantized = self.quantize_pitch(pitch_to_quantize)
+
+        energy_to_quantize = energy_target if energy_target is not None else energy_pred
+        energy_to_quantize = self._maybe_normalize_energy(energy_to_quantize, device=encoder_output.device)
+        energy_quantized = self.quantize_energy(energy_to_quantize)
 
         # Get embeddings
         pitch_embed = self.pitch_embedding(pitch_quantized)
         energy_embed = self.energy_embedding(energy_quantized)
+
+        # Zero out embeddings at padded positions to avoid leakage
+        if mask is not None:
+            mask_unsq = mask.unsqueeze(-1)
+            pitch_embed = pitch_embed.masked_fill(mask_unsq, 0.0)
+            energy_embed = energy_embed.masked_fill(mask_unsq, 0.0)
 
         # Add variance embeddings to encoder output
         adapted_output = encoder_output + pitch_embed + energy_embed
