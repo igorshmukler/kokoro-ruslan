@@ -35,6 +35,8 @@ from kokoro.training.mps_grad_scaler import MPSGradScaler
 
 from kokoro.utils.adaptive_memory_manager import AdaptiveMemoryManager
 
+import math
+
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +53,6 @@ logger = logging.getLogger(__name__)
 #     if n_train <= 0 or batch_size <= 0:
 #         return 0.9999
 #     return k ** (batch_size / (k * n_train))
-
-
-import math
 
 def recommended_ema_decay(n_train: int, batch_size: int, k: float) -> float:
     """
