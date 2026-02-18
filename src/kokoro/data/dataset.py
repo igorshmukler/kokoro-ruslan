@@ -48,11 +48,14 @@ class RuslanDataset(Dataset):
         # Pre-computed feature caching
         self.use_feature_cache = getattr(config, 'use_feature_cache', True)
         self.feature_cache_dir = Path(getattr(config, 'feature_cache_dir', self.data_dir / '.feature_cache'))
+
+        # XXX - FIXME:
+        # LRU is a bad choice here. For now, just increased the size, so it does not need to evict.
         # In-memory bounded LRU cache for this dataset instance
         self.feature_cache = OrderedDict()
         self.feature_cache_total_bytes = 0
-        self.feature_cache_max_entries = int(getattr(config, 'feature_cache_max_entries', 1024))
-        self.feature_cache_max_mb = float(getattr(config, 'feature_cache_max_mb', 512.0))
+        self.feature_cache_max_entries = int(getattr(config, 'feature_cache_max_entries', 30000))
+        self.feature_cache_max_mb = float(getattr(config, 'feature_cache_max_mb', 8192.0))
         self.feature_cache_max_bytes = int(max(0.0, self.feature_cache_max_mb) * 1024 * 1024)
         self.verbose_cache_logging = bool(getattr(config, 'verbose', False))
         self.feature_cache_log_interval = int(getattr(config, 'feature_cache_log_interval', 500))

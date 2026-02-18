@@ -6,6 +6,11 @@ venv
 ruslan_corpus/
 data/processed_data
 output.wav
+/vocoder_models/**/checkpoints/
+*.pt
+*.ckpt
+*.h5
+*.onnx
 
 # MFA output files
 mfa_output/
@@ -23,6 +28,8 @@ models/checkpoints/*
 !models/checkpoints/.gitkeep
 models/vocoder/*
 !models/vocoder/.gitkeep
+*.pkl
+*.pth
 
 # Logs
 logs/training/*
