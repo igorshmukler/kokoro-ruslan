@@ -413,6 +413,25 @@ class RuslanDataset(Dataset):
             in_mem_mb,
         )
 
+    def get_feature_cache_stats(self) -> Dict[str, float]:
+        """Return current feature-cache counters and derived hit rate."""
+        total_hits = self.feature_cache_mem_hits + self.feature_cache_disk_hits
+        requests = self.feature_cache_requests
+        hit_rate = (total_hits / requests) * 100.0 if requests > 0 else 0.0
+        in_mem_mb = self.feature_cache_total_bytes / (1024 * 1024)
+
+        return {
+            'enabled': bool(self.use_feature_cache),
+            'requests': int(requests),
+            'hits': int(total_hits),
+            'mem_hits': int(self.feature_cache_mem_hits),
+            'disk_hits': int(self.feature_cache_disk_hits),
+            'misses': int(self.feature_cache_misses),
+            'hit_rate': float(hit_rate),
+            'in_mem_entries': int(len(self.feature_cache)),
+            'in_mem_mb': float(in_mem_mb),
+        }
+
     def _load_cached_features(self, audio_file: str) -> Optional[Dict]:
         """Load pre-computed features from cache"""
         if not self.use_feature_cache:

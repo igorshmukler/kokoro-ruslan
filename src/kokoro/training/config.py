@@ -89,7 +89,7 @@ class TrainingConfig:
     f_max: float = 8000.0
 
     # Data loading
-    num_workers: int = 2
+    num_workers: int = 0
     pin_memory: bool = False
 
     # Feature caching for faster training

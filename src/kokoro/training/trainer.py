@@ -191,14 +191,18 @@ class KokoroTrainer:
                 shuffle=True
             )
 
+        num_workers = max(0, int(getattr(config, 'num_workers', 0)))
+        prefetch_factor = 2 if num_workers > 0 else None
+        persistent_workers = num_workers > 0
+
         self.dataloader = DataLoader(
             self.dataset,
             batch_sampler=self.batch_sampler,
             collate_fn=collate_fn,
-            num_workers=0,  # Avoid multiprocessing issues with audio loading
+            num_workers=num_workers,
             pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-            prefetch_factor=None,  # Not used with num_workers=0
-            persistent_workers=False  # Not used with num_workers=0
+            prefetch_factor=prefetch_factor,
+            persistent_workers=persistent_workers
         )
 
         # Initialize validation dataloader if validation set exists
@@ -229,10 +233,10 @@ class KokoroTrainer:
                 self.val_dataset,
                 batch_sampler=val_batch_sampler,
                 collate_fn=collate_fn,
-                num_workers=0,  # Avoid multiprocessing issues with audio loading
+                num_workers=num_workers,
                 pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-                prefetch_factor=None,  # Not used with num_workers=0
-                persistent_workers=False  # Not used with num_workers=0
+                prefetch_factor=prefetch_factor,
+                persistent_workers=persistent_workers
             )
         else:
             self.val_dataloader = None
@@ -2147,6 +2151,52 @@ class KokoroTrainer:
                 dur_loss_epoch / num_batches,
                 stop_loss_epoch / num_batches)
 
+    def _snapshot_cache_stats(self, dataset) -> Optional[Dict[str, float]]:
+        """Safely snapshot dataset feature-cache stats for epoch delta reporting."""
+        if dataset is None or not hasattr(dataset, 'get_feature_cache_stats'):
+            return None
+
+        try:
+            stats = dataset.get_feature_cache_stats()
+        except Exception as e:
+            logger.debug(f"Could not snapshot feature cache stats: {e}")
+            return None
+
+        if not stats.get('enabled', False):
+            return None
+        return stats
+
+    def _log_epoch_cache_delta(self, epoch: int, split_name: str, dataset, start_stats: Optional[Dict[str, float]]):
+        """Log feature-cache counters for one epoch/split."""
+        if start_stats is None:
+            return
+
+        end_stats = self._snapshot_cache_stats(dataset)
+        if end_stats is None:
+            return
+
+        requests = max(0, int(end_stats['requests'] - start_stats['requests']))
+        mem_hits = max(0, int(end_stats['mem_hits'] - start_stats['mem_hits']))
+        disk_hits = max(0, int(end_stats['disk_hits'] - start_stats['disk_hits']))
+        hits = mem_hits + disk_hits
+        misses = max(0, int(end_stats['misses'] - start_stats['misses']))
+
+        if requests <= 0:
+            return
+
+        hit_rate = (hits / requests) * 100.0
+        logger.info(
+            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%%",
+            epoch + 1,
+            split_name,
+            requests,
+            hits,
+            mem_hits,
+            disk_hits,
+            misses,
+            hit_rate,
+        )
+
     def train(self):
         """Main training function with mixed precision support and adaptive memory management"""
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -2197,6 +2247,7 @@ class KokoroTrainer:
 
         for epoch in range(self.start_epoch, self.config.num_epochs):
             epoch_start_time = time.time()
+            train_cache_start = self._snapshot_cache_stats(self.dataset)
             if self.enable_adaptive_memory:
                 epoch_cleanup_count_start = self.memory_manager.cleanup_count
                 epoch_cleanup_time_start = self.memory_manager.total_cleanup_time
@@ -2215,11 +2266,14 @@ class KokoroTrainer:
                         f"Avg Dur Loss: {avg_dur_loss:.4f}, "
                         f"Avg Stop Loss: {avg_stop_loss:.4f}, "
                         f"Current LR: {current_lr:.8f}")
+            self._log_epoch_cache_delta(epoch, "train", self.dataset, train_cache_start)
 
             # Run validation if enabled
             validation_interval = getattr(self.config, 'validation_interval', 1)
             if self.val_dataloader is not None and (epoch + 1) % validation_interval == 0:
+                val_cache_start = self._snapshot_cache_stats(self.val_dataset)
                 val_total_loss, val_mel_loss, val_dur_loss, val_stop_loss = self.validate_epoch(epoch)
+                self._log_epoch_cache_delta(epoch, "val", self.val_dataset, val_cache_start)
                 self.validation_losses.append(val_total_loss)
 
                 # Check for improvement
@@ -2308,6 +2362,39 @@ class KokoroTrainer:
                     logger.info("✓ No significant overfitting detected")
 
             logger.info("="*60 + "\n")
+
+        # Print cumulative feature cache summary (if enabled)
+        cache_splits = [
+            ("train", self.dataset),
+            ("val", self.val_dataset),
+        ]
+        cache_logged = False
+        for split_name, dataset in cache_splits:
+            stats = self._snapshot_cache_stats(dataset)
+            if stats is None:
+                continue
+
+            if not cache_logged:
+                logger.info("=" * 60)
+                logger.info("FEATURE CACHE SUMMARY")
+                logger.info("=" * 60)
+                cache_logged = True
+
+            logger.info(
+                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB",
+                split_name,
+                stats['requests'],
+                stats['hits'],
+                stats['mem_hits'],
+                stats['disk_hits'],
+                stats['misses'],
+                stats['hit_rate'],
+                stats['in_mem_entries'],
+                stats['in_mem_mb'],
+            )
+
+        if cache_logged:
+            logger.info("=" * 60)
 
         # Print final mixed precision statistics
         if self.use_mixed_precision:
