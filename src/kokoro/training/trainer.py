@@ -28,7 +28,7 @@ from kokoro.data.dataset import RuslanDataset, collate_fn, LengthBasedBatchSampl
 from kokoro.model.model import KokoroModel
 from kokoro.training.checkpoint_manager import (
     save_phoneme_processor, load_checkpoint, find_latest_checkpoint,
-    save_checkpoint, save_final_model
+    save_checkpoint, save_final_model, build_model_metadata
 )
 from kokoro.utils.interbatch_profiler import InterbatchProfiler
 from kokoro.training.mps_grad_scaler import MPSGradScaler
@@ -1364,6 +1364,7 @@ class KokoroTrainer:
 
     def save_checkpoint_with_scaler(self, epoch: int, loss: float):
         """Save checkpoint including scaler state and EMA weights"""
+        model_metadata = build_model_metadata(self.config, self.model)
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -1373,6 +1374,7 @@ class KokoroTrainer:
             'optimizer_steps_completed': self.optimizer_steps_completed,
             'loss': loss,
             'config': self.config,
+            'model_metadata': model_metadata,
         }
 
         if self.use_mixed_precision and self.scaler:

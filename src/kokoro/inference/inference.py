@@ -133,56 +133,82 @@ class KokoroTTS:
         if state_dict_to_load is None:
             raise RuntimeError("Checkpoint does not contain a recognized model state dictionary (expected 'model_state_dict' or 'model' key, or raw state dict).")
 
-        # Define common model parameters that should match training config
-        # These values MUST correspond to the architecture the loaded model was trained with.
-        # You might want to load these from a `model_config.json` saved during training.
-        EMBED_DIM = 512
-        NUM_LAYERS = 6
-        NUM_HEADS = 8
-        FF_DIM = 2048
-        DROPOUT = 0.1
-        MAX_DECODER_SEQ_LEN = 4000 # Critical: This must match the positional encoding size used during training
+        # Prefer explicit architecture metadata saved with checkpoints
+        metadata = checkpoint.get('model_metadata') if isinstance(checkpoint, dict) else None
+        architecture = metadata.get('architecture', {}) if isinstance(metadata, dict) else {}
 
-        vocab_size = len(self.phoneme_processor.phoneme_to_id)
+        vocab_size_from_processor = len(self.phoneme_processor.phoneme_to_id)
+        if architecture:
+            required_fields = [
+                'mel_dim', 'hidden_dim', 'n_encoder_layers', 'n_decoder_layers',
+                'n_heads', 'encoder_ff_dim', 'decoder_ff_dim', 'encoder_dropout',
+                'max_decoder_seq_len'
+            ]
+            missing_fields = [field for field in required_fields if field not in architecture]
+            if missing_fields:
+                raise RuntimeError(
+                    f"Checkpoint metadata is incomplete. Missing fields: {missing_fields}. "
+                    "Please retrain or resave checkpoint with full model metadata."
+                )
+
+            metadata_vocab_size = architecture.get('vocab_size')
+            if metadata_vocab_size is not None and int(metadata_vocab_size) != vocab_size_from_processor:
+                raise RuntimeError(
+                    f"Vocabulary size mismatch: checkpoint metadata expects {int(metadata_vocab_size)}, "
+                    f"phoneme processor has {vocab_size_from_processor}. "
+                    "Use the matching phoneme_processor.pkl from the same training run."
+                )
+
+            model_kwargs = {
+                'vocab_size': vocab_size_from_processor,
+                'mel_dim': int(architecture['mel_dim']),
+                'hidden_dim': int(architecture['hidden_dim']),
+                'n_encoder_layers': int(architecture['n_encoder_layers']),
+                'n_heads': int(architecture['n_heads']),
+                'encoder_ff_dim': int(architecture['encoder_ff_dim']),
+                'encoder_dropout': float(architecture['encoder_dropout']),
+                'n_decoder_layers': int(architecture['n_decoder_layers']),
+                'decoder_ff_dim': int(architecture['decoder_ff_dim']),
+                'max_decoder_seq_len': int(architecture['max_decoder_seq_len']),
+                'use_variance_predictor': bool(architecture.get('use_variance_predictor', True)),
+                'variance_filter_size': int(architecture.get('variance_filter_size', 256)),
+                'variance_kernel_size': int(architecture.get('variance_kernel_size', 3)),
+                'variance_dropout': float(architecture.get('variance_dropout', 0.1)),
+                'n_variance_bins': int(architecture.get('n_variance_bins', 256)),
+                'pitch_min': float(architecture.get('pitch_min', 0.0)),
+                'pitch_max': float(architecture.get('pitch_max', 1.0)),
+                'energy_min': float(architecture.get('energy_min', 0.0)),
+                'energy_max': float(architecture.get('energy_max', 1.0)),
+                'use_stochastic_depth': bool(architecture.get('use_stochastic_depth', True)),
+                'stochastic_depth_rate': float(architecture.get('stochastic_depth_rate', 0.1)),
+                'enable_profiling': getattr(self, 'enable_profiling', False),
+            }
+        else:
+            raise RuntimeError(
+                "Checkpoint is missing required 'model_metadata.architecture'. "
+                "Legacy checkpoints without metadata are not supported for strict inference load. "
+                "Use a checkpoint and phoneme processor saved from the same metadata-enabled training run."
+            )
+
         model = KokoroModel(
-            vocab_size=vocab_size,
-            mel_dim=self.n_mels,
-            hidden_dim=EMBED_DIM,
-            n_encoder_layers=NUM_LAYERS,
-            n_heads=NUM_HEADS,
-            encoder_ff_dim=FF_DIM,
-            encoder_dropout=DROPOUT,
-            n_decoder_layers=NUM_LAYERS,
-            decoder_ff_dim=FF_DIM,
-            max_decoder_seq_len=MAX_DECODER_SEQ_LEN,
-            enable_profiling= getattr(self, 'enable_profiling', False)
+            **model_kwargs
         )
 
-        # Filter and load state dict
-        filtered_state_dict = {}
-        model_keys = set(model.state_dict().keys())
-
-        for k, v in state_dict_to_load.items():
-            if k in model_keys:
-                if model.state_dict()[k].shape == v.shape:
-                    filtered_state_dict[k] = v
-                else:
-                    logger.warning(f"Skipping parameter '{k}' due to shape mismatch: checkpoint shape {v.shape}, model shape {model.state_dict()[k].shape}.")
-            else:
-                logger.warning(f"Skipping unknown key '{k}' from checkpoint. It might be an optimizer state or a deprecated parameter.")
-
+        # Strict load only: fail fast on architecture/state mismatch
         try:
-            model.load_state_dict(filtered_state_dict, strict=True)
+            model.load_state_dict(state_dict_to_load, strict=True)
             logger.info("Model state dictionary loaded successfully (strict=True).")
         except RuntimeError as e:
-            logger.warning(f"Failed to load model state dict strictly: {e}. Attempting non-strict load. This may indicate a mismatch between the model architecture and the loaded weights.")
-            model.load_state_dict(filtered_state_dict, strict=False)
-            logger.info("Model state dictionary loaded with strict=False.")
+            raise RuntimeError(
+                "Strict model load failed due to architecture/state mismatch. "
+                "Use a checkpoint and phoneme processor from the same run, and ensure metadata matches. "
+                f"Original error: {e}"
+            ) from e
 
         model.to(self.device)
         model.eval() # Set model to evaluation mode
 
-        logger.info(f"Model '{model_path.name}' loaded successfully with vocab_size={vocab_size}.")
+        logger.info(f"Model '{model_path.name}' loaded successfully with vocab_size={vocab_size_from_processor}.")
         return model
 
     def text_to_speech(

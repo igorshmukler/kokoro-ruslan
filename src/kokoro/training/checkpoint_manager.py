@@ -7,13 +7,47 @@ import os
 import torch
 import pickle
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import logging
 
 from kokoro.training.config import TrainingConfig
 from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 
 logger = logging.getLogger(__name__)
+
+
+def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module] = None) -> Dict[str, Any]:
+    """Build explicit architecture metadata for robust strict loading."""
+    metadata = {
+        'schema_version': 1,
+        'architecture': {
+            'mel_dim': int(getattr(config, 'n_mels', 80)),
+            'hidden_dim': int(getattr(config, 'hidden_dim', 512)),
+            'n_encoder_layers': int(getattr(config, 'n_encoder_layers', 6)),
+            'n_decoder_layers': int(getattr(config, 'n_decoder_layers', 6)),
+            'n_heads': int(getattr(config, 'n_heads', 8)),
+            'encoder_ff_dim': int(getattr(config, 'encoder_ff_dim', 2048)),
+            'decoder_ff_dim': int(getattr(config, 'decoder_ff_dim', 2048)),
+            'encoder_dropout': float(getattr(config, 'encoder_dropout', 0.1)),
+            'max_decoder_seq_len': int(getattr(config, 'max_decoder_seq_len', 4000)),
+            'use_variance_predictor': bool(getattr(config, 'use_variance_predictor', True)),
+            'variance_filter_size': int(getattr(config, 'variance_filter_size', 256)),
+            'variance_kernel_size': int(getattr(config, 'variance_kernel_size', 3)),
+            'variance_dropout': float(getattr(config, 'variance_dropout', 0.1)),
+            'n_variance_bins': int(getattr(config, 'n_variance_bins', 256)),
+            'pitch_min': float(getattr(config, 'pitch_min', 0.0)),
+            'pitch_max': float(getattr(config, 'pitch_max', 1.0)),
+            'energy_min': float(getattr(config, 'energy_min', 0.0)),
+            'energy_max': float(getattr(config, 'energy_max', 1.0)),
+            'use_stochastic_depth': bool(getattr(config, 'use_stochastic_depth', True)),
+            'stochastic_depth_rate': float(getattr(config, 'stochastic_depth_rate', 0.1)),
+        }
+    }
+
+    if model is not None:
+        metadata['architecture']['vocab_size'] = int(getattr(model, 'vocab_size', 0))
+
+    return metadata
 
 
 def save_phoneme_processor(processor: RussianPhonemeProcessor, output_dir: str):
@@ -44,13 +78,15 @@ def save_checkpoint(
     output_dir: str
 ):
     """Save training checkpoint"""
+    model_metadata = build_model_metadata(config, model)
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
         'loss': loss,
-        'config': config
+        'config': config,
+        'model_metadata': model_metadata,
     }
     checkpoint_path = os.path.join(output_dir, f"checkpoint_epoch_{epoch+1}.pth")
     torch.save(checkpoint, checkpoint_path)
@@ -70,77 +106,129 @@ def load_checkpoint(
     # Add safe globals for our custom classes
     torch.serialization.add_safe_globals([TrainingConfig, RussianPhonemeProcessor])
 
-    # Helper function to load and process state_dict
-    def _load_and_process_state_dict(model_state_dict, current_model):
-        model_keys = current_model.state_dict().keys()
-        new_state_dict = {}
-        for k, v in model_state_dict.items():
-            if k in model_keys:
-                current_param = current_model.state_dict()[k]
-                current_shape = current_param.shape
+    def _extract_architecture_metadata(checkpoint_dict: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(checkpoint_dict, dict):
+            return {}
+        model_metadata = checkpoint_dict.get('model_metadata')
+        if not isinstance(model_metadata, dict):
+            return {}
+        architecture = model_metadata.get('architecture')
+        return architecture if isinstance(architecture, dict) else {}
 
-                # Specific handling for positional encoding where we can truncate if needed
-                if "positional_encoding.pe" in k: # Catches both encoder and decoder PEs
-                    if v.shape == current_shape:
-                        new_state_dict[k] = v
-                    elif v.dim() == 3 and len(current_shape) == 3 and v.shape[0] == current_shape[0] and v.shape[2] == current_shape[2]:
-                        # Check if it's a difference in sequence length (second dimension)
-                        if v.shape[1] > current_shape[1]:
-                            logger.warning(
-                                f"Truncating checkpoint's '{k}' from {v.shape} to "
-                                f"{current_shape}. Ensure 'params.max_seq_len' is correctly set."
-                            )
-                            new_state_dict[k] = v[:, :current_shape[1], :]
-                        else: # v.shape[1] < current_shape[1] - cannot simply pad, usually indicates config error
-                            logger.error(
-                                f"Size mismatch for {k}: Checkpoint has {v.shape}, current model has {current_shape}. "
-                                "Cannot extend positional encoding. Check 'params.max_seq_len' in your config. "
-                                "Skipping this key, model might not load correctly without it."
-                            )
-                            # Do not add to new_state_dict, allowing load_state_dict to report missing key
-                            # or you can load with strict=False later.
-                    else: # Positional encoding has mismatched dimensions beyond just sequence length
-                        logger.error(f"Complex size mismatch for positional encoding {k}: Checkpoint has {v.shape}, current model has {current_shape}. Skipping this key.")
-                else:
-                    # For all other layers, shapes must match exactly
-                    if v.shape == current_shape:
-                        new_state_dict[k] = v
-                    else:
-                        logger.error(
-                            f"Size mismatch for {k}: Checkpoint has {v.shape}, current model has {current_shape}. "
-                            "This indicates a significant architectural change. "
-                            "Consider retraining or adjusting model definition. Skipping this key."
-                        )
+    def _validate_architecture_metadata(architecture: Dict[str, Any], current_model: torch.nn.Module):
+        required_fields = [
+            'mel_dim', 'hidden_dim', 'n_encoder_layers', 'n_decoder_layers',
+            'max_decoder_seq_len', 'use_variance_predictor'
+        ]
+        missing_fields = [field for field in required_fields if field not in architecture]
+        if missing_fields:
+            raise RuntimeError(
+                f"Checkpoint metadata is incomplete. Missing fields: {missing_fields}. "
+                "Please resume from a compatible checkpoint with full metadata."
+            )
+
+        current_snapshot = {
+            'vocab_size': int(getattr(current_model, 'vocab_size', 0)),
+            'mel_dim': int(getattr(current_model, 'mel_dim', 0)),
+            'hidden_dim': int(getattr(current_model, 'hidden_dim', 0)),
+            'n_encoder_layers': int(len(getattr(current_model, 'transformer_encoder_layers', []))),
+            'n_decoder_layers': int(getattr(getattr(current_model, 'decoder', None), 'num_layers', 0)),
+            'max_decoder_seq_len': int(getattr(current_model, 'max_decoder_seq_len', 0)),
+            'use_variance_predictor': bool(getattr(current_model, 'use_variance_predictor', False)),
+        }
+
+        compared_fields = [
+            'vocab_size', 'mel_dim', 'hidden_dim', 'n_encoder_layers',
+            'n_decoder_layers', 'max_decoder_seq_len', 'use_variance_predictor'
+        ]
+        mismatches = []
+        for field in compared_fields:
+            if field not in architecture:
+                continue
+            expected_value = architecture[field]
+            current_value = current_snapshot[field]
+            if isinstance(current_value, bool):
+                expected_cast = bool(expected_value)
+            elif isinstance(current_value, int):
+                expected_cast = int(expected_value)
             else:
-                logger.warning(f"Skipping unexpected key in checkpoint: {k}")
-        return new_state_dict
+                expected_cast = expected_value
+            if expected_cast != current_value:
+                mismatches.append((field, expected_cast, current_value))
+
+        if mismatches:
+            mismatch_summary = ', '.join(
+                [f"{field}: checkpoint={expected} current={current}" for field, expected, current in mismatches]
+            )
+            raise RuntimeError(
+                "Checkpoint architecture metadata mismatch. "
+                f"{mismatch_summary}. "
+                "Use a checkpoint produced by the same model/config."
+            )
+
+    def _strict_resume(checkpoint_dict: Dict[str, Any]) -> Tuple[int, float, RussianPhonemeProcessor]:
+        if not isinstance(checkpoint_dict, dict):
+            raise RuntimeError("Checkpoint payload is not a dictionary.")
+
+        architecture = _extract_architecture_metadata(checkpoint_dict)
+        if architecture:
+            _validate_architecture_metadata(architecture, model)
+        else:
+            raise RuntimeError(
+                "Checkpoint is missing required 'model_metadata.architecture'. "
+                "Legacy checkpoints without metadata are not supported for strict resume. "
+                "Use a checkpoint saved with metadata from the same training run."
+            )
+
+        if 'model_state_dict' in checkpoint_dict:
+            model_state_dict = checkpoint_dict['model_state_dict']
+        elif 'model' in checkpoint_dict:
+            model_state_dict = checkpoint_dict['model']
+        else:
+            # Legacy raw state_dict fallback
+            if all(isinstance(v, torch.Tensor) for v in checkpoint_dict.values()):
+                model_state_dict = checkpoint_dict
+            else:
+                raise RuntimeError(
+                    "Checkpoint does not contain a recognized model state dictionary. "
+                    "Expected key 'model_state_dict' or 'model'."
+                )
+
+        try:
+            model.load_state_dict(model_state_dict, strict=True)
+        except RuntimeError as e:
+            raise RuntimeError(
+                "Strict checkpoint model load failed due to architecture/state mismatch. "
+                f"Original error: {e}"
+            ) from e
+
+        if 'optimizer_state_dict' not in checkpoint_dict or 'scheduler_state_dict' not in checkpoint_dict:
+            raise RuntimeError(
+                "Checkpoint is missing optimizer/scheduler state required for training resume."
+            )
+
+        optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
+
+        if 'epoch' not in checkpoint_dict or 'loss' not in checkpoint_dict:
+            raise RuntimeError("Checkpoint is missing required 'epoch' or 'loss' fields.")
+
+        start_epoch = checkpoint_dict['epoch'] + 1
+        best_loss = checkpoint_dict['loss']
+
+        if 'phoneme_processor' in checkpoint_dict:
+            phoneme_processor = checkpoint_dict['phoneme_processor']
+        else:
+            phoneme_processor = load_phoneme_processor(output_dir)
+
+        logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
+        return start_epoch, best_loss, phoneme_processor
 
 
     try:
         # Try loading with weights_only=True first (new default)
         checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
-
-        # Process and load model state dict
-        filtered_model_state_dict = _load_and_process_state_dict(checkpoint['model_state_dict'], model)
-        # We use strict=False here because _load_and_process_state_dict might skip keys it can't handle
-        # or if the current model has new parameters not in the old checkpoint.
-        model.load_state_dict(filtered_model_state_dict, strict=False)
-
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-        start_epoch = checkpoint['epoch'] + 1
-        best_loss = checkpoint['loss']
-
-        # Try to load phoneme processor from checkpoint first
-        if 'phoneme_processor' in checkpoint:
-            phoneme_processor = checkpoint['phoneme_processor']
-        else:
-            # Fall back to loading from separate file
-            phoneme_processor = load_phoneme_processor(output_dir)
-
-        logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
-        return start_epoch, best_loss, phoneme_processor
+        return _strict_resume(checkpoint)
 
     except Exception as e:
         logger.warning(f"Loading with weights_only=True failed: {e}")
@@ -149,24 +237,7 @@ def load_checkpoint(
         try:
             # Try loading with weights_only=False for older checkpoints
             checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
-
-            # Process and load model state dict
-            filtered_model_state_dict = _load_and_process_state_dict(checkpoint['model_state_dict'], model)
-            model.load_state_dict(filtered_model_state_dict, strict=False) # Use strict=False here
-
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-            start_epoch = checkpoint['epoch'] + 1
-            best_loss = checkpoint['loss']
-
-            if 'phoneme_processor' in checkpoint:
-                phoneme_processor = checkpoint['phoneme_processor']
-            else:
-                phoneme_processor = load_phoneme_processor(output_dir)
-
-            logger.info(f"Resumed from epoch {start_epoch} with loss {best_loss:.4f}")
-            return start_epoch, best_loss, phoneme_processor
+            return _strict_resume(checkpoint)
 
         except Exception as e2:
             logger.error(f"Error loading checkpoint even with weights_only=False: {e2}")
@@ -194,8 +265,10 @@ def find_latest_checkpoint(output_dir: str) -> Optional[str]:
 def save_final_model(model: torch.nn.Module, config: TrainingConfig, output_dir: str):
     """Save final model"""
     final_model_path = os.path.join(output_dir, "kokoro_russian_final.pth")
+    model_metadata = build_model_metadata(config, model)
     torch.save({
         'model_state_dict': model.state_dict(),
-        'config': config
+        'config': config,
+        'model_metadata': model_metadata,
     }, final_model_path)
     logger.info(f"Final model saved: {final_model_path}")
