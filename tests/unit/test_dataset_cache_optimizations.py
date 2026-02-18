@@ -71,7 +71,7 @@ def test_feature_cache_lru_respects_entry_limit(tmp_path):
         use_variance_predictor=False,
     )
     config.feature_cache_max_entries = 2
-    config.feature_cache_max_mb = 512.0
+    config.feature_cache_max_mb = 8192.0 # 8 GB to hold everything in memory
 
     dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
 

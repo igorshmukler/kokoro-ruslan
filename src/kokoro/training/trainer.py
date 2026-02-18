@@ -35,9 +35,46 @@ from kokoro.training.mps_grad_scaler import MPSGradScaler
 
 from kokoro.utils.adaptive_memory_manager import AdaptiveMemoryManager
 
+import math
+
 
 logger = logging.getLogger(__name__)
 
+
+# def recommended_ema_decay(n_train: int, batch_size: int, k: float = 1.0) -> float:
+#     """
+#     Calculate recommended EMA decay based on dataset size.
+
+#     Alpha is chosen so the EMA half-life equals k epochs,
+#     meaning weights from k epochs ago contribute k% to the current EMA.
+#     Formula: alpha = k ** (batch_size / (k * n_train))
+#     """
+#     # Guard against division by zero
+#     if n_train <= 0 or batch_size <= 0:
+#         return 0.9999
+#     return k ** (batch_size / (k * n_train))
+
+def recommended_ema_decay(n_train: int, batch_size: int, k: float) -> float:
+    """
+    Calculate EMA decay so that the 'center of mass' or smoothing
+    window aligns with k epochs.
+    """
+    if n_train <= 0 or batch_size <= 0:
+        return 0.9999
+
+    # 1. Calculate total steps per epoch
+    steps_per_epoch = n_train / batch_size
+
+    # 2. Total steps in the desired window (k epochs)
+    total_steps = steps_per_epoch * k
+
+    # 3. Standard EMA decay formula:
+    # Often expressed as alpha = (window - 1) / (window + 1)
+    # or alpha = exp(-1 / total_steps) for a precise half-life
+    decay = (total_steps - 1) / (total_steps + 1)
+
+    # Clip to a sensible range for TTS (usually between 0.99 and 0.9999)
+    return max(0.9, min(decay, 0.9999))
 
 def check_mps_mixed_precision_support():
     """Check if MPS supports mixed precision training"""
@@ -411,13 +448,48 @@ class KokoroTrainer:
 
         # EMA (Exponential Moving Average) of model weights
         self.use_ema = getattr(config, 'use_ema', True)
-        self.ema_decay = getattr(config, 'ema_decay', 0.9999)
+        # Compute EMA decay if not provided in config
+        cfg_ema = getattr(config, 'ema_decay', None)
         self.ema_update_every = getattr(config, 'ema_update_every', 1)
+
+        if cfg_ema is None and self.use_ema:
+            # Use training dataset size and effective batch size (including grad accumulation)
+            try:
+                n_train = len(self.dataset)
+            except Exception:
+                n_train = 0
+
+            effective_batch = int(getattr(config, 'batch_size', 1) * getattr(config, 'gradient_accumulation_steps', 1))
+            k = float(getattr(config, 'ema_half_life_epochs', 1.0))
+            computed = recommended_ema_decay(n_train=n_train, batch_size=effective_batch, k=k)
+            self.ema_decay = computed
+            # Persist back to config for visibility
+            try:
+                config.ema_decay = computed
+            except Exception:
+                pass
+
+            # Record computed metadata for richer startup logging
+            self.ema_decay_source = 'computed'
+            self.ema_n_train = n_train
+            self.ema_effective_batch = effective_batch
+            self.ema_half_life_epochs = k
+
+            logger.info(f"Computed EMA decay: {self.ema_decay:.6f} (n_train={n_train}, eff_batch={effective_batch}, k={k})")
+        else:
+            self.ema_decay = float(cfg_ema) if cfg_ema is not None else 0.9999
+            self.ema_decay_source = 'config' if cfg_ema is not None else 'default'
+            self.ema_n_train = None
+            self.ema_effective_batch = None
+            self.ema_half_life_epochs = getattr(config, 'ema_half_life_epochs', 1.0)
         self.ema_updates = 0  # Track number of EMA updates
 
         if self.use_ema:
             # Initialize EMA model as a deep copy of the current model
             # This ensures all model parameters and configuration are correctly copied
+            # If model gets very large, this will become a problem
+            # One option is to move the model to CPU before copying and then back to device
+            # That adds some complexity and overhead
             self.ema_model = copy.deepcopy(self.model).to(self.device)
             self.ema_model.eval()  # EMA model is always in eval mode
 
@@ -425,7 +497,18 @@ class KokoroTrainer:
             for param in self.ema_model.parameters():
                 param.requires_grad = False
 
-            logger.info(f"EMA initialized: decay={self.ema_decay}, update_every={self.ema_update_every}")
+            # Detailed logging: show source of decay and relevant computed values
+            if getattr(self, 'ema_decay_source', None) == 'computed':
+                logger.info(
+                    f"EMA initialized: decay={self.ema_decay:.6f} (computed from n_train={self.ema_n_train}, "
+                    f"eff_batch={self.ema_effective_batch}, half_life_epochs={self.ema_half_life_epochs}), "
+                    f"update_every={self.ema_update_every}"
+                )
+            else:
+                logger.info(
+                    f"EMA initialized: decay={self.ema_decay:.6f} (source={self.ema_decay_source}), "
+                    f"half_life_epochs={self.ema_half_life_epochs}, update_every={self.ema_update_every}"
+                )
         else:
             self.ema_model = None
             logger.info("EMA disabled")
@@ -1265,6 +1348,11 @@ class KokoroTrainer:
         stop_loss_epoch = 0.0
         pitch_loss_epoch = 0.0
         energy_loss_epoch = 0.0
+        # Metrics: spectral convergence and F0 RMSE
+        spectral_conv_sum = 0.0
+        spectral_conv_count = 0
+        f0_rmse_sum = 0.0
+        f0_rmse_count = 0
         num_batches = 0
 
         with torch.no_grad():  # Disable gradient computation
@@ -1331,6 +1419,53 @@ class KokoroTrainer:
                         energy_loss_epoch += loss_energy.item()
                     num_batches += 1
 
+                    # --- Spectral convergence (on mel spectrograms) ---
+                    try:
+                        # mel_specs & predicted_mel are (batch, time, n_mels)
+                        batch_sc = 0.0
+                        batch_sc_count = 0
+                        for b in range(mel_specs.size(0)):
+                            L = int(mel_lengths[b].item())
+                            if L <= 0:
+                                continue
+                            ref = mel_specs[b, :L, :]
+                            pred = predicted_mel[b, :L, :]
+                            # Frobenius norm per sample
+                            num = torch.norm(ref - pred, p='fro')
+                            den = torch.norm(ref, p='fro')
+                            if den.item() > 0:
+                                sc = (num / den).item()
+                                batch_sc += sc
+                                batch_sc_count += 1
+                        if batch_sc_count > 0:
+                            spectral_conv_sum += (batch_sc / batch_sc_count)
+                            spectral_conv_count += 1
+                    except Exception:
+                        # Non-critical metric; continue on failure
+                        pass
+
+                    # --- F0 RMSE (frame-level) ---
+                    try:
+                        if (pitches is not None) and (predicted_pitch is not None):
+                            batch_f0 = 0.0
+                            batch_f0_count = 0
+                            for b in range(pitches.size(0)):
+                                L = int(mel_lengths[b].item())
+                                if L <= 0:
+                                    continue
+                                tgt = pitches[b, :L]
+                                pred_f0 = predicted_pitch[b, :L]
+                                # RMSE for this sample
+                                mse = torch.mean((tgt - pred_f0) ** 2).item()
+                                rmse = float(math.sqrt(mse))
+                                batch_f0 += rmse
+                                batch_f0_count += 1
+                            if batch_f0_count > 0:
+                                f0_rmse_sum += (batch_f0 / batch_f0_count)
+                                f0_rmse_count += 1
+                    except Exception:
+                        pass
+
                     # Update progress bar
                     progress_bar.set_postfix({
                         'val_loss': f"{total_loss.item():.4f}",
@@ -1353,6 +1488,9 @@ class KokoroTrainer:
             avg_stop_loss = stop_loss_epoch / num_batches
             avg_pitch_loss = pitch_loss_epoch / num_batches if pitch_loss_epoch > 0 else 0.0
             avg_energy_loss = energy_loss_epoch / num_batches if energy_loss_epoch > 0 else 0.0
+            # Finalize metric averages
+            avg_spectral_conv = (spectral_conv_sum / spectral_conv_count) if spectral_conv_count > 0 else None
+            avg_f0_rmse = (f0_rmse_sum / f0_rmse_count) if f0_rmse_count > 0 else None
 
             logger.info(f"Validation Epoch {epoch+1} - "
                        f"Loss: {avg_total_loss:.4f}, "
@@ -1361,6 +1499,10 @@ class KokoroTrainer:
                        f"Stop: {avg_stop_loss:.4f}")
             if avg_pitch_loss > 0:
                 logger.info(f"  Pitch: {avg_pitch_loss:.4f}, Energy: {avg_energy_loss:.4f}")
+            if avg_spectral_conv is not None:
+                logger.info(f"  SpectralConv: {avg_spectral_conv:.6f}")
+            if avg_f0_rmse is not None:
+                logger.info(f"  f0_RMSE: {avg_f0_rmse:.6f}")
 
             return (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
         else:
@@ -2185,8 +2327,29 @@ class KokoroTrainer:
             return
 
         hit_rate = (hits / requests) * 100.0
+        # Compute epoch-average latencies (ms) when raw counters are available
+        try:
+            mem_ns_start = int(start_stats.get('mem_latency_ns_total', 0))
+            mem_count_start = int(start_stats.get('mem_latency_count', 0))
+            mem_ns_end = int(end_stats.get('mem_latency_ns_total', 0))
+            mem_count_end = int(end_stats.get('mem_latency_count', 0))
+
+            disk_ns_start = int(start_stats.get('disk_latency_ns_total', 0))
+            disk_count_start = int(start_stats.get('disk_latency_count', 0))
+            disk_ns_end = int(end_stats.get('disk_latency_ns_total', 0))
+            disk_count_end = int(end_stats.get('disk_latency_count', 0))
+
+            mem_count_delta = max(0, mem_count_end - mem_count_start)
+            disk_count_delta = max(0, disk_count_end - disk_count_start)
+
+            mem_epoch_ms = ( (mem_ns_end - mem_ns_start) / mem_count_delta / 1e6 ) if mem_count_delta > 0 else 0.0
+            disk_epoch_ms = ( (disk_ns_end - disk_ns_start) / disk_count_delta / 1e6 ) if disk_count_delta > 0 else 0.0
+        except Exception:
+            mem_epoch_ms = 0.0
+            disk_epoch_ms = 0.0
+
         logger.info(
-            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%%",
+            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% mem_lat_ms=%.3f disk_lat_ms=%.3f",
             epoch + 1,
             split_name,
             requests,
@@ -2195,6 +2358,8 @@ class KokoroTrainer:
             disk_hits,
             misses,
             hit_rate,
+            mem_epoch_ms,
+            disk_epoch_ms,
         )
 
     def train(self):
@@ -2381,7 +2546,7 @@ class KokoroTrainer:
                 cache_logged = True
 
             logger.info(
-                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB",
+                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%.3f disk_lat_ms=%.3f",
                 split_name,
                 stats['requests'],
                 stats['hits'],
@@ -2391,6 +2556,8 @@ class KokoroTrainer:
                 stats['hit_rate'],
                 stats['in_mem_entries'],
                 stats['in_mem_mb'],
+                stats.get('mem_latency_ms_avg', 0.0),
+                stats.get('disk_latency_ms_avg', 0.0),
             )
 
         if cache_logged:
