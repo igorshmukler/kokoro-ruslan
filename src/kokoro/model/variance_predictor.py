@@ -641,11 +641,29 @@ class EnergyExtractor:
         else:
             squeeze_output = False
 
-        # Unfold to create overlapping windows
-        frames = waveform.unfold(1, win_length, hop_length)
+        # Respect center-padding used by typical mel spectrograms: pad by half-window
+        hop = int(hop_length)
+        win_len = int(win_length)
 
-        # Calculate RMS energy per frame
-        energy = torch.sqrt(torch.mean(frames ** 2, dim=-1) + 1e-8)
+        pad_val = win_len // 2
+        # Reflect-pad to mimic STFT center=True behaviour
+        waveform = F.pad(waveform, (pad_val, pad_val), mode='reflect')
+
+        # Ensure there are at least win_len samples after padding
+        if waveform.size(1) < win_len:
+            waveform = F.pad(waveform, (0, win_len - waveform.size(1)))
+
+        # Unfold to create overlapping windows
+        frames = waveform.unfold(1, win_len, hop).contiguous()
+
+        # Apply Hann window per frame to match mel spectrogram energy computation (centered STFT)
+        device = waveform.device
+        dtype = waveform.dtype
+        window = torch.hann_window(win_len, device=device, dtype=dtype)
+        frames = frames * window.unsqueeze(0).unsqueeze(0)
+
+        # Calculate RMS energy per frame (with window applied)
+        energy = torch.sqrt(torch.mean(frames.pow(2), dim=-1) + 1e-8)
 
         if squeeze_output:
             energy = energy.squeeze(0)
