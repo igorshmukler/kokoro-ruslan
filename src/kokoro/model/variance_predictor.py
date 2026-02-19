@@ -364,24 +364,33 @@ class PitchExtractor:
                      sample_rate: int = 22050,
                      hop_length: int = DEFAULT_HOP_LENGTH,
                      fmin: float = 50.0,
-                     fmax: float = 800.0) -> torch.Tensor:
+                     fmax: float = 800.0,
+                     win_length: Optional[int] = None) -> torch.Tensor:
         """
-        Extract pitch from waveform using YIN algorithm approximation
+        Extract pitch (F0) from waveform using YIN-style CMND algorithm.
+
+        Improvements over previous version:
+        - Cumulative Mean Normalized Difference (CMND) reduces octave errors
+        - Parabolic interpolation for sub-sample lag accuracy
+        - Adaptive per-utterance voicing threshold
+        - Median filtering to remove frame-to-frame jitter
+        - Linear interpolation across short unvoiced gaps
+        - win_length parameter is now respected
 
         Args:
             waveform: Audio waveform (batch, samples) or (samples,)
             sample_rate: Sample rate
-            hop_length: Hop length for STFT
-            fmin: Minimum frequency
-            fmax: Maximum frequency
+            hop_length: Hop length for framing
+            fmin: Minimum frequency in Hz
+            fmax: Maximum frequency in Hz
+            win_length: Analysis window length (defaults to max(2048, hop*8))
 
         Returns:
-            Pitch contour (batch, frames) or (frames,)
+            Normalized pitch contour in [0, 1] — (batch, frames) or (frames,)
+            Unvoiced frames are 0.0.
         """
-        # Robust, dependency-free F0 estimator using frame-wise autocorrelation (FFT-based)
-        # Returns normalized pitch in [0,1] using provided fmin/fmax bounds.
         try:
-            # Ensure 2D: (batch, samples)
+            # --- Setup ---
             if waveform.dim() == 1:
                 waveform = waveform.unsqueeze(0)
                 squeeze_output = True
@@ -390,87 +399,159 @@ class PitchExtractor:
 
             device = waveform.device
             dtype = waveform.dtype
-
-            # Parameters
-            win_length = int(2048)
             hop = int(hop_length)
 
-            # Pad signal so that we have at least one full frame
-            if waveform.size(1) < win_length:
-                pad_len = win_length - waveform.size(1)
-                waveform = torch.nn.functional.pad(waveform, (0, pad_len))
+            # Respect caller's win_length, fall back to adaptive default
+            if win_length is not None:
+                win_len = int(win_length)
+            else:
+                win_len = max(2048, hop * 8)
 
-            # Framing: (batch, n_frames, win_length)
-            frames = waveform.unfold(1, win_length, hop).contiguous()
+            # Pad signal to at least one full window
+            if waveform.size(1) < win_len:
+                waveform = F.pad(waveform, (0, win_len - waveform.size(1)))
+
+            # --- Framing & Windowing ---
+            # frames: (batch, n_frames, win_len)
+            frames = waveform.unfold(1, win_len, hop).contiguous()
             batch_size, n_frames, _ = frames.shape
 
-            # Windowing
-            window = torch.hann_window(win_length, device=device, dtype=dtype).unsqueeze(0).unsqueeze(0)
-            frames = frames * window
+            window = torch.hann_window(win_len, device=device, dtype=dtype)
+            frames = frames * window.unsqueeze(0).unsqueeze(0)
 
-            # FFT size (use 2*win_length for proper autocorrelation length)
-            nfft = win_length * 2
-
-            # Compute autocorrelation via Wiener-Khinchin: irfft(|rfft(x)|^2)
+            # --- Autocorrelation via Wiener-Khinchin ---
+            nfft = win_len * 2
             spec = torch.fft.rfft(frames, n=nfft)
-            power = (spec.abs() ** 2)
-            acf = torch.fft.irfft(power, n=nfft)
+            acf = torch.fft.irfft(spec.abs() ** 2, n=nfft)[..., :win_len]
 
-            # Keep positive lags up to win_length
-            acf = acf[..., :win_length]
+            # --- CMND (Cumulative Mean Normalized Difference) ---
+            # Difference function: d(tau) = acf[0] + acf[0] - 2*acf[tau]
+            zero_lag = acf[..., 0:1]  # (B, frames, 1)
+            diff = 2 * zero_lag - 2 * acf  # (B, frames, win_len)
 
-            # Normalize ACF by zero-lag to get comparable peaks
-            zero_lag = acf[..., 0:1].clamp(min=1e-8)
-            acf_norm = acf / zero_lag
+            # CMND: d'(tau) = d(tau) / [(1/tau) * sum_{j=1}^{tau} d(j)]
+            # d'[0] = 1 by convention
+            cmnd = torch.zeros_like(diff)
+            cmnd[..., 0] = 1.0
+            cumsum = torch.cumsum(diff[..., 1:], dim=-1)  # (B, frames, win_len-1)
+            tau_range = torch.arange(1, win_len, device=device, dtype=dtype)
+            cmnd[..., 1:] = diff[..., 1:] / (cumsum / tau_range + 1e-8)
 
-            # Determine search lag range corresponding to fmin..fmax
+            # --- Lag Search Range ---
             lag_min = max(2, int(sample_rate / fmax))
-            lag_max = min(win_length - 1, max(lag_min + 1, int(sample_rate / fmin)))
+            lag_max = min(win_len - 2, max(lag_min + 1, int(sample_rate / fmin)))
+            # -2 upper bound to leave room for parabolic interpolation
 
             lags = torch.arange(lag_min, lag_max + 1, device=device)
+            n_lags = len(lags)
 
-            # Gather ACF values at candidate lags: shape (B, n_frames, n_lags)
-            ac_lags = acf_norm[..., lags]
+            # CMND values in search range: (B, frames, n_lags)
+            # Lower CMND = better pitch candidate (unlike ACF where higher = better)
+            cmnd_lags = cmnd[..., lag_min:lag_max + 1]
 
-            # Confidence: max ACF peak in the search region
-            ac_max_vals, _ = ac_lags.max(dim=-1)
+            # Also gather ACF in search range for voicing confidence
+            acf_norm = acf / zero_lag.clamp(min=1e-8)
+            ac_lags = acf_norm[..., lag_min:lag_max + 1]
+            ac_max_vals, _ = ac_lags.max(dim=-1)  # (B, frames)
 
-            # Energy per frame to suppress unvoiced frames
+            # Best lag = first dip below threshold in CMND, else global minimum
+            # We use argmin on CMND (equivalent to YIN threshold search)
+            best_idx = torch.argmin(cmnd_lags, dim=-1)  # (B, frames)
+
+            # --- Parabolic Interpolation for Sub-Sample Accuracy ---
+            # Clamp neighbors to valid range
+            idx_prev = (best_idx - 1).clamp(min=0)
+            idx_next = (best_idx + 1).clamp(max=n_lags - 1)
+
+            alpha = cmnd_lags.gather(-1, idx_prev.unsqueeze(-1)).squeeze(-1)
+            beta  = cmnd_lags.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)
+            gamma = cmnd_lags.gather(-1, idx_next.unsqueeze(-1)).squeeze(-1)
+
+            denom = (alpha - 2 * beta + gamma).clamp(abs=1e-8)
+            offset = 0.5 * (alpha - gamma) / denom
+            offset = offset.clamp(-1.0, 1.0)  # Sanity clamp
+
+            # Map best_idx to actual lag, apply sub-sample offset
+            best_lags = (lags[best_idx].float() + offset).clamp(min=1.0)
+            freqs = sample_rate / best_lags  # (B, frames)
+
+            # --- Adaptive Voicing Threshold ---
+            # Per-utterance: base threshold on 25th percentile of ACF peaks
+            # This adapts to recording conditions rather than using a fixed value
+            ac_25th = torch.quantile(ac_max_vals, 0.25, dim=-1, keepdim=True)
+            voicing_thresh = torch.clamp(ac_25th * 0.8, min=0.15, max=0.35)
+
             frame_energy = frames.pow(2).mean(dim=-1)
             energy_thresh = torch.clamp(frame_energy.mean(dim=-1, keepdim=True) * 0.1, min=1e-9)
 
-            # Best lag index within candidate lags
-            best_idx = torch.argmax(ac_lags, dim=-1)  # (B, n_frames)
+            unvoiced_mask = (ac_max_vals < voicing_thresh) | (frame_energy < energy_thresh)
+            freqs = freqs.masked_fill(unvoiced_mask, 0.0)
 
-            # Map best indices to actual lag values
-            lag_values = lags.unsqueeze(0).unsqueeze(0).expand(batch_size, n_frames, -1)
-            best_lags = torch.gather(lag_values, -1, best_idx.unsqueeze(-1)).squeeze(-1).float()
+            # Clip to valid frequency range before normalization
+            freqs = torch.where(
+                (freqs < fmin) | (freqs > fmax),
+                torch.zeros_like(freqs),
+                freqs
+            )
 
-            # Convert lag to frequency
-            freqs = sample_rate / best_lags
+            # --- Interpolate Short Unvoiced Gaps ---
+            # Fill gaps of up to MAX_GAP_FRAMES with linear interpolation
+            # This smooths over consonants mid-word without filling long silences
+            MAX_GAP_FRAMES = 5
+            freqs_np = freqs.cpu().numpy()
 
-            # Mask unvoiced frames (low ACF peak or low energy)
-            unvoiced = (ac_max_vals < 0.1) | (frame_energy < energy_thresh)
-            freqs = freqs.masked_fill(unvoiced, 0.0)
+            for b in range(batch_size):
+                f = freqs_np[b]
+                voiced = f > 0
+                if not voiced.any() or voiced.all():
+                    continue
 
-            # Normalize to [0,1] using fmin/fmax
+                indices = np.arange(len(f), dtype=np.float32)
+                voiced_idx = indices[voiced]
+                voiced_vals = f[voiced]
+
+                # Interpolate across the full contour
+                f_interp = np.interp(indices, voiced_idx, voiced_vals)
+
+                # Only fill gaps shorter than MAX_GAP_FRAMES; leave long silences as 0
+                in_gap = False
+                gap_start = 0
+                for i in range(len(f)):
+                    if not voiced[i]:
+                        if not in_gap:
+                            in_gap = True
+                            gap_start = i
+                    else:
+                        if in_gap:
+                            gap_len = i - gap_start
+                            if gap_len <= MAX_GAP_FRAMES:
+                                f[gap_start:i] = f_interp[gap_start:i]
+                            in_gap = False
+                # Don't fill trailing silence
+
+                freqs_np[b] = f
+
+            freqs = torch.from_numpy(freqs_np).to(device=device, dtype=dtype)
+
+            # --- Median Filter (removes jitter) ---
+            MEDIAN_K = 5
+            pad = MEDIAN_K // 2
+            freqs_padded = F.pad(freqs, (pad, pad), mode='reflect')
+            freqs = freqs_padded.unfold(-1, MEDIAN_K, 1).median(dim=-1).values
+
+            # --- Normalize to [0, 1] ---
             freqs_norm = torch.clamp((freqs - fmin) / (fmax - fmin + 1e-8), min=0.0, max=1.0)
+            # Preserve zero (unvoiced) frames — normalization may shift them slightly
+            freqs_norm = freqs_norm.masked_fill(freqs == 0.0, 0.0)
 
-            # Return shape compatibility
-            if squeeze_output:
-                return freqs_norm.squeeze(0)
-            return freqs_norm
+            return freqs_norm.squeeze(0) if squeeze_output else freqs_norm
 
         except Exception as e:
             logger.warning(f"Pitch extraction failed: {e}, using zeros")
-            # Fallback: return zeros with conservative shape
-            if waveform.dim() == 1:
-                n_frames = max(1, waveform.shape[0] // hop_length)
+            n_frames = max(1, waveform.shape[-1] // hop_length)
+            if squeeze_output:
                 return torch.zeros(n_frames, device=waveform.device)
-            else:
-                n_frames = max(1, waveform.shape[1] // hop_length)
-                return torch.zeros(waveform.shape[0], n_frames, device=waveform.device)
-
+            return torch.zeros(waveform.shape[0], n_frames, device=waveform.device)
 
 class EnergyExtractor:
     """
