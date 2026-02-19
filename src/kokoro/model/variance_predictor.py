@@ -419,6 +419,9 @@ class PitchExtractor:
                 waveform[..., 1:] - pre_emphasis * waveform[..., :-1]
             ], dim=-1)
 
+            pad_val = win_len // 2
+            waveform = F.pad(waveform, (pad_val, pad_val), mode='reflect')
+
             # --- Framing & Windowing ---
             frames = waveform.unfold(1, win_len, hop).contiguous()
             batch_size, n_frames, _ = frames.shape
@@ -461,9 +464,21 @@ class PitchExtractor:
             ac_lags = acf_norm[..., lag_min:lag_max + 1]
             ac_max_vals, _ = ac_lags.max(dim=-1)  # (B, frames)
 
-            # Best lag = first dip below threshold in CMND, else global minimum
-            # We use argmin on CMND (equivalent to YIN threshold search)
-            best_idx = torch.argmin(cmnd_lags, dim=-1)  # (B, frames)
+            threshold = 0.15
+            # Find lags below threshold
+            below_thresh = cmnd_lags < threshold
+
+            # Create a mask for the first occurrences
+            # (B, frames, n_lags)
+            first_dip = (below_thresh.cumsum(-1) == 1) & below_thresh
+
+            # If any dip is found, take the first one. Otherwise, take global argmin.
+            has_dip = below_thresh.any(dim=-1)
+            best_idx = torch.where(
+                has_dip,
+                first_dip.argmax(dim=-1),
+                torch.argmin(cmnd_lags, dim=-1)
+            )
 
             # --- Parabolic Interpolation for Sub-Sample Accuracy ---
             # Clamp neighbors to valid range
@@ -502,44 +517,48 @@ class PitchExtractor:
                 freqs
             )
 
-            # --- Interpolate Short Unvoiced Gaps ---
+            # --- Interpolate Short Unvoiced Gaps (vectorized, torch-only) ---
             # Fill gaps of up to MAX_GAP_FRAMES with linear interpolation
-            # This smooths over consonants mid-word without filling long silences
+            # This avoids CPU <-> GPU copies by performing interpolation in PyTorch.
             MAX_GAP_FRAMES = 5
-            freqs_np = freqs.cpu().numpy()
 
-            for b in range(batch_size):
-                f = freqs_np[b]
-                voiced = f > 0
-                if not voiced.any() or voiced.all():
-                    continue
+            # freqs: (B, T)
+            Bf, Tf = freqs.shape
+            idx = torch.arange(Tf, device=device, dtype=torch.long).unsqueeze(0).expand(Bf, Tf)
+            voiced_mask = freqs > 0.0
 
-                indices = np.arange(len(f), dtype=np.float32)
-                voiced_idx = indices[voiced]
-                voiced_vals = f[voiced]
+            if voiced_mask.any():
+                # Previous voiced index at or before each frame (or -1 if none)
+                prev_candidates = torch.where(voiced_mask, idx, torch.full_like(idx, -1))
+                prev_idx = torch.cummax(prev_candidates, dim=1)[0]
 
-                # Interpolate across the full contour
-                f_interp = np.interp(indices, voiced_idx, voiced_vals)
+                # Next voiced index at or after each frame (or Tf if none)
+                next_candidates = torch.where(voiced_mask, idx, torch.full_like(idx, Tf))
+                next_rev = torch.cummin(next_candidates.flip(dims=[1]), dim=1)[0]
+                next_idx = next_rev.flip(dims=[1])
 
-                # Only fill gaps shorter than MAX_GAP_FRAMES; leave long silences as 0
-                in_gap = False
-                gap_start = 0
-                for i in range(len(f)):
-                    if not voiced[i]:
-                        if not in_gap:
-                            in_gap = True
-                            gap_start = i
-                    else:
-                        if in_gap:
-                            gap_len = i - gap_start
-                            if gap_len <= MAX_GAP_FRAMES:
-                                f[gap_start:i] = f_interp[gap_start:i]
-                            in_gap = False
-                # Don't fill trailing silence
+                # Gap length between voiced neighbors
+                gap_len = (next_idx - prev_idx - 1)
 
-                freqs_np[b] = f
+                # Positions eligible for filling: currently unvoiced, have prev and next, and small gap
+                fill_mask = (~voiced_mask) & (prev_idx >= 0) & (next_idx < Tf) & (gap_len <= MAX_GAP_FRAMES)
 
-            freqs = torch.from_numpy(freqs_np).to(device=device, dtype=dtype)
+                if fill_mask.any():
+                    # Gather neighbor values (clamp indices for gather safety)
+                    prev_idx_clamped = prev_idx.clamp(min=0)
+                    next_idx_clamped = next_idx.clamp(max=Tf - 1)
+
+                    prev_vals = freqs.gather(1, prev_idx_clamped)
+                    next_vals = freqs.gather(1, next_idx_clamped)
+
+                    # Interpolation factor
+                    denom = (next_idx.float() - prev_idx.float()).clamp(min=1.0)
+                    t = (idx.float() - prev_idx.float()) / denom
+
+                    interp = prev_vals * (1.0 - t) + next_vals * t
+
+                    # Assign only to eligible positions
+                    freqs[fill_mask] = interp[fill_mask]
 
             # --- Median Filter (removes jitter) ---
             MEDIAN_K = 5
