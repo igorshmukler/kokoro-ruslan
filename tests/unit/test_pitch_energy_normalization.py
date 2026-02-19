@@ -43,7 +43,7 @@ def test_dataset_uses_extractor_pitch_hz_bounds_not_normalized_bins(tmp_path, mo
 
     observed = {}
 
-    def _mock_pitch(waveform, sample_rate, hop_length, fmin, fmax):
+    def _mock_pitch(waveform, sample_rate, hop_length, fmin, fmax, win_length=None):
         observed["fmin"] = fmin
         observed["fmax"] = fmax
         length = max(1, int(np.ceil(waveform.shape[-1] / hop_length)))
@@ -73,7 +73,7 @@ def test_dataset_passes_linear_mel_to_energy_extractor(tmp_path, monkeypatch):
     monkeypatch.setattr(
         PitchExtractor,
         "extract_pitch",
-        staticmethod(lambda waveform, sample_rate, hop_length, fmin, fmax: torch.zeros(max(1, int(np.ceil(waveform.shape[-1] / hop_length))))),
+        staticmethod(lambda waveform, sample_rate, hop_length, fmin, fmax, win_length=None: torch.zeros(max(1, int(np.ceil(waveform.shape[-1] / hop_length))))),
     )
 
     observed = {}

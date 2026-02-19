@@ -649,7 +649,6 @@ class RuslanDataset(Dataset):
                     audio.squeeze(0),  # Remove channel dim
                     sample_rate=self.config.sample_rate,
                     hop_length=self.config.hop_length,
-                    win_length=self.config.win_length,
                     fmin=getattr(self.config, 'pitch_extract_fmin', 50.0),
                     fmax=getattr(self.config, 'pitch_extract_fmax', 800.0)
                 )
