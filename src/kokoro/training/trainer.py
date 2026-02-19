@@ -2222,8 +2222,8 @@ class KokoroTrainer:
 
                 progress_bar.set_postfix(postfix_dict)
 
-                # Print memory management report periodically
-                if self.enable_adaptive_memory and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
+                # Print memory management report periodically (only when verbose)
+                if self.enable_adaptive_memory and getattr(self.config, 'verbose', False) and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
                     logger.info(f"Memory management stats at batch {batch_idx}:")
                     report = self.memory_manager.get_memory_report()
                     logger.info(f"  Current pressure: {report['current_pressure']}")
