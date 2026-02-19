@@ -474,8 +474,7 @@ class PitchExtractor:
             beta  = cmnd_lags.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)
             gamma = cmnd_lags.gather(-1, idx_next.unsqueeze(-1)).squeeze(-1)
 
-            # denom = (alpha - 2 * beta + gamma).clamp(min=1e-8)
-            denom = (alpha - 2 * beta + gamma).clamp(abs=1e-8)
+            denom = (alpha - 2 * beta + gamma).clamp(min=1e-8)
 
             offset = 0.5 * (alpha - gamma) / denom
             offset = offset.clamp(-1.0, 1.0)  # Sanity clamp
