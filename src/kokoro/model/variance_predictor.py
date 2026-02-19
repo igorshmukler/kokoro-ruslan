@@ -474,7 +474,9 @@ class PitchExtractor:
             beta  = cmnd_lags.gather(-1, best_idx.unsqueeze(-1)).squeeze(-1)
             gamma = cmnd_lags.gather(-1, idx_next.unsqueeze(-1)).squeeze(-1)
 
+            # denom = (alpha - 2 * beta + gamma).clamp(min=1e-8)
             denom = (alpha - 2 * beta + gamma).clamp(abs=1e-8)
+
             offset = 0.5 * (alpha - gamma) / denom
             offset = offset.clamp(-1.0, 1.0)  # Sanity clamp
 
@@ -582,25 +584,18 @@ class EnergyExtractor:
         else:
             mel_linear = mel_spec
 
-        # Energy is frame-level mean across mel bins
-        if mel_linear.dim() == 2:
-            energy = torch.mean(mel_linear, dim=0)
-        else:
-            energy = torch.mean(mel_linear, dim=1)
+        # Energy is frame-level mean across mel bins (works for batched or unbatched inputs)
+        energy = torch.mean(mel_linear, dim=-2)
 
         # Dynamic range compression and robust per-utterance normalization
         energy = torch.log1p(torch.clamp(energy, min=0.0))
 
-        if energy.dim() == 1:
-            floor = torch.quantile(energy, 0.05)
-            ceil = torch.quantile(energy, 0.95)
-            denom = torch.clamp(ceil - floor, min=1e-8)
-            energy = (energy - floor) / denom
-        else:
-            floor = torch.quantile(energy, 0.05, dim=1, keepdim=True)
-            ceil = torch.quantile(energy, 0.95, dim=1, keepdim=True)
-            denom = torch.clamp(ceil - floor, min=1e-8)
-            energy = (energy - floor) / denom
+        # Compute robust per-utterance floor/ceil along the frames axis.
+        # Use keepdim=True so broadcasting works for both (frames,) and (batch, frames).
+        floor = torch.quantile(energy, 0.05, dim=-1, keepdim=True)
+        ceil = torch.quantile(energy, 0.95, dim=-1, keepdim=True)
+        denom = torch.clamp(ceil - floor, min=1e-8)
+        energy = (energy - floor) / denom
 
         energy = torch.clamp(energy, 0.0, 1.0)
 
