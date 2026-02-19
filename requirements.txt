@@ -44,4 +44,4 @@ absl-py>=0.4
 # torch-audio  # Alternative audio processing
 
 # Development and debugging (optional)
-# matplotlib>=3.5.0  # For visualization during development
+matplotlib>=3.5.0  # For visualization during development
