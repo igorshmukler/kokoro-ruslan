@@ -10,7 +10,7 @@ def test_extract_pitch_single_sine():
     t = torch.arange(int(sr * duration), dtype=torch.float32)
     waveform = torch.sin(2 * math.pi * freq * (t / sr))
 
-    pitch = PitchExtractor.extract_pitch(waveform, sample_rate=sr, hop_length=256, fmin=50.0, fmax=800.0)
+    pitch = PitchExtractor.extract_pitch(waveform, sample_rate=sr, hop_length=256, fmin=50.0, fmax=800.0, win_length=1024)
 
     # Expect a 1-D tensor of frame-wise normalized pitch values
     assert pitch.dim() == 1
@@ -32,7 +32,7 @@ def test_extract_pitch_batch_sines():
 
     waves = torch.stack([torch.sin(2 * math.pi * f * (t / sr)) for f in freqs], dim=0)
 
-    pitches = PitchExtractor.extract_pitch(waves, sample_rate=sr, hop_length=256, fmin=50.0, fmax=800.0)
+    pitches = PitchExtractor.extract_pitch(waves, sample_rate=sr, hop_length=256, fmin=50.0, fmax=800.0, win_length=1024)
 
     assert pitches.dim() == 2
     for i, f in enumerate(freqs):
@@ -48,7 +48,7 @@ def test_short_waveform_returns_values_in_range():
     t = torch.arange(100, dtype=torch.float32)
     wave = torch.sin(2 * math.pi * 220 * (t / sr))
 
-    pitch = PitchExtractor.extract_pitch(wave, sample_rate=sr, hop_length=256, fmin=50.0, fmax=800.0)
+    pitch = PitchExtractor.extract_pitch(wave, sample_rate=sr, hop_length=256, fmin=50.0, fmax=800.0, win_length=512)
 
     # Should return at least one frame and values in [0,1]
     assert pitch.numel() >= 1
