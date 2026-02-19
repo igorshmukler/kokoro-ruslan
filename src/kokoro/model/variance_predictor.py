@@ -590,9 +590,14 @@ class PitchExtractor:
             # returned shapes match caller expectations (no surprises from padding).
             n_frames = max(1, orig_num_samples // hop_length)
             device = waveform.device if 'waveform' in locals() else torch.device('cpu')
+
+            # Create batched zeros tensor then squeeze if the caller passed a
+            # single 1D waveform (squeeze_output==True). This guarantees the
+            # returned tensor shape matches the original input shape.
+            zeros_batched = torch.zeros((orig_batch_size, n_frames), device=device)
             if squeeze_output:
-                return torch.zeros(n_frames, device=device)
-            return torch.zeros(orig_batch_size, n_frames, device=device)
+                return zeros_batched.squeeze(0)
+            return zeros_batched
 
 class EnergyExtractor:
     """
