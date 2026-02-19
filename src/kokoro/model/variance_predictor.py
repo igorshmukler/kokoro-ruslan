@@ -411,8 +411,14 @@ class PitchExtractor:
             if waveform.size(1) < win_len:
                 waveform = F.pad(waveform, (0, win_len - waveform.size(1)))
 
+            # --- Pre-emphasis ---
+            pre_emphasis = 0.97
+            waveform = torch.cat([
+                waveform[..., :1],
+                waveform[..., 1:] - pre_emphasis * waveform[..., :-1]
+            ], dim=-1)
+
             # --- Framing & Windowing ---
-            # frames: (batch, n_frames, win_len)
             frames = waveform.unfold(1, win_len, hop).contiguous()
             batch_size, n_frames, _ = frames.shape
 
@@ -482,7 +488,7 @@ class PitchExtractor:
             voicing_thresh = torch.clamp(ac_25th * 0.8, min=0.15, max=0.35)
 
             frame_energy = frames.pow(2).mean(dim=-1)
-            energy_thresh = torch.clamp(frame_energy.mean(dim=-1, keepdim=True) * 0.1, min=1e-9)
+            energy_thresh = torch.clamp(torch.median(frame_energy, dim=-1, keepdim=True).values * 0.05, min=1e-9)
 
             unvoiced_mask = (ac_max_vals < voicing_thresh) | (frame_energy < energy_thresh)
             freqs = freqs.masked_fill(unvoiced_mask, 0.0)
