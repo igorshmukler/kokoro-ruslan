@@ -398,6 +398,12 @@ class PitchExtractor:
             else:
                 squeeze_output = False
 
+            # Capture original (pre-padding/processing) lengths and batch info so
+            # exception handling can return tensors matching the caller's expected
+            # shape. Do this after potential unsqueeze above so shapes align.
+            orig_num_samples = waveform.shape[-1]
+            orig_batch_size = waveform.shape[0]
+
             device = waveform.device
             dtype = waveform.dtype
             hop = int(hop_length)
@@ -573,10 +579,13 @@ class PitchExtractor:
 
         except Exception as e:
             logger.warning(f"Pitch extraction failed: {e}, using zeros")
-            n_frames = max(1, waveform.shape[-1] // hop_length)
+            # Use original pre-processed sample count to compute frame count so
+            # returned shapes match caller expectations (no surprises from padding).
+            n_frames = max(1, orig_num_samples // hop_length)
+            device = waveform.device if 'waveform' in locals() else torch.device('cpu')
             if squeeze_output:
-                return torch.zeros(n_frames, device=waveform.device)
-            return torch.zeros(waveform.shape[0], n_frames, device=waveform.device)
+                return torch.zeros(n_frames, device=device)
+            return torch.zeros(orig_batch_size, n_frames, device=device)
 
 class EnergyExtractor:
     """
