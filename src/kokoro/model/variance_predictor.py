@@ -468,17 +468,15 @@ class PitchExtractor:
             # Find lags below threshold
             below_thresh = cmnd_lags < threshold
 
-            # Create a mask for the first occurrences
-            # (B, frames, n_lags)
+            # Create a mask for the first occurrences (B, frames, n_lags)
             first_dip = (below_thresh.cumsum(-1) == 1) & below_thresh
 
             # If any dip is found, take the first one. Otherwise, take global argmin.
             has_dip = below_thresh.any(dim=-1)
-            best_idx = torch.where(
-                has_dip,
-                first_dip.argmax(dim=-1),
-                torch.argmin(cmnd_lags, dim=-1)
-            )
+            # argmax is not implemented for Bool on some backends; convert to long first.
+            first_dip_idx = first_dip.long().argmax(dim=-1)
+            argmin_idx = torch.argmin(cmnd_lags, dim=-1)
+            best_idx = torch.where(has_dip, first_dip_idx, argmin_idx)
 
             # --- Parabolic Interpolation for Sub-Sample Accuracy ---
             # Clamp neighbors to valid range
