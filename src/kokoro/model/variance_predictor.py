@@ -328,14 +328,21 @@ class VarianceAdaptor(nn.Module):
         # Predict energy
         energy_pred = self.energy_predictor(encoder_output, mask)
 
-        # Normalize targets/predictions to [0,1] before quantization.
-        # Inference naturally falls back to predictions when targets are None.
-        pitch_to_quantize = pitch_target if pitch_target is not None else pitch_pred
-        pitch_to_quantize = self._maybe_normalize_pitch(pitch_to_quantize, device=encoder_output.device)
+        # Normalize targets to [0,1] before quantization when targets are supplied.
+        # For model predictions, assume the network outputs normalized values
+        # (training targets are normalized). Do NOT apply the Hz heuristic to
+        # raw predictions (logits) which can erroneously trigger Hz->norm conversion.
+        if pitch_target is not None:
+            pitch_to_quantize = self._maybe_normalize_pitch(pitch_target, device=encoder_output.device)
+        else:
+            # Predictions should already be in [0,1]; clamp as a safety net.
+            pitch_to_quantize = pitch_pred.clamp(0.0, 1.0)
         pitch_quantized = self.quantize_pitch(pitch_to_quantize)
 
-        energy_to_quantize = energy_target if energy_target is not None else energy_pred
-        energy_to_quantize = self._maybe_normalize_energy(energy_to_quantize, device=encoder_output.device)
+        if energy_target is not None:
+            energy_to_quantize = self._maybe_normalize_energy(energy_target, device=encoder_output.device)
+        else:
+            energy_to_quantize = energy_pred.clamp(0.0, 1.0)
         energy_quantized = self.quantize_energy(energy_to_quantize)
 
         # Get embeddings
