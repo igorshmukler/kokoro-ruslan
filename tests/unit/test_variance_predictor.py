@@ -41,22 +41,30 @@ def test_forward_accepts_hz_targets():
     batch = 2
     seq_len = 6
     hidden = adaptor.hidden_dim
+    frames_per_phoneme = 3
+    expected_frames = seq_len * frames_per_phoneme
 
     encoder_output = torch.randn(batch, seq_len, hidden)
 
-    # Create pitch targets in Hz and normalized - forward should accept either
     base_norm = torch.linspace(0.1, 0.9, steps=seq_len)
     hz_targets = base_norm * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
     pitch_target_hz = hz_targets.unsqueeze(0).repeat(batch, 1)
 
+    # Must supply duration_target — without it, random predicted durations
+    # make the output frame count unpredictable and the shape assertion meaningless
+    duration_target = torch.full((batch, seq_len), frames_per_phoneme, dtype=torch.float)
+
     adapted, dur_pred, pitch_pred, energy_pred, frame_mask = adaptor(
-        encoder_output, None, pitch_target=pitch_target_hz, energy_target=None, duration_target=None
+        encoder_output, None,
+        pitch_target=pitch_target_hz,
+        energy_target=None,
+        duration_target=duration_target,
     )
 
-    assert adapted.shape == (batch, seq_len, hidden) # encoder_output.shape
-    assert dur_pred.shape == (batch, seq_len)
-    assert pitch_pred.shape == (batch, seq_len)
-    assert energy_pred.shape == (batch, seq_len)
+    assert adapted.shape == (batch, expected_frames, hidden)
+    assert dur_pred.shape == (batch, seq_len)        # duration pred is token-level
+    assert pitch_pred.shape == (batch, expected_frames)   # pitch/energy are frame-level
+    assert energy_pred.shape == (batch, expected_frames)
 
 
 def test_energy_normalization_and_quantize():
