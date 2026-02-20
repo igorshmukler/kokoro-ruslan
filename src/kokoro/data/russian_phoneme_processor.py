@@ -9,7 +9,7 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
-@dataclass
+@dataclass(frozen=True)
 class StressInfo:
     """Information about stress in a word"""
     position: int  # Position of stressed syllable (0-based)
