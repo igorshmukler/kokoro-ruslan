@@ -44,7 +44,7 @@ def test_normalize_text_handles_yo_and_stress_marks():
     ("привет", "prʲɪvʲet"),
     ("как", "kak"),
     ("дела", "dʲɪla"),
-    ("молоко", "mɐlɐko"),
+    ("молоко", "məlɐko"),
     ("хорошо", "xərɐʃo"),
     ("сегодня", "sʲɪvodʲnʲə"),
     ("здравствуйте", "zdrastvujtʲe"),
