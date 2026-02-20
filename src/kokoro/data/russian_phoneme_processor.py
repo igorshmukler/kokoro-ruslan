@@ -332,6 +332,24 @@ class RussianPhonemeProcessor:
         """
         word = word.lower()
 
+        # --- 1. The "Г" Exceptions ---
+
+        # A. Genitive endings: -ого/-его -> -ово/-ево
+        # (Applies to pronouns and adjectives: красного, его, синего)
+        # We exclude common adverbs/nouns where 'г' is hard: много, строго, дорого
+        hard_g_exceptions = {'много', 'немного', 'строго', 'дорого', 'лого', 'иго', 'благо'}
+        if word.endswith(('ого', 'его')) and word not in hard_g_exceptions:
+            # Only replace the 'г' in the last 3 characters
+            word = word[:-3] + word[-3:].replace('г', 'в')
+
+        # B. The Г -> Х shift (Specific clusters)
+        # e.g., легко -> лехко, мягко -> мяхко
+        word = word.replace('легк', 'лехк')
+        word = word.replace('мягк', 'мяхк')
+        # Also handles comparative: легче -> лехче
+        word = word.replace('легч', 'лехч')
+        word = word.replace('мягч', 'мяхч')
+
         # --- Cluster simplifications (Cyrillic only) ---
 
         # 'вств' cluster: first 'в' is typically silent in spoken Russian
