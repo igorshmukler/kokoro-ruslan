@@ -42,6 +42,16 @@ class RuslanDataset(Dataset):
                  indices: Optional[List[int]] = None):
         self.data_dir = Path(data_dir)
         self.config = config
+        # Adopt restored variance/global stats from config if present so
+        # the dataset doesn't recompute or override them during init.
+        for _k in ('pitch_running_mean', 'pitch_running_std', 'energy_running_mean', 'energy_running_std'):
+            if hasattr(config, _k):
+                try:
+                    setattr(self, _k, getattr(config, _k))
+                except Exception:
+                    pass
+            else:
+                setattr(self, _k, None)
         self.phoneme_processor = RussianPhonemeProcessor()
         self.use_mfa = use_mfa
         self.indices = indices  # Subset of indices for train/val split

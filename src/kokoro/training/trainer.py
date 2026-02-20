@@ -110,6 +110,52 @@ class KokoroTrainer:
         self.config = config
         self.device = torch.device(config.device)
 
+        # Attempt to load checkpoint metadata (weights_only) early so any
+        # restored global variance statistics are available before the
+        # dataset is constructed. This avoids the dataset recomputing
+        # normalization/state that should instead be restored from the
+        # checkpoint.
+        try:
+            resume_checkpoint = getattr(self.config, 'resume_checkpoint', None)
+            if resume_checkpoint:
+                checkpoint_path = None
+                if isinstance(resume_checkpoint, str) and resume_checkpoint.lower() == 'auto':
+                    checkpoint_path = find_latest_checkpoint(self.config.output_dir)
+                else:
+                    checkpoint_path = str(resume_checkpoint)
+
+                if checkpoint_path and os.path.exists(checkpoint_path):
+                    try:
+                        # Use weights_only=True to avoid loading large tensors
+                        meta = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+                        if isinstance(meta, dict):
+                            # Restore variance_stats into config and trainer
+                            vs = meta.get('variance_stats')
+                            if isinstance(vs, dict):
+                                for k, v in vs.items():
+                                    try:
+                                        setattr(self.config, k, v)
+                                        setattr(self, k, v)
+                                    except Exception:
+                                        logger.debug(f"Could not set variance stat {k} from checkpoint metadata")
+                                logger.info(f"Loaded variance_stats from checkpoint metadata: {list(vs.keys())}")
+
+                            # Also load pitch/energy bounds from saved model metadata (if available)
+                            mm = meta.get('model_metadata')
+                            if isinstance(mm, dict):
+                                arch = mm.get('architecture', {})
+                                for name in ('pitch_min', 'pitch_max', 'energy_min', 'energy_max'):
+                                    if name in arch:
+                                        try:
+                                            setattr(self.config, name, arch[name])
+                                        except Exception:
+                                            pass
+                    except Exception as e:
+                        logger.warning(f"Could not pre-load checkpoint metadata: {e}")
+        except Exception:
+            # Never fail init because of metadata loading - we'll proceed normally
+            logger.debug("Early checkpoint metadata load skipped or failed")
+
         # Ensure fatal signals (including SIGABRT) dump Python stacks for crash triage
         try:
             if not faulthandler.is_enabled():
@@ -1281,6 +1327,39 @@ class KokoroTrainer:
             else:
                 logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
+            # Restore persisted variance statistics if present
+            if 'variance_stats' in checkpoint:
+                vs = checkpoint['variance_stats']
+                for k, v in vs.items():
+                    try:
+                        setattr(self, k, v)
+                    except Exception:
+                        logger.warning(f"Failed to restore variance stat {k}")
+                logger.info(f"Restored variance_stats: {list(vs.keys())}")
+
+                # Propagate restored globals to dataset and model when available
+                try:
+                    if hasattr(self, 'dataset') and self.dataset is not None:
+                        for k, v in vs.items():
+                            try:
+                                setattr(self.dataset, k, v)
+                            except Exception:
+                                logger.debug(f"Could not set {k} on dataset")
+                    if hasattr(self, 'model') and self.model is not None:
+                        # Also set on model and variance_adaptor if present
+                        for k, v in vs.items():
+                            try:
+                                setattr(self.model, k, v)
+                            except Exception:
+                                logger.debug(f"Could not set {k} on model")
+                            if hasattr(self.model, 'variance_adaptor') and self.model.variance_adaptor is not None:
+                                try:
+                                    setattr(self.model.variance_adaptor, k, v)
+                                except Exception:
+                                    logger.debug(f"Could not set {k} on model.variance_adaptor")
+                except Exception as e:
+                    logger.debug(f"Error propagating variance_stats to components: {e}")
+
         self.dataset.phoneme_processor = phoneme_processor
 
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
@@ -1481,6 +1560,14 @@ class KokoroTrainer:
             'config': self.config,
             'model_metadata': model_metadata,
         }
+
+        # Persist running variance statistics if present on the trainer.
+        variance_stats = {}
+        for k in ('pitch_running_mean', 'pitch_running_std', 'energy_running_mean', 'energy_running_std'):
+            if hasattr(self, k):
+                variance_stats[k] = getattr(self, k)
+        if variance_stats:
+            checkpoint['variance_stats'] = variance_stats
 
         if self.use_mixed_precision and self.scaler:
             checkpoint['scaler'] = self.scaler.state_dict()
