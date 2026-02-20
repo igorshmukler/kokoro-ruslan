@@ -1,11 +1,9 @@
 import re
 import unicodedata
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from functools import lru_cache
 import logging
-
-from sympy import reduced
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -63,6 +61,12 @@ class RussianPhonemeProcessor:
             'р': 'rʲ', 'с': 'sʲ', 'т': 'tʲ', 'ф': 'fʲ', 'х': 'xʲ'
         }
 
+        self._multi_char_phonemes = sorted(
+            list(self.palatalized.values()) +
+            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
+            key=len, reverse=True
+        )
+
         # Hard consonants (never palatalized)
         self.hard_consonants = {'ж', 'ш', 'ц'}
 
@@ -94,9 +98,6 @@ class RussianPhonemeProcessor:
         # Build vocabulary after all mappings are set
         self.phoneme_to_id = self._build_vocab()
 
-        # Cache for processed words to improve performance
-        self._word_cache: Dict[str, Tuple[List[str], StressInfo]] = {}
-
     def _load_stress_patterns(self, dict_path: Optional[str] = None) -> Dict[str, int]:
         """
         Load stress patterns from file or use built-in patterns.
@@ -123,7 +124,6 @@ class RussianPhonemeProcessor:
             'дела': 1,    # дела́
             'молоко': 2,  # молоко́
             'сегодня': 1, # сего́дня - add for consistency with exceptions
-            'здравствуйте': 1 # здра́вствуйте - add for consistency with exceptions
         }
 
         if dict_path:
@@ -350,6 +350,9 @@ class RussianPhonemeProcessor:
         # 'лнц' — silent л (e.g. солнце)
         word = word.replace('лнц', 'нц')
 
+        # remove combining marks for assimilation logic, but keep the base characters
+        word = re.sub(r'[\u0300-\u036f]', '', word.lower())
+
         # --- Voicing assimilation (regressive, right-to-left) ---
         chars = list(word)
         for i in range(len(chars) - 1):
@@ -429,25 +432,6 @@ class RussianPhonemeProcessor:
 
         return [p for p in processed_phonemes if p] # Filter out any empty strings
 
-    def _process_consonant(self, word: str, pos: int) -> str:
-        """
-        Helper for `apply_palatalization` to get the base phoneme for a consonant,
-        including inherent softness/hardness.
-        Palatalization due to context is handled in `apply_palatalization`.
-        """
-        char = word[pos].lower()
-
-        if char == 'й':
-            return self.consonants['й'] # 'j'
-        elif char in self.soft_consonants:
-            return self.consonants[char] # 'ч', 'щ'
-        elif char in self.hard_consonants:
-            return self.consonants[char] # 'ж', 'ш', 'ц'
-        elif char in self.consonants:
-            return self.consonants[char] # Default hard consonant
-        return char # Fallback (shouldn't be reached for valid consonants)
-
-
     def _process_vowel(self, word: str, pos: int) -> str:
         """
         Processes a single vowel character to its base phoneme,
@@ -485,26 +469,18 @@ class RussianPhonemeProcessor:
         return self.vowels[char] # Default vowel mapping
 
 
-    def process_word(self, word: str) -> Tuple[List[str], StressInfo]:
-        """Public entry point — normalizes the word then processes it."""
-        if not word:
-            return [], StressInfo(0, 0, False)
-        normalized = self.normalize_text(word)
-        if not normalized:
-            return [], StressInfo(0, 0, False)
-        return self._process_normalized_word(normalized)
 
     @lru_cache(maxsize=500)
-    def _process_normalized_word(self, word: str) -> Tuple[List[str], StressInfo]:
+    def _process_normalized_word(self, word: str) -> Tuple[Tuple[str, ...], StressInfo]:
         """
         Process a single already-normalized word. Cached on the normalized form.
-        Called directly by process_text to avoid redundant normalize_text calls.
+        Returns a tuple of phonemes (not a list) because lru_cache requires hashable
+        return values to avoid cache mutation bugs. Callers convert to list at the boundary.
         """
-        # Check exceptions on the clean word
         word_clean = re.sub(r'[\u0300-\u036f]', '', word).lower()
         if word_clean in self.exceptions:
             ipa_string = self.exceptions[word_clean]
-            tokenized = self._tokenize_ipa_string(ipa_string)
+            tokenized = tuple(self._tokenize_ipa_string(ipa_string))
             if word_clean in self.stress_patterns:
                 syllable_pos = self.stress_patterns[word_clean]
                 vowel_index = self._vowel_index_from_syllable(word_clean, syllable_pos)
@@ -520,10 +496,40 @@ class RussianPhonemeProcessor:
             base_phonemes = self.apply_palatalization(word_after_assimilation)
             final_phonemes = self.apply_vowel_reduction(base_phonemes, stress_info.position)
 
-            return final_phonemes, stress_info
+            return tuple(final_phonemes), stress_info
         except Exception as e:
             logger.error(f"Error processing word '{word}': {e}")
+
+            return tuple(), StressInfo(0, 0, False)
+
+    def process_word(self, word: str) -> Tuple[List[str], StressInfo]:
+        """Public entry point — normalizes the word then processes it."""
+        if not word:
             return [], StressInfo(0, 0, False)
+        normalized = self.normalize_text(word)
+        if not normalized:
+            return [], StressInfo(0, 0, False)
+
+        phonemes, stress_info = self._process_normalized_word(normalized)
+        return list(phonemes), stress_info
+
+    def process_text(self, text: str) -> List[Tuple[str, List[str], StressInfo]]:
+        """Process full text and return word-phoneme-stress tuples."""
+        if not text:
+            return []
+
+        normalized_text = self.normalize_text(text)
+        results = []
+
+        for word in normalized_text.split():
+            try:
+                phonemes, stress_info = self._process_normalized_word(word)
+                results.append((word, list(phonemes), stress_info))
+            except Exception as e:
+                logger.error(f"Error processing word '{word}': {e}")
+                results.append((word, [], StressInfo(0, 0, False)))
+
+        return results
 
     def _tokenize_ipa_string(self, ipa_string: str) -> List[str]:
         """
@@ -536,26 +542,13 @@ class RussianPhonemeProcessor:
         phonemes = []
         i = 0
 
-        # Define multi-character phonemes (longest first).
-        # Include all possible palatalized consonants, affricates, and reduced vowels.
-        multi_char_phonemes = sorted(
-            list(self.palatalized.values()) + # e.g., 'bʲ', 'dʲ'
-            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'dʑ', # Affricates and their palatalized/voiced forms
-             'ɐ', 'ə', 'ɪ', 'ɨ', # Reduced vowels
-             'ja', 'jo', 'ju', 'je', # Iotated vowels (base forms)
-             'stf' # Specific clusters like 'здравствуйте' part
-            ],
-            key=len,
-            reverse=True # Match longest sequence first
-        )
-
         # Single characters (for fallback)
         single_chars = set('pbvmfnlrkgxdʒʃʐzvstchwiaeouɨɐəɪˈˌ') # Common IPA single chars including vowels and stress marks
 
         while i < len(ipa_string):
             matched = False
             # Try to match longest possible phoneme first
-            for mc_ph in multi_char_phonemes:
+            for mc_ph in self.multi_char_phonemes:
                 if ipa_string.startswith(mc_ph, i):
                     phonemes.append(mc_ph)
                     i += len(mc_ph)
@@ -576,27 +569,6 @@ class RussianPhonemeProcessor:
         # Post-processing: remove isolated stress marks and 'ʲ' if they were accidentally tokenized alone
         # Stress marks are typically applied *after* phoneme sequence is determined for TTS.
         return [p for p in phonemes if p and p not in self.STRESS_MARKS and p != 'ˈ' and p != 'ˌ' and p != 'ʲ']
-
-    def process_text(self, text: str) -> List[Tuple[str, List[str], StressInfo]]:
-        """Process full text and return word-phoneme-stress tuples."""
-        if not text:
-            return []
-
-        normalized_text = self.normalize_text(text)
-        results = []
-
-        for word in normalized_text.split():
-            try:
-                # Call internal method directly — text is already normalized
-                phonemes, stress_info = self._process_normalized_word(word)
-
-                results.append((word, phonemes, stress_info))
-            except Exception as e:
-                logger.error(f"Error processing word '{word}': {e}")
-
-                results.append((word, [], StressInfo(0, 0, False)))
-
-        return results
 
     def to_ipa(self, phonemes: List[str]) -> str:
         """Convert internal phoneme representation to IPA string."""
@@ -655,7 +627,7 @@ class RussianPhonemeProcessor:
             phoneme_set.update(exception_phonemes)
 
         # Add commonly used phonemes that might be missing or appear in specific contexts
-        additional_phonemes = {'j', 'ʐ', 'ts', 'tʃ', 'ʃtʃ', 'bʲ', 'vʲ', 'gʲ', 'dʲ', 'zʲ', 'kʲ', 'lʲ', 'mʲ', 'nʲ', 'pʲ', 'rʲ', 'sʲ', 'tʲ', 'fʲ', 'xʲ', 'stf'}
+        additional_phonemes = {'j', 'ʐ', 'ts', 'tʃ', 'ʃtʃ', 'bʲ', 'vʲ', 'gʲ', 'dʲ', 'zʲ', 'kʲ', 'lʲ', 'mʲ', 'nʲ', 'pʲ', 'rʲ', 'sʲ', 'tʲ', 'fʲ', 'xʲ'}
         phoneme_set.update(additional_phonemes)
 
         # Clean up the set from any control characters or isolated diacritics
@@ -718,16 +690,13 @@ class RussianPhonemeProcessor:
 
     def clear_cache(self):
         self.normalize_text.cache_clear()
-        self.process_word.cache_clear()       # now a pass-through, minimal cache value
         self._process_normalized_word.cache_clear()  # this is where real caching happens
-        self._word_cache.clear()
 
     def get_cache_info(self) -> Dict:
         """Get cache statistics for debugging"""
         return {
             "normalize_text_cache": self.normalize_text.cache_info(),
-            "process_word_cache": self.process_word.cache_info(),
-            "word_cache_size": len(self._word_cache)
+            "_process_normalized_word_cache": self._process_normalized_word.cache_info(),
         }
 
 
@@ -797,7 +766,6 @@ if __name__ == "__main__":
         "молоко": "mɐlɐko", # mɐ-lɐ-kó (stress on last o)
         "хорошо": "xərɐʃo", # xə-rɐ-šó (stress on last o)
         "сегодня": "sʲɪvodʲnʲə", # from exceptions
-        "здравствуйте": "zdrastvujtʲe" # from exceptions
     }
 
     for word, expected_ipa in test_words_for_verification.items():
