@@ -19,6 +19,7 @@ DEFAULT_FILTER_SIZE = 256
 DEFAULT_N_BINS = 256
 DEFAULT_HOP_LENGTH = 256
 
+
 class LengthRegulator(nn.Module):
     """
     Expands phoneme-level hidden states to frame-level based on durations.
@@ -51,6 +52,7 @@ class LengthRegulator(nn.Module):
                 output = output[:, :max_len, :]
 
         return output
+
 
 class VariancePredictor(nn.Module):
     """
@@ -134,25 +136,19 @@ class VariancePredictor(nn.Module):
 
         # Apply conv layers
         for conv, norm in zip(self.conv_layers, self.layer_norms):
-            # Conv1d - ensure input is contiguous
             x = conv(x)
 
             # Transpose for layer norm: (batch, seq_len, filter_size)
             x = x.transpose(1, 2).contiguous()
-
-            # Layer norm
             x = norm(x)
-
-            # Activation and dropout
             x = self.activation(x)
             x = self.dropout(x)
 
             # Transpose back for next conv: (batch, filter_size, seq_len)
-            # Ensure contiguous before next convolution
             x = x.transpose(1, 2).contiguous()
 
-        # Final transpose for linear layer
-        x = x.transpose(1, 2).contiguous()  # (batch, seq_len, filter_size)
+        # Final transpose for linear layer: (batch, seq_len, filter_size)
+        x = x.transpose(1, 2).contiguous()
 
         # Project to single value per timestep
         output = self.linear(x).squeeze(-1)  # (batch, seq_len)
@@ -166,8 +162,14 @@ class VariancePredictor(nn.Module):
 
 class VarianceAdaptor(nn.Module):
     """
-    Variance Adaptor combining duration, pitch, and energy predictors
-    Based on FastSpeech 2
+    Variance Adaptor combining duration, pitch, and energy predictors.
+    Based on FastSpeech 2.
+
+    Processing order:
+      1. Predict durations at the TOKEN level (phoneme-level encoder output).
+      2. Expand encoder output to FRAME level via LengthRegulator.
+      3. Predict pitch and energy at the FRAME level for finer intonation detail.
+      4. Add pitch/energy embeddings to the frame-level representation.
     """
 
     def __init__(self,
@@ -198,58 +200,43 @@ class VarianceAdaptor(nn.Module):
 
         self.hidden_dim = hidden_dim
         self.n_bins = n_bins
-        # Store pitch and energy ranges for normalization helpers
         self.pitch_min = pitch_min
         self.pitch_max = pitch_max
         self.energy_min = energy_min
         self.energy_max = energy_max
 
-        # Duration predictor (already exists in model, but we can add here for completeness)
+        # Duration predictor operates at token (phoneme) level
         self.duration_predictor = VariancePredictor(
             hidden_dim, filter_size, kernel_size, dropout, num_layers=2
         )
 
-        # Pitch predictor
+        # Pitch and energy predictors operate at frame level (post-expansion)
         self.pitch_predictor = VariancePredictor(
             hidden_dim, filter_size, kernel_size, dropout, num_layers=5
         )
-
-        # Energy predictor
         self.energy_predictor = VariancePredictor(
             hidden_dim, filter_size, kernel_size, dropout, num_layers=2
         )
 
-        # Pitch quantization bins (normalized 0..1)
-        # The pitch extractor and any inputs to quantize_pitch must provide
-        # pitch values normalized into the [0, 1] range.
-        self.register_buffer(
-            'pitch_bins',
-            torch.linspace(0.0, 1.0, n_bins - 1)
-        )
+        # Quantization bins in normalized [0, 1] space
+        self.register_buffer('pitch_bins', torch.linspace(0.0, 1.0, n_bins - 1))
+        self.register_buffer('energy_bins', torch.linspace(0.0, 1.0, n_bins - 1))
 
-        # Energy quantization bins (normalized 0..1)
-        # Energy inputs should be normalized to [0,1] before quantization.
-        self.register_buffer(
-            'energy_bins',
-            torch.linspace(0.0, 1.0, n_bins - 1)
-        )
-
-        # Pitch embedding
         self.pitch_embedding = nn.Embedding(n_bins, hidden_dim)
-
-        # Energy embedding
         self.energy_embedding = nn.Embedding(n_bins, hidden_dim)
+
+        # Length regulator for expanding token-level to frame-level
+        self.length_regulator = LengthRegulator()
 
         logger.info(f"VarianceAdaptor initialized with {n_bins} bins for pitch/energy")
 
+    # ------------------------------------------------------------------
+    # Quantization helpers
+    # ------------------------------------------------------------------
+
     def quantize_pitch(self, pitch: torch.Tensor) -> torch.Tensor:
         """
-        Quantize normalized pitch values to bin indices.
-
-        Notes:
-        - Expects `pitch` to be normalized to the [0, 1] range (matching
-          `self.pitch_bins`). If your extractor returns Hz, convert to
-          normalized form before calling this method.
+        Quantize normalized pitch values (in [0, 1]) to bin indices.
 
         Args:
             pitch: Normalized pitch values in [0, 1] (batch, seq_len)
@@ -257,176 +244,249 @@ class VarianceAdaptor(nn.Module):
         Returns:
             Quantized pitch indices (batch, seq_len)
         """
-        # Use torch.bucketize for efficient quantization
-        pitch_quantized = torch.bucketize(pitch, self.pitch_bins)
-        return pitch_quantized.long()
-
-    def _hz_to_normalized(self, f0: torch.Tensor) -> torch.Tensor:
-        """
-        Convert Hz-valued F0 to normalized [0, 1] using adaptor pitch_min/pitch_max.
-
-        Args:
-            f0: Tensor of frequencies in Hz
-
-        Returns:
-            Tensor of normalized values in [0,1]
-        """
-        return torch.clamp((f0 - self.pitch_min) / (self.pitch_max - self.pitch_min + 1e-8), 0.0, 1.0)
-
-    def _maybe_normalize_pitch(self, pitch: torch.Tensor, device: Optional[torch.device] = None) -> torch.Tensor:
-        """
-        Heuristic: if `pitch` appears to be in Hz (values outside [0,1]),
-        convert to normalized [0,1]. Otherwise, assume already normalized.
-        """
-        if pitch is None:
-            return pitch
-
-        # Work on a tensor copy to avoid in-place surprises
-        if not torch.is_tensor(pitch):
-            pitch = torch.tensor(pitch)
-
-        if device is not None:
-            pitch = pitch.to(device)
-
-        # If any value outside [0,1], treat as Hz and convert
-        if pitch.numel() > 0 and (torch.max(pitch) > 1.0 or torch.min(pitch) < 0.0):
-            return self._hz_to_normalized(pitch)
-
-        return pitch
+        return torch.bucketize(pitch, self.pitch_bins).long()
 
     def quantize_energy(self, energy: torch.Tensor) -> torch.Tensor:
         """
-        Quantize continuous energy values to bins
+        Quantize normalized energy values (in [0, 1]) to bin indices.
 
         Args:
-            energy: Continuous energy values (batch, seq_len)
+            energy: Normalized energy values in [0, 1] (batch, seq_len)
 
         Returns:
             Quantized energy indices (batch, seq_len)
         """
-        # Use torch.bucketize for efficient quantization
-        energy_quantized = torch.bucketize(energy, self.energy_bins)
-        return energy_quantized.long()
+        return torch.bucketize(energy, self.energy_bins).long()
+
+    # ------------------------------------------------------------------
+    # Normalization helpers
+    # ------------------------------------------------------------------
+
+    def _hz_to_normalized(self, f0: torch.Tensor) -> torch.Tensor:
+        """Convert Hz-valued F0 to normalized [0, 1]."""
+        return torch.clamp(
+            (f0 - self.pitch_min) / (self.pitch_max - self.pitch_min + 1e-8),
+            0.0, 1.0
+        )
+
+    def _maybe_normalize_pitch(self,
+                                pitch: torch.Tensor,
+                                device: Optional[torch.device] = None) -> torch.Tensor:
+        """
+        Heuristic normalization for pitch targets only (never for model predictions).
+        If values are outside [0, 1] they are assumed to be in Hz and converted.
+        """
+        if pitch is None:
+            return pitch
+        if not torch.is_tensor(pitch):
+            pitch = torch.tensor(pitch)
+        if device is not None:
+            pitch = pitch.to(device)
+        if pitch.numel() > 0 and (torch.max(pitch) > 1.0 or torch.min(pitch) < 0.0):
+            return self._hz_to_normalized(pitch)
+        return pitch
 
     def _energy_to_normalized(self, energy: torch.Tensor) -> torch.Tensor:
-        """
-        Convert energy to normalized [0, 1] using adaptor energy_min/energy_max.
-        """
-        return torch.clamp((energy - self.energy_min) / (self.energy_max - self.energy_min + 1e-8), 0.0, 1.0)
+        """Convert energy to normalized [0, 1]."""
+        return torch.clamp(
+            (energy - self.energy_min) / (self.energy_max - self.energy_min + 1e-8),
+            0.0, 1.0
+        )
 
-    def _maybe_normalize_energy(self, energy: torch.Tensor, device: Optional[torch.device] = None) -> torch.Tensor:
+    def _maybe_normalize_energy(self,
+                                 energy: torch.Tensor,
+                                 device: Optional[torch.device] = None) -> torch.Tensor:
         """
-        Heuristic: if `energy` appears to be outside [0,1], convert to normalized.
+        Heuristic normalization for energy targets only (never for model predictions).
+        If values are outside [0, 1] they are assumed to be raw energy and converted.
         """
         if energy is None:
             return energy
-
         if not torch.is_tensor(energy):
             energy = torch.tensor(energy)
-
         if device is not None:
             energy = energy.to(device)
-
         if energy.numel() > 0 and (torch.max(energy) > 1.0 or torch.min(energy) < 0.0):
             return self._energy_to_normalized(energy)
-
         return energy
+
+    # ------------------------------------------------------------------
+    # Frame-level target expansion
+    # ------------------------------------------------------------------
+
+    def _expand_targets_to_frame_level(self,
+                                        targets: torch.Tensor,
+                                        durations: torch.Tensor,
+                                        max_len: Optional[int] = None) -> torch.Tensor:
+        """
+        Expand token-level targets (batch, n_phonemes) to frame-level
+        (batch, n_frames) using the same durations used for the hidden states.
+
+        Args:
+            targets: Token-level values (batch, n_phonemes)
+            durations: Integer frame counts per phoneme (batch, n_phonemes)
+            max_len: If provided, truncate/pad output to this length
+
+        Returns:
+            Frame-level targets (batch, n_frames)
+        """
+        durations = torch.round(durations.clamp(min=0)).long()
+        batch_size = targets.shape[0]
+
+        expanded = []
+        for i in range(batch_size):
+            exp = torch.repeat_interleave(targets[i], durations[i], dim=0)
+            expanded.append(exp)
+
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
+
+        if max_len is not None:
+            if output.size(1) < max_len:
+                output = F.pad(output, (0, max_len - output.size(1)))
+            else:
+                output = output[:, :max_len]
+
+        return output
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
 
     def forward(self,
                 encoder_output: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
                 pitch_target: Optional[torch.Tensor] = None,
                 energy_target: Optional[torch.Tensor] = None,
-                duration_target: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
+                duration_target: Optional[torch.Tensor] = None,
+                mel_target: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
         """
-        Forward pass through variance adaptor
+        Forward pass through variance adaptor.
+
+        During training, ground-truth duration/pitch/energy targets are supplied
+        so the model conditions on correct values (teacher forcing).  During
+        inference all three are None and the model uses its own predictions.
 
         Args:
-            encoder_output: Encoder output (batch, seq_len, hidden_dim)
-            mask: Padding mask (batch, seq_len) - True for padding
-            pitch_target: Target pitch values for training (batch, seq_len)
-            energy_target: Target energy values for training (batch, seq_len)
-            duration_target: Target duration values for training (batch, seq_len)
+            encoder_output: Phoneme-level encoder output (batch, n_phonemes, hidden_dim)
+            mask: Phoneme-level padding mask (batch, n_phonemes) — True for padding
+            pitch_target: Token-level normalized pitch targets (batch, n_phonemes).
+                          May be in Hz; will be auto-converted to [0, 1] if needed.
+            energy_target: Token-level normalized energy targets (batch, n_phonemes).
+                           Will be auto-converted to [0, 1] if needed.
+            duration_target: Ground-truth frame counts per phoneme (batch, n_phonemes).
+                             If None, model predictions are used (inference mode).
+                             NOTE: if your duration predictor is trained in log-domain,
+                             pass raw (non-log) integer frame counts here and apply
+                             exp() to duration_pred before using it for inference.
+            mel_target: Ground-truth mel spectrogram (batch, n_frames, n_mels) used
+                        only to determine the target frame length for alignment.
 
         Returns:
-            Tuple of (adapted_output, duration_pred, pitch_pred, energy_pred)
+            Tuple of:
+                adapted_output  — Frame-level hidden states (batch, n_frames, hidden_dim)
+                duration_pred   — Token-level duration logits  (batch, n_phonemes)
+                pitch_pred      — Frame-level pitch predictions (batch, n_frames)
+                energy_pred     — Frame-level energy predictions (batch, n_frames)
+                frame_mask      — Frame-level padding mask (batch, n_frames), True=padding
         """
-        # Predict durations
+        device = encoder_output.device
+
+        # 1. Predict durations at the TOKEN level
         duration_pred = self.duration_predictor(encoder_output, mask)
 
-        # Predict pitch
-        pitch_pred = self.pitch_predictor(encoder_output, mask)
-
-        # Predict energy
-        energy_pred = self.energy_predictor(encoder_output, mask)
-
-        # Normalize targets to [0,1] before quantization when targets are supplied.
-        # For model predictions, assume the network outputs normalized values
-        # (training targets are normalized). Do NOT apply the Hz heuristic to
-        # raw predictions (logits) which can erroneously trigger Hz->norm conversion.
-        if pitch_target is not None:
-            pitch_to_quantize = self._maybe_normalize_pitch(pitch_target, device=encoder_output.device)
+        # 2. Determine which durations to use for expansion
+        if duration_target is not None:
+            durations_to_use = duration_target
         else:
-            # Predictions should already be in [0,1]; clamp as a safety net.
-            pitch_to_quantize = pitch_pred.clamp(0.0, 1.0)
-        pitch_quantized = self.quantize_pitch(pitch_to_quantize)
+            # Inference: use predicted durations (assumed to be raw frame counts,
+            # not log-domain — apply exp() upstream if your predictor uses log targets)
+            durations_to_use = torch.clamp(torch.round(duration_pred), min=0)
+
+        durations_to_use = durations_to_use.to(device)
+
+        # 3. Expand encoder hidden states to frame level
+        max_len = mel_target.size(1) if mel_target is not None else None
+        x = self.length_regulator(encoder_output, durations_to_use, max_len=max_len)
+
+        # 4. Build a frame-level padding mask from the expanded durations
+        lengths = durations_to_use.long().sum(dim=1)
+        if max_len is not None:
+            lengths = lengths.clamp(max=max_len)
+        frame_mask = (
+            torch.arange(x.size(1), device=device).unsqueeze(0) >= lengths.unsqueeze(1)
+        )
+
+        # 5. Predict pitch and energy at the FRAME level
+        pitch_pred = self.pitch_predictor(x, frame_mask)
+        energy_pred = self.energy_predictor(x, frame_mask)
+
+        # 6. Determine values to embed
+        #    Training:  expand token-level targets to frame-level, then normalize.
+        #    Inference: clamp model predictions into [0, 1] (no Hz heuristic applied
+        #               to raw logits — that would silently corrupt predictions).
+        if pitch_target is not None:
+            # Expand token-level targets → frame-level before normalization
+            pitch_frame = self._expand_targets_to_frame_level(
+                pitch_target, durations_to_use, max_len=max_len
+            )
+            p_val = self._maybe_normalize_pitch(pitch_frame, device=device)
+        else:
+            p_val = pitch_pred.clamp(0.0, 1.0)
 
         if energy_target is not None:
-            energy_to_quantize = self._maybe_normalize_energy(energy_target, device=encoder_output.device)
+            energy_frame = self._expand_targets_to_frame_level(
+                energy_target, durations_to_use, max_len=max_len
+            )
+            e_val = self._maybe_normalize_energy(energy_frame, device=device)
         else:
-            energy_to_quantize = energy_pred.clamp(0.0, 1.0)
-        energy_quantized = self.quantize_energy(energy_to_quantize)
+            e_val = energy_pred.clamp(0.0, 1.0)
 
-        # Get embeddings
-        pitch_embed = self.pitch_embedding(pitch_quantized)
-        energy_embed = self.energy_embedding(energy_quantized)
+        # 7. Look up embeddings and add to frame-level hidden states
+        pitch_embed = self.pitch_embedding(self.quantize_pitch(p_val))
+        energy_embed = self.energy_embedding(self.quantize_energy(e_val))
 
-        # Zero out embeddings at padded positions to avoid leakage
-        if mask is not None:
-            mask_unsq = mask.unsqueeze(-1)
-            pitch_embed = pitch_embed.masked_fill(mask_unsq, 0.0)
-            energy_embed = energy_embed.masked_fill(mask_unsq, 0.0)
+        adapted_output = x + pitch_embed + energy_embed
 
-        # Add variance embeddings to encoder output
-        adapted_output = encoder_output + pitch_embed + energy_embed
+        # Zero out padded positions
+        if frame_mask is not None:
+            adapted_output = adapted_output.masked_fill(frame_mask.unsqueeze(-1), 0.0)
 
-        return adapted_output, duration_pred, pitch_pred, energy_pred
+        return adapted_output, duration_pred, pitch_pred, energy_pred, frame_mask
 
 
 class PitchExtractor:
     """
-    Extract pitch (F0) from audio waveform
-    Uses PyTorch-compatible implementation
+    Extract pitch (F0) from audio waveform.
+    Uses a PyTorch-native YIN-style CMND algorithm.
     """
 
     @staticmethod
     def extract_pitch(waveform: torch.Tensor,
-                     sample_rate: int = 22050,
-                     hop_length: int = DEFAULT_HOP_LENGTH,
-                     fmin: float = 50.0,
-                     fmax: float = 800.0,
-                     win_length: Optional[int] = None) -> torch.Tensor:
+                      sample_rate: int = 22050,
+                      hop_length: int = DEFAULT_HOP_LENGTH,
+                      fmin: float = 50.0,
+                      fmax: float = 800.0,
+                      win_length: Optional[int] = None) -> torch.Tensor:
         """
         Extract pitch (F0) from waveform using YIN-style CMND algorithm.
 
-        Improvements over previous version:
+        Features:
         - Cumulative Mean Normalized Difference (CMND) reduces octave errors
         - Parabolic interpolation for sub-sample lag accuracy
         - Adaptive per-utterance voicing threshold
         - Median filtering to remove frame-to-frame jitter
         - Linear interpolation across short unvoiced gaps
-        - win_length parameter is now respected
 
         Args:
             waveform: Audio waveform (batch, samples) or (samples,)
-            sample_rate: Sample rate
+            sample_rate: Sample rate in Hz
             hop_length: Hop length for framing
             fmin: Minimum frequency in Hz
             fmax: Maximum frequency in Hz
             win_length: Analysis window length (defaults to max(2048, hop*8))
 
         Returns:
-            Normalized pitch contour in [0, 1] — (batch, frames) or (frames,)
+            Normalized pitch contour in [0, 1] — (batch, frames) or (frames,).
             Unvoiced frames are 0.0.
         """
         try:
@@ -437,9 +497,8 @@ class PitchExtractor:
             else:
                 squeeze_output = False
 
-            # Capture original (pre-padding/processing) lengths and batch info so
-            # exception handling can return tensors matching the caller's expected
-            # shape. Do this after potential unsqueeze above so shapes align.
+            # Capture shapes before any modification so the exception handler
+            # can reconstruct the correct output shape.
             orig_num_samples = waveform.shape[-1]
             orig_batch_size = waveform.shape[0]
 
@@ -447,11 +506,7 @@ class PitchExtractor:
             dtype = waveform.dtype
             hop = int(hop_length)
 
-            # Respect caller's win_length, fall back to adaptive default
-            if win_length is not None:
-                win_len = int(win_length)
-            else:
-                win_len = max(2048, hop * 8)
+            win_len = int(win_length) if win_length is not None else max(2048, hop * 8)
 
             # Pad signal to at least one full window
             if waveform.size(1) < win_len:
@@ -480,51 +535,37 @@ class PitchExtractor:
             acf = torch.fft.irfft(spec.abs() ** 2, n=nfft)[..., :win_len]
 
             # --- CMND (Cumulative Mean Normalized Difference) ---
-            # Difference function: d(tau) = acf[0] + acf[0] - 2*acf[tau]
-            zero_lag = acf[..., 0:1]  # (B, frames, 1)
-            diff = 2 * zero_lag - 2 * acf  # (B, frames, win_len)
+            zero_lag = acf[..., 0:1]
+            diff = 2 * zero_lag - 2 * acf
 
-            # CMND: d'(tau) = d(tau) / [(1/tau) * sum_{j=1}^{tau} d(j)]
-            # d'[0] = 1 by convention
             cmnd = torch.zeros_like(diff)
             cmnd[..., 0] = 1.0
-            cumsum = torch.cumsum(diff[..., 1:], dim=-1)  # (B, frames, win_len-1)
+            cumsum = torch.cumsum(diff[..., 1:], dim=-1)
             tau_range = torch.arange(1, win_len, device=device, dtype=dtype)
             cmnd[..., 1:] = diff[..., 1:] / (cumsum / tau_range + 1e-8)
 
             # --- Lag Search Range ---
             lag_min = max(2, int(sample_rate / fmax))
             lag_max = min(win_len - 2, max(lag_min + 1, int(sample_rate / fmin)))
-            # -2 upper bound to leave room for parabolic interpolation
 
             lags = torch.arange(lag_min, lag_max + 1, device=device)
             n_lags = len(lags)
-
-            # CMND values in search range: (B, frames, n_lags)
-            # Lower CMND = better pitch candidate (unlike ACF where higher = better)
             cmnd_lags = cmnd[..., lag_min:lag_max + 1]
 
-            # Also gather ACF in search range for voicing confidence
             acf_norm = acf / zero_lag.clamp(min=1e-8)
             ac_lags = acf_norm[..., lag_min:lag_max + 1]
-            ac_max_vals, _ = ac_lags.max(dim=-1)  # (B, frames)
+            ac_max_vals, _ = ac_lags.max(dim=-1)
 
+            # --- CMND Threshold + Argmin Fallback ---
             threshold = 0.15
-            # Find lags below threshold
             below_thresh = cmnd_lags < threshold
-
-            # Create a mask for the first occurrences (B, frames, n_lags)
             first_dip = (below_thresh.cumsum(-1) == 1) & below_thresh
-
-            # If any dip is found, take the first one. Otherwise, take global argmin.
             has_dip = below_thresh.any(dim=-1)
-            # argmax is not implemented for Bool on some backends; convert to long first.
             first_dip_idx = first_dip.long().argmax(dim=-1)
             argmin_idx = torch.argmin(cmnd_lags, dim=-1)
             best_idx = torch.where(has_dip, first_dip_idx, argmin_idx)
 
-            # --- Parabolic Interpolation for Sub-Sample Accuracy ---
-            # Clamp neighbors to valid range
+            # --- Parabolic Interpolation ---
             idx_prev = (best_idx - 1).clamp(min=0)
             idx_next = (best_idx + 1).clamp(max=n_lags - 1)
 
@@ -533,113 +574,81 @@ class PitchExtractor:
             gamma = cmnd_lags.gather(-1, idx_next.unsqueeze(-1)).squeeze(-1)
 
             denom = (alpha - 2 * beta + gamma).clamp(min=1e-8)
+            offset = (0.5 * (alpha - gamma) / denom).clamp(-1.0, 1.0)
 
-            offset = 0.5 * (alpha - gamma) / denom
-            offset = offset.clamp(-1.0, 1.0)  # Sanity clamp
-
-            # Map best_idx to actual lag, apply sub-sample offset
             best_lags = (lags[best_idx].float() + offset).clamp(min=1.0)
-            freqs = sample_rate / best_lags  # (B, frames)
+            freqs = sample_rate / best_lags
 
             # --- Adaptive Voicing Threshold ---
-            # Per-utterance: base threshold on 25th percentile of ACF peaks
-            # This adapts to recording conditions rather than using a fixed value
             ac_25th = torch.quantile(ac_max_vals, 0.25, dim=-1, keepdim=True)
             voicing_thresh = torch.clamp(ac_25th * 0.8, min=0.15, max=0.35)
 
             frame_energy = frames.pow(2).mean(dim=-1)
-            energy_thresh = torch.clamp(torch.median(frame_energy, dim=-1, keepdim=True).values * 0.05, min=1e-9)
+            energy_thresh = torch.clamp(
+                torch.median(frame_energy, dim=-1, keepdim=True).values * 0.05, min=1e-9
+            )
 
             unvoiced_mask = (ac_max_vals < voicing_thresh) | (frame_energy < energy_thresh)
             freqs = freqs.masked_fill(unvoiced_mask, 0.0)
 
-            # Clip to valid frequency range before normalization
             freqs = torch.where(
-                (freqs < fmin) | (freqs > fmax),
-                torch.zeros_like(freqs),
-                freqs
+                (freqs < fmin) | (freqs > fmax), torch.zeros_like(freqs), freqs
             )
 
             # --- Interpolate Short Unvoiced Gaps (vectorized, torch-only) ---
-            # Fill gaps of up to MAX_GAP_FRAMES with linear interpolation
-            # This avoids CPU <-> GPU copies by performing interpolation in PyTorch.
             MAX_GAP_FRAMES = 5
-
-            # freqs: (B, T)
             Bf, Tf = freqs.shape
             idx = torch.arange(Tf, device=device, dtype=torch.long).unsqueeze(0).expand(Bf, Tf)
             voiced_mask = freqs > 0.0
 
             if voiced_mask.any():
-                # Previous voiced index at or before each frame (or -1 if none)
                 prev_candidates = torch.where(voiced_mask, idx, torch.full_like(idx, -1))
                 prev_idx = torch.cummax(prev_candidates, dim=1)[0]
 
-                # Next voiced index at or after each frame (or Tf if none)
                 next_candidates = torch.where(voiced_mask, idx, torch.full_like(idx, Tf))
-                next_rev = torch.cummin(next_candidates.flip(dims=[1]), dim=1)[0]
-                next_idx = next_rev.flip(dims=[1])
+                next_idx = torch.cummin(next_candidates.flip(dims=[1]), dim=1)[0].flip(dims=[1])
 
-                # Gap length between voiced neighbors
-                gap_len = (next_idx - prev_idx - 1)
-
-                # Positions eligible for filling: currently unvoiced, have prev and next, and small gap
-                fill_mask = (~voiced_mask) & (prev_idx >= 0) & (next_idx < Tf) & (gap_len <= MAX_GAP_FRAMES)
+                gap_len = next_idx - prev_idx - 1
+                fill_mask = (
+                    (~voiced_mask) & (prev_idx >= 0) & (next_idx < Tf) & (gap_len <= MAX_GAP_FRAMES)
+                )
 
                 if fill_mask.any():
-                    # Gather neighbor values (clamp indices for gather safety)
-                    prev_idx_clamped = prev_idx.clamp(min=0)
-                    next_idx_clamped = next_idx.clamp(max=Tf - 1)
-
-                    prev_vals = freqs.gather(1, prev_idx_clamped)
-                    next_vals = freqs.gather(1, next_idx_clamped)
-
-                    # Interpolation factor
+                    prev_vals = freqs.gather(1, prev_idx.clamp(min=0))
+                    next_vals = freqs.gather(1, next_idx.clamp(max=Tf - 1))
                     denom = (next_idx.float() - prev_idx.float()).clamp(min=1.0)
                     t = (idx.float() - prev_idx.float()) / denom
-
                     interp = prev_vals * (1.0 - t) + next_vals * t
-
-                    # Assign only to eligible positions
                     freqs[fill_mask] = interp[fill_mask]
 
-            # --- Median Filter (removes jitter) ---
+            # --- Median Filter ---
             MEDIAN_K = 5
             pad = MEDIAN_K // 2
-            freqs_padded = F.pad(freqs, (pad, pad), mode='reflect')
-            freqs = freqs_padded.unfold(-1, MEDIAN_K, 1).median(dim=-1).values
+            freqs = F.pad(freqs, (pad, pad), mode='reflect').unfold(-1, MEDIAN_K, 1).median(dim=-1).values
 
-            # --- Normalize to [0, 1] ---
-            freqs_norm = torch.clamp((freqs - fmin) / (fmax - fmin + 1e-8), min=0.0, max=1.0)
-            # Preserve zero (unvoiced) frames — normalization may shift them slightly
+            # --- Normalize to [0, 1], preserving unvoiced zeros ---
+            freqs_norm = torch.clamp((freqs - fmin) / (fmax - fmin + 1e-8), 0.0, 1.0)
             freqs_norm = freqs_norm.masked_fill(freqs == 0.0, 0.0)
 
             return freqs_norm.squeeze(0) if squeeze_output else freqs_norm
 
         except Exception as e:
             logger.warning(f"Pitch extraction failed: {e}, using zeros")
-            # Use original pre-processed sample count to compute frame count so
-            # returned shapes match caller expectations (no surprises from padding).
             n_frames = max(1, orig_num_samples // hop_length)
             device = waveform.device if 'waveform' in locals() else torch.device('cpu')
+            zeros = torch.zeros((orig_batch_size, n_frames), device=device)
+            return zeros.squeeze(0) if squeeze_output else zeros
 
-            # Create batched zeros tensor then squeeze if the caller passed a
-            # single 1D waveform (squeeze_output==True). This guarantees the
-            # returned tensor shape matches the original input shape.
-            zeros_batched = torch.zeros((orig_batch_size, n_frames), device=device)
-            if squeeze_output:
-                return zeros_batched.squeeze(0)
-            return zeros_batched
 
 class EnergyExtractor:
     """
-    Extract energy (RMS) from mel spectrogram or waveform
+    Extract energy (RMS) from mel spectrogram or waveform.
     """
 
     @staticmethod
     def extract_energy_from_mel(mel_spec: torch.Tensor) -> torch.Tensor:
         """
-        Extract energy from mel spectrogram, normalized to [0, 1]
+        Extract energy from mel spectrogram, normalized to [0, 1].
 
         Args:
             mel_spec: Mel spectrogram (batch, n_mels, frames) or (n_mels, frames)
@@ -648,34 +657,23 @@ class EnergyExtractor:
             Energy contour normalized to [0, 1] (batch, frames) or (frames,)
         """
         # Convert to linear domain if input appears to be log-mel
-        if mel_spec.min() < 0:
-            mel_linear = torch.exp(mel_spec)
-        else:
-            mel_linear = mel_spec
+        mel_linear = torch.exp(mel_spec) if mel_spec.min() < 0 else mel_spec
 
-        # Energy is frame-level mean across mel bins (works for batched or unbatched inputs)
         energy = torch.mean(mel_linear, dim=-2)
-
-        # Dynamic range compression and robust per-utterance normalization
         energy = torch.log1p(torch.clamp(energy, min=0.0))
 
-        # Compute robust per-utterance floor/ceil along the frames axis.
-        # Use keepdim=True so broadcasting works for both (frames,) and (batch, frames).
         floor = torch.quantile(energy, 0.05, dim=-1, keepdim=True)
-        ceil = torch.quantile(energy, 0.95, dim=-1, keepdim=True)
-        denom = torch.clamp(ceil - floor, min=1e-8)
-        energy = (energy - floor) / denom
+        ceil  = torch.quantile(energy, 0.95, dim=-1, keepdim=True)
+        energy = (energy - floor) / torch.clamp(ceil - floor, min=1e-8)
 
-        energy = torch.clamp(energy, 0.0, 1.0)
-
-        return energy
+        return torch.clamp(energy, 0.0, 1.0)
 
     @staticmethod
     def extract_energy_from_waveform(waveform: torch.Tensor,
-                                    hop_length: int = DEFAULT_HOP_LENGTH,
-                                    win_length: int = 1024) -> torch.Tensor:
+                                     hop_length: int = DEFAULT_HOP_LENGTH,
+                                     win_length: int = 1024) -> torch.Tensor:
         """
-        Extract RMS energy from waveform
+        Extract RMS energy from waveform.
 
         Args:
             waveform: Audio waveform (batch, samples) or (samples,)
@@ -685,41 +683,29 @@ class EnergyExtractor:
         Returns:
             Energy contour (batch, frames) or (frames,)
         """
-        # Ensure 2D
         if waveform.dim() == 1:
             waveform = waveform.unsqueeze(0)
             squeeze_output = True
         else:
             squeeze_output = False
 
-        # Respect center-padding used by typical mel spectrograms: pad by half-window
         hop = int(hop_length)
         win_len = int(win_length)
-
         pad_val = win_len // 2
-        # Reflect-pad to mimic STFT center=True behaviour
-        waveform = F.pad(waveform, (pad_val, pad_val), mode='reflect')
 
-        # Ensure there are at least win_len samples after padding
+        waveform = F.pad(waveform, (pad_val, pad_val), mode='reflect')
         if waveform.size(1) < win_len:
             waveform = F.pad(waveform, (0, win_len - waveform.size(1)))
 
-        # Unfold to create overlapping windows
         frames = waveform.unfold(1, win_len, hop).contiguous()
 
-        # Apply Hann window per frame to match mel spectrogram energy computation (centered STFT)
-        device = waveform.device
-        dtype = waveform.dtype
+        device, dtype = waveform.device, waveform.dtype
         window = torch.hann_window(win_len, device=device, dtype=dtype)
         frames = frames * window.unsqueeze(0).unsqueeze(0)
 
-        # Calculate RMS energy per frame (with window applied)
         energy = torch.sqrt(torch.mean(frames.pow(2), dim=-1) + 1e-8)
 
-        if squeeze_output:
-            energy = energy.squeeze(0)
-
-        return energy
+        return energy.squeeze(0) if squeeze_output else energy
 
 
 def normalize_variance(values: torch.Tensor,
@@ -727,7 +713,7 @@ def normalize_variance(values: torch.Tensor,
                        mean: Optional[float] = None,
                        std: Optional[float] = None) -> Tuple[torch.Tensor, float, float]:
     """
-    Normalize variance values (pitch/energy) to zero mean and unit variance
+    Normalize variance values (pitch/energy) to zero mean and unit variance.
 
     Args:
         values: Variance values (batch, seq_len)
@@ -739,22 +725,19 @@ def normalize_variance(values: torch.Tensor,
         Tuple of (normalized_values, mean, std)
     """
     if mask is not None:
-        # Compute statistics only on non-masked values
-        non_masked_values = values[~mask]
+        non_masked = values[~mask]
         if mean is None:
-            mean = non_masked_values.mean().item()
+            mean = non_masked.mean().item()
         if std is None:
-            std = non_masked_values.std().item() + 1e-8
+            std = non_masked.std().item() + 1e-8
     else:
         if mean is None:
             mean = values.mean().item()
         if std is None:
             std = values.std().item() + 1e-8
 
-    # Normalize
     normalized = (values - mean) / std
 
-    # Zero out masked values
     if mask is not None:
         normalized = normalized.masked_fill(mask, 0.0)
 
@@ -762,39 +745,39 @@ def normalize_variance(values: torch.Tensor,
 
 
 if __name__ == "__main__":
-    """Test variance predictor"""
+    """Smoke tests for all components."""
     logging.basicConfig(level=logging.INFO)
 
-    # Test variance predictor
+    # VariancePredictor
     predictor = VariancePredictor(hidden_dim=DEFAULT_HIDDEN_DIM, filter_size=DEFAULT_FILTER_SIZE)
-    x = torch.randn(4, 100, DEFAULT_HIDDEN_DIM)  # (batch, seq_len, hidden_dim)
+    x = torch.randn(4, 100, DEFAULT_HIDDEN_DIM)
     mask = torch.zeros(4, 100).bool()
-
     output = predictor(x, mask)
-    print(f"VariancePredictor output shape: {output.shape}")  # Should be (4, 100)
+    print(f"VariancePredictor output shape: {output.shape}")  # (4, 100)
 
-    # Test variance adaptor
+    # VarianceAdaptor — training mode with token-level targets
     adaptor = VarianceAdaptor(hidden_dim=DEFAULT_HIDDEN_DIM, n_bins=DEFAULT_N_BINS)
-    pitch_target = torch.randn(4, 100) * 100 + 200  # Pitch in Hz
-    energy_target = torch.randn(4, 100) * 10 + 50   # Energy
-    duration_target = torch.randint(1, 20, (4, 100)).float()
+    pitch_target = torch.randn(4, 100) * 100 + 200   # Hz-scale (will be auto-normalized)
+    energy_target = torch.randn(4, 100) * 10 + 50    # raw energy (will be auto-normalized)
+    duration_target = torch.randint(1, 5, (4, 100)).float()  # token-level frame counts
 
-    adapted, dur_pred, pitch_pred, energy_pred = adaptor(
+    adapted, dur_pred, pitch_pred, energy_pred, frame_mask = adaptor(
         x, mask, pitch_target, energy_target, duration_target
     )
 
-    print(f"Adapted output shape: {adapted.shape}")
-    print(f"Duration prediction shape: {dur_pred.shape}")
-    print(f"Pitch prediction shape: {pitch_pred.shape}")
-    print(f"Energy prediction shape: {energy_pred.shape}")
+    print(f"Adapted output shape:    {adapted.shape}")
+    print(f"Duration pred shape:     {dur_pred.shape}")
+    print(f"Pitch pred shape:        {pitch_pred.shape}")
+    print(f"Energy pred shape:       {energy_pred.shape}")
+    print(f"Frame mask shape:        {frame_mask.shape}")
 
-    # Test pitch extractor
-    waveform = torch.randn(1, 22050)  # 1 second of audio
+    # PitchExtractor
+    waveform = torch.randn(1, 22050)
     pitch = PitchExtractor.extract_pitch(waveform, sample_rate=22050, hop_length=DEFAULT_HOP_LENGTH)
     print(f"Pitch shape: {pitch.shape}")
 
-    # Test energy extractor
-    mel_spec = torch.randn(80, 100)  # (n_mels, frames)
+    # EnergyExtractor
+    mel_spec = torch.randn(80, 100)
     energy = EnergyExtractor.extract_energy_from_mel(mel_spec)
     print(f"Energy shape: {energy.shape}")
 
