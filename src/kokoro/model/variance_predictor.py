@@ -27,45 +27,18 @@ class LengthRegulator(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def forward(self,
-                x: torch.Tensor,
-                durations: torch.Tensor,
-                max_len: Optional[int] = None) -> torch.Tensor:
-        # MFA durations are frame counts (integers)
+    def forward(self, x, durations, max_len=None):
         durations = torch.round(durations.clamp(min=0)).long()
-
-        # To avoid device-specific backend issues (notably on MPS), perform
-        # the variable-length expansion on CPU and move the result back to the
-        # original device. Also guard against zero-length expansions which
-        # would cause pad_sequence to fail.
-        device = x.device
         batch_size = x.shape[0]
-
-        x_cpu = x.detach().to('cpu')
-        durations_cpu = durations.detach().to('cpu')
-
         expanded = []
+
         for i in range(batch_size):
-            repeats = int(durations_cpu[i].sum().item()) if durations_cpu.dim() == 2 else int(durations_cpu[i].item())
-            # If per-phoneme durations provided, use per-phoneme repeat_interleave
-            if durations_cpu.dim() == 2:
-                # If all zero, create a single zero frame to keep shapes consistent
-                if durations_cpu[i].sum().item() == 0:
-                    expanded_sample = torch.zeros((1, x_cpu.size(2)), dtype=x_cpu.dtype)
-                else:
-                    expanded_sample = torch.repeat_interleave(x_cpu[i], durations_cpu[i], dim=0)
+            if durations[i].sum() == 0:
+                expanded.append(torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device))
             else:
-                # durations is 1D per-sample
-                if repeats == 0:
-                    expanded_sample = torch.zeros((1, x_cpu.size(2)), dtype=x_cpu.dtype)
-                else:
-                    expanded_sample = torch.repeat_interleave(x_cpu[i], durations_cpu[i], dim=0)
+                expanded.append(torch.repeat_interleave(x[i], durations[i], dim=0))
 
-            expanded.append(expanded_sample)
-
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
-
-        # Align with Ground Truth Mel length for Loss calculation
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
         if max_len is not None:
             if output.size(1) < max_len:
                 output = F.pad(output, (0, 0, 0, max_len - output.size(1)))
@@ -73,7 +46,6 @@ class LengthRegulator(nn.Module):
                 output = output[:, :max_len, :]
 
         return output
-
 
 class VariancePredictor(nn.Module):
     """
@@ -233,7 +205,7 @@ class VarianceAdaptor(nn.Module):
 
         # Pitch and energy predictors operate at frame level (post-expansion)
         self.pitch_predictor = VariancePredictor(
-            hidden_dim, filter_size, kernel_size, dropout, num_layers=5
+            hidden_dim, filter_size, kernel_size, dropout, num_layers=2
         )
         self.energy_predictor = VariancePredictor(
             hidden_dim, filter_size, kernel_size, dropout, num_layers=2
@@ -334,11 +306,10 @@ class VarianceAdaptor(nn.Module):
     # ------------------------------------------------------------------
     # Frame-level target expansion
     # ------------------------------------------------------------------
-
     def _expand_targets_to_frame_level(self,
-                                        targets: torch.Tensor,
-                                        durations: torch.Tensor,
-                                        max_len: Optional[int] = None) -> torch.Tensor:
+                                    targets: torch.Tensor,
+                                    durations: torch.Tensor,
+                                    max_len: Optional[int] = None) -> torch.Tensor:
         """
         Expand token-level targets (batch, n_phonemes) to frame-level
         (batch, n_frames) using the same durations used for the hidden states.
@@ -352,23 +323,17 @@ class VarianceAdaptor(nn.Module):
             Frame-level targets (batch, n_frames)
         """
         durations = torch.round(durations.clamp(min=0)).long()
-
-        # Perform expansion on CPU to avoid device-specific issues (MPS)
-        device = targets.device
-        targets_cpu = targets.detach().to('cpu')
-        durations_cpu = durations.detach().to('cpu')
-        batch_size = targets_cpu.shape[0]
+        batch_size = targets.shape[0]
 
         expanded = []
         for i in range(batch_size):
-            # If all durations zero, emit a single zero value to avoid empty tensors
-            if durations_cpu[i].sum().item() == 0:
-                exp = torch.zeros((1,), dtype=targets_cpu.dtype)
+            if durations[i].sum() == 0:
+                # Guard against fully-zero durations producing an empty tensor
+                expanded.append(torch.zeros((1,), dtype=targets.dtype, device=targets.device))
             else:
-                exp = torch.repeat_interleave(targets_cpu[i], durations_cpu[i], dim=0)
-            expanded.append(exp)
+                expanded.append(torch.repeat_interleave(targets[i], durations[i], dim=0))
 
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
 
         if max_len is not None:
             if output.size(1) < max_len:
@@ -381,7 +346,6 @@ class VarianceAdaptor(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
-
     def forward(self,
                 encoder_output: torch.Tensor,
                 mask: Optional[torch.Tensor] = None,
