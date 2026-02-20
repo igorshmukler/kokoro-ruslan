@@ -1186,18 +1186,34 @@ class KokoroTrainer:
         else:
             loss_stop_token = torch.tensor(0.0, device=self.device)
 
-        # Pitch Loss (if variance predictor enabled) - reuse phoneme mask
+        # Pitch Loss (if variance predictor enabled) - ensure predictions are phoneme-level
         loss_pitch = torch.tensor(0.0, device=self.device)
         if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
-            loss_pitch_unreduced = self.criterion_pitch(predicted_pitch, pitch_targets)
+            # If model returned frame-level pitch predictions, average to phoneme-level
+            if predicted_pitch.dim() == 2 and predicted_pitch.size(1) != phoneme_durations.size(1):
+                pred_pitch_ph = self._average_pitch_energy_by_duration(
+                    predicted_pitch, phoneme_durations, phoneme_lengths
+                )
+            else:
+                pred_pitch_ph = predicted_pitch
+
+            loss_pitch_unreduced = self.criterion_pitch(pred_pitch_ph, pitch_targets)
             pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
             if pitch_valid.any():
                 loss_pitch = loss_pitch_unreduced[pitch_valid].mean()
 
-        # Energy Loss (if variance predictor enabled) - reuse phoneme mask
+        # Energy Loss (if variance predictor enabled) - ensure predictions are phoneme-level
         loss_energy = torch.tensor(0.0, device=self.device)
         if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
-            loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
+            # If model returned frame-level energy predictions, average to phoneme-level
+            if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
+                pred_energy_ph = self._average_pitch_energy_by_duration(
+                    predicted_energy, phoneme_durations, phoneme_lengths
+                )
+            else:
+                pred_energy_ph = predicted_energy
+
+            loss_energy_unreduced = self.criterion_energy(pred_energy_ph, energy_targets)
             energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
             if energy_valid.any():
                 loss_energy = loss_energy_unreduced[energy_valid].mean()
@@ -2943,10 +2959,10 @@ class KokoroTrainer:
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
                     else:
-                        predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                        predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
                 self.interbatch_profiler.end_forward_pass()
 

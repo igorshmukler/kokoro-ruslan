@@ -532,8 +532,9 @@ class KokoroModel(nn.Module):
                             energy_targets, phoneme_durations, text_padding_mask
                         )
 
-                    # Apply variance adaptor
-                    adapted_encoder_output, predicted_log_durations, predicted_pitch, predicted_energy = \
+                    # Apply variance adaptor (returns adapted_output, duration_pred,
+                    # pitch_pred, energy_pred, frame_mask)
+                    adapted_encoder_output, predicted_log_durations, predicted_pitch, predicted_energy, frame_mask = \
                         self.variance_adaptor(
                             text_encoded,
                             mask=text_padding_mask,
@@ -542,18 +543,23 @@ class KokoroModel(nn.Module):
                             duration_target=phoneme_durations.float()
                         )
 
-                    # Use adapted output for length regulation
-                    text_encoded = adapted_encoder_output
+                    # Use adapted output (frame-level) returned by the adaptor.
+                    # We will skip the separate length_regulate step since the
+                    # adaptor already produced frame-level encoder outputs.
+                    expanded_encoder_outputs = adapted_encoder_output
+                    encoder_output_padding_mask = frame_mask
                 else:
                     # Fallback to basic duration predictor
                     predicted_log_durations = self._predict_durations(text_encoded)
                     predicted_pitch = None
                     predicted_energy = None
 
-                # Length regulate (logging handled internally)
-                expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                    text_encoded, phoneme_durations.float(), text_padding_mask
-                )
+                # If variance_adaptor was not used above, perform length regulation
+                # to expand token-level encoder outputs to frame-level.
+                if not self.use_variance_predictor:
+                    expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                        text_encoded, phoneme_durations.float(), text_padding_mask
+                    )
 
                 # Adjust sequence length to match mel_seq_len
                 with torch.profiler.record_function("mel_length_adjust"):
@@ -705,7 +711,8 @@ class KokoroModel(nn.Module):
                     with torch.profiler.record_function("inference_predict_durations"):
                         # Duration prediction (no checkpointing in eval mode, logging handled internally)
                         if self.use_variance_predictor:
-                            _, predicted_log_durations, _, _ = self.variance_adaptor(
+                            # variance_adaptor returns five items; we only need durations here
+                                _, predicted_log_durations, _, _, _ = self.variance_adaptor(
                                 text_encoded,
                                 mask=text_padding_mask,
                                 pitch_target=None,

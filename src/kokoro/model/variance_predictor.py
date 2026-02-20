@@ -33,15 +33,37 @@ class LengthRegulator(nn.Module):
                 max_len: Optional[int] = None) -> torch.Tensor:
         # MFA durations are frame counts (integers)
         durations = torch.round(durations.clamp(min=0)).long()
+
+        # To avoid device-specific backend issues (notably on MPS), perform
+        # the variable-length expansion on CPU and move the result back to the
+        # original device. Also guard against zero-length expansions which
+        # would cause pad_sequence to fail.
+        device = x.device
         batch_size = x.shape[0]
+
+        x_cpu = x.detach().to('cpu')
+        durations_cpu = durations.detach().to('cpu')
 
         expanded = []
         for i in range(batch_size):
-            # Duplicate phoneme embeddings based on MFA or predicted duration
-            expanded_sample = torch.repeat_interleave(x[i], durations[i], dim=0)
+            repeats = int(durations_cpu[i].sum().item()) if durations_cpu.dim() == 2 else int(durations_cpu[i].item())
+            # If per-phoneme durations provided, use per-phoneme repeat_interleave
+            if durations_cpu.dim() == 2:
+                # If all zero, create a single zero frame to keep shapes consistent
+                if durations_cpu[i].sum().item() == 0:
+                    expanded_sample = torch.zeros((1, x_cpu.size(2)), dtype=x_cpu.dtype)
+                else:
+                    expanded_sample = torch.repeat_interleave(x_cpu[i], durations_cpu[i], dim=0)
+            else:
+                # durations is 1D per-sample
+                if repeats == 0:
+                    expanded_sample = torch.zeros((1, x_cpu.size(2)), dtype=x_cpu.dtype)
+                else:
+                    expanded_sample = torch.repeat_interleave(x_cpu[i], durations_cpu[i], dim=0)
+
             expanded.append(expanded_sample)
 
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
 
         # Align with Ground Truth Mel length for Loss calculation
         if max_len is not None:
@@ -330,14 +352,23 @@ class VarianceAdaptor(nn.Module):
             Frame-level targets (batch, n_frames)
         """
         durations = torch.round(durations.clamp(min=0)).long()
-        batch_size = targets.shape[0]
+
+        # Perform expansion on CPU to avoid device-specific issues (MPS)
+        device = targets.device
+        targets_cpu = targets.detach().to('cpu')
+        durations_cpu = durations.detach().to('cpu')
+        batch_size = targets_cpu.shape[0]
 
         expanded = []
         for i in range(batch_size):
-            exp = torch.repeat_interleave(targets[i], durations[i], dim=0)
+            # If all durations zero, emit a single zero value to avoid empty tensors
+            if durations_cpu[i].sum().item() == 0:
+                exp = torch.zeros((1,), dtype=targets_cpu.dtype)
+            else:
+                exp = torch.repeat_interleave(targets_cpu[i], durations_cpu[i], dim=0)
             expanded.append(exp)
 
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
 
         if max_len is not None:
             if output.size(1) < max_len:
