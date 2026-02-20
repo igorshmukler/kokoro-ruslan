@@ -102,7 +102,7 @@ python -m kokoro.cli.training --corpus ./ruslan_corpus
 | `--output` | `-o` | `./kokoro_russian_model` | Output model directory |
 | `--resume` | `-r` | `None` | Resume from `auto` or checkpoint path |
 | `--batch-size` | `-b` | `8` | Batch size |
-| `--epochs` | `-e` | `100` | Number of epochs |
+| `--epochs` | `-e` | `50` | Number of epochs |
 | `--learning-rate` | `-lr` | `1e-4` | Base learning rate |
 | `--save-every` |  | `2` | Save checkpoint every N epochs |
 | `--mfa-alignments` |  | `auto` | MFA alignments directory |
