@@ -352,6 +352,21 @@ class RussianPhonemeProcessor:
         word = word.replace('легч', 'лехч')
         word = word.replace('мягч', 'мяхч')
 
+        # 2. Affricate Merging (Merging two letters into one sound)
+        # These are high-impact for naturalness
+        word = word.replace('сч', 'щ')   # счастье -> щастье
+        word = word.replace('зч', 'щ')   # извозчик -> извощик
+        word = word.replace('тч', 'ч')   # отчим -> очим
+        word = word.replace('дч', 'ч')   # докладчик -> доклачик
+        word = word.replace('тс', 'ц')   # советский -> совецкий
+        word = word.replace('дс', 'ц')   # детский -> децкий
+
+        # 3. Additional Silent Consonants
+        word = word.replace('рдц', 'рц') # сердце -> серце
+        word = word.replace('стл', 'сл') # счастливый -> счасливый
+        word = word.replace('нтск', 'нск') # гигантский -> гиганский
+        word = word.replace('ндск', 'нск') # голландский -> голланский
+
         # --- Cluster simplifications (Cyrillic only) ---
 
         # 'вств' cluster: first 'в' is typically silent in spoken Russian
