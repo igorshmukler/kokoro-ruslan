@@ -9,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 import logging
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -407,6 +406,13 @@ class VarianceAdaptor(nn.Module):
         # 3. Expand encoder hidden states to frame level
         max_len = mel_target.size(1) if mel_target is not None else None
         x = self.length_regulator(encoder_output, durations_to_use, max_len=max_len)
+
+        # Guard: expanded sequence must be at least as long as the conv kernel so
+        # that VariancePredictor doesn't raise "kernel size > input size".  This can
+        # happen during early training when predicted durations are near zero.
+        min_frames = 3  # matches default kernel_size in VariancePredictor
+        if x.size(1) < min_frames:
+            x = F.pad(x, (0, 0, 0, min_frames - x.size(1)))
 
         # 4. Build a frame-level padding mask from the expanded durations
         lengths = durations_to_use.long().sum(dim=1)

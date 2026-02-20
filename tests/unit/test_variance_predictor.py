@@ -53,7 +53,7 @@ def test_forward_accepts_hz_targets():
         encoder_output, None, pitch_target=pitch_target_hz, energy_target=None, duration_target=None
     )
 
-    assert adapted.shape == encoder_output.shape
+    assert adapted.shape == (batch, seq_len, hidden) # encoder_output.shape
     assert dur_pred.shape == (batch, seq_len)
     assert pitch_pred.shape == (batch, seq_len)
     assert energy_pred.shape == (batch, seq_len)
