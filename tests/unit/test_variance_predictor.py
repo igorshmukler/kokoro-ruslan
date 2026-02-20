@@ -49,7 +49,7 @@ def test_forward_accepts_hz_targets():
     hz_targets = base_norm * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
     pitch_target_hz = hz_targets.unsqueeze(0).repeat(batch, 1)
 
-    adapted, dur_pred, pitch_pred, energy_pred = adaptor(
+    adapted, dur_pred, pitch_pred, energy_pred, frame_mask = adaptor(
         encoder_output, None, pitch_target=pitch_target_hz, energy_target=None, duration_target=None
     )
 
