@@ -73,31 +73,45 @@ def test_energy_normalization_and_quantize():
 
 
 def test_mask_zeroing_embeddings():
-    adaptor = VarianceAdaptor(n_bins=8, pitch_min=50.0, pitch_max=800.0, energy_min=0.0, energy_max=100.0)
+    adaptor = VarianceAdaptor(n_bins=8, pitch_min=50.0, pitch_max=800.0,
+                              energy_min=0.0, energy_max=100.0)
 
     batch = 2
     seq_len = 5
     hidden = adaptor.hidden_dim
 
-    # Use zero encoder so adapted - encoder == embeddings
     encoder_output = torch.zeros(batch, seq_len, hidden)
 
-    # pitch and energy targets in Hz
     base_norm = torch.linspace(0.1, 0.9, steps=seq_len)
-    pitch_hz = base_norm * (adaptor.pitch_max - adaptor.pitch_min) + adaptor.pitch_min
-    energy_raw = base_norm * (adaptor.energy_max - adaptor.energy_min) + adaptor.energy_min
+    pitch_target = (base_norm * (adaptor.pitch_max - adaptor.pitch_min)
+                    + adaptor.pitch_min).unsqueeze(0).repeat(batch, 1)
+    energy_target = (base_norm * (adaptor.energy_max - adaptor.energy_min)
+                     + adaptor.energy_min).unsqueeze(0).repeat(batch, 1)
 
-    pitch_target = pitch_hz.unsqueeze(0).repeat(batch, 1)
-    energy_target = energy_raw.unsqueeze(0).repeat(batch, 1)
+    # Explicit durations: 2 frames each for first 4 tokens, 0 for the last
+    # (last token is "masked/padding" — zero duration means it contributes
+    # no frames, so its position simply won't appear in the output)
+    duration_target = torch.tensor([[2, 2, 2, 2, 0],
+                                    [2, 2, 2, 2, 0]], dtype=torch.float)
 
-    # mask: mark the last position as padding
-    mask = torch.zeros(batch, seq_len).bool()
-    mask[:, -1] = True
+    phoneme_mask = torch.zeros(batch, seq_len).bool()
+    phoneme_mask[:, -1] = True  # last phoneme is padding
 
-    adapted, *_ = adaptor(encoder_output, mask, pitch_target=pitch_target, energy_target=energy_target)
+    adapted, dur_pred, pitch_pred, energy_pred, frame_mask = adaptor(
+        encoder_output, phoneme_mask,
+        pitch_target=pitch_target,
+        energy_target=energy_target,
+        duration_target=duration_target,
+    )
 
-    delta = adapted - encoder_output
-    # For masked positions, delta must be zero
-    assert torch.allclose(delta[mask], torch.zeros_like(delta[mask]))
-    # For unmasked positions, expect non-zero embeddings
-    assert torch.any(delta[~mask])
+    # encoder_output is all zeros, so adapted IS the embedding signal
+    # frame_mask marks padding frames in the expanded output
+    delta = adapted  # encoder is zero so delta == adapted
+
+    # Masked (padding) frame positions must be zeroed
+    assert torch.allclose(delta[frame_mask], torch.zeros_like(delta[frame_mask])), \
+        "Padded frame positions should be zero"
+
+    # Unmasked frame positions must have non-zero embeddings
+    assert torch.any(delta[~frame_mask]), \
+        "Real frame positions should have non-zero embeddings"
