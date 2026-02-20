@@ -1210,46 +1210,10 @@ class KokoroTrainer:
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
 
-    def _reset_variance_predictors(self):
-        """Reset variance predictor weights - critical when changing normalization"""
-        logger.warning("🔄 Resetting variance predictor weights - extractors now return normalized [0,1] values")
-
-        reset_count = 0
-        # Check all possible attribute names
-        for attr_name in ['pitch_predictor', 'variance_adaptor', 'pitch_adaptor']:
-            if hasattr(self.model, attr_name):
-                predictor = getattr(self.model, attr_name)
-                if predictor is not None and hasattr(predictor, 'pitch_predictor'):
-                    predictor.pitch_predictor._init_weights()
-                    logger.info(f"  ✓ Pitch predictor reinitialized (via {attr_name})")
-                    reset_count += 1
-                elif predictor is not None and hasattr(predictor, '_init_weights'):
-                    predictor._init_weights()
-                    logger.info(f"  ✓ {attr_name} reinitialized")
-                    reset_count += 1
-
-        for attr_name in ['energy_predictor', 'variance_adaptor', 'energy_adaptor']:
-            if hasattr(self.model, attr_name):
-                predictor = getattr(self.model, attr_name)
-                if predictor is not None and hasattr(predictor, 'energy_predictor'):
-                    predictor.energy_predictor._init_weights()
-                    logger.info(f"  ✓ Energy predictor reinitialized (via {attr_name})")
-                    reset_count += 1
-                elif predictor is not None and hasattr(predictor, '_init_weights') and 'energy' in attr_name:
-                    predictor._init_weights()
-                    logger.info(f"  ✓ {attr_name} reinitialized")
-                    reset_count += 1
-
-        if reset_count == 0:
-            logger.warning("  ⚠️  No variance predictors found to reset - checking model structure")
-            logger.warning(f"  Model attributes: {[attr for attr in dir(self.model) if 'predict' in attr.lower() or 'variance' in attr.lower()]}")
-
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""
         if not self.config.resume_checkpoint:
             logger.info("No resume checkpoint specified, starting from scratch.")
-            # Still reset variance predictors for normalized features
-            self._reset_variance_predictors()
             return
 
         checkpoint_path = None
@@ -1257,8 +1221,6 @@ class KokoroTrainer:
             checkpoint_path = find_latest_checkpoint(self.config.output_dir)
             if not checkpoint_path:
                 logger.info("No checkpoint found for auto-resume, starting from scratch.")
-                # Still reset variance predictors for normalized features
-                self._reset_variance_predictors()
                 return
         else:
             checkpoint_path = self.config.resume_checkpoint
@@ -1320,12 +1282,6 @@ class KokoroTrainer:
                 logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
         self.dataset.phoneme_processor = phoneme_processor
-        # Ensure variance predictors are reset to match any preprocessing/normalization
-        # metadata loaded with the checkpoint (defensive, avoids divergence).
-        try:
-            self._reset_variance_predictors()
-        except Exception:
-            logger.debug("_reset_variance_predictors raised during checkpoint resumption; continuing")
 
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 

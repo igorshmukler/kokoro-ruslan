@@ -79,8 +79,6 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
     def _fake_reset():
         trainer.reset_called = True
 
-    trainer._reset_variance_predictors = _fake_reset
-
     def _fake_load_checkpoint(path, model, optimizer, scheduler, output_dir):
         assert path == str(checkpoint_path)
         assert output_dir == str(tmp_path)
@@ -128,7 +126,6 @@ def test_setup_checkpoint_resumption_keeps_defaults_when_counter_keys_missing(mo
         return 2, 5.0973, "dummy_processor"
 
     monkeypatch.setattr(trainer_module, "load_checkpoint", _fake_load_checkpoint)
-    trainer._reset_variance_predictors = lambda: None
 
     KokoroTrainer.setup_checkpoint_resumption(trainer)
 
