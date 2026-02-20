@@ -29,16 +29,24 @@ class LengthRegulator(nn.Module):
 
     def forward(self, x, durations, max_len=None):
         durations = torch.round(durations.clamp(min=0)).long()
+        device = x.device
         batch_size = x.shape[0]
+
+        # repeat_interleave with variable-length integer repeats segfaults on MPS
+        # for large tensors (known MPS backend bug). Offload to CPU for the
+        # indexing step only. Note: .to('cpu') preserves grad_fn unlike .detach().
+        x_cpu = x.to('cpu')
+        durations_cpu = durations.to('cpu')
+
         expanded = []
-
         for i in range(batch_size):
-            if durations[i].sum() == 0:
-                expanded.append(torch.zeros((1, x.size(-1)), dtype=x.dtype, device=x.device))
+            if durations_cpu[i].sum() == 0:
+                expanded.append(torch.zeros((1, x_cpu.size(-1)), dtype=x_cpu.dtype))
             else:
-                expanded.append(torch.repeat_interleave(x[i], durations[i], dim=0))
+                expanded.append(torch.repeat_interleave(x_cpu[i], durations_cpu[i], dim=0))
 
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
+
         if max_len is not None:
             if output.size(1) < max_len:
                 output = F.pad(output, (0, 0, 0, max_len - output.size(1)))
@@ -310,30 +318,23 @@ class VarianceAdaptor(nn.Module):
                                     targets: torch.Tensor,
                                     durations: torch.Tensor,
                                     max_len: Optional[int] = None) -> torch.Tensor:
-        """
-        Expand token-level targets (batch, n_phonemes) to frame-level
-        (batch, n_frames) using the same durations used for the hidden states.
-
-        Args:
-            targets: Token-level values (batch, n_phonemes)
-            durations: Integer frame counts per phoneme (batch, n_phonemes)
-            max_len: If provided, truncate/pad output to this length
-
-        Returns:
-            Frame-level targets (batch, n_frames)
-        """
         durations = torch.round(durations.clamp(min=0)).long()
+        device = targets.device
         batch_size = targets.shape[0]
+
+        # Same MPS repeat_interleave segfault as LengthRegulator — offload to CPU.
+        # Targets don't carry gradients so detach() is safe here.
+        targets_cpu = targets.detach().to('cpu')
+        durations_cpu = durations.detach().to('cpu')
 
         expanded = []
         for i in range(batch_size):
-            if durations[i].sum() == 0:
-                # Guard against fully-zero durations producing an empty tensor
-                expanded.append(torch.zeros((1,), dtype=targets.dtype, device=targets.device))
+            if durations_cpu[i].sum() == 0:
+                expanded.append(torch.zeros((1,), dtype=targets_cpu.dtype))
             else:
-                expanded.append(torch.repeat_interleave(targets[i], durations[i], dim=0))
+                expanded.append(torch.repeat_interleave(targets_cpu[i], durations_cpu[i], dim=0))
 
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
 
         if max_len is not None:
             if output.size(1) < max_len:
