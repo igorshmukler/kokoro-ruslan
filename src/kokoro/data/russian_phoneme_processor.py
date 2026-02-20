@@ -66,6 +66,8 @@ class RussianPhonemeProcessor:
             ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
             key=len, reverse=True
         )
+        # Public alias expected by other methods/tests
+        self.multi_char_phonemes = self._multi_char_phonemes
 
         # Hard consonants (never palatalized)
         self.hard_consonants = {'ж', 'ш', 'ц'}
