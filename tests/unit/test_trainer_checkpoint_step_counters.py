@@ -93,7 +93,8 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
     assert trainer.dataset.phoneme_processor == "dummy_processor"
     assert trainer.current_optimizer_step == 777
     assert trainer.optimizer_steps_completed == 888
-    assert trainer.reset_called is True
+    # After change: we no longer reset variance predictors automatically on resume
+    assert trainer.reset_called is False
 
 
 def test_setup_checkpoint_resumption_keeps_defaults_when_counter_keys_missing(monkeypatch, tmp_path):

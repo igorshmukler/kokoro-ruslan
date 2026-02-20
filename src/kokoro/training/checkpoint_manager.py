@@ -179,6 +179,26 @@ def load_checkpoint(
         architecture = _extract_architecture_metadata(checkpoint_dict)
         if architecture:
             _validate_architecture_metadata(architecture, model)
+            # If the checkpoint indicates variance predictors were used, ensure
+            # that the saved pitch/energy normalization bounds correspond to
+            # normalized [0,1] targets. Loading a checkpoint trained with
+            # different normalization without adjusting the current config can
+            # silently corrupt training/inference, so fail-fast here.
+            if architecture.get('use_variance_predictor', False):
+                p_min = float(architecture.get('pitch_min', float('nan')))
+                p_max = float(architecture.get('pitch_max', float('nan')))
+                e_min = float(architecture.get('energy_min', float('nan')))
+                e_max = float(architecture.get('energy_max', float('nan')))
+
+                if not (p_min == 0.0 and p_max == 1.0 and e_min == 0.0 and e_max == 1.0):
+                    raise RuntimeError(
+                        "Checkpoint variance targets are not normalized to [0,1]. "
+                        "Aborting strict resume/load to avoid predictor-target mismatch. "
+                        "If this checkpoint was intentionally trained with different "
+                        "normalization, either resave with normalized targets or set "
+                        "use_variance_predictor=False in the current config and handle "
+                        "normalization manually."
+                    )
         else:
             raise RuntimeError(
                 "Checkpoint is missing required 'model_metadata.architecture'. "
