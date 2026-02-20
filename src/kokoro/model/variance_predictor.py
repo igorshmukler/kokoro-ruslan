@@ -19,6 +19,38 @@ DEFAULT_FILTER_SIZE = 256
 DEFAULT_N_BINS = 256
 DEFAULT_HOP_LENGTH = 256
 
+class LengthRegulator(nn.Module):
+    """
+    Expands phoneme-level hidden states to frame-level based on durations.
+    Essential for bridging the gap between text and audio length.
+    """
+    def __init__(self):
+        super().__init__()
+
+    def forward(self,
+                x: torch.Tensor,
+                durations: torch.Tensor,
+                max_len: Optional[int] = None) -> torch.Tensor:
+        # MFA durations are frame counts (integers)
+        durations = torch.round(durations.clamp(min=0)).long()
+        batch_size = x.shape[0]
+
+        expanded = []
+        for i in range(batch_size):
+            # Duplicate phoneme embeddings based on MFA or predicted duration
+            expanded_sample = torch.repeat_interleave(x[i], durations[i], dim=0)
+            expanded.append(expanded_sample)
+
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True)
+
+        # Align with Ground Truth Mel length for Loss calculation
+        if max_len is not None:
+            if output.size(1) < max_len:
+                output = F.pad(output, (0, 0, 0, max_len - output.size(1)))
+            else:
+                output = output[:, :max_len, :]
+
+        return output
 
 class VariancePredictor(nn.Module):
     """
