@@ -358,7 +358,6 @@ class RussianPhonemeProcessor:
         word = word.replace('зч', 'щ')   # извозчик -> извощик
         word = word.replace('тч', 'ч')   # отчим -> очим
         word = word.replace('дч', 'ч')   # докладчик -> доклачик
-        word = word.replace('тс', 'ц')   # советский -> совецкий
         word = word.replace('дс', 'ц')   # детский -> децкий
 
         # 3. Additional Silent Consonants
@@ -381,6 +380,8 @@ class RussianPhonemeProcessor:
         # 'стн', 'здн' — silent consonant clusters (e.g. честный, поздно)
         word = word.replace('стн', 'сн')
         word = word.replace('здн', 'зн')
+
+        word = word.replace('тс', 'ц')   # советский -> совецкий
 
         # 'лнц' — silent л (e.g. солнце)
         word = word.replace('лнц', 'нц')
@@ -709,6 +710,16 @@ class RussianPhonemeProcessor:
     def from_dict(cls, data: Dict) -> "RussianPhonemeProcessor":
         """Recreate processor from a dictionary (for saving/loading)"""
         instance = cls()
+        instance.palatalized = data.get("palatalized", {})
+
+        # Must rebuild after restoring palatalized:
+        instance._multi_char_phonemes = sorted(
+            list(instance.palatalized.values()) +
+            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
+            key=len, reverse=True
+        )
+        instance.multi_char_phonemes = instance._multi_char_phonemes
+
         # Restore all attributes, ensuring sets are converted from lists
         instance.vowels = data.get("vowels", {})
         instance.consonants = data.get("consonants", {})
