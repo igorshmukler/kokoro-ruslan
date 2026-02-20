@@ -339,7 +339,12 @@ class RussianPhonemeProcessor:
         # A. Genitive endings: -ого/-его -> -ово/-ево
         # (Applies to pronouns and adjectives: красного, его, синего)
         # We exclude common adverbs/nouns where 'г' is hard: много, строго, дорого
-        hard_g_exceptions = {'много', 'немного', 'строго', 'дорого', 'лого', 'иго', 'благо'}
+        hard_g_exceptions = {
+            'много', 'немного', 'строго', 'дорого', 'лого', 'иго', 'благо', 'танго',
+            'манго', 'лего', 'карго', 'арго', 'индиго', 'фламинго', 'маренго',
+            'конго', 'альтер-эго', 'убого', 'полого', 'разноголосо', 'гюго', 'чикаго',
+            'живаго', 'сан-диего', 'ого'
+        }
         if word.endswith(('ого', 'его')) and word not in hard_g_exceptions:
             # Only replace the 'г' in the last 3 characters
             word = word[:-3] + word[-3:].replace('г', 'в')
