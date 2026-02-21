@@ -766,81 +766,6 @@ def collate_fn(batch: List[Dict]) -> Dict:
     }
 
 
-class LengthBasedBatchSampler(Sampler):
-    """
-    Samples mini-batches of indices for training.
-    The samples are grouped by lengths to minimize padding.
-    Assumes the dataset is already sorted by length.
-    """
-    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False, shuffle: bool = True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.shuffle = shuffle
-
-        # Create buckets of indices based on length
-        # Since the dataset is pre-sorted by audio_length, we can just group
-        self.batches = self._create_batches()
-
-    def _create_batches(self) -> List[List[int]]:
-        # 1. Get all indices and their lengths
-        idx_and_len = []
-        for i in range(len(self.dataset)):
-            idx_and_len.append((i, self._get_sample_frames(i)))
-
-        # 2. Sort by length (Bucketing) to minimize padding
-        # We add a bit of randomness to the sort if shuffle is True
-        if self.shuffle:
-            random.shuffle(idx_and_len)
-            # Optional: sort into "mega-batches" then shuffle within them
-            idx_and_len.sort(key=lambda x: x[1])
-
-        batches = []
-        current_batch = []
-        max_len_in_batch = 0
-
-        for idx, length in idx_and_len:
-            new_max = max(max_len_in_batch, length)
-            # The GPU cost is the width of the widest sample * number of samples
-            projected_cost = (len(current_batch) + 1) * new_max
-
-            if (projected_cost > self.max_frames or
-                len(current_batch) >= self.max_batch_size):
-
-                if current_batch:
-                    # Check min_batch_size constraint
-                    if len(current_batch) >= self.min_batch_size:
-                        batches.append(current_batch)
-                    elif not self.drop_last:
-                        batches.append(current_batch)
-
-                current_batch = [idx]
-                max_len_in_batch = length
-            else:
-                current_batch.append(idx)
-                max_len_in_batch = new_max
-
-        # Handle the final batch
-        if current_batch:
-            if len(current_batch) >= self.min_batch_size or not self.drop_last:
-                batches.append(current_batch)
-
-        # Shuffle the batches themselves so the model doesn't see
-        # short samples then long samples every epoch
-        if self.shuffle:
-            random.shuffle(batches)
-
-        return batches
-
-    def __iter__(self):
-        # Iterate over the prepared batches
-        for batch in self.batches:
-            yield batch
-
-    def __len__(self) -> int:
-        return len(self.batches)
-
-
 class DynamicFrameBatchSampler(Sampler):
     """
     Dynamic batch sampler that groups samples to meet a frame budget.
@@ -933,32 +858,69 @@ class DynamicFrameBatchSampler(Sampler):
         batch is closed it's appended to the returned list. The returned
         list is optionally shuffled before being stored on the sampler.
         """
-        indices = list(range(len(self.dataset)))
-        if self.shuffle:
-            random.shuffle(indices)
+        # Build adaptive buckets first so that long and short samples are
+        # batched separately. This reduces padding and ensures the per-batch
+        # expanded-frames worst-case remains bounded by `self.max_frames`.
+        N = len(self.dataset)
+        if N == 0:
+            return []
 
-        batches = []
-        batch = []
-        max_frames_in_batch = 0
+        indices = list(range(N))
 
-        for idx in indices:
-            sample_frames = self._get_sample_frames(idx)
-            new_max = max(max_frames_in_batch, sample_frames)
-            projected_cost = (len(batch) + 1) * new_max
+        # Collect lengths
+        lengths = np.array([self._get_sample_frames(i) for i in indices], dtype=np.int64)
 
-            if batch and (projected_cost > self.max_frames or
-                      len(batch) >= self.max_batch_size):
-                if len(batch) >= self.min_batch_size or not self.drop_last:
-                    batches.append(batch)
-                batch = []
-                max_frames_in_batch = 0
+        # Choose number of buckets adaptively: at most 16, at least 1.
+        # For small datasets, reduce buckets to avoid empty bins.
+        num_buckets = min(16, max(1, int(np.sqrt(N))))
 
-            batch.append(idx)
-            max_frames_in_batch = max(max_frames_in_batch, sample_frames)
+        # Compute quantile cut points to form roughly even-populated buckets
+        try:
+            cut_points = np.percentile(lengths, np.linspace(0, 100, num_buckets + 1))
+        except Exception:
+            # Fallback to simple linear bins if percentile computation fails
+            cut_points = np.linspace(lengths.min(), lengths.max(), num_buckets + 1)
 
-        if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
-            batches.append(batch)
+        # Assign indices to buckets
+        buckets = [[] for _ in range(num_buckets)]
+        for idx, ln in zip(indices, lengths.tolist()):
+            # Find first cut greater than ln (exclude the last edge)
+            b = int(np.searchsorted(cut_points, ln, side='right') - 1)
+            b = max(0, min(num_buckets - 1, b))
+            buckets[b].append(idx)
 
+        batches: List[List[int]] = []
+
+        # For each bucket, shuffle within-bucket (if requested) and greedily pack
+        for bucket in buckets:
+            if not bucket:
+                continue
+            if self.shuffle:
+                random.shuffle(bucket)
+
+            batch: List[int] = []
+            max_frames_in_batch = 0
+
+            for idx in bucket:
+                sample_frames = self._get_sample_frames(idx)
+                new_max = max(max_frames_in_batch, sample_frames)
+                projected_cost = (len(batch) + 1) * new_max
+
+                # If adding would exceed budget or size limit, close current batch
+                if batch and (projected_cost > self.max_frames or len(batch) >= self.max_batch_size):
+                    if len(batch) >= self.min_batch_size or not self.drop_last:
+                        batches.append(batch)
+                    batch = []
+                    max_frames_in_batch = 0
+
+                batch.append(idx)
+                max_frames_in_batch = max(max_frames_in_batch, sample_frames)
+
+            # Flush last batch in this bucket
+            if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
+                batches.append(batch)
+
+        # Optionally shuffle order of batches so training sees varied sizes per epoch
         if self.shuffle:
             random.shuffle(batches)
 
@@ -978,3 +940,37 @@ class DynamicFrameBatchSampler(Sampler):
 
     def __len__(self) -> int:
         return len(self.batches)
+
+
+class LengthBasedBatchSampler(Sampler):
+    """
+    Fixed-batch-size sampler that groups samples by length to minimize padding.
+    Delegates to DynamicFrameBatchSampler with a large frame budget so that
+    batch_size is always the binding constraint rather than frame cost.
+    """
+    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False, shuffle: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+        # Delegate to DynamicFrameBatchSampler.
+        # Set max_frames large enough that it never binds — batch_size is the only cap.
+        max_sample_frames = max(
+            (dataset.samples[i]['audio_length'] for i in range(len(dataset))),
+            default=10000
+        )
+        self._delegate = DynamicFrameBatchSampler(
+            dataset=dataset,
+            max_frames=max_sample_frames * batch_size,  # never the binding constraint
+            min_batch_size=1,
+            max_batch_size=batch_size,
+            drop_last=drop_last,
+            shuffle=shuffle
+        )
+
+    def __iter__(self):
+        yield from self._delegate
+
+    def __len__(self) -> int:
+        return len(self._delegate)
