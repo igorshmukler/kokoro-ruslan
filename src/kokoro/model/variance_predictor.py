@@ -122,7 +122,7 @@ class VariancePredictor(nn.Module):
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass
+        Forward pass with chunked processing to avoid OOM on long sequences.
 
         Args:
             x: Input tensor (batch, seq_len, hidden_dim)
@@ -131,30 +131,38 @@ class VariancePredictor(nn.Module):
         Returns:
             Predicted variance (batch, seq_len)
         """
-        # Transpose for Conv1d: (batch, hidden_dim, seq_len)
-        # Ensure contiguous for torch.compile compatibility
+        batch_size, seq_len, _ = x.shape
+        chunk_size = 512  # Process 512 frames at a time
+
+        if seq_len <= chunk_size:
+            # Short sequence — run normally
+            return self._forward_chunk(x, mask)
+
+        # Long sequence — process in chunks
+        outputs = []
+        for start in range(0, seq_len, chunk_size):
+            end = min(start + chunk_size, seq_len)
+            x_chunk = x[:, start:end, :]
+            mask_chunk = mask[:, start:end] if mask is not None else None
+            outputs.append(self._forward_chunk(x_chunk, mask_chunk))
+
+        return torch.cat(outputs, dim=1)
+
+    def _forward_chunk(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Process a single chunk through the conv layers."""
         x = x.transpose(1, 2).contiguous()
 
-        # Apply conv layers
         for conv, norm in zip(self.conv_layers, self.layer_norms):
             x = conv(x)
-
-            # Transpose for layer norm: (batch, seq_len, filter_size)
             x = x.transpose(1, 2).contiguous()
             x = norm(x)
             x = self.activation(x)
             x = self.dropout(x)
-
-            # Transpose back for next conv: (batch, filter_size, seq_len)
             x = x.transpose(1, 2).contiguous()
 
-        # Final transpose for linear layer: (batch, seq_len, filter_size)
         x = x.transpose(1, 2).contiguous()
+        output = self.linear(x).squeeze(-1)
 
-        # Project to single value per timestep
-        output = self.linear(x).squeeze(-1)  # (batch, seq_len)
-
-        # Apply mask if provided
         if mask is not None:
             output = output.masked_fill(mask, 0.0)
 
