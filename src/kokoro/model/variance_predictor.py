@@ -661,7 +661,7 @@ class EnergyExtractor:
         Extract energy from mel spectrogram, normalized to [0, 1].
 
         Args:
-            mel_spec: Mel spectrogram (batch, n_mels, frames) or (n_mels, frames)
+            mel_spec: Mel spectrogram (batch, frames, n_mels) or (frames, n_mels)
 
         Returns:
             Energy contour normalized to [0, 1] (batch, frames) or (frames,)
@@ -669,7 +669,8 @@ class EnergyExtractor:
         # Convert to linear domain if input appears to be log-mel
         mel_linear = torch.exp(mel_spec) if mel_spec.min() < 0 else mel_spec
 
-        energy = torch.mean(mel_linear, dim=-2)
+        # average over mel bins to get a single energy value per frame, then apply log compression
+        energy = torch.mean(mel_linear, dim=-1)
         energy = torch.log1p(torch.clamp(energy, min=0.0))
 
         floor = torch.quantile(energy, 0.05, dim=-1, keepdim=True)

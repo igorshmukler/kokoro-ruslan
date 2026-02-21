@@ -196,6 +196,7 @@ class TrainingConfig:
             if self.max_batch_size > 12:
                 print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 12")
                 self.max_batch_size = 12
+
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1
             print("Warning: checkpoint_segments must be >= 1, setting to 1")
