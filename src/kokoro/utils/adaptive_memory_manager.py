@@ -4,6 +4,7 @@ Adaptive Memory Cleanup System for Kokoro Language Model Training
 Provides intelligent memory management based on device type and memory pressure
 """
 
+import sys
 import torch
 import time
 import logging
@@ -425,6 +426,10 @@ class AdaptiveMemoryManager:
         elif self.device_type == DeviceType.MPS:
             torch.mps.synchronize()
 
+        # Clear any lingering references in the traceback/exception objects
+        if hasattr(sys, 'exc_info'):
+            sys.exc_clear() if hasattr(sys, 'exc_clear') else None
+
         # Aggressive garbage collection
         gc.collect()
         gc.collect()  # Second call often frees more
@@ -432,12 +437,11 @@ class AdaptiveMemoryManager:
         # Clear all caches
         if self.device_type == DeviceType.CUDA:
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             torch.cuda.reset_peak_memory_stats(self.device)
         elif self.device_type == DeviceType.MPS:
             torch.mps.empty_cache()
-
-        # Additional wait for MPS
-        if self.device_type == DeviceType.MPS:
+            # Additional wait for MPS
             time.sleep(0.1)
 
         cleanup_time = time.time() - start_time
