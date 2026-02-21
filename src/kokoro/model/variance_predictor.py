@@ -19,6 +19,88 @@ DEFAULT_N_BINS = 256
 DEFAULT_HOP_LENGTH = 256
 
 
+def _vectorized_expand_tokens(
+    tokens: torch.Tensor,
+    durations: torch.Tensor,
+    max_len: Optional[int] = None
+) -> torch.Tensor:
+    """
+    Vectorized token expansion. CPU round-trip retained for MPS stability.
+    Python loop over batch items eliminated via repeat_interleave + scatter.
+    """
+    device = tokens.device
+    is_3d = tokens.dim() == 3
+    B, L = tokens.shape[0], tokens.shape[1]
+
+    tokens_cpu = tokens.detach().to('cpu')
+    durations_cpu = durations.detach().to('cpu').long().clamp(min=0)
+
+    lengths = durations_cpu.sum(dim=1)                # (B,)
+    max_expanded = int(lengths.max().item())
+    if max_len is not None:
+        max_expanded = min(max_expanded, int(max_len))
+
+    if max_expanded == 0:
+        out_len = max(1, int(max_len)) if max_len is not None else 1
+        if is_3d:
+            return tokens_cpu.new_zeros(B, out_len, tokens_cpu.size(2)).to(device)
+        return tokens_cpu.new_zeros(B, out_len).to(device)
+
+    try:
+        d_flat = durations_cpu.reshape(B * L)
+
+        if is_3d:
+            D = tokens_cpu.size(2)
+            flat = tokens_cpu.reshape(B * L, D)
+            expanded_flat = torch.repeat_interleave(flat, d_flat, dim=0)  # (total, D)
+        else:
+            flat = tokens_cpu.reshape(B * L)
+            expanded_flat = torch.repeat_interleave(flat, d_flat, dim=0)  # (total,)
+
+        # Build batch index for each expanded frame — no Python loop
+        batch_ids = torch.arange(B).repeat_interleave(lengths)            # (total,)
+
+        # Build within-batch frame index by subtracting each batch item's start offset
+        batch_start_offsets = torch.zeros(B, dtype=torch.long)
+        batch_start_offsets[1:] = lengths.cumsum(0)[:-1]
+        per_frame_offset = batch_start_offsets.repeat_interleave(lengths)  # (total,)
+        frame_ids = torch.arange(expanded_flat.size(0)) - per_frame_offset # (total,)
+
+        # Mask frames that exceed max_expanded (happens when max_len clips)
+        valid = frame_ids < max_expanded
+
+        if is_3d:
+            out_cpu = tokens_cpu.new_zeros(B, max_expanded, D)
+            out_cpu[batch_ids[valid], frame_ids[valid]] = expanded_flat[valid]
+        else:
+            out_cpu = tokens_cpu.new_zeros(B, max_expanded)
+            out_cpu[batch_ids[valid], frame_ids[valid]] = expanded_flat[valid]
+
+        # Pad to exact max_len if needed
+        if max_len is not None and out_cpu.size(1) < max_len:
+            pad = max_len - out_cpu.size(1)
+            out_cpu = F.pad(out_cpu, (0, 0, 0, pad) if is_3d else (0, pad))
+
+        return out_cpu.to(device)
+
+    except Exception as e:
+        logger.warning(f"Vectorized expansion failed, using fallback: {e}")
+        expanded = []
+        for i in range(B):
+            if durations_cpu[i].sum() == 0:
+                z_shape = (1, tokens_cpu.size(2)) if is_3d else (1,)
+                expanded.append(torch.zeros(z_shape, dtype=tokens_cpu.dtype))
+            else:
+                expanded.append(torch.repeat_interleave(tokens_cpu[i], durations_cpu[i], dim=0))
+        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
+        if max_len is not None:
+            if output.size(1) < max_len:
+                output = F.pad(output, (0, 0, 0, max_len - output.size(1)) if is_3d else (0, max_len - output.size(1)))
+            else:
+                output = output[:, :max_len] if not is_3d else output[:, :max_len, :]
+        return output
+
+
 class LengthRegulator(nn.Module):
     """
     Expands phoneme-level hidden states to frame-level based on durations.
@@ -37,83 +119,7 @@ class LengthRegulator(nn.Module):
         # 3) Scatter the single expanded flat tensor into a preallocated (B, max_len, D)
         #    buffer using computed offsets — this uses one big allocation for the output
         # Fallback: if vectorized path fails, fall back to safe per-example expansion
-        x_cpu = x.to('cpu')
-        durations_cpu = durations.to('cpu')
-
-        try:
-            B, L, D = x_cpu.shape
-
-            # Flatten tokens and durations
-            x_flat = x_cpu.reshape(B * L, D)
-            durations_flat = durations_cpu.reshape(B * L)
-
-            # Total expanded frames across batch
-            lengths = durations_cpu.sum(dim=1)
-            total_expanded = int(lengths.sum().item())
-
-            if total_expanded == 0:
-                # No expansion; return minimal padded tensor
-                out_len = 1 if max_len is None else max(1, int(max_len))
-                out = torch.zeros((B, out_len, D), dtype=x_cpu.dtype, device=device)
-                return out
-
-            # Repeat-interleave flattened tokens -> (total_expanded, D)
-            expanded_flat = torch.repeat_interleave(x_flat, durations_flat, dim=0)
-
-            # Compute per-batch offsets
-            lengths_list = lengths.tolist()
-            max_expanded_len = max(lengths_list) if max_len is None else min(int(max(lengths_list)), int(max_len))
-
-            # Preallocate output on CPU then move to device once filled
-            out_cpu = x_cpu.new_zeros((B, max_expanded_len, D))
-
-            # Fill per-batch slices from expanded_flat using cumulative offsets
-            offsets = [0]
-            for ln in lengths_list:
-                offsets.append(offsets[-1] + int(ln))
-
-            for i in range(B):
-                start = offsets[i]
-                end = offsets[i + 1]
-                ln = end - start
-                if ln == 0:
-                    continue
-                take = expanded_flat[start:end]
-                if take.size(0) > max_expanded_len:
-                    take = take[:max_expanded_len]
-                    ln = max_expanded_len
-                out_cpu[i, :ln] = take
-
-            # Apply max_len cropping if requested
-            if max_len is not None:
-                if out_cpu.size(1) < max_len:
-                    # pad on the right
-                    pad_size = int(max_len) - out_cpu.size(1)
-                    pad_tensor = x_cpu.new_zeros((B, pad_size, D))
-                    out_cpu = torch.cat([out_cpu, pad_tensor], dim=1)
-                else:
-                    out_cpu = out_cpu[:, :int(max_len), :]
-
-            output = out_cpu.to(device)
-            return output
-        except Exception:
-            # Fallback to safe per-example expansion if anything goes wrong
-            expanded = []
-            for i in range(batch_size):
-                if durations_cpu[i].sum() == 0:
-                    expanded.append(torch.zeros((1, x_cpu.size(-1)), dtype=x_cpu.dtype))
-                else:
-                    expanded.append(torch.repeat_interleave(x_cpu[i], durations_cpu[i], dim=0))
-
-            output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
-
-            if max_len is not None:
-                if output.size(1) < max_len:
-                    output = F.pad(output, (0, 0, 0, max_len - output.size(1)))
-                else:
-                    output = output[:, :max_len, :]
-
-            return output
+        return _vectorized_expand_tokens(x, durations, max_len=max_len)
 
 
 class VariancePredictor(nn.Module):
@@ -360,72 +366,7 @@ class VarianceAdaptor(nn.Module):
         batch_size = targets.shape[0]
         # Vectorized expansion similar to LengthRegulator: flatten tokens and durations,
         # repeat_interleave once, then scatter into a preallocated (B, max_len) buffer.
-        targets_cpu = targets.detach().to('cpu')
-        durations_cpu = durations.detach().to('cpu')
-
-        try:
-            B, L = targets_cpu.shape
-
-            t_flat = targets_cpu.reshape(B * L)
-            d_flat = durations_cpu.reshape(B * L)
-
-            lengths = durations_cpu.sum(dim=1)
-            total_expanded = int(lengths.sum().item())
-
-            if total_expanded == 0:
-                out_len = 1 if max_len is None else max(1, int(max_len))
-                return targets_cpu.new_zeros((B, out_len)).to(device)
-
-            expanded_flat = torch.repeat_interleave(t_flat, d_flat, dim=0)
-
-            lengths_list = lengths.tolist()
-            max_expanded_len = max(lengths_list) if max_len is None else min(int(max(lengths_list)), int(max_len))
-
-            out_cpu = targets_cpu.new_zeros((B, max_expanded_len))
-
-            offsets = [0]
-            for ln in lengths_list:
-                offsets.append(offsets[-1] + int(ln))
-
-            for i in range(B):
-                start = offsets[i]
-                end = offsets[i + 1]
-                ln = end - start
-                if ln == 0:
-                    continue
-                take = expanded_flat[start:end]
-                if take.size(0) > max_expanded_len:
-                    take = take[:max_expanded_len]
-                    ln = max_expanded_len
-                out_cpu[i, :ln] = take
-
-            if max_len is not None:
-                if out_cpu.size(1) < max_len:
-                    pad_size = int(max_len) - out_cpu.size(1)
-                    pad_tensor = targets_cpu.new_zeros((B, pad_size))
-                    out_cpu = torch.cat([out_cpu, pad_tensor], dim=1)
-                else:
-                    out_cpu = out_cpu[:, :int(max_len)]
-
-            return out_cpu.to(device)
-        except Exception:
-            # Fallback to per-sample expand if vectorized approach fails
-            expanded = []
-            for i in range(batch_size):
-                if durations_cpu[i].sum() == 0:
-                    expanded.append(torch.zeros((1,), dtype=targets_cpu.dtype))
-                else:
-                    expanded.append(torch.repeat_interleave(targets_cpu[i], durations_cpu[i], dim=0))
-
-            output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
-
-            if max_len is not None:
-                if output.size(1) < max_len:
-                    output = F.pad(output, (0, max_len - output.size(1)))
-                else:
-                    output = output[:, :max_len]
-
-            return output
+        return _vectorized_expand_tokens(targets, durations, max_len=max_len)
 
     # ------------------------------------------------------------------
     # Forward
