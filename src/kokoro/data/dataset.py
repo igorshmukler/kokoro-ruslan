@@ -783,38 +783,50 @@ class LengthBasedBatchSampler(Sampler):
         self.batches = self._create_batches()
 
     def _create_batches(self) -> List[List[int]]:
-        batches = []
-        indices = list(range(len(self.dataset)))
+        # 1. Get all indices and their lengths
+        idx_and_len = []
+        for i in range(len(self.dataset)):
+            idx_and_len.append((i, self._get_sample_frames(i)))
 
+        # 2. Sort by length (Bucketing) to minimize padding
+        # We add a bit of randomness to the sort if shuffle is True
         if self.shuffle:
-            # Shuffle within "length-similar" windows to maintain some randomness
-            # without completely destroying the length ordering.
-            # A common strategy is to shuffle fixed-size chunks of the sorted data.
-            window_size = 1000 # Example window size, tune as needed
-            num_windows = len(indices) // window_size
-            shuffled_indices = []
-            for i in range(num_windows):
-                window = indices[i * window_size : (i + 1) * window_size]
-                random.shuffle(window)
-                shuffled_indices.extend(window)
-            # Add remaining indices
-            remaining_indices = indices[num_windows * window_size:]
-            random.shuffle(remaining_indices)
-            shuffled_indices.extend(remaining_indices)
-            indices = shuffled_indices
+            random.shuffle(idx_and_len)
+            # Optional: sort into "mega-batches" then shuffle within them
+            idx_and_len.sort(key=lambda x: x[1])
 
-        # Group into batches
+        batches = []
         current_batch = []
-        for idx in indices:
-            current_batch.append(idx)
-            if len(current_batch) == self.batch_size:
+        max_len_in_batch = 0
+
+        for idx, length in idx_and_len:
+            new_max = max(max_len_in_batch, length)
+            # The GPU cost is the width of the widest sample * number of samples
+            projected_cost = (len(current_batch) + 1) * new_max
+
+            if (projected_cost > self.max_frames or
+                len(current_batch) >= self.max_batch_size):
+
+                if current_batch:
+                    # Check min_batch_size constraint
+                    if len(current_batch) >= self.min_batch_size:
+                        batches.append(current_batch)
+                    elif not self.drop_last:
+                        batches.append(current_batch)
+
+                current_batch = [idx]
+                max_len_in_batch = length
+            else:
+                current_batch.append(idx)
+                max_len_in_batch = new_max
+
+        # Handle the final batch
+        if current_batch:
+            if len(current_batch) >= self.min_batch_size or not self.drop_last:
                 batches.append(current_batch)
-                current_batch = []
 
-        if len(current_batch) > 0 and not self.drop_last:
-            batches.append(current_batch)
-
-        # Shuffle the order of batches
+        # Shuffle the batches themselves so the model doesn't see
+        # short samples then long samples every epoch
         if self.shuffle:
             random.shuffle(batches)
 
