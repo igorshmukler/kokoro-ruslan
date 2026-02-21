@@ -87,7 +87,7 @@ class VariancePredictor(nn.Module):
             self.norms.append(nn.GroupNorm(num_groups=1, num_channels=filter_size))
 
         self.dropout = nn.Dropout(dropout)
-        self.activation = nn.ReLU()
+        self.activation = nn.ReLU(inplace=True)
 
         # Output projection back to (Batch, Length, 1)
         self.linear = nn.Linear(filter_size, 1)
