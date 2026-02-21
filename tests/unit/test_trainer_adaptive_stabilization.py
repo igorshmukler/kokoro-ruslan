@@ -131,6 +131,9 @@ def test_train_epoch_processes_high_risk_batch_with_adaptive_stabilization(monke
 
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _capture_clip)
 
+    # Prevent tests from calling torch.mps.empty_cache (some torch builds raise when MPS not available)
+    monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
+
     avg_total_loss, _, _, _ = trainer.train_epoch(0)
 
     risk_ratio = max(1785 / 1400, 240 / 150)
@@ -156,6 +159,9 @@ def test_train_epoch_keeps_default_clip_for_normal_batch(monkeypatch):
 
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _capture_clip)
 
+    # Prevent tests from calling torch.mps.empty_cache
+    monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
+
     avg_total_loss, _, _, _ = trainer.train_epoch(0)
 
     assert trainer.model.forward_calls == 1
@@ -176,6 +182,9 @@ def test_train_epoch_uses_emergency_clip_norm_on_gradient_explosion(monkeypatch)
         return original_clip(parameters, max_norm, *args, **kwargs)
 
     monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _capture_clip)
+
+    # Prevent tests from calling torch.mps.empty_cache
+    monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
 
     avg_total_loss, _, _, _ = trainer.train_epoch(0)
 
