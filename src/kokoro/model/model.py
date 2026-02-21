@@ -400,66 +400,105 @@ class KokoroModel(nn.Module):
             return expanded_encoder_outputs, encoder_output_padding_mask
 
     def _average_by_duration(self,
-                            values: torch.Tensor,
-                            durations: torch.Tensor,
-                            mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                         values: torch.Tensor,
+                         durations: torch.Tensor,
+                         mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Vectorized average of frame-level values (pitch/energy) to phoneme-level using durations
+        Vectorized average of frame-level values to phoneme-level using durations.
+        Replaces both _average_by_duration and _average_pitch_energy_by_duration.
 
         Args:
-            values: Frame-level values (batch, mel_frames)
-            durations: Phoneme durations (batch, phonemes)
-            mask: Phoneme padding mask (batch, phonemes)
+            values:    Frame-level values    (batch, mel_frames)
+            durations: Phoneme durations     (batch, phonemes)
+            mask:      Phoneme padding mask  (batch, phonemes) — True = padding
 
         Returns:
-            Phoneme-level averaged values (batch, phonemes)
+            Phoneme-level averaged values    (batch, phonemes)
         """
         batch_size, num_phonemes = durations.shape
         device = durations.device
 
-        # Clamp durations to valid range and convert to long
-        durations_clamped = torch.clamp(durations.long(), min=0)
+        durations_clamped = durations.long().clamp(min=0)
 
-        # Create phoneme mask if not provided
-        if mask is None:
-            phoneme_mask = torch.zeros_like(durations_clamped, dtype=torch.bool)
+        # Cumulative sum gives frame boundaries for each phoneme
+        # ends[b, p]   = last frame index (exclusive) for phoneme p in sample b
+        # starts[b, p] = first frame index for phoneme p
+        ends = durations_clamped.cumsum(dim=1)                          # (B, P)
+        starts = ends - durations_clamped                               # (B, P)
+        max_frames = values.size(1)
+
+        # Clamp to valid frame range
+        starts = starts.clamp(max=max_frames - 1)
+        ends = ends.clamp(max=max_frames)
+
+        # Build a frame→phoneme assignment map using scatter
+        # frame_labels[b, f] = phoneme index that owns frame f (or num_phonemes for overflow)
+        frame_labels = torch.full(
+            (batch_size, max_frames), num_phonemes,
+            dtype=torch.long, device=device
+        )
+
+        # For each phoneme p, mark its frames with label p
+        # We do this by scattering 1s into a diff tensor and taking cumsum
+        # This is O(B*P) scatter ops instead of O(B*P) Python iterations
+        diff = torch.zeros(batch_size, max_frames + 1, dtype=torch.long, device=device)
+
+        # At each start position, increment; at each end position, decrement
+        # Then cumsum gives us which phoneme each frame belongs to
+        phoneme_ids = torch.arange(num_phonemes, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Use scatter_add to build boundaries
+        diff.scatter_add_(1, starts.clamp(max=max_frames), torch.ones_like(starts))
+        diff.scatter_add_(1, ends.clamp(max=max_frames), -torch.ones_like(ends))
+
+        # cumsum of diff gives active phoneme count — but we need phoneme index
+        # Use a different approach: scatter values directly using frame→phoneme map
+
+        # For each phoneme, create a range mask and use it to average
+        # Shape: (B, P, F) would be too large — use scatter_add on (B, F) instead
+
+        # frame_phoneme[b, f] = which phoneme owns frame f
+        # Build this by: for each phoneme p, fill [starts[b,p]:ends[b,p]] with p
+        phoneme_range = torch.arange(num_phonemes, device=device)  # (P,)
+
+        # (B, P) starts and ends → use scatter to fill frame_labels
+        # Trick: scatter the phoneme index at start position, then propagate
+        frame_labels_float = torch.zeros(batch_size, max_frames + 1, device=device)
+        frame_labels_float.scatter_add_(
+            1,
+            starts.clamp(max=max_frames),
+            phoneme_range.unsqueeze(0).expand(batch_size, -1).float()
+        )
+        frame_labels_float.scatter_add_(
+            1,
+            ends.clamp(max=max_frames),
+            -phoneme_range.unsqueeze(0).expand(batch_size, -1).float()
+        )
+        # cumsum gives phoneme index for each frame
+        frame_to_phoneme = frame_labels_float[:, :-1].cumsum(dim=1).long()  # (B, F)
+
+        # scatter_add values into phoneme buckets
+        phoneme_sums = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
+        phoneme_counts = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
+
+        # Mask out frames beyond actual sequence
+        valid_frame_mask = frame_to_phoneme < num_phonemes  # (B, F)
+        safe_labels = frame_to_phoneme.clamp(max=num_phonemes - 1)
+
+        phoneme_sums.scatter_add_(1, safe_labels, values * valid_frame_mask.to(values.dtype))
+        phoneme_counts.scatter_add_(1, safe_labels, valid_frame_mask.to(values.dtype))
+
+        # Avoid division by zero for empty phonemes
+        output = phoneme_sums / phoneme_counts.clamp(min=1.0)
+
+        # Zero out padded phoneme positions
+        if mask is not None:
+            output = output.masked_fill(mask.bool(), 0.0)
         else:
-            phoneme_mask = mask.bool()
+            # Zero out phonemes with zero duration (they're padding regardless)
+            output = output.masked_fill(durations_clamped == 0, 0.0)
 
-        # Initialize output tensor
-        phoneme_values = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
-
-        # Process each sample in batch (vectorized inner loop)
-        for b in range(batch_size):
-            curr_durations = durations_clamped[b]  # (phonemes,)
-            curr_values = values[b]  # (frames,)
-            curr_mask = phoneme_mask[b]  # (phonemes,)
-
-            # Compute cumulative sum to get frame boundaries
-            cumsum = torch.cumsum(curr_durations, dim=0)
-
-            # Create start and end indices for each phoneme
-            starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
-            ends = cumsum
-
-            # Clamp to valid frame range
-            max_frames = curr_values.shape[0]
-            starts = torch.clamp(starts, min=0, max=max_frames - 1)
-            ends = torch.clamp(ends, min=1, max=max_frames)
-
-            # Compute averages using scatter_add for efficiency
-            for p in range(num_phonemes):
-                if curr_mask[p] or curr_durations[p] == 0:
-                    phoneme_values[b, p] = 0.0
-                else:
-                    start_idx = starts[p].item()
-                    end_idx = ends[p].item()
-                    if start_idx < end_idx and end_idx <= max_frames:
-                        phoneme_values[b, p] = curr_values[start_idx:end_idx].mean()
-                    else:
-                        phoneme_values[b, p] = 0.0
-
-        return phoneme_values
+        return output
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:

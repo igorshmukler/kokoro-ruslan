@@ -2231,19 +2231,31 @@ class KokoroTrainer:
                     accumulated_losses.clear()
 
                     # Delete tensors and clear MPS cache only when memory pressure is high
-                    if self.device_type == DeviceType.MPS.value:
-                        pressure = cleanup_result.get('pressure_level', 'low')
-                        if pressure in ['high', 'critical']:
-                            # Explicitly delete large tensors
-                            del predicted_mel, predicted_log_durations, predicted_stop_logits
-                            if 'predicted_pitch' in locals():
-                                del predicted_pitch
-                            if 'predicted_energy' in locals():
-                                del predicted_energy
-                            # Clear cache
-                            torch.mps.empty_cache()
-                            import gc
-                            gc.collect()
+                    # if self.device_type == DeviceType.MPS.value:
+                    #     pressure = cleanup_result.get('pressure_level', 'low')
+                    #     if pressure in ['high', 'critical']:
+                    #         # Explicitly delete large tensors
+                    #         del predicted_mel, predicted_log_durations, predicted_stop_logits
+                    #         if 'predicted_pitch' in locals():
+                    #             del predicted_pitch
+                    #         if 'predicted_energy' in locals():
+                    #             del predicted_energy
+                    #         # Clear cache
+                    #         torch.mps.empty_cache()
+                    #         import gc
+                    #         gc.collect()
+
+                    # Explicitly delete large tensors
+                    del predicted_mel, predicted_log_durations, predicted_stop_logits
+                    if 'predicted_pitch' in locals():
+                        del predicted_pitch
+                    if 'predicted_energy' in locals():
+                        del predicted_energy
+                    # Clear cache
+                    torch.mps.empty_cache()
+                    import gc
+                    gc.collect()
+
 
                 # Get current loss values for progress bar (still need .item() for display)
                 current_total_loss = total_loss.item()
@@ -2942,10 +2954,10 @@ class KokoroTrainer:
                     phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
 
                     # Validate tensor dimensions to prevent MPS overflow (INT_MAX limit)
-                    max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
-                    if max_dim > 2000:  # Safety threshold
-                        logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
-                        continue
+                    # max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
+                    # if max_dim > 2000:  # Safety threshold
+                    #     logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
+                    #     continue
 
                 self.interbatch_profiler.end_data_loading()
 
