@@ -178,12 +178,15 @@ class TrainingConfig:
             from pathlib import Path
             self.feature_cache_dir = str(Path(self.data_dir) / ".feature_cache")
 
+        MPS_MAX_FRAMES_PER_BATCH = 22000
+        MPS_MAX_BATCH_SIZE = 16
+
         # MPS-specific memory optimizations
         if self.device == 'mps' or (torch.backends.mps.is_available() and self.device != 'cuda'):
             # Balanced settings to avoid MPS dimension overflow while maximizing throughput
-            if self.max_frames_per_batch > 20000:
-                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to 20000")
-                self.max_frames_per_batch = 20000
+            if self.max_frames_per_batch > MPS_MAX_FRAMES_PER_BATCH:
+                print(f"MPS detected: Reducing max_frames_per_batch from {self.max_frames_per_batch} to {MPS_MAX_FRAMES_PER_BATCH}")
+                self.max_frames_per_batch = MPS_MAX_FRAMES_PER_BATCH
 
             if self.max_seq_length > 1800:
                 print(f"MPS detected: Reducing max_seq_length from {self.max_seq_length} to 1800")
@@ -193,9 +196,9 @@ class TrainingConfig:
                 print(f"MPS detected: Reducing batch_size from {self.batch_size} to 10")
                 self.batch_size = 10
 
-            if self.max_batch_size > 12:
-                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to 12")
-                self.max_batch_size = 12
+            if self.max_batch_size > MPS_MAX_BATCH_SIZE:
+                print(f"MPS detected: Reducing max_batch_size from {self.max_batch_size} to {MPS_MAX_BATCH_SIZE}")
+                self.max_batch_size = MPS_MAX_BATCH_SIZE
 
         if self.checkpoint_segments < 1:
             self.checkpoint_segments = 1

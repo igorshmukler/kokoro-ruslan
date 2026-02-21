@@ -188,26 +188,18 @@ class AdaptiveMemoryManager:
             }
 
     def _get_total_memory(self) -> float:
-        """Get total available memory in MB"""
         if self.device_type == DeviceType.CUDA:
             return torch.cuda.get_device_properties(self.device).total_memory / 1024**2
         elif self.device_type == DeviceType.MPS:
-            # Estimate for Apple Silicon (could be made configurable)
-            try:
-                # Try to get a better estimate by allocating and measuring
-                test_tensor = torch.randn(1000, 1000, device=self.device)
-                allocated = torch.mps.current_allocated_memory() / 1024**2
-                del test_tensor
-                torch.mps.empty_cache()
-                # Estimate total as 8x the small allocation (very rough)
-                return max(8192, allocated * 8000)  # Minimum 8GB estimate
-            except:
-                return 8192  # Default 8GB estimate for Apple Silicon
-        else:  # CPU
             if PSUTIL_AVAILABLE:
                 return psutil.virtual_memory().total / 1024**2
             else:
-                return 16384  # Default 16GB estimate for CPU when psutil unavailable
+                return 32768  # 32GB fallback
+        else:
+            if PSUTIL_AVAILABLE:
+                return psutil.virtual_memory().total / 1024**2
+            else:
+                return 16384
 
     def get_current_memory_stats(self) -> Dict[str, float]:
         """Get current memory statistics"""

@@ -55,111 +55,80 @@ class LengthRegulator(nn.Module):
 
         return output
 
+
 class VariancePredictor(nn.Module):
     """
-    Variance predictor for pitch/energy prediction
-    Uses 1D convolutions with layer normalization
+    Variance Predictor using GroupNorm to maintain (B, C, L) format.
     """
-
     def __init__(self,
                  hidden_dim: int = DEFAULT_HIDDEN_DIM,
                  filter_size: int = DEFAULT_FILTER_SIZE,
                  kernel_size: int = 3,
                  dropout: float = 0.1,
                  num_layers: int = 2):
-        """
-        Initialize variance predictor
-
-        Args:
-            hidden_dim: Hidden dimension from encoder
-            filter_size: Filter size for conv layers
-            kernel_size: Kernel size for convolutions
-            dropout: Dropout rate
-            num_layers: Number of conv layers
-        """
         super().__init__()
 
-        self.hidden_dim = hidden_dim
-        self.filter_size = filter_size
-
-        # Build convolutional layers
         self.conv_layers = nn.ModuleList()
-        self.layer_norms = nn.ModuleList()
+        self.norms = nn.ModuleList()
 
         for i in range(num_layers):
             in_channels = hidden_dim if i == 0 else filter_size
 
-            conv = nn.Conv1d(
+            # Standard 1D Conv: Expects (Batch, Channels, Length)
+            self.conv_layers.append(nn.Conv1d(
                 in_channels,
                 filter_size,
                 kernel_size=kernel_size,
                 padding=(kernel_size - 1) // 2
-            )
-            self.conv_layers.append(conv)
+            ))
 
-            # Layer normalization
-            self.layer_norms.append(nn.LayerNorm(filter_size))
-
-        # Output projection
-        self.linear = nn.Linear(filter_size, 1)
+            # GroupNorm(1, ...) is equivalent to LayerNorm over the channel dim
+            # but natively supports the (B, C, L) format of Conv1d.
+            self.norms.append(nn.GroupNorm(num_groups=1, num_channels=filter_size))
 
         self.dropout = nn.Dropout(dropout)
         self.activation = nn.ReLU()
 
-        # Initialize weights
+        # Output projection back to (Batch, Length, 1)
+        self.linear = nn.Linear(filter_size, 1)
         self._init_weights()
 
     def _init_weights(self):
-        """Initialize weights with Xavier uniform"""
         for conv in self.conv_layers:
             nn.init.xavier_uniform_(conv.weight)
-            if conv.bias is not None:
-                nn.init.zeros_(conv.bias)
-
         nn.init.xavier_uniform_(self.linear.weight)
-        if self.linear.bias is not None:
-            nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Forward pass with chunked processing to avoid OOM on long sequences.
-
-        Args:
-            x: Input tensor (batch, seq_len, hidden_dim)
-            mask: Padding mask (batch, seq_len) - True for padding
-
-        Returns:
-            Predicted variance (batch, seq_len)
+        Forward pass with optimized dimensionality handling.
+        Input: (B, L, H)
+        Output: (B, L)
         """
         batch_size, seq_len, _ = x.shape
-        chunk_size = 512  # Process 512 frames at a time
+        chunk_size = 512
 
         if seq_len <= chunk_size:
-            # Short sequence — run normally
             return self._forward_chunk(x, mask)
 
-        # Long sequence — process in chunks
         outputs = []
         for start in range(0, seq_len, chunk_size):
             end = min(start + chunk_size, seq_len)
-            x_chunk = x[:, start:end, :]
-            mask_chunk = mask[:, start:end] if mask is not None else None
-            outputs.append(self._forward_chunk(x_chunk, mask_chunk))
-
+            outputs.append(self._forward_chunk(x[:, start:end, :],
+                                               mask[:, start:end] if mask is not None else None))
         return torch.cat(outputs, dim=1)
 
     def _forward_chunk(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Process a single chunk through the conv layers."""
+        # 1. Flip to (B, C, L) ONCE
         x = x.transpose(1, 2).contiguous()
 
-        for conv, norm in zip(self.conv_layers, self.layer_norms):
+        # 2. Sequential processing without dimension swapping
+        for conv, norm in zip(self.conv_layers, self.norms):
             x = conv(x)
-            x = x.transpose(1, 2).contiguous()
             x = norm(x)
             x = self.activation(x)
             x = self.dropout(x)
-            x = x.transpose(1, 2).contiguous()
 
+        # 3. Flip back to (B, L, C) for the final linear projection
         x = x.transpose(1, 2).contiguous()
         output = self.linear(x).squeeze(-1)
 
