@@ -110,9 +110,6 @@ class LengthRegulator(nn.Module):
         super().__init__()
 
     def forward(self, x, durations, max_len=None):
-        durations = torch.round(durations.clamp(min=0)).long()
-        device = x.device
-        batch_size = x.shape[0]
         # Vectorized expansion strategy:
         # 1) Move the per-token tensors to CPU to avoid MPS repeat_interleave bugs
         # 2) Flatten (B, L, D) -> (B*L, D) and repeat_interleave with flattened repeats
@@ -361,9 +358,6 @@ class VarianceAdaptor(nn.Module):
                                     targets: torch.Tensor,
                                     durations: torch.Tensor,
                                     max_len: Optional[int] = None) -> torch.Tensor:
-        durations = torch.round(durations.clamp(min=0)).long()
-        device = targets.device
-        batch_size = targets.shape[0]
         # Vectorized expansion similar to LengthRegulator: flatten tokens and durations,
         # repeat_interleave once, then scatter into a preallocated (B, max_len) buffer.
         return _vectorized_expand_tokens(targets, durations, max_len=max_len)
