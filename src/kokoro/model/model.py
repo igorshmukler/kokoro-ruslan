@@ -483,6 +483,11 @@ class KokoroModel(nn.Module):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
             device = mel_specs.device
 
+            # Capture input shapes early so they can be logged even if the
+            # original tensors are deleted during processing (prevents F821).
+            phoneme_indices_shape = tuple(phoneme_indices.shape) if 'phoneme_indices' in locals() else None
+            mel_specs_shape = tuple(mel_specs.shape) if 'mel_specs' in locals() else None
+
             if text_padding_mask is None:
                 text_padding_mask = (phoneme_indices == 0).to(torch.bool)
             else:
@@ -614,8 +619,11 @@ class KokoroModel(nn.Module):
 
             except Exception as e:
                 logger.error(f"Error in forward_training: {e}")
-                logger.error(f"Input shapes - phoneme_indices: {phoneme_indices.shape if 'phoneme_indices' in dir() else 'deleted'}, "
-                        f"mel_specs: {mel_specs.shape if 'mel_specs' in dir() else 'deleted'}")
+                logger.error(
+                    "Input shapes - phoneme_indices: %s, mel_specs: %s",
+                    phoneme_indices_shape if phoneme_indices_shape is not None else 'deleted',
+                    mel_specs_shape if mel_specs_shape is not None else 'deleted'
+                )
                 raise e
 
     def forward_inference(
