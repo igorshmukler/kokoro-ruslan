@@ -580,7 +580,7 @@ class KokoroTrainer:
 
         # Adaptive memory management configuration
         self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
-        self.memory_report_interval = getattr(config, 'memory_report_interval', 500)
+        self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
 
         # Gradient explosion tracking (adaptive threshold)
         self.grad_explosion_norm_ema = None
@@ -3147,7 +3147,7 @@ if __name__ == "__main__":
 
             # Adaptive memory management configurations
             self.enable_adaptive_memory = True   # Enable adaptive memory management
-            self.memory_report_interval = 500    # Report memory stats every N batches
+            self.memory_report_interval = 50    # Report memory stats every N batches
 
     temp_config = TrainingConfig()
 

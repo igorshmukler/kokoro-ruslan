@@ -207,13 +207,25 @@ class AdaptiveMemoryManager:
             current = torch.cuda.memory_allocated(self.device) / 1024**2
             reserved = torch.cuda.memory_reserved(self.device) / 1024**2
             peak = torch.cuda.max_memory_allocated(self.device) / 1024**2
+
+
         elif self.device_type == DeviceType.MPS:
             try:
-                current = torch.mps.current_allocated_memory() / 1024**2
-                reserved = current  # MPS doesn't separate reserved
-                peak = current      # MPS doesn't track peak separately
-            except:
+                pytorch_allocated = torch.mps.current_allocated_memory() / 1024**2
+
+                if PSUTIL_AVAILABLE:
+                    vm = psutil.virtual_memory()
+                    # System-wide used memory is the right pressure signal
+                    current = (vm.total - vm.available) / 1024**2
+                else:
+                    current = pytorch_allocated  # degraded fallback
+
+                reserved = pytorch_allocated  # still useful to track separately
+                peak = current
+            except Exception as e:
+                logger.warning(f"Failed to get MPS memory stats: {e}")
                 current = reserved = peak = 0.0
+
         else:  # CPU
             if PSUTIL_AVAILABLE:
                 memory = psutil.virtual_memory()
@@ -281,6 +293,7 @@ class AdaptiveMemoryManager:
             if self.device_type == DeviceType.CUDA:
                 torch.cuda.empty_cache()
             elif self.device_type == DeviceType.MPS:
+                torch.mps.synchronize()
                 torch.mps.empty_cache()
 
         if strategy.cleanup_delay > 0:
