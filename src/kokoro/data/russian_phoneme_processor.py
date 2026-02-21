@@ -384,7 +384,8 @@ class RussianPhonemeProcessor:
         word = word.replace('стн', 'сн')
         word = word.replace('здн', 'зн')
 
-        word = word.replace('тс', 'ц')   # советский -> совецкий
+        word = word.replace('тск', 'цк')   # советский → совецкий, детский → децкий
+        word = word.replace('дск', 'цк')   # городской → горо(д→ц)кой
 
         # 'лнц' — silent л (e.g. солнце)
         word = word.replace('лнц', 'нц')
