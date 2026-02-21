@@ -66,8 +66,6 @@ class RussianPhonemeProcessor:
             ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
             key=len, reverse=True
         )
-        # Public alias expected by other methods/tests
-        self.multi_char_phonemes = self._multi_char_phonemes
 
         # Hard consonants (never palatalized)
         self.hard_consonants = {'ж', 'ш', 'ц'}
@@ -589,7 +587,7 @@ class RussianPhonemeProcessor:
         while i < len(ipa_string):
             matched = False
             # Try to match longest possible phoneme first
-            for mc_ph in self.multi_char_phonemes:
+            for mc_ph in self._multi_char_phonemes:
                 if ipa_string.startswith(mc_ph, i):
                     phonemes.append(mc_ph)
                     i += len(mc_ph)
@@ -728,7 +726,6 @@ class RussianPhonemeProcessor:
         # Restore all attributes, ensuring sets are converted from lists
         instance.vowels = data.get("vowels", {})
         instance.consonants = data.get("consonants", {})
-        instance.palatalized = data.get("palatalized", {})
         instance.hard_consonants = set(data.get("hard_consonants", []))
         instance.soft_consonants = set(data.get("soft_consonants", []))
         instance.voiced_consonants = set(data.get("voiced_consonants", []))
