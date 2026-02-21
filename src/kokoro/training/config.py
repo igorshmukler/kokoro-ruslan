@@ -100,9 +100,9 @@ class TrainingConfig:
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
-    max_frames_per_batch: int = 20000  # Maximum mel frames per batch (auto-adjusted for MPS)
+    max_frames_per_batch: int = 15000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
-    max_batch_size: int = 16  # Maximum samples per batch
+    max_batch_size: int = 8  # Maximum samples per batch
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 30.0

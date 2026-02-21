@@ -872,66 +872,6 @@ class DynamicFrameBatchSampler(Sampler):
         sample = self.dataset.samples[idx]
         return sample['audio_length']
 
-    def _create_batches(self) -> List[List[int]]:
-        """Create batches that fit within frame budget"""
-        batches = []
-        indices = list(range(len(self.dataset)))
-
-        if self.shuffle:
-            # Shuffle within length-similar windows to maintain some locality
-            window_size = 1000
-            num_windows = len(indices) // window_size
-            shuffled_indices = []
-
-            for i in range(num_windows):
-                window = indices[i * window_size : (i + 1) * window_size]
-                random.shuffle(window)
-                shuffled_indices.extend(window)
-
-            # Add remaining indices
-            remaining = indices[num_windows * window_size:]
-            random.shuffle(remaining)
-            shuffled_indices.extend(remaining)
-            indices = shuffled_indices
-
-        # Group samples into batches based on frame budget
-        current_batch = []
-        current_frames = 0
-
-        for idx in indices:
-            sample_frames = self._get_sample_frames(idx)
-
-            # Check if adding this sample would exceed limits
-            would_exceed_frames = (current_frames + sample_frames) > self.max_frames
-            would_exceed_max_batch = len(current_batch) >= self.max_batch_size
-
-            # Start new batch if we exceed frame budget or max batch size
-            if current_batch and (would_exceed_frames or would_exceed_max_batch):
-                # Only add batch if it meets minimum size requirement
-                if len(current_batch) >= self.min_batch_size:
-                    batches.append(current_batch)
-                elif not self.drop_last:
-                    # Add small batch if not dropping
-                    batches.append(current_batch)
-
-                current_batch = []
-                current_frames = 0
-
-            # Add sample to current batch
-            current_batch.append(idx)
-            current_frames += sample_frames
-
-        # Handle remaining samples
-        if current_batch:
-            if len(current_batch) >= self.min_batch_size or not self.drop_last:
-                batches.append(current_batch)
-
-        # Shuffle batch order
-        if self.shuffle:
-            random.shuffle(batches)
-
-        return batches
-
     def _log_statistics(self):
         """Log batching statistics for monitoring"""
         if not self.batches:
@@ -953,11 +893,43 @@ class DynamicFrameBatchSampler(Sampler):
         logger.info(f"  Frame budget: {self.max_frames}")
         logger.info(f"  Batch size range: [{self.min_batch_size}, {self.max_batch_size}]")
 
+    def _create_batches(self) -> List[List[int]]:
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            random.shuffle(indices)
+
+        batches = []
+        batch = []
+        max_frames_in_batch = 0
+
+        for idx in indices:
+            sample_frames = self._get_sample_frames(idx)
+            new_max = max(max_frames_in_batch, sample_frames)
+            projected_cost = (len(batch) + 1) * new_max
+
+            if batch and (projected_cost > self.max_frames or
+                      len(batch) >= self.max_batch_size):
+                if len(batch) >= self.min_batch_size or not self.drop_last:
+                    batches.append(batch)
+                batch = []
+                max_frames_in_batch = 0
+
+            batch.append(idx)
+            max_frames_in_batch = max(max_frames_in_batch, sample_frames)
+
+        if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
+            batches.append(batch)
+
+        if self.shuffle:
+            random.shuffle(batches)
+
+        return batches
+
     def __iter__(self):
-        """Iterate over batches"""
-        for batch in self.batches:
-            yield batch
+        # Rebuild each epoch so shuffle produces different batches
+        if self.shuffle:
+            self.batches = self._create_batches()
+        yield from self.batches
 
     def __len__(self) -> int:
-        """Return number of batches"""
         return len(self.batches)
