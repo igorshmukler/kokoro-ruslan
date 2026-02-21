@@ -831,19 +831,29 @@ class LengthBasedBatchSampler(Sampler):
 
 class DynamicFrameBatchSampler(Sampler):
     """
-    Dynamic batch sampler that groups samples by total frame count.
+    Dynamic batch sampler that groups samples to meet a frame budget.
 
-    Instead of fixed batch size, batches are created to fit within a maximum
-    frame budget, allowing longer samples to have smaller batch sizes and
-    shorter samples to have larger batch sizes for optimal GPU utilization.
+    This sampler creates batches whose estimated cost is bounded by
+    `max_frames`. The cost heuristic used is: batch_cost = (batch_size *
+    max_sample_frames_in_batch), which favors grouping samples of similar
+    length to reduce padding. Batches are built from dataset indices and
+    returned as lists of indices.
 
-    Args:
-        dataset: Dataset with samples that have 'mel_length' attribute
-        max_frames: Maximum total mel frames per batch
-        min_batch_size: Minimum number of samples per batch
-        max_batch_size: Maximum number of samples per batch
-        drop_last: Drop incomplete batches
-        shuffle: Shuffle batches
+    Notes:
+    - The sampler reads frame counts from `dataset.samples[idx]['audio_length']`.
+    - If a single sample's frame count exceeds `max_frames` it will still be
+      included (as a single-item batch) rather than being split.
+    - When `shuffle=True` batches are rebuilt each epoch (see `__iter__`).
+
+    Parameters:
+        dataset: Dataset providing `samples` list with `'audio_length'` per sample.
+        max_frames: Maximum estimated frames-per-batch budget (heuristic).
+        min_batch_size: Minimum number of samples required to keep a batch.
+                        If `drop_last=True` and a batch is smaller than this
+                        value it can be dropped.
+        max_batch_size: Hard cap on number of samples per batch.
+        drop_last: Whether to drop incomplete batches below `min_batch_size`.
+        shuffle: If True, shuffle sample order and batch order each epoch.
     """
 
     def __init__(self,
@@ -867,13 +877,22 @@ class DynamicFrameBatchSampler(Sampler):
         self._log_statistics()
 
     def _get_sample_frames(self, idx: int) -> int:
-        """Get number of mel frames for a sample"""
-        # Access the sample's audio_length (which is mel frames)
+        """Return the estimated mel-frame count for sample index ``idx``.
+
+        The implementation expects the dataset to expose per-sample metadata
+        at ``dataset.samples[idx]['audio_length']`` (an integer). This value
+        is used by the batching heuristic and is not modified by the sampler.
+        """
         sample = self.dataset.samples[idx]
         return sample['audio_length']
 
     def _log_statistics(self):
-        """Log batching statistics for monitoring"""
+        """Compute and log simple statistics about the created batches.
+
+        Logs total batches, min/max/avg batch sizes and per-batch frame
+        totals computed from ``_get_sample_frames``. This is informational and
+        does not affect batching behavior.
+        """
         if not self.batches:
             return
 
@@ -894,6 +913,14 @@ class DynamicFrameBatchSampler(Sampler):
         logger.info(f"  Batch size range: [{self.min_batch_size}, {self.max_batch_size}]")
 
     def _create_batches(self) -> List[List[int]]:
+        """Construct batches (lists of indices) according to the frame budget.
+
+        Iterates over dataset indices (optionally shuffled), greedily packs
+        indices into a batch until the projected cost would exceed
+        ``self.max_frames`` or ``self.max_batch_size`` is reached. When a
+        batch is closed it's appended to the returned list. The returned
+        list is optionally shuffled before being stored on the sampler.
+        """
         indices = list(range(len(self.dataset)))
         if self.shuffle:
             random.shuffle(indices)
@@ -926,7 +953,13 @@ class DynamicFrameBatchSampler(Sampler):
         return batches
 
     def __iter__(self):
-        # Rebuild each epoch so shuffle produces different batches
+        """Yield batches for the current epoch.
+
+        If ``shuffle`` is True, batches are rebuilt each epoch so that
+        different shuffles produce new batch groupings. The iterator yields
+        lists of dataset indices suitable for passing directly to
+        ``DataLoader(batch_sampler=...)`` or for manual collating.
+        """
         if self.shuffle:
             self.batches = self._create_batches()
         yield from self.batches
