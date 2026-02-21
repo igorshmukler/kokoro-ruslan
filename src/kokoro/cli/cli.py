@@ -4,6 +4,7 @@ Command line interface for Kokoro training
 """
 
 import argparse
+import torch
 from kokoro.training.config import TrainingConfig
 
 
@@ -59,8 +60,8 @@ Examples:
     parser.add_argument(
         '--epochs', '-e',
         type=int,
-        default=100,
-        help='Number of training epochs (default: 100)'
+        default=50,
+        help='Number of training epochs (default: 50)'
     )
 
     parser.add_argument(
@@ -158,6 +159,18 @@ Examples:
         help='Profile AMP benefits before training (compare speed with/without mixed precision)'
     )
 
+    amp_group = parser.add_mutually_exclusive_group()
+    amp_group.add_argument(
+        '--enable-amp',
+        action='store_true',
+        help='Force-enable automatic mixed precision (overrides sensible defaults)'
+    )
+    amp_group.add_argument(
+        '--disable-amp',
+        action='store_true',
+        help='Force-disable automatic mixed precision (overrides sensible defaults)'
+    )
+
     parser.add_argument(
         '--profile-amp-batches',
         type=int,
@@ -206,6 +219,22 @@ def create_config_from_args(args) -> TrainingConfig:
     # Validation settings
     validation_split = 0.0 if args.no_validation else args.val_split
 
+    # Determine a sensible default for AMP depending on available device
+    if torch.cuda.is_available():
+        default_amp = True
+    elif torch.backends.mps.is_available():
+        default_amp = False
+    else:
+        default_amp = False
+
+    # Allow explicit CLI override
+    if getattr(args, 'enable_amp', False):
+        use_amp = True
+    elif getattr(args, 'disable_amp', False):
+        use_amp = False
+    else:
+        use_amp = default_amp
+
     return TrainingConfig(
         data_dir=args.corpus,
         output_dir=args.output,
@@ -220,7 +249,7 @@ def create_config_from_args(args) -> TrainingConfig:
         f_min=0.0,
         f_max=8000.0,
         save_every=args.save_every,
-        use_mixed_precision=True,
+        use_mixed_precision=use_amp,
         # Dynamic batching settings
         use_dynamic_batching=args.dynamic_batching,
         max_frames_per_batch=args.max_frames if args.max_frames is not None else 30000,

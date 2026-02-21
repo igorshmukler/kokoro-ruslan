@@ -42,6 +42,16 @@ class RuslanDataset(Dataset):
                  indices: Optional[List[int]] = None):
         self.data_dir = Path(data_dir)
         self.config = config
+        # Adopt restored variance/global stats from config if present so
+        # the dataset doesn't recompute or override them during init.
+        for _k in ('pitch_running_mean', 'pitch_running_std', 'energy_running_mean', 'energy_running_std'):
+            if hasattr(config, _k):
+                try:
+                    setattr(self, _k, getattr(config, _k))
+                except Exception:
+                    pass
+            else:
+                setattr(self, _k, None)
         self.phoneme_processor = RussianPhonemeProcessor()
         self.use_mfa = use_mfa
         self.indices = indices  # Subset of indices for train/val split
@@ -412,9 +422,12 @@ class RuslanDataset(Dataset):
         mem_latency_ms = (self.feature_cache_mem_latency_ns / self.feature_cache_mem_latency_count / 1e6) if self.feature_cache_mem_latency_count > 0 else 0.0
         disk_latency_ms = (self.feature_cache_disk_latency_ns / self.feature_cache_disk_latency_count / 1e6) if self.feature_cache_disk_latency_count > 0 else 0.0
 
+        mem_lat_display = "N/A" if self.feature_cache_mem_hits == 0 or mem_latency_ms == 0.0 else f"{mem_latency_ms:.3f}"
+        disk_lat_display = "N/A" if self.feature_cache_disk_hits == 0 or disk_latency_ms == 0.0 else f"{disk_latency_ms:.3f}"
+
         logger.info(
             "Feature cache stats: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% "
-            "in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%.3f disk_lat_ms=%.3f",
+            "in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%s disk_lat_ms=%s",
             self.feature_cache_requests,
             total_hits,
             self.feature_cache_mem_hits,
@@ -423,8 +436,8 @@ class RuslanDataset(Dataset):
             hit_rate,
             len(self.feature_cache),
             in_mem_mb,
-            mem_latency_ms,
-            disk_latency_ms,
+            mem_lat_display,
+            disk_lat_display,
         )
 
     def get_feature_cache_stats(self) -> Dict[str, float]:
@@ -770,38 +783,50 @@ class LengthBasedBatchSampler(Sampler):
         self.batches = self._create_batches()
 
     def _create_batches(self) -> List[List[int]]:
-        batches = []
-        indices = list(range(len(self.dataset)))
+        # 1. Get all indices and their lengths
+        idx_and_len = []
+        for i in range(len(self.dataset)):
+            idx_and_len.append((i, self._get_sample_frames(i)))
 
+        # 2. Sort by length (Bucketing) to minimize padding
+        # We add a bit of randomness to the sort if shuffle is True
         if self.shuffle:
-            # Shuffle within "length-similar" windows to maintain some randomness
-            # without completely destroying the length ordering.
-            # A common strategy is to shuffle fixed-size chunks of the sorted data.
-            window_size = 1000 # Example window size, tune as needed
-            num_windows = len(indices) // window_size
-            shuffled_indices = []
-            for i in range(num_windows):
-                window = indices[i * window_size : (i + 1) * window_size]
-                random.shuffle(window)
-                shuffled_indices.extend(window)
-            # Add remaining indices
-            remaining_indices = indices[num_windows * window_size:]
-            random.shuffle(remaining_indices)
-            shuffled_indices.extend(remaining_indices)
-            indices = shuffled_indices
+            random.shuffle(idx_and_len)
+            # Optional: sort into "mega-batches" then shuffle within them
+            idx_and_len.sort(key=lambda x: x[1])
 
-        # Group into batches
+        batches = []
         current_batch = []
-        for idx in indices:
-            current_batch.append(idx)
-            if len(current_batch) == self.batch_size:
+        max_len_in_batch = 0
+
+        for idx, length in idx_and_len:
+            new_max = max(max_len_in_batch, length)
+            # The GPU cost is the width of the widest sample * number of samples
+            projected_cost = (len(current_batch) + 1) * new_max
+
+            if (projected_cost > self.max_frames or
+                len(current_batch) >= self.max_batch_size):
+
+                if current_batch:
+                    # Check min_batch_size constraint
+                    if len(current_batch) >= self.min_batch_size:
+                        batches.append(current_batch)
+                    elif not self.drop_last:
+                        batches.append(current_batch)
+
+                current_batch = [idx]
+                max_len_in_batch = length
+            else:
+                current_batch.append(idx)
+                max_len_in_batch = new_max
+
+        # Handle the final batch
+        if current_batch:
+            if len(current_batch) >= self.min_batch_size or not self.drop_last:
                 batches.append(current_batch)
-                current_batch = []
 
-        if len(current_batch) > 0 and not self.drop_last:
-            batches.append(current_batch)
-
-        # Shuffle the order of batches
+        # Shuffle the batches themselves so the model doesn't see
+        # short samples then long samples every epoch
         if self.shuffle:
             random.shuffle(batches)
 
@@ -818,19 +843,29 @@ class LengthBasedBatchSampler(Sampler):
 
 class DynamicFrameBatchSampler(Sampler):
     """
-    Dynamic batch sampler that groups samples by total frame count.
+    Dynamic batch sampler that groups samples to meet a frame budget.
 
-    Instead of fixed batch size, batches are created to fit within a maximum
-    frame budget, allowing longer samples to have smaller batch sizes and
-    shorter samples to have larger batch sizes for optimal GPU utilization.
+    This sampler creates batches whose estimated cost is bounded by
+    `max_frames`. The cost heuristic used is: batch_cost = (batch_size *
+    max_sample_frames_in_batch), which favors grouping samples of similar
+    length to reduce padding. Batches are built from dataset indices and
+    returned as lists of indices.
 
-    Args:
-        dataset: Dataset with samples that have 'mel_length' attribute
-        max_frames: Maximum total mel frames per batch
-        min_batch_size: Minimum number of samples per batch
-        max_batch_size: Maximum number of samples per batch
-        drop_last: Drop incomplete batches
-        shuffle: Shuffle batches
+    Notes:
+    - The sampler reads frame counts from `dataset.samples[idx]['audio_length']`.
+    - If a single sample's frame count exceeds `max_frames` it will still be
+      included (as a single-item batch) rather than being split.
+    - When `shuffle=True` batches are rebuilt each epoch (see `__iter__`).
+
+    Parameters:
+        dataset: Dataset providing `samples` list with `'audio_length'` per sample.
+        max_frames: Maximum estimated frames-per-batch budget (heuristic).
+        min_batch_size: Minimum number of samples required to keep a batch.
+                        If `drop_last=True` and a batch is smaller than this
+                        value it can be dropped.
+        max_batch_size: Hard cap on number of samples per batch.
+        drop_last: Whether to drop incomplete batches below `min_batch_size`.
+        shuffle: If True, shuffle sample order and batch order each epoch.
     """
 
     def __init__(self,
@@ -854,73 +889,22 @@ class DynamicFrameBatchSampler(Sampler):
         self._log_statistics()
 
     def _get_sample_frames(self, idx: int) -> int:
-        """Get number of mel frames for a sample"""
-        # Access the sample's audio_length (which is mel frames)
+        """Return the estimated mel-frame count for sample index ``idx``.
+
+        The implementation expects the dataset to expose per-sample metadata
+        at ``dataset.samples[idx]['audio_length']`` (an integer). This value
+        is used by the batching heuristic and is not modified by the sampler.
+        """
         sample = self.dataset.samples[idx]
         return sample['audio_length']
 
-    def _create_batches(self) -> List[List[int]]:
-        """Create batches that fit within frame budget"""
-        batches = []
-        indices = list(range(len(self.dataset)))
-
-        if self.shuffle:
-            # Shuffle within length-similar windows to maintain some locality
-            window_size = 1000
-            num_windows = len(indices) // window_size
-            shuffled_indices = []
-
-            for i in range(num_windows):
-                window = indices[i * window_size : (i + 1) * window_size]
-                random.shuffle(window)
-                shuffled_indices.extend(window)
-
-            # Add remaining indices
-            remaining = indices[num_windows * window_size:]
-            random.shuffle(remaining)
-            shuffled_indices.extend(remaining)
-            indices = shuffled_indices
-
-        # Group samples into batches based on frame budget
-        current_batch = []
-        current_frames = 0
-
-        for idx in indices:
-            sample_frames = self._get_sample_frames(idx)
-
-            # Check if adding this sample would exceed limits
-            would_exceed_frames = (current_frames + sample_frames) > self.max_frames
-            would_exceed_max_batch = len(current_batch) >= self.max_batch_size
-
-            # Start new batch if we exceed frame budget or max batch size
-            if current_batch and (would_exceed_frames or would_exceed_max_batch):
-                # Only add batch if it meets minimum size requirement
-                if len(current_batch) >= self.min_batch_size:
-                    batches.append(current_batch)
-                elif not self.drop_last:
-                    # Add small batch if not dropping
-                    batches.append(current_batch)
-
-                current_batch = []
-                current_frames = 0
-
-            # Add sample to current batch
-            current_batch.append(idx)
-            current_frames += sample_frames
-
-        # Handle remaining samples
-        if current_batch:
-            if len(current_batch) >= self.min_batch_size or not self.drop_last:
-                batches.append(current_batch)
-
-        # Shuffle batch order
-        if self.shuffle:
-            random.shuffle(batches)
-
-        return batches
-
     def _log_statistics(self):
-        """Log batching statistics for monitoring"""
+        """Compute and log simple statistics about the created batches.
+
+        Logs total batches, min/max/avg batch sizes and per-batch frame
+        totals computed from ``_get_sample_frames``. This is informational and
+        does not affect batching behavior.
+        """
         if not self.batches:
             return
 
@@ -940,11 +924,57 @@ class DynamicFrameBatchSampler(Sampler):
         logger.info(f"  Frame budget: {self.max_frames}")
         logger.info(f"  Batch size range: [{self.min_batch_size}, {self.max_batch_size}]")
 
+    def _create_batches(self) -> List[List[int]]:
+        """Construct batches (lists of indices) according to the frame budget.
+
+        Iterates over dataset indices (optionally shuffled), greedily packs
+        indices into a batch until the projected cost would exceed
+        ``self.max_frames`` or ``self.max_batch_size`` is reached. When a
+        batch is closed it's appended to the returned list. The returned
+        list is optionally shuffled before being stored on the sampler.
+        """
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            random.shuffle(indices)
+
+        batches = []
+        batch = []
+        max_frames_in_batch = 0
+
+        for idx in indices:
+            sample_frames = self._get_sample_frames(idx)
+            new_max = max(max_frames_in_batch, sample_frames)
+            projected_cost = (len(batch) + 1) * new_max
+
+            if batch and (projected_cost > self.max_frames or
+                      len(batch) >= self.max_batch_size):
+                if len(batch) >= self.min_batch_size or not self.drop_last:
+                    batches.append(batch)
+                batch = []
+                max_frames_in_batch = 0
+
+            batch.append(idx)
+            max_frames_in_batch = max(max_frames_in_batch, sample_frames)
+
+        if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
+            batches.append(batch)
+
+        if self.shuffle:
+            random.shuffle(batches)
+
+        return batches
+
     def __iter__(self):
-        """Iterate over batches"""
-        for batch in self.batches:
-            yield batch
+        """Yield batches for the current epoch.
+
+        If ``shuffle`` is True, batches are rebuilt each epoch so that
+        different shuffles produce new batch groupings. The iterator yields
+        lists of dataset indices suitable for passing directly to
+        ``DataLoader(batch_sampler=...)`` or for manual collating.
+        """
+        if self.shuffle:
+            self.batches = self._create_batches()
+        yield from self.batches
 
     def __len__(self) -> int:
-        """Return number of batches"""
         return len(self.batches)

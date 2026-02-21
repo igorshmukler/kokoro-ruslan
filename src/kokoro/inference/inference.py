@@ -17,6 +17,8 @@ from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 from kokoro.inference.vocoder_manager import VocoderManager
 from kokoro.data.audio_utils import AudioUtils, PhonemeProcessorUtils
 
+import re
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -295,6 +297,41 @@ class KokoroTTS:
             int(self.inference_min_len_floor),
         )
 
+    def split_text(self, text: str, max_chars: int = 150) -> List[str]:
+        """
+        Splits long Russian text into smaller chunks based on punctuation.
+        Useful for preventing inference degradation on long paragraphs.
+        """
+        # Split by common sentence endings (. ! ? ;), keeping the delimiter
+        sentences = re.split(r'([.!?;\n])', text)
+
+        chunks = []
+        current_chunk = ""
+
+        # Reconstruct sentences (re.split with groups keeps the delimiters in the list)
+        full_sentences = []
+        for i in range(0, len(sentences)-1, 2):
+            full_sentences.append(sentences[i] + sentences[i+1])
+        if len(sentences) % 2 != 0:
+            full_sentences.append(sentences[-1])
+
+        for sentence in full_sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+
+            # If adding this sentence exceeds max_chars, save current and start new
+            if len(current_chunk) + len(sentence) > max_chars and current_chunk:
+                chunks.append(current_chunk.strip())
+                current_chunk = sentence
+            else:
+                current_chunk += " " + sentence
+
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+
+        return chunks
+
     def text_to_speech(
         self,
         text: str,
@@ -305,73 +342,81 @@ class KokoroTTS:
         min_len_floor: Optional[int] = None,
     ) -> torch.Tensor:
         """
-        Updated text_to_speech with better parameters and error handling.
+        text_to_speech with chunking and error handling.
         """
         if not text:
-            logger.warning("Received empty text for conversion. Returning empty audio.")
+            logger.warning("Received empty text for conversion.")
             return torch.empty(0)
 
-        logger.info(f"Converting text: '{text}'")
+        # Split into manageable chunks to prevent attention drift and OOM
+        chunks = self.split_text(text)
+        all_audio_segments = []
+
+        # Determine inference parameters once
+        eff_stop_threshold = self.inference_stop_threshold if stop_threshold is None else stop_threshold
+        eff_max_len = self.inference_max_len if max_len is None else max_len
+        eff_min_len_ratio = self.inference_min_len_ratio if min_len_ratio is None else min_len_ratio
+        eff_min_len_floor = self.inference_min_len_floor if min_len_floor is None else min_len_floor
+
+        logger.info(f"Converting text in {len(chunks)} chunk(s)")
 
         try:
-            # Step 1: Process text into phoneme sequence
-            raw_processor_output = self.phoneme_processor.process_text(text)
-            phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
+            for i, chunk in enumerate(chunks):
+                if len(chunks) > 1:
+                    logger.info(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:40]}...'")
 
-            if not phoneme_sequence:
-                logger.error(f"Phoneme processor produced no phonemes for text: '{text}'. Conversion aborted.")
-                raise ValueError("No phonemes generated from the input text.")
+                # Step 1: Phoneme processing
+                raw_processor_output = self.phoneme_processor.process_text(chunk)
+                phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
 
-            logger.info(f"Phonemes: {' '.join(phoneme_sequence)}")
+                if not phoneme_sequence:
+                    continue
 
-            # Step 2: Convert phonemes to numerical indices
-            phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
-                phoneme_sequence, self.phoneme_processor.phoneme_to_id
-            )
-            logger.debug(f"Phoneme indices (first 20): {phoneme_indices[:20]}...")
-
-            # Convert to tensor and add batch dimension
-            phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
-
-            # Step 3: Generate mel spectrogram with updated parameters
-            effective_stop_threshold = (
-                self.inference_stop_threshold if stop_threshold is None else stop_threshold
-            )
-            effective_max_len = self.inference_max_len if max_len is None else max_len
-            effective_min_len_ratio = self.inference_min_len_ratio if min_len_ratio is None else min_len_ratio
-            effective_min_len_floor = self.inference_min_len_floor if min_len_floor is None else min_len_floor
-
-            with torch.no_grad():
-                mel_spec = self.model.forward_inference(
-                    phoneme_indices=phoneme_tensor,
-                    max_len=effective_max_len,
-                    stop_threshold=effective_stop_threshold,
-                    min_len_ratio=effective_min_len_ratio,
-                    min_len_floor=effective_min_len_floor,
-                    text_padding_mask=None
+                # Step 2: To Indices & Tensor
+                phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
+                    phoneme_sequence, self.phoneme_processor.phoneme_to_id
                 )
+                phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
 
-            if mel_spec.numel() == 0 or mel_spec.shape[1] == 0:
-                raise RuntimeError(
-                    "Model generated an empty mel spectrogram. "
-                    "Check model checkpoint compatibility and inference duration path."
-                )
+                # Step 3: Generate Mel
+                with torch.no_grad():
+                    mel_spec = self.model.forward_inference(
+                        phoneme_indices=phoneme_tensor,
+                        max_len=eff_max_len,
+                        stop_threshold=eff_stop_threshold,
+                        min_len_ratio=eff_min_len_ratio,
+                        min_len_floor=eff_min_len_floor,
+                        text_padding_mask=None
+                    )
 
-            # Remove batch dimension and move to CPU for vocoder
-            mel_spec = mel_spec.squeeze(0).cpu()
+                if mel_spec.numel() == 0:
+                    logger.error(f"Chunk {i+1} generated empty mel. Skipping.")
+                    continue
 
-            # Step 4: Convert mel spectrogram to audio using the neural vocoder
-            audio = self.vocoder_manager.mel_to_audio(mel_spec)
+                # Step 4: Vocoding
+                mel_spec = mel_spec.squeeze(0).cpu()
+                chunk_audio = self.vocoder_manager.mel_to_audio(mel_spec)
+                all_audio_segments.append(chunk_audio)
 
-            # Save audio if an output path is provided
+                # Optional: Add 150ms of silence between chunks for natural phrasing
+                silence = torch.zeros(int(self.sample_rate * 0.15))
+                all_audio_segments.append(silence)
+
+            if not all_audio_segments:
+                raise RuntimeError("No audio was generated for any of the text chunks.")
+
+            # Concatenate all segments into one final audio tensor
+            final_audio = torch.cat(all_audio_segments, dim=0)
+
+            # Step 5: Save
             if output_path:
-                self.audio_utils.save_audio(audio, output_path)
-                logger.info(f"Audio saved to: {output_path}")
+                self.audio_utils.save_audio(final_audio, output_path)
+                logger.info(f"Full audio saved to: {output_path}")
 
-            return audio
+            return final_audio
 
         except Exception as e:
-            logger.error(f"Error in text_to_speech: {e}")
+            logger.error(f"Error in chunked text_to_speech: {e}")
             raise
 
     def batch_text_to_speech(self, texts: List[str], output_dir: str):

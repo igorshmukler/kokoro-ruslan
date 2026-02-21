@@ -400,72 +400,112 @@ class KokoroModel(nn.Module):
             return expanded_encoder_outputs, encoder_output_padding_mask
 
     def _average_by_duration(self,
-                            values: torch.Tensor,
-                            durations: torch.Tensor,
-                            mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                         values: torch.Tensor,
+                         durations: torch.Tensor,
+                         mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Vectorized average of frame-level values (pitch/energy) to phoneme-level using durations
+        Vectorized average of frame-level values to phoneme-level using durations.
+        Replaces both _average_by_duration and _average_pitch_energy_by_duration.
 
         Args:
-            values: Frame-level values (batch, mel_frames)
-            durations: Phoneme durations (batch, phonemes)
-            mask: Phoneme padding mask (batch, phonemes)
+            values:    Frame-level values    (batch, mel_frames)
+            durations: Phoneme durations     (batch, phonemes)
+            mask:      Phoneme padding mask  (batch, phonemes) — True = padding
 
         Returns:
-            Phoneme-level averaged values (batch, phonemes)
+            Phoneme-level averaged values    (batch, phonemes)
         """
         batch_size, num_phonemes = durations.shape
         device = durations.device
 
-        # Clamp durations to valid range and convert to long
-        durations_clamped = torch.clamp(durations.long(), min=0)
+        durations_clamped = durations.long().clamp(min=0)
 
-        # Create phoneme mask if not provided
-        if mask is None:
-            phoneme_mask = torch.zeros_like(durations_clamped, dtype=torch.bool)
+        # Cumulative sum gives frame boundaries for each phoneme
+        # ends[b, p]   = last frame index (exclusive) for phoneme p in sample b
+        # starts[b, p] = first frame index for phoneme p
+        ends = durations_clamped.cumsum(dim=1)                          # (B, P)
+        starts = ends - durations_clamped                               # (B, P)
+        max_frames = values.size(1)
+
+        # Clamp to valid frame range
+        starts = starts.clamp(max=max_frames - 1)
+        ends = ends.clamp(max=max_frames)
+
+        # Build a frame→phoneme assignment map using scatter
+        # frame_labels[b, f] = phoneme index that owns frame f (or num_phonemes for overflow)
+        frame_labels = torch.full(
+            (batch_size, max_frames), num_phonemes,
+            dtype=torch.long, device=device
+        )
+
+        # For each phoneme p, mark its frames with label p
+        # We do this by scattering 1s into a diff tensor and taking cumsum
+        # This is O(B*P) scatter ops instead of O(B*P) Python iterations
+        diff = torch.zeros(batch_size, max_frames + 1, dtype=torch.long, device=device)
+
+        # At each start position, increment; at each end position, decrement
+        # Then cumsum gives us which phoneme each frame belongs to
+        phoneme_ids = torch.arange(num_phonemes, device=device).unsqueeze(0).expand(batch_size, -1)
+
+        # Use scatter_add to build boundaries
+        diff.scatter_add_(1, starts.clamp(max=max_frames), torch.ones_like(starts))
+        diff.scatter_add_(1, ends.clamp(max=max_frames), -torch.ones_like(ends))
+
+        # cumsum of diff gives active phoneme count — but we need phoneme index
+        # Use a different approach: scatter values directly using frame→phoneme map
+
+        # For each phoneme, create a range mask and use it to average
+        # Shape: (B, P, F) would be too large — use scatter_add on (B, F) instead
+
+        # frame_phoneme[b, f] = which phoneme owns frame f
+        # Build this by: for each phoneme p, fill [starts[b,p]:ends[b,p]] with p
+        phoneme_range = torch.arange(num_phonemes, device=device)  # (P,)
+
+        # (B, P) starts and ends → use scatter to fill frame_labels
+        # Trick: scatter the phoneme index at start position, then propagate
+        frame_labels_float = torch.zeros(batch_size, max_frames + 1, device=device)
+        frame_labels_float.scatter_add_(
+            1,
+            starts.clamp(max=max_frames),
+            phoneme_range.unsqueeze(0).expand(batch_size, -1).float()
+        )
+        frame_labels_float.scatter_add_(
+            1,
+            ends.clamp(max=max_frames),
+            -phoneme_range.unsqueeze(0).expand(batch_size, -1).float()
+        )
+        # cumsum gives phoneme index for each frame
+        frame_to_phoneme = frame_labels_float[:, :-1].cumsum(dim=1).long()  # (B, F)
+
+        # scatter_add values into phoneme buckets
+        phoneme_sums = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
+        phoneme_counts = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
+
+        # Mask out frames beyond actual sequence
+        valid_frame_mask = frame_to_phoneme < num_phonemes  # (B, F)
+        safe_labels = frame_to_phoneme.clamp(max=num_phonemes - 1)
+
+        phoneme_sums.scatter_add_(1, safe_labels, values * valid_frame_mask.to(values.dtype))
+        phoneme_counts.scatter_add_(1, safe_labels, valid_frame_mask.to(values.dtype))
+
+        # Avoid division by zero for empty phonemes
+        output = phoneme_sums / phoneme_counts.clamp(min=1.0)
+
+        # Zero out padded phoneme positions
+        if mask is not None:
+            output = output.masked_fill(mask.bool(), 0.0)
         else:
-            phoneme_mask = mask.bool()
+            # Zero out phonemes with zero duration (they're padding regardless)
+            output = output.masked_fill(durations_clamped == 0, 0.0)
 
-        # Initialize output tensor
-        phoneme_values = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
-
-        # Process each sample in batch (vectorized inner loop)
-        for b in range(batch_size):
-            curr_durations = durations_clamped[b]  # (phonemes,)
-            curr_values = values[b]  # (frames,)
-            curr_mask = phoneme_mask[b]  # (phonemes,)
-
-            # Compute cumulative sum to get frame boundaries
-            cumsum = torch.cumsum(curr_durations, dim=0)
-
-            # Create start and end indices for each phoneme
-            starts = torch.cat([torch.zeros(1, device=device, dtype=torch.long), cumsum[:-1]])
-            ends = cumsum
-
-            # Clamp to valid frame range
-            max_frames = curr_values.shape[0]
-            starts = torch.clamp(starts, min=0, max=max_frames - 1)
-            ends = torch.clamp(ends, min=1, max=max_frames)
-
-            # Compute averages using scatter_add for efficiency
-            for p in range(num_phonemes):
-                if curr_mask[p] or curr_durations[p] == 0:
-                    phoneme_values[b, p] = 0.0
-                else:
-                    start_idx = starts[p].item()
-                    end_idx = ends[p].item()
-                    if start_idx < end_idx and end_idx <= max_frames:
-                        phoneme_values[b, p] = curr_values[start_idx:end_idx].mean()
-                    else:
-                        phoneme_values[b, p] = 0.0
-
-        return phoneme_values
+        return output
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:
         """Generates an upper-triangular matrix of -inf, used for masked self-attention."""
         mask = torch.triu(torch.ones(sz, sz, device=device) * float('-inf'), diagonal=1)
         return mask
+
 
     def forward_training(
         self,
@@ -478,31 +518,14 @@ class KokoroModel(nn.Module):
         text_padding_mask: Optional[torch.Tensor] = None,
         mel_padding_mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, ...]:
-        """
-        Enhanced training forward pass with variance prediction
-
-        Returns:
-            Tuple of (predicted_mel_frames, predicted_log_durations, predicted_stop_logits,
-                     predicted_pitch, predicted_energy)
-        """
         with torch.profiler.record_function("forward_training"):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
             device = mel_specs.device
 
-            # BATCH 281 LOGGING - Track model forward entry
-            is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
-            if is_batch_281:
-                logger.info(f"  [Model] forward_training: batch={batch_size}, mel_seq={mel_seq_len}")
-
-            # Log at the very beginning (outside any checkpointed regions)
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("training_start")
-
-            # Log gradient checkpointing status
-            if self.gradient_checkpointing and self.training:
-                logger.debug("Using gradient checkpointing for forward pass")
-                if is_batch_281:
-                    logger.info(f"  [Model] Gradient checkpointing ENABLED")
+            # Capture input shapes early so they can be logged even if the
+            # original tensors are deleted during processing (prevents F821).
+            phoneme_indices_shape = tuple(phoneme_indices.shape) if 'phoneme_indices' in locals() else None
+            mel_specs_shape = tuple(mel_specs.shape) if 'mel_specs' in locals() else None
 
             if text_padding_mask is None:
                 text_padding_mask = (phoneme_indices == 0).to(torch.bool)
@@ -510,157 +533,136 @@ class KokoroModel(nn.Module):
                 text_padding_mask = text_padding_mask.to(torch.bool)
 
             try:
-                # Encode text using checkpointed Transformer encoder (logging handled internally)
+                # ── 1. Encode text ──────────────────────────────────────────
                 text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
+                # phoneme_indices no longer needed
+                del phoneme_indices
 
-                # Use variance adaptor if enabled
+                # ── 2. Variance adaptor ─────────────────────────────────────
                 if self.use_variance_predictor:
-                    # Variance adaptor predicts duration, pitch, energy and adds embeddings
-                    # For training, we need to average pitch/energy from mel-level to phoneme-level
                     phoneme_pitch = None
                     phoneme_energy = None
 
                     if pitch_targets is not None:
-                        # Average pitch per phoneme duration
                         phoneme_pitch = self._average_by_duration(
                             pitch_targets, phoneme_durations, text_padding_mask
                         )
+                        # pitch_targets expanded into phoneme_pitch — free original
+                        del pitch_targets
 
                     if energy_targets is not None:
-                        # Average energy per phoneme duration
                         phoneme_energy = self._average_by_duration(
                             energy_targets, phoneme_durations, text_padding_mask
                         )
+                        del energy_targets
 
-                    # Apply variance adaptor
-                    adapted_encoder_output, predicted_log_durations, predicted_pitch, predicted_energy = \
-                        self.variance_adaptor(
-                            text_encoded,
-                            mask=text_padding_mask,
-                            pitch_target=phoneme_pitch,
-                            energy_target=phoneme_energy,
-                            duration_target=phoneme_durations.float()
-                        )
+                    (adapted_encoder_output,
+                     predicted_log_durations,
+                     predicted_pitch,
+                     predicted_energy,
+                     frame_mask) = self.variance_adaptor(
+                        text_encoded,
+                        mask=text_padding_mask,
+                        pitch_target=phoneme_pitch,
+                        energy_target=phoneme_energy,
+                        duration_target=phoneme_durations.float()
+                    )
 
-                    # Use adapted output for length regulation
-                    text_encoded = adapted_encoder_output
+                    # Free everything consumed by the adaptor
+                    del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations
+
+                    expanded_encoder_outputs = adapted_encoder_output
+                    encoder_output_padding_mask = frame_mask
+                    del adapted_encoder_output, frame_mask
+
                 else:
-                    # Fallback to basic duration predictor
                     predicted_log_durations = self._predict_durations(text_encoded)
                     predicted_pitch = None
                     predicted_energy = None
 
-                # Length regulate (logging handled internally)
-                expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                    text_encoded, phoneme_durations.float(), text_padding_mask
+                    expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                        text_encoded, phoneme_durations.float(), text_padding_mask
+                    )
+                    del text_encoded, phoneme_durations
+
+                # ── 3. Align expanded output to mel length ──────────────────
+                current_expanded_len = expanded_encoder_outputs.shape[1]
+                if current_expanded_len != mel_seq_len:
+                    if current_expanded_len > mel_seq_len:
+                        expanded_encoder_outputs = expanded_encoder_outputs[:, :mel_seq_len, :]
+                        encoder_output_padding_mask = encoder_output_padding_mask[:, :mel_seq_len]
+                    else:
+                        pad_len = mel_seq_len - current_expanded_len
+                        expanded_encoder_outputs = torch.cat([
+                            expanded_encoder_outputs,
+                            torch.zeros(batch_size, pad_len, self.hidden_dim,
+                                        device=device, dtype=expanded_encoder_outputs.dtype)
+                        ], dim=1)
+                        encoder_output_padding_mask = torch.cat([
+                            encoder_output_padding_mask,
+                            torch.ones(batch_size, pad_len, dtype=torch.bool, device=device)
+                        ], dim=1)
+
+                # ── 4. Decoder input ────────────────────────────────────────
+                decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
+                # mel_specs no longer needed after this
+                del mel_specs
+
+                if self.gradient_checkpointing and self.training:
+                    decoder_input_projected = checkpoint(
+                        self.mel_projection_in, decoder_input_mels, use_reentrant=False
+                    )
+                else:
+                    decoder_input_projected = self.mel_projection_in(decoder_input_mels)
+                del decoder_input_mels
+
+                decoder_input_projected_with_pe = self.encoder_positional_encoding(
+                    decoder_input_projected, seq_offset=0
                 )
+                del decoder_input_projected
 
-                # Adjust sequence length to match mel_seq_len
-                with torch.profiler.record_function("mel_length_adjust"):
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("mel_length_adjust_start")
+                tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
 
-                    current_expanded_len = expanded_encoder_outputs.shape[1]
-                    if current_expanded_len != mel_seq_len:
-                        if current_expanded_len > mel_seq_len:
-                            expanded_encoder_outputs = expanded_encoder_outputs[:, :mel_seq_len, :]
-                            encoder_output_padding_mask = encoder_output_padding_mask[:, :mel_seq_len]
-                        else:
-                            pad_len = mel_seq_len - current_expanded_len
-                            padding_tensor = torch.zeros(
-                                batch_size, pad_len, self.hidden_dim,
-                                device=device, dtype=expanded_encoder_outputs.dtype
-                            )
-                            expanded_encoder_outputs = torch.cat(
-                                [expanded_encoder_outputs, padding_tensor], dim=1
-                            )
-                            padding_mask_tensor = torch.ones(
-                                batch_size, pad_len, dtype=torch.bool, device=device
-                            )
-                            encoder_output_padding_mask = torch.cat(
-                                [encoder_output_padding_mask, padding_mask_tensor], dim=1
-                            )
+                if mel_padding_mask is not None:
+                    mel_padding_mask = mel_padding_mask.to(torch.bool)
 
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("mel_length_adjust_end")
+                # ── 5. Decoder ──────────────────────────────────────────────
+                decoder_outputs = self._checkpoint_decoder_forward(
+                    decoder_input_projected_with_pe,
+                    expanded_encoder_outputs,
+                    tgt_mask=tgt_mask,
+                    memory_key_padding_mask=encoder_output_padding_mask,
+                    tgt_key_padding_mask=mel_padding_mask
+                )
+                # Memory tensors no longer needed after decoder
+                del decoder_input_projected_with_pe, expanded_encoder_outputs
+                del encoder_output_padding_mask, tgt_mask
 
-                with torch.profiler.record_function("decoder_input_prep"):
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("decoder_input_prep_start")
-
-                    # Prepare decoder input with checkpointing
-                    decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
-
-                    if self.gradient_checkpointing and self.training:
-                        decoder_input_projected = checkpoint(
-                            self.mel_projection_in, decoder_input_mels, use_reentrant=False
-                        )
-                    else:
-                        decoder_input_projected = self.mel_projection_in(decoder_input_mels)
-
-                    # Apply positional encoding
-                    decoder_input_projected_with_pe = self.encoder_positional_encoding(
-                        decoder_input_projected, seq_offset=0
+                # ── 6. Output projections ───────────────────────────────────
+                if self.gradient_checkpointing and self.training:
+                    predicted_mel_frames = checkpoint(
+                        self.mel_projection_out, decoder_outputs, use_reentrant=False
                     )
+                    predicted_stop_logits = checkpoint(
+                        self.stop_token_predictor, decoder_outputs, use_reentrant=False
+                    ).squeeze(-1)
+                else:
+                    predicted_mel_frames = self.mel_projection_out(decoder_outputs)
+                    predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
 
-                    # Generate causal mask for decoder self-attention
-                    tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
+                # decoder_outputs served both projections — free now
+                del decoder_outputs
 
-                    if mel_padding_mask is not None:
-                        mel_padding_mask = mel_padding_mask.to(torch.bool)
-
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("decoder_input_prep_end")
-
-                with torch.profiler.record_function("transformer_decoder_forward"):
-                    # BATCH 281 LOGGING
-                    is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
-                    if is_batch_281:
-                        logger.info(f"  [Model] Calling decoder: input_shape={decoder_input_projected_with_pe.shape}, memory_shape={expanded_encoder_outputs.shape}")
-
-                    # Pass through Transformer Decoder with checkpointing (logging handled internally)
-                    decoder_outputs = self._checkpoint_decoder_forward(
-                        decoder_input_projected_with_pe,
-                        expanded_encoder_outputs,
-                        tgt_mask=tgt_mask,
-                        memory_key_padding_mask=encoder_output_padding_mask,
-                        tgt_key_padding_mask=mel_padding_mask
-                    )
-
-                    if is_batch_281:
-                        logger.info(f"  [Model] Decoder completed: output_shape={decoder_outputs.shape}")
-
-                with torch.profiler.record_function("output_projections"):
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("output_projections_start")
-
-                    # Project decoder outputs with checkpointing
-                    if self.gradient_checkpointing and self.training:
-                        predicted_mel_frames = checkpoint(
-                            self.mel_projection_out, decoder_outputs, use_reentrant=False
-                        )
-                        predicted_stop_logits = checkpoint(
-                            self.stop_token_predictor, decoder_outputs, use_reentrant=False
-                        ).squeeze(-1)
-                    else:
-                        predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-                        predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
-
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("output_projections_end")
-
-                # Log at the very end (outside any checkpointed regions)
-                if self.enable_profiling:
-                    self.profiler.log_memory_stats("training_end")
-
-                return predicted_mel_frames, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy
+                return (predicted_mel_frames, predicted_log_durations,
+                        predicted_stop_logits, predicted_pitch, predicted_energy)
 
             except Exception as e:
                 logger.error(f"Error in forward_training: {e}")
-                logger.error(f"Input shapes - phoneme_indices: {phoneme_indices.shape}, mel_specs: {mel_specs.shape}")
-                logger.error(f"phoneme_durations: {phoneme_durations.shape}")
-                if self.enable_profiling:
-                    logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
+                logger.error(
+                    "Input shapes - phoneme_indices: %s, mel_specs: %s",
+                    phoneme_indices_shape if phoneme_indices_shape is not None else 'deleted',
+                    mel_specs_shape if mel_specs_shape is not None else 'deleted'
+                )
                 raise e
 
     def forward_inference(
@@ -705,7 +707,8 @@ class KokoroModel(nn.Module):
                     with torch.profiler.record_function("inference_predict_durations"):
                         # Duration prediction (no checkpointing in eval mode, logging handled internally)
                         if self.use_variance_predictor:
-                            _, predicted_log_durations, _, _ = self.variance_adaptor(
+                            # variance_adaptor returns five items; we only need durations here
+                                _, predicted_log_durations, _, _, _ = self.variance_adaptor(
                                 text_encoded,
                                 mask=text_padding_mask,
                                 pitch_target=None,

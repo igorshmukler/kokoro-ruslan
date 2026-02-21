@@ -110,6 +110,52 @@ class KokoroTrainer:
         self.config = config
         self.device = torch.device(config.device)
 
+        # Attempt to load checkpoint metadata (weights_only) early so any
+        # restored global variance statistics are available before the
+        # dataset is constructed. This avoids the dataset recomputing
+        # normalization/state that should instead be restored from the
+        # checkpoint.
+        try:
+            resume_checkpoint = getattr(self.config, 'resume_checkpoint', None)
+            if resume_checkpoint:
+                checkpoint_path = None
+                if isinstance(resume_checkpoint, str) and resume_checkpoint.lower() == 'auto':
+                    checkpoint_path = find_latest_checkpoint(self.config.output_dir)
+                else:
+                    checkpoint_path = str(resume_checkpoint)
+
+                if checkpoint_path and os.path.exists(checkpoint_path):
+                    try:
+                        # Use weights_only=True to avoid loading large tensors
+                        meta = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+                        if isinstance(meta, dict):
+                            # Restore variance_stats into config and trainer
+                            vs = meta.get('variance_stats')
+                            if isinstance(vs, dict):
+                                for k, v in vs.items():
+                                    try:
+                                        setattr(self.config, k, v)
+                                        setattr(self, k, v)
+                                    except Exception:
+                                        logger.debug(f"Could not set variance stat {k} from checkpoint metadata")
+                                logger.info(f"Loaded variance_stats from checkpoint metadata: {list(vs.keys())}")
+
+                            # Also load pitch/energy bounds from saved model metadata (if available)
+                            mm = meta.get('model_metadata')
+                            if isinstance(mm, dict):
+                                arch = mm.get('architecture', {})
+                                for name in ('pitch_min', 'pitch_max', 'energy_min', 'energy_max'):
+                                    if name in arch:
+                                        try:
+                                            setattr(self.config, name, arch[name])
+                                        except Exception:
+                                            pass
+                    except Exception as e:
+                        logger.warning(f"Could not pre-load checkpoint metadata: {e}")
+        except Exception:
+            # Never fail init because of metadata loading - we'll proceed normally
+            logger.debug("Early checkpoint metadata load skipped or failed")
+
         # Ensure fatal signals (including SIGABRT) dump Python stacks for crash triage
         try:
             if not faulthandler.is_enabled():
@@ -534,7 +580,7 @@ class KokoroTrainer:
 
         # Adaptive memory management configuration
         self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
-        self.memory_report_interval = getattr(config, 'memory_report_interval', 500)
+        self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
 
         # Gradient explosion tracking (adaptive threshold)
         self.grad_explosion_norm_ema = None
@@ -1140,18 +1186,34 @@ class KokoroTrainer:
         else:
             loss_stop_token = torch.tensor(0.0, device=self.device)
 
-        # Pitch Loss (if variance predictor enabled) - reuse phoneme mask
+        # Pitch Loss (if variance predictor enabled) - ensure predictions are phoneme-level
         loss_pitch = torch.tensor(0.0, device=self.device)
         if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
-            loss_pitch_unreduced = self.criterion_pitch(predicted_pitch, pitch_targets)
+            # If model returned frame-level pitch predictions, average to phoneme-level
+            if predicted_pitch.dim() == 2 and predicted_pitch.size(1) != phoneme_durations.size(1):
+                pred_pitch_ph = self._average_pitch_energy_by_duration(
+                    predicted_pitch, phoneme_durations, phoneme_lengths
+                )
+            else:
+                pred_pitch_ph = predicted_pitch
+
+            loss_pitch_unreduced = self.criterion_pitch(pred_pitch_ph, pitch_targets)
             pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
             if pitch_valid.any():
                 loss_pitch = loss_pitch_unreduced[pitch_valid].mean()
 
-        # Energy Loss (if variance predictor enabled) - reuse phoneme mask
+        # Energy Loss (if variance predictor enabled) - ensure predictions are phoneme-level
         loss_energy = torch.tensor(0.0, device=self.device)
         if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
-            loss_energy_unreduced = self.criterion_energy(predicted_energy, energy_targets)
+            # If model returned frame-level energy predictions, average to phoneme-level
+            if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
+                pred_energy_ph = self._average_pitch_energy_by_duration(
+                    predicted_energy, phoneme_durations, phoneme_lengths
+                )
+            else:
+                pred_energy_ph = predicted_energy
+
+            loss_energy_unreduced = self.criterion_energy(pred_energy_ph, energy_targets)
             energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
             if energy_valid.any():
                 loss_energy = loss_energy_unreduced[energy_valid].mean()
@@ -1210,46 +1272,10 @@ class KokoroTrainer:
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
 
-    def _reset_variance_predictors(self):
-        """Reset variance predictor weights - critical when changing normalization"""
-        logger.warning("🔄 Resetting variance predictor weights - extractors now return normalized [0,1] values")
-
-        reset_count = 0
-        # Check all possible attribute names
-        for attr_name in ['pitch_predictor', 'variance_adaptor', 'pitch_adaptor']:
-            if hasattr(self.model, attr_name):
-                predictor = getattr(self.model, attr_name)
-                if predictor is not None and hasattr(predictor, 'pitch_predictor'):
-                    predictor.pitch_predictor._init_weights()
-                    logger.info(f"  ✓ Pitch predictor reinitialized (via {attr_name})")
-                    reset_count += 1
-                elif predictor is not None and hasattr(predictor, '_init_weights'):
-                    predictor._init_weights()
-                    logger.info(f"  ✓ {attr_name} reinitialized")
-                    reset_count += 1
-
-        for attr_name in ['energy_predictor', 'variance_adaptor', 'energy_adaptor']:
-            if hasattr(self.model, attr_name):
-                predictor = getattr(self.model, attr_name)
-                if predictor is not None and hasattr(predictor, 'energy_predictor'):
-                    predictor.energy_predictor._init_weights()
-                    logger.info(f"  ✓ Energy predictor reinitialized (via {attr_name})")
-                    reset_count += 1
-                elif predictor is not None and hasattr(predictor, '_init_weights') and 'energy' in attr_name:
-                    predictor._init_weights()
-                    logger.info(f"  ✓ {attr_name} reinitialized")
-                    reset_count += 1
-
-        if reset_count == 0:
-            logger.warning("  ⚠️  No variance predictors found to reset - checking model structure")
-            logger.warning(f"  Model attributes: {[attr for attr in dir(self.model) if 'predict' in attr.lower() or 'variance' in attr.lower()]}")
-
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""
         if not self.config.resume_checkpoint:
             logger.info("No resume checkpoint specified, starting from scratch.")
-            # Still reset variance predictors for normalized features
-            self._reset_variance_predictors()
             return
 
         checkpoint_path = None
@@ -1257,8 +1283,6 @@ class KokoroTrainer:
             checkpoint_path = find_latest_checkpoint(self.config.output_dir)
             if not checkpoint_path:
                 logger.info("No checkpoint found for auto-resume, starting from scratch.")
-                # Still reset variance predictors for normalized features
-                self._reset_variance_predictors()
                 return
         else:
             checkpoint_path = self.config.resume_checkpoint
@@ -1319,13 +1343,40 @@ class KokoroTrainer:
             else:
                 logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
+            # Restore persisted variance statistics if present
+            if 'variance_stats' in checkpoint:
+                vs = checkpoint['variance_stats']
+                for k, v in vs.items():
+                    try:
+                        setattr(self, k, v)
+                    except Exception:
+                        logger.warning(f"Failed to restore variance stat {k}")
+                logger.info(f"Restored variance_stats: {list(vs.keys())}")
+
+                # Propagate restored globals to dataset and model when available
+                try:
+                    if hasattr(self, 'dataset') and self.dataset is not None:
+                        for k, v in vs.items():
+                            try:
+                                setattr(self.dataset, k, v)
+                            except Exception:
+                                logger.debug(f"Could not set {k} on dataset")
+                    if hasattr(self, 'model') and self.model is not None:
+                        # Also set on model and variance_adaptor if present
+                        for k, v in vs.items():
+                            try:
+                                setattr(self.model, k, v)
+                            except Exception:
+                                logger.debug(f"Could not set {k} on model")
+                            if hasattr(self.model, 'variance_adaptor') and self.model.variance_adaptor is not None:
+                                try:
+                                    setattr(self.model.variance_adaptor, k, v)
+                                except Exception:
+                                    logger.debug(f"Could not set {k} on model.variance_adaptor")
+                except Exception as e:
+                    logger.debug(f"Error propagating variance_stats to components: {e}")
+
         self.dataset.phoneme_processor = phoneme_processor
-        # Ensure variance predictors are reset to match any preprocessing/normalization
-        # metadata loaded with the checkpoint (defensive, avoids divergence).
-        try:
-            self._reset_variance_predictors()
-        except Exception:
-            logger.debug("_reset_variance_predictors raised during checkpoint resumption; continuing")
 
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
@@ -1525,6 +1576,14 @@ class KokoroTrainer:
             'config': self.config,
             'model_metadata': model_metadata,
         }
+
+        # Persist running variance statistics if present on the trainer.
+        variance_stats = {}
+        for k in ('pitch_running_mean', 'pitch_running_std', 'energy_running_mean', 'energy_running_std'):
+            if hasattr(self, k):
+                variance_stats[k] = getattr(self, k)
+        if variance_stats:
+            checkpoint['variance_stats'] = variance_stats
 
         if self.use_mixed_precision and self.scaler:
             checkpoint['scaler'] = self.scaler.state_dict()
@@ -2172,19 +2231,31 @@ class KokoroTrainer:
                     accumulated_losses.clear()
 
                     # Delete tensors and clear MPS cache only when memory pressure is high
-                    if self.device_type == DeviceType.MPS.value:
-                        pressure = cleanup_result.get('pressure_level', 'low')
-                        if pressure in ['high', 'critical']:
-                            # Explicitly delete large tensors
-                            del predicted_mel, predicted_log_durations, predicted_stop_logits
-                            if 'predicted_pitch' in locals():
-                                del predicted_pitch
-                            if 'predicted_energy' in locals():
-                                del predicted_energy
-                            # Clear cache
-                            torch.mps.empty_cache()
-                            import gc
-                            gc.collect()
+                    # if self.device_type == DeviceType.MPS.value:
+                    #     pressure = cleanup_result.get('pressure_level', 'low')
+                    #     if pressure in ['high', 'critical']:
+                    #         # Explicitly delete large tensors
+                    #         del predicted_mel, predicted_log_durations, predicted_stop_logits
+                    #         if 'predicted_pitch' in locals():
+                    #             del predicted_pitch
+                    #         if 'predicted_energy' in locals():
+                    #             del predicted_energy
+                    #         # Clear cache
+                    #         torch.mps.empty_cache()
+                    #         import gc
+                    #         gc.collect()
+
+                    # Explicitly delete large tensors
+                    del predicted_mel, predicted_log_durations, predicted_stop_logits
+                    if 'predicted_pitch' in locals():
+                        del predicted_pitch
+                    if 'predicted_energy' in locals():
+                        del predicted_energy
+                    # Clear cache
+                    torch.mps.empty_cache()
+                    import gc
+                    gc.collect()
+
 
                 # Get current loss values for progress bar (still need .item() for display)
                 current_total_loss = total_loss.item()
@@ -2222,8 +2293,8 @@ class KokoroTrainer:
 
                 progress_bar.set_postfix(postfix_dict)
 
-                # Print memory management report periodically
-                if self.enable_adaptive_memory and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
+                # Print memory management report periodically (only when verbose)
+                if self.enable_adaptive_memory and getattr(self.config, 'verbose', False) and batch_idx % self.memory_report_interval == 0 and batch_idx > 0:
                     logger.info(f"Memory management stats at batch {batch_idx}:")
                     report = self.memory_manager.get_memory_report()
                     logger.info(f"  Current pressure: {report['current_pressure']}")
@@ -2351,8 +2422,12 @@ class KokoroTrainer:
             mem_epoch_ms = 0.0
             disk_epoch_ms = 0.0
 
+        # Show 'N/A' for mem/disk latency when there were no in-memory/disk hits
+        mem_lat_display = "N/A" if mem_count_delta == 0 or mem_hits == 0 else f"{mem_epoch_ms:.3f}"
+        disk_lat_display = "N/A" if disk_count_delta == 0 or disk_hits == 0 else f"{disk_epoch_ms:.3f}"
+
         logger.info(
-            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% mem_lat_ms=%.3f disk_lat_ms=%.3f",
+            "Epoch %d %s cache: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% mem_lat_ms=%s disk_lat_ms=%s",
             epoch + 1,
             split_name,
             requests,
@@ -2361,8 +2436,8 @@ class KokoroTrainer:
             disk_hits,
             misses,
             hit_rate,
-            mem_epoch_ms,
-            disk_epoch_ms,
+            mem_lat_display,
+            disk_lat_display,
         )
 
     def train(self):
@@ -2548,8 +2623,16 @@ class KokoroTrainer:
                 logger.info("=" * 60)
                 cache_logged = True
 
+            # Display 'N/A' for mem latency when there are no in-memory entries/hits
+            mem_hits = int(stats.get('mem_hits', 0))
+            mem_latency = stats.get('mem_latency_ms_avg', 0.0)
+            mem_lat_display = "N/A" if mem_hits == 0 or mem_latency == 0.0 else f"{mem_latency:.3f}"
+            disk_hits = int(stats.get('disk_hits', 0))
+            disk_latency = stats.get('disk_latency_ms_avg', 0.0)
+            disk_lat_display = "N/A" if disk_hits == 0 or disk_latency == 0.0 else f"{disk_latency:.3f}"
+
             logger.info(
-                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%.3f disk_lat_ms=%.3f",
+                "%s cache cumulative: requests=%d hits=%d (mem=%d,disk=%d) misses=%d hit_rate=%.1f%% in_mem_entries=%d in_mem_size=%.1fMB mem_lat_ms=%s disk_lat_ms=%s",
                 split_name,
                 stats['requests'],
                 stats['hits'],
@@ -2559,8 +2642,8 @@ class KokoroTrainer:
                 stats['hit_rate'],
                 stats['in_mem_entries'],
                 stats['in_mem_mb'],
-                stats.get('mem_latency_ms_avg', 0.0),
-                stats.get('disk_latency_ms_avg', 0.0),
+                mem_lat_display,
+                disk_lat_display,
             )
 
         if cache_logged:
@@ -2871,10 +2954,10 @@ class KokoroTrainer:
                     phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
 
                     # Validate tensor dimensions to prevent MPS overflow (INT_MAX limit)
-                    max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
-                    if max_dim > 2000:  # Safety threshold
-                        logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
-                        continue
+                    # max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
+                    # if max_dim > 2000:  # Safety threshold
+                    #     logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
+                    #     continue
 
                 self.interbatch_profiler.end_data_loading()
 
@@ -2888,10 +2971,10 @@ class KokoroTrainer:
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
                     else:
-                        predicted_mel, predicted_log_durations, predicted_stop_logits = \
+                        predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
                 self.interbatch_profiler.end_forward_pass()
 
@@ -3076,7 +3159,7 @@ if __name__ == "__main__":
 
             # Adaptive memory management configurations
             self.enable_adaptive_memory = True   # Enable adaptive memory management
-            self.memory_report_interval = 500    # Report memory stats every N batches
+            self.memory_report_interval = 50    # Report memory stats every N batches
 
     temp_config = TrainingConfig()
 

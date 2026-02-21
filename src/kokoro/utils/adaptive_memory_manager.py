@@ -4,6 +4,7 @@ Adaptive Memory Cleanup System for Kokoro Language Model Training
 Provides intelligent memory management based on device type and memory pressure
 """
 
+import sys
 import torch
 import time
 import logging
@@ -187,26 +188,18 @@ class AdaptiveMemoryManager:
             }
 
     def _get_total_memory(self) -> float:
-        """Get total available memory in MB"""
         if self.device_type == DeviceType.CUDA:
             return torch.cuda.get_device_properties(self.device).total_memory / 1024**2
         elif self.device_type == DeviceType.MPS:
-            # Estimate for Apple Silicon (could be made configurable)
-            try:
-                # Try to get a better estimate by allocating and measuring
-                test_tensor = torch.randn(1000, 1000, device=self.device)
-                allocated = torch.mps.current_allocated_memory() / 1024**2
-                del test_tensor
-                torch.mps.empty_cache()
-                # Estimate total as 8x the small allocation (very rough)
-                return max(8192, allocated * 8000)  # Minimum 8GB estimate
-            except:
-                return 8192  # Default 8GB estimate for Apple Silicon
-        else:  # CPU
             if PSUTIL_AVAILABLE:
                 return psutil.virtual_memory().total / 1024**2
             else:
-                return 16384  # Default 16GB estimate for CPU when psutil unavailable
+                return 32768  # 32GB fallback
+        else:
+            if PSUTIL_AVAILABLE:
+                return psutil.virtual_memory().total / 1024**2
+            else:
+                return 16384
 
     def get_current_memory_stats(self) -> Dict[str, float]:
         """Get current memory statistics"""
@@ -214,13 +207,25 @@ class AdaptiveMemoryManager:
             current = torch.cuda.memory_allocated(self.device) / 1024**2
             reserved = torch.cuda.memory_reserved(self.device) / 1024**2
             peak = torch.cuda.max_memory_allocated(self.device) / 1024**2
+
+
         elif self.device_type == DeviceType.MPS:
             try:
-                current = torch.mps.current_allocated_memory() / 1024**2
-                reserved = current  # MPS doesn't separate reserved
-                peak = current      # MPS doesn't track peak separately
-            except:
+                pytorch_allocated = torch.mps.current_allocated_memory() / 1024**2
+
+                if PSUTIL_AVAILABLE:
+                    vm = psutil.virtual_memory()
+                    # System-wide used memory is the right pressure signal
+                    current = (vm.total - vm.available) / 1024**2
+                else:
+                    current = pytorch_allocated  # degraded fallback
+
+                reserved = pytorch_allocated  # still useful to track separately
+                peak = current
+            except Exception as e:
+                logger.warning(f"Failed to get MPS memory stats: {e}")
                 current = reserved = peak = 0.0
+
         else:  # CPU
             if PSUTIL_AVAILABLE:
                 memory = psutil.virtual_memory()
@@ -288,6 +293,7 @@ class AdaptiveMemoryManager:
             if self.device_type == DeviceType.CUDA:
                 torch.cuda.empty_cache()
             elif self.device_type == DeviceType.MPS:
+                torch.mps.synchronize()
                 torch.mps.empty_cache()
 
         if strategy.cleanup_delay > 0:
@@ -425,6 +431,10 @@ class AdaptiveMemoryManager:
         elif self.device_type == DeviceType.MPS:
             torch.mps.synchronize()
 
+        # Clear any lingering references in the traceback/exception objects
+        if hasattr(sys, 'exc_info'):
+            sys.exc_clear() if hasattr(sys, 'exc_clear') else None
+
         # Aggressive garbage collection
         gc.collect()
         gc.collect()  # Second call often frees more
@@ -432,12 +442,11 @@ class AdaptiveMemoryManager:
         # Clear all caches
         if self.device_type == DeviceType.CUDA:
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
             torch.cuda.reset_peak_memory_stats(self.device)
         elif self.device_type == DeviceType.MPS:
             torch.mps.empty_cache()
-
-        # Additional wait for MPS
-        if self.device_type == DeviceType.MPS:
+            # Additional wait for MPS
             time.sleep(0.1)
 
         cleanup_time = time.time() - start_time
