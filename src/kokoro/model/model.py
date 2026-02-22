@@ -295,100 +295,65 @@ class KokoroModel(nn.Module):
 
             return log_durations
 
+
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
-        """
-        Fixed length regulation with proper tensor dimension handling.
-        """
         with torch.profiler.record_function("length_regulate"):
-            # Log before length regulation (no checkpointing here)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("length_regulation_start")
 
             batch_size, max_text_len, hidden_dim = encoder_outputs.shape
             device = encoder_outputs.device
 
-            # Ensure durations are positive and properly clamped
             durations = torch.clamp(durations, min=1.0)
 
-            expanded_encoder_outputs_list = []
-            encoder_output_padding_mask_list = []
+            # First pass: expand each sample and track max length
+            expanded_list = []
             max_expanded_len = 0
 
             for i in range(batch_size):
-                current_encoder_output = encoder_outputs[i]  # (L_text, D)
-                current_durations = durations[i]             # (L_text,)
-                current_text_padding_mask = text_padding_mask[i].to(torch.bool)  # (L_text,)
+                non_padded = ~text_padding_mask[i].to(torch.bool)
 
-                # Select non-padded elements
-                non_padded_indices = ~current_text_padding_mask
-
-                if not torch.any(non_padded_indices):
+                if not torch.any(non_padded):
                     logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
-                    expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
-                    expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
+                    expanded = torch.empty(0, hidden_dim, device=device)
                 else:
-                    filtered_encoder_output = current_encoder_output[non_padded_indices]
-                    filtered_durations = current_durations[non_padded_indices]
-
-                    filtered_durations = torch.clamp(filtered_durations, min=1).long()
-
+                    filtered_enc = encoder_outputs[i][non_padded]
+                    filtered_dur = torch.clamp(durations[i][non_padded], min=1).long()
                     try:
-                        expanded_encoder_output = torch.repeat_interleave(
-                            filtered_encoder_output, filtered_durations, dim=0
-                        )
-                        expanded_padding_mask = torch.zeros(
-                            expanded_encoder_output.shape[0], dtype=torch.bool, device=device
-                        )
+                        expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
                     except Exception as e:
                         logger.error(f"Error in repeat_interleave for batch {i}: {e}")
-                        expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
-                        expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
+                        expanded = torch.empty(0, hidden_dim, device=device)
 
-                expanded_encoder_outputs_list.append(expanded_encoder_output)
-                encoder_output_padding_mask_list.append(expanded_padding_mask)
-                max_expanded_len = max(max_expanded_len, expanded_encoder_output.shape[0])
+                expanded_list.append(expanded)
+                max_expanded_len = max(max_expanded_len, expanded.shape[0])
 
             if max_expanded_len == 0:
                 logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
                 max_expanded_len = 1
-                dummy_output = torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
-                dummy_mask = torch.ones(1, dtype=torch.bool, device=device)
-                expanded_encoder_outputs_list = [dummy_output] * batch_size
-                encoder_output_padding_mask_list = [dummy_mask] * batch_size
+                expanded_list = [
+                    torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
+                ] * batch_size
 
-            # Pad all sequences to the same length
-            final_expanded_outputs = []
-            final_padding_masks = []
+            # Pre-allocate output tensors — padding mask starts all-True, valid
+            # frames are written as False (not padding) during the fill loop
+            out = torch.zeros(batch_size, max_expanded_len, hidden_dim,
+                          device=device, dtype=encoder_outputs.dtype)
+            mask = torch.ones(batch_size, max_expanded_len, dtype=torch.bool, device=device)
 
-            for i in range(batch_size):
-                current_output = expanded_encoder_outputs_list[i]
-                current_mask = encoder_output_padding_mask_list[i]
-                current_len = current_output.shape[0]
+            for i, expanded in enumerate(expanded_list):
+                ln = expanded.shape[0]
+                if ln > 0:
+                    out[i, :ln] = expanded
+                    mask[i, :ln] = False  # valid frames
 
-                padding_needed = max_expanded_len - current_len
-
-                if padding_needed > 0:
-                    padding_tensor = torch.zeros(
-                        padding_needed, hidden_dim, device=device, dtype=current_output.dtype
-                    )
-                    current_output = torch.cat([current_output, padding_tensor], dim=0)
-
-                    padding_mask_fill = torch.ones(padding_needed, dtype=torch.bool, device=device)
-                    current_mask = torch.cat([current_mask, padding_mask_fill], dim=0)
-
-                final_expanded_outputs.append(current_output)
-                final_padding_masks.append(current_mask)
-
-            expanded_encoder_outputs = torch.stack(final_expanded_outputs, dim=0)
-            encoder_output_padding_mask = torch.stack(final_padding_masks, dim=0)
-
-            # Log after length regulation (no checkpointing here)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("length_regulation_end")
 
-            logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {expanded_encoder_outputs.shape}")
+            logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {out.shape}")
 
-            return expanded_encoder_outputs, encoder_output_padding_mask
+            return out, mask
+
 
     def _average_by_duration(self,
                          values: torch.Tensor,
