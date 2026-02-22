@@ -422,29 +422,6 @@ class KokoroModel(nn.Module):
         starts = starts.clamp(max=max_frames - 1)
         ends = ends.clamp(max=max_frames)
 
-        # Build a frame→phoneme assignment map using scatter
-        # frame_labels[b, f] = phoneme index that owns frame f (or num_phonemes for overflow)
-        frame_labels = torch.full(
-            (batch_size, max_frames), num_phonemes,
-            dtype=torch.long, device=device
-        )
-
-        # For each phoneme p, mark its frames with label p
-        # We do this by scattering 1s into a diff tensor and taking cumsum
-        # This is O(B*P) scatter ops instead of O(B*P) Python iterations
-        diff = torch.zeros(batch_size, max_frames + 1, dtype=torch.long, device=device)
-
-        # At each start position, increment; at each end position, decrement
-        # Then cumsum gives us which phoneme each frame belongs to
-        phoneme_ids = torch.arange(num_phonemes, device=device).unsqueeze(0).expand(batch_size, -1)
-
-        # Use scatter_add to build boundaries
-        diff.scatter_add_(1, starts.clamp(max=max_frames), torch.ones_like(starts))
-        diff.scatter_add_(1, ends.clamp(max=max_frames), -torch.ones_like(ends))
-
-        # cumsum of diff gives active phoneme count — but we need phoneme index
-        # Use a different approach: scatter values directly using frame→phoneme map
-
         # For each phoneme, create a range mask and use it to average
         # Shape: (B, P, F) would be too large — use scatter_add on (B, F) instead
 
