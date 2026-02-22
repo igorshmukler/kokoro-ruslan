@@ -296,6 +296,63 @@ class KokoroModel(nn.Module):
             return log_durations
 
 
+    # def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
+    #     with torch.profiler.record_function("length_regulate"):
+    #         if self.enable_profiling:
+    #             self.profiler.log_memory_stats("length_regulation_start")
+
+    #         batch_size, max_text_len, hidden_dim = encoder_outputs.shape
+    #         device = encoder_outputs.device
+
+    #         durations = torch.clamp(durations, min=1.0)
+
+    #         # First pass: expand each sample and track max length
+    #         expanded_list = []
+    #         max_expanded_len = 0
+
+    #         for i in range(batch_size):
+    #             non_padded = ~text_padding_mask[i].to(torch.bool)
+
+    #             if not torch.any(non_padded):
+    #                 logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
+    #                 expanded = torch.empty(0, hidden_dim, device=device)
+    #             else:
+    #                 filtered_enc = encoder_outputs[i][non_padded]
+    #                 filtered_dur = torch.clamp(durations[i][non_padded], min=1).long()
+    #                 try:
+    #                     expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
+    #                 except Exception as e:
+    #                     logger.error(f"Error in repeat_interleave for batch {i}: {e}")
+    #                     expanded = torch.empty(0, hidden_dim, device=device)
+
+    #             expanded_list.append(expanded)
+    #             max_expanded_len = max(max_expanded_len, expanded.shape[0])
+
+    #         if max_expanded_len == 0:
+    #             logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
+    #             max_expanded_len = 1
+    #             expanded_list = [
+    #                 torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
+    #             ] * batch_size
+
+    #         # Pre-allocate output tensors — padding mask starts all-True, valid
+    #         # frames are written as False (not padding) during the fill loop
+    #         out = torch.zeros(batch_size, max_expanded_len, hidden_dim,
+    #                       device=device, dtype=encoder_outputs.dtype)
+    #         mask = torch.ones(batch_size, max_expanded_len, dtype=torch.bool, device=device)
+
+    #         for i, expanded in enumerate(expanded_list):
+    #             ln = expanded.shape[0]
+    #             if ln > 0:
+    #                 out[i, :ln] = expanded
+    #                 mask[i, :ln] = False  # valid frames
+
+    #         if self.enable_profiling:
+    #             self.profiler.log_memory_stats("length_regulation_end")
+
+    #         logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {out.shape}")
+
+    #         return out, mask
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
         with torch.profiler.record_function("length_regulate"):
             if self.enable_profiling:
@@ -306,46 +363,48 @@ class KokoroModel(nn.Module):
 
             durations = torch.clamp(durations, min=1.0)
 
-            # First pass: expand each sample and track max length
-            expanded_list = []
-            max_expanded_len = 0
-
+            # ── Pass 1: compute per-sample output lengths on CPU only ──────────
+            # No GPU tensors created here — just integer arithmetic.
+            lengths = []
+            non_padded_masks = []
             for i in range(batch_size):
-                non_padded = ~text_padding_mask[i].to(torch.bool)
-
-                if not torch.any(non_padded):
-                    logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
-                    expanded = torch.empty(0, hidden_dim, device=device)
+                npm = ~text_padding_mask[i].to(torch.bool)
+                non_padded_masks.append(npm)
+                if torch.any(npm):
+                    dur_i = durations[i][npm].clamp(min=1).long()
+                    lengths.append(int(dur_i.sum().item()))
                 else:
-                    filtered_enc = encoder_outputs[i][non_padded]
-                    filtered_dur = torch.clamp(durations[i][non_padded], min=1).long()
-                    try:
-                        expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
-                    except Exception as e:
-                        logger.error(f"Error in repeat_interleave for batch {i}: {e}")
-                        expanded = torch.empty(0, hidden_dim, device=device)
+                    lengths.append(0)
 
-                expanded_list.append(expanded)
-                max_expanded_len = max(max_expanded_len, expanded.shape[0])
+            max_expanded_len = max(max(lengths, default=0), 1)
 
-            if max_expanded_len == 0:
-                logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
-                max_expanded_len = 1
-                expanded_list = [
-                    torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
-                ] * batch_size
-
-            # Pre-allocate output tensors — padding mask starts all-True, valid
-            # frames are written as False (not padding) during the fill loop
-            out = torch.zeros(batch_size, max_expanded_len, hidden_dim,
-                          device=device, dtype=encoder_outputs.dtype)
+            # ── Single allocation ───────────────────────────────────────────────
+            # out  starts zeroed  (correct padding value)
+            # mask starts all-True (all padding); valid frames set to False below
+            out  = torch.zeros(batch_size, max_expanded_len, hidden_dim,
+                           device=device, dtype=encoder_outputs.dtype)
             mask = torch.ones(batch_size, max_expanded_len, dtype=torch.bool, device=device)
 
-            for i, expanded in enumerate(expanded_list):
-                ln = expanded.shape[0]
-                if ln > 0:
-                    out[i, :ln] = expanded
-                    mask[i, :ln] = False  # valid frames
+            # ── Pass 2: expand directly into out, one sample at a time ─────────
+            # Each `expanded` tensor is freed before the next iteration,
+            # so peak extra memory is one sample's expansion, not all B.
+            for i in range(batch_size):
+                if lengths[i] == 0:
+                    logger.warning(f"Batch {i}: All tokens are padding, leaving row zeroed")
+                    continue
+
+                filtered_enc = encoder_outputs[i][non_padded_masks[i]]
+                filtered_dur = durations[i][non_padded_masks[i]].clamp(min=1).long()
+
+                try:
+                    expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
+                    ln = expanded.shape[0]
+                    out[i, :ln]  = expanded
+                    mask[i, :ln] = False        # mark valid frames
+                    del expanded                # free before next sample
+                except Exception as e:
+                    logger.error(f"Error in repeat_interleave for batch {i}: {e}")
+                    # row stays zeroed, mask stays all-True — safely treated as padding
 
             if self.enable_profiling:
                 self.profiler.log_memory_stats("length_regulation_end")
