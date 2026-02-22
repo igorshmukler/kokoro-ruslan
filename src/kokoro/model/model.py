@@ -605,12 +605,7 @@ class KokoroModel(nn.Module):
                 # mel_specs no longer needed after this
                 del mel_specs
 
-                if self.gradient_checkpointing and self.training:
-                    decoder_input_projected = checkpoint(
-                        self.mel_projection_in, decoder_input_mels, use_reentrant=False
-                    )
-                else:
-                    decoder_input_projected = self.mel_projection_in(decoder_input_mels)
+                decoder_input_projected = self.mel_projection_in(decoder_input_mels)
                 del decoder_input_mels
 
                 decoder_input_projected_with_pe = self.encoder_positional_encoding(
@@ -636,16 +631,8 @@ class KokoroModel(nn.Module):
                 del encoder_output_padding_mask
 
                 # ── 6. Output projections ───────────────────────────────────
-                if self.gradient_checkpointing and self.training:
-                    predicted_mel_frames = checkpoint(
-                        self.mel_projection_out, decoder_outputs, use_reentrant=False
-                    )
-                    predicted_stop_logits = checkpoint(
-                        self.stop_token_predictor, decoder_outputs, use_reentrant=False
-                    ).squeeze(-1)
-                else:
-                    predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-                    predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+                predicted_mel_frames = self.mel_projection_out(decoder_outputs)
+                predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
 
                 # decoder_outputs served both projections — free now
                 del decoder_outputs
