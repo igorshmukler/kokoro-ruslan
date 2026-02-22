@@ -801,6 +801,16 @@ class KokoroModel(nn.Module):
 
                     if generated_mels:
                         mel_output = torch.cat(generated_mels, dim=1)
+
+                        mel_output = torch.clamp(mel_output, min=-11.5, max=2.0)
+
+                        logger.info(f"Final Mel range: {mel_output.min().item():.2f} to {mel_output.max().item():.2f}")
+
+                        # Apply: (Normalized * Std) + Mean
+                        # mel_output = (mel_output * mel_std) + mel_mean
+                        # Safety clamp to prevent vocoder "explosions"
+                        # mel_output = torch.clamp(mel_output, min=-12.0, max=2.5)
+
                         logger.info(f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
                                    f"({mel_output.shape[1]/generation_time:.1f} frames/s)")
                     else:
