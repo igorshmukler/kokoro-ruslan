@@ -237,11 +237,6 @@ class KokoroModel(nn.Module):
         if self.enable_profiling:
             self.profiler.log_memory_stats("decoder_checkpoint_start")
 
-        # BATCH 281 LOGGING
-        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
-        if is_batch_281:
-            logger.info(f"  [GradCheckpoint] Starting decoder checkpoint: input={decoder_input.shape}, memory={memory.shape}")
-
         # IMPORTANT: Do not wrap the entire decoder in checkpoint here.
         # `ImprovedTransformerDecoder.forward` already applies per-layer checkpointing,
         # and nesting checkpoint wrappers causes excessive recomputation in backward.
@@ -252,10 +247,6 @@ class KokoroModel(nn.Module):
             memory_key_padding_mask=memory_key_padding_mask,
             tgt_key_padding_mask=tgt_key_padding_mask
         )
-
-        # BATCH 281 LOGGING
-        if is_batch_281:
-            logger.info(f"  [GradCheckpoint] Decoder checkpoint complete: result={result.shape}")
 
         # Log after checkpointed decoder (outside checkpoint)
         if self.enable_profiling:
@@ -506,6 +497,12 @@ class KokoroModel(nn.Module):
         mask = torch.triu(torch.ones(sz, sz, device=device) * float('-inf'), diagonal=1)
         return mask
 
+    def _get_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
+        if not hasattr(self, '_causal_mask_cache') or \
+            self._causal_mask_cache.size(0) != sz or \
+            self._causal_mask_cache.device.type != device.type:
+            self._causal_mask_cache = self._generate_square_subsequent_mask(sz, device)
+        return self._causal_mask_cache
 
     def forward_training(
         self,
@@ -621,7 +618,7 @@ class KokoroModel(nn.Module):
                 )
                 del decoder_input_projected
 
-                tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
+                tgt_mask = self._get_causal_mask(mel_seq_len, device)
 
                 if mel_padding_mask is not None:
                     mel_padding_mask = mel_padding_mask.to(torch.bool)
@@ -636,7 +633,7 @@ class KokoroModel(nn.Module):
                 )
                 # Memory tensors no longer needed after decoder
                 del decoder_input_projected_with_pe, expanded_encoder_outputs
-                del encoder_output_padding_mask, tgt_mask
+                del encoder_output_padding_mask
 
                 # ── 6. Output projections ───────────────────────────────────
                 if self.gradient_checkpointing and self.training:
@@ -769,7 +766,7 @@ class KokoroModel(nn.Module):
                                 )
 
                                 current_seq_len = decoder_input_seq.shape[1]
-                                tgt_mask = self._generate_square_subsequent_mask(current_seq_len, device)
+                                tgt_mask = self._get_causal_mask(current_seq_len, device)
 
                                 decoder_outputs = self.decoder(
                                     tgt=decoder_input_seq_with_pe,

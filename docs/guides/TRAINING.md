@@ -3,6 +3,22 @@
 ## Overview
 This guide summarizes expected loss behavior during training, how to detect over-smoothing, epoch expectations, and quick commands to test a trained model.
 
+### The Alignment Penalty (The "Blurry Boundary" Problem)
+Energy changes drastically at phoneme boundaries — think of the jump from a silent "p" to a loud "a." When dur_loss is still relatively high, the model is likely predicting the timing of these transitions slightly off.
+
+If the ground truth says the energy should drop at frame 40, but the duration predictor thinks it should drop at frame 42, the MSE loss sees a "huge" error for those 2 frames. Pitch is often more continuous across transitions, so it doesn't get "punished" as severely for minor timing offsets as energy does.
+
+### Information Redundancy
+Energy is "double-booked." It carries two types of information at once:
+
+Phonetic Info: Consonants are quiet; vowels are loud.
+
+Prosodic Info: We speak louder to emphasize specific words.
+
+The model has to learn to separate the "volume" that comes from the letter being spoken from the "volume" that comes from the emotion or stress in the sentence. Pitch is mostly just prosodic, making it a "cleaner" signal for the model to isolate.
+
+Once dur_loss drops below 0.3, the energy_loss should finally cave in and follow.
+
 ## Loss Phases (Mel Loss)
 - 0.8 – 1.0 — "Alien": The model places sounds in roughly the right locations but the timbre and fine details are not learned yet.
 - 0.4 – 0.6 — "Static": Words become intelligible, but the voice sounds like it's behind a wall of noise (a rain-like texture).
