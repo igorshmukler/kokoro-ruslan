@@ -237,11 +237,6 @@ class KokoroModel(nn.Module):
         if self.enable_profiling:
             self.profiler.log_memory_stats("decoder_checkpoint_start")
 
-        # BATCH 281 LOGGING
-        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
-        if is_batch_281:
-            logger.info(f"  [GradCheckpoint] Starting decoder checkpoint: input={decoder_input.shape}, memory={memory.shape}")
-
         # IMPORTANT: Do not wrap the entire decoder in checkpoint here.
         # `ImprovedTransformerDecoder.forward` already applies per-layer checkpointing,
         # and nesting checkpoint wrappers causes excessive recomputation in backward.
@@ -252,10 +247,6 @@ class KokoroModel(nn.Module):
             memory_key_padding_mask=memory_key_padding_mask,
             tgt_key_padding_mask=tgt_key_padding_mask
         )
-
-        # BATCH 281 LOGGING
-        if is_batch_281:
-            logger.info(f"  [GradCheckpoint] Decoder checkpoint complete: result={result.shape}")
 
         # Log after checkpointed decoder (outside checkpoint)
         if self.enable_profiling:
@@ -304,100 +295,65 @@ class KokoroModel(nn.Module):
 
             return log_durations
 
+
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
-        """
-        Fixed length regulation with proper tensor dimension handling.
-        """
         with torch.profiler.record_function("length_regulate"):
-            # Log before length regulation (no checkpointing here)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("length_regulation_start")
 
             batch_size, max_text_len, hidden_dim = encoder_outputs.shape
             device = encoder_outputs.device
 
-            # Ensure durations are positive and properly clamped
             durations = torch.clamp(durations, min=1.0)
 
-            expanded_encoder_outputs_list = []
-            encoder_output_padding_mask_list = []
+            # First pass: expand each sample and track max length
+            expanded_list = []
             max_expanded_len = 0
 
             for i in range(batch_size):
-                current_encoder_output = encoder_outputs[i]  # (L_text, D)
-                current_durations = durations[i]             # (L_text,)
-                current_text_padding_mask = text_padding_mask[i].to(torch.bool)  # (L_text,)
+                non_padded = ~text_padding_mask[i].to(torch.bool)
 
-                # Select non-padded elements
-                non_padded_indices = ~current_text_padding_mask
-
-                if not torch.any(non_padded_indices):
+                if not torch.any(non_padded):
                     logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
-                    expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
-                    expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
+                    expanded = torch.empty(0, hidden_dim, device=device)
                 else:
-                    filtered_encoder_output = current_encoder_output[non_padded_indices]
-                    filtered_durations = current_durations[non_padded_indices]
-
-                    filtered_durations = torch.clamp(filtered_durations, min=1).long()
-
+                    filtered_enc = encoder_outputs[i][non_padded]
+                    filtered_dur = torch.clamp(durations[i][non_padded], min=1).long()
                     try:
-                        expanded_encoder_output = torch.repeat_interleave(
-                            filtered_encoder_output, filtered_durations, dim=0
-                        )
-                        expanded_padding_mask = torch.zeros(
-                            expanded_encoder_output.shape[0], dtype=torch.bool, device=device
-                        )
+                        expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
                     except Exception as e:
                         logger.error(f"Error in repeat_interleave for batch {i}: {e}")
-                        expanded_encoder_output = torch.empty(0, hidden_dim, device=device)
-                        expanded_padding_mask = torch.empty(0, dtype=torch.bool, device=device)
+                        expanded = torch.empty(0, hidden_dim, device=device)
 
-                expanded_encoder_outputs_list.append(expanded_encoder_output)
-                encoder_output_padding_mask_list.append(expanded_padding_mask)
-                max_expanded_len = max(max_expanded_len, expanded_encoder_output.shape[0])
+                expanded_list.append(expanded)
+                max_expanded_len = max(max_expanded_len, expanded.shape[0])
 
             if max_expanded_len == 0:
                 logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
                 max_expanded_len = 1
-                dummy_output = torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
-                dummy_mask = torch.ones(1, dtype=torch.bool, device=device)
-                expanded_encoder_outputs_list = [dummy_output] * batch_size
-                encoder_output_padding_mask_list = [dummy_mask] * batch_size
+                expanded_list = [
+                    torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
+                ] * batch_size
 
-            # Pad all sequences to the same length
-            final_expanded_outputs = []
-            final_padding_masks = []
+            # Pre-allocate output tensors — padding mask starts all-True, valid
+            # frames are written as False (not padding) during the fill loop
+            out = torch.zeros(batch_size, max_expanded_len, hidden_dim,
+                          device=device, dtype=encoder_outputs.dtype)
+            mask = torch.ones(batch_size, max_expanded_len, dtype=torch.bool, device=device)
 
-            for i in range(batch_size):
-                current_output = expanded_encoder_outputs_list[i]
-                current_mask = encoder_output_padding_mask_list[i]
-                current_len = current_output.shape[0]
+            for i, expanded in enumerate(expanded_list):
+                ln = expanded.shape[0]
+                if ln > 0:
+                    out[i, :ln] = expanded
+                    mask[i, :ln] = False  # valid frames
 
-                padding_needed = max_expanded_len - current_len
-
-                if padding_needed > 0:
-                    padding_tensor = torch.zeros(
-                        padding_needed, hidden_dim, device=device, dtype=current_output.dtype
-                    )
-                    current_output = torch.cat([current_output, padding_tensor], dim=0)
-
-                    padding_mask_fill = torch.ones(padding_needed, dtype=torch.bool, device=device)
-                    current_mask = torch.cat([current_mask, padding_mask_fill], dim=0)
-
-                final_expanded_outputs.append(current_output)
-                final_padding_masks.append(current_mask)
-
-            expanded_encoder_outputs = torch.stack(final_expanded_outputs, dim=0)
-            encoder_output_padding_mask = torch.stack(final_padding_masks, dim=0)
-
-            # Log after length regulation (no checkpointing here)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("length_regulation_end")
 
-            logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {expanded_encoder_outputs.shape}")
+            logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {out.shape}")
 
-            return expanded_encoder_outputs, encoder_output_padding_mask
+            return out, mask
+
 
     def _average_by_duration(self,
                          values: torch.Tensor,
@@ -430,29 +386,6 @@ class KokoroModel(nn.Module):
         # Clamp to valid frame range
         starts = starts.clamp(max=max_frames - 1)
         ends = ends.clamp(max=max_frames)
-
-        # Build a frame→phoneme assignment map using scatter
-        # frame_labels[b, f] = phoneme index that owns frame f (or num_phonemes for overflow)
-        frame_labels = torch.full(
-            (batch_size, max_frames), num_phonemes,
-            dtype=torch.long, device=device
-        )
-
-        # For each phoneme p, mark its frames with label p
-        # We do this by scattering 1s into a diff tensor and taking cumsum
-        # This is O(B*P) scatter ops instead of O(B*P) Python iterations
-        diff = torch.zeros(batch_size, max_frames + 1, dtype=torch.long, device=device)
-
-        # At each start position, increment; at each end position, decrement
-        # Then cumsum gives us which phoneme each frame belongs to
-        phoneme_ids = torch.arange(num_phonemes, device=device).unsqueeze(0).expand(batch_size, -1)
-
-        # Use scatter_add to build boundaries
-        diff.scatter_add_(1, starts.clamp(max=max_frames), torch.ones_like(starts))
-        diff.scatter_add_(1, ends.clamp(max=max_frames), -torch.ones_like(ends))
-
-        # cumsum of diff gives active phoneme count — but we need phoneme index
-        # Use a different approach: scatter values directly using frame→phoneme map
 
         # For each phoneme, create a range mask and use it to average
         # Shape: (B, P, F) would be too large — use scatter_add on (B, F) instead
@@ -506,6 +439,12 @@ class KokoroModel(nn.Module):
         mask = torch.triu(torch.ones(sz, sz, device=device) * float('-inf'), diagonal=1)
         return mask
 
+    def _get_causal_mask(self, sz: int, device: torch.device) -> torch.Tensor:
+        if not hasattr(self, '_causal_mask_cache') or \
+            self._causal_mask_cache.size(0) != sz or \
+            self._causal_mask_cache.device.type != device.type:
+            self._causal_mask_cache = self._generate_square_subsequent_mask(sz, device)
+        return self._causal_mask_cache
 
     def forward_training(
         self,
@@ -608,12 +547,7 @@ class KokoroModel(nn.Module):
                 # mel_specs no longer needed after this
                 del mel_specs
 
-                if self.gradient_checkpointing and self.training:
-                    decoder_input_projected = checkpoint(
-                        self.mel_projection_in, decoder_input_mels, use_reentrant=False
-                    )
-                else:
-                    decoder_input_projected = self.mel_projection_in(decoder_input_mels)
+                decoder_input_projected = self.mel_projection_in(decoder_input_mels)
                 del decoder_input_mels
 
                 decoder_input_projected_with_pe = self.encoder_positional_encoding(
@@ -621,7 +555,7 @@ class KokoroModel(nn.Module):
                 )
                 del decoder_input_projected
 
-                tgt_mask = self._generate_square_subsequent_mask(mel_seq_len, device)
+                tgt_mask = self._get_causal_mask(mel_seq_len, device)
 
                 if mel_padding_mask is not None:
                     mel_padding_mask = mel_padding_mask.to(torch.bool)
@@ -636,19 +570,11 @@ class KokoroModel(nn.Module):
                 )
                 # Memory tensors no longer needed after decoder
                 del decoder_input_projected_with_pe, expanded_encoder_outputs
-                del encoder_output_padding_mask, tgt_mask
+                del encoder_output_padding_mask
 
                 # ── 6. Output projections ───────────────────────────────────
-                if self.gradient_checkpointing and self.training:
-                    predicted_mel_frames = checkpoint(
-                        self.mel_projection_out, decoder_outputs, use_reentrant=False
-                    )
-                    predicted_stop_logits = checkpoint(
-                        self.stop_token_predictor, decoder_outputs, use_reentrant=False
-                    ).squeeze(-1)
-                else:
-                    predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-                    predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+                predicted_mel_frames = self.mel_projection_out(decoder_outputs)
+                predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
 
                 # decoder_outputs served both projections — free now
                 del decoder_outputs
@@ -748,6 +674,8 @@ class KokoroModel(nn.Module):
                     generated_mels = []
                     decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
 
+                    projected_history: list[torch.Tensor] = []
+
                     # Generation loop (no checkpointing needed in eval mode)
                     generation_start_time = time.time()
                     for t in range(max_expected_length):
@@ -756,20 +684,16 @@ class KokoroModel(nn.Module):
                         with torch.profiler.record_function(f"inference_decode_step_{t}"):
                             try:
                                 mel_projected_t = self.mel_projection_in(decoder_input_mel)
+                                projected_history.append(mel_projected_t)
+                                decoder_input_seq = torch.cat(projected_history, dim=1)
 
-                                if t == 0:
-                                    decoder_input_seq = mel_projected_t
-                                else:
-                                    previous_mels = torch.cat(generated_mels, dim=1)
-                                    previous_projected = self.mel_projection_in(previous_mels)
-                                    decoder_input_seq = torch.cat([previous_projected, mel_projected_t], dim=1)
+                                current_seq_len = decoder_input_seq.shape[1]
+                                tgt_mask = self._get_causal_mask(current_seq_len, device)
 
                                 decoder_input_seq_with_pe = self.encoder_positional_encoding(
                                     decoder_input_seq, seq_offset=0
                                 )
-
-                                current_seq_len = decoder_input_seq.shape[1]
-                                tgt_mask = self._generate_square_subsequent_mask(current_seq_len, device)
+                                del decoder_input_seq
 
                                 decoder_outputs = self.decoder(
                                     tgt=decoder_input_seq_with_pe,
@@ -817,6 +741,16 @@ class KokoroModel(nn.Module):
 
                     if generated_mels:
                         mel_output = torch.cat(generated_mels, dim=1)
+
+                        mel_output = torch.clamp(mel_output, min=-11.5, max=2.0)
+
+                        logger.info(f"Final Mel range: {mel_output.min().item():.2f} to {mel_output.max().item():.2f}")
+
+                        # Apply: (Normalized * Std) + Mean
+                        # mel_output = (mel_output * mel_std) + mel_mean
+                        # Safety clamp to prevent vocoder "explosions"
+                        # mel_output = torch.clamp(mel_output, min=-12.0, max=2.5)
+
                         logger.info(f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
                                    f"({mel_output.shape[1]/generation_time:.1f} frames/s)")
                     else:

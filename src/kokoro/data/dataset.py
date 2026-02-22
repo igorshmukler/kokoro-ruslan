@@ -726,119 +726,53 @@ class RuslanDataset(Dataset):
         return features
 
 def collate_fn(batch: List[Dict]) -> Dict:
-    """Collate function for DataLoader - optimized for MPS"""
-    # Transpose mel_spec from (n_mels, time) to (time, n_mels) for batch_first=True padding
-    mel_specs = [item['mel_spec'].transpose(0, 1) for item in batch]
-    phoneme_indices = [item['phoneme_indices'] for item in batch]
-    phoneme_durations = [item['phoneme_durations'] for item in batch]
-    stop_token_targets = [item['stop_token_targets'] for item in batch] # (float32)
+    """Collate function for DataLoader - optimized for MPS.
 
-    # Pitch and energy
-    pitches = [item['pitch'] for item in batch]
-    energies = [item['energy'] for item in batch]
+    Pre-allocates output tensors and fills by slice to avoid repeated
+    pad_sequence allocations and per-sample transposes in the hot path.
+    All variable-length tensors use [B, T, ...] layout consistently.
+    """
+    B = len(batch)
+    # Read lengths once — used for both pre-allocation and the length tensors
+    mel_lengths     = [item['mel_length']     for item in batch]
+    phoneme_lengths = [item['phoneme_length'] for item in batch]
+    max_mel_T     = max(mel_lengths)
+    max_phoneme_T = max(phoneme_lengths)
 
-    # Extract original lengths for loss masking if needed later
-    mel_lengths = torch.tensor([item['mel_length'] for item in batch], dtype=torch.long)
-    phoneme_lengths = torch.tensor([item['phoneme_length'] for item in batch], dtype=torch.long)
+    n_mels = batch[0]['mel_spec'].shape[0]  # (n_mels, T) layout from dataset
 
-    texts = [item['text'] for item in batch]
-    audio_files = [item['audio_file'] for item in batch]
+    # Pre-allocate output tensors — all zero-padded
+    mel_specs_out      = torch.zeros(B, max_mel_T, n_mels)
+    pitches_out        = torch.zeros(B, max_mel_T)
+    energies_out       = torch.zeros(B, max_mel_T)
+    stop_tokens_out    = torch.zeros(B, max_mel_T)
+    phoneme_idx_out    = torch.zeros(B, max_phoneme_T, dtype=torch.long)
+    phoneme_dur_out    = torch.zeros(B, max_phoneme_T, dtype=torch.long)
 
-    # Pad sequences
-    mel_specs_padded = pad_sequence(mel_specs, batch_first=True, padding_value=0.0)
-    phoneme_indices_padded = pad_sequence(phoneme_indices, batch_first=True, padding_value=0)
-    phoneme_durations_padded = pad_sequence(phoneme_durations, batch_first=True, padding_value=0)
-    stop_token_targets_padded = pad_sequence(stop_token_targets, batch_first=True, padding_value=0.0)
-    pitches_padded = pad_sequence(pitches, batch_first=True, padding_value=0.0)
-    energies_padded = pad_sequence(energies, batch_first=True, padding_value=0.0)
+    for i, item in enumerate(batch):
+        mel_T = mel_lengths[i]
+        ph_T  = phoneme_lengths[i]
+
+        # mel_spec is (n_mels, T) in the dataset — transpose once here
+        mel_specs_out[i, :mel_T, :]   = item['mel_spec'].T          # → (T, n_mels)
+        pitches_out[i, :mel_T]        = item['pitch']
+        energies_out[i, :mel_T]       = item['energy']
+        stop_tokens_out[i, :mel_T]    = item['stop_token_targets']
+        phoneme_idx_out[i, :ph_T]     = item['phoneme_indices']
+        phoneme_dur_out[i, :ph_T]     = item['phoneme_durations']
 
     return {
-        'mel_specs': mel_specs_padded,
-        'phoneme_indices': phoneme_indices_padded,
-        'phoneme_durations': phoneme_durations_padded,
-        'stop_token_targets': stop_token_targets_padded,
-        'pitches': pitches_padded,
-        'energies': energies_padded,
-        'mel_lengths': mel_lengths,        # Add mel lengths to the batch
-        'phoneme_lengths': phoneme_lengths, # Add phoneme lengths to the batch
-        'texts': texts,
-        'audio_files': audio_files
+        'mel_specs':          mel_specs_out,         # (B, T, n_mels)
+        'phoneme_indices':    phoneme_idx_out,       # (B, P)
+        'phoneme_durations':  phoneme_dur_out,       # (B, P)
+        'stop_token_targets': stop_tokens_out,       # (B, T)
+        'pitches':            pitches_out,           # (B, T)
+        'energies':           energies_out,          # (B, T)
+        'mel_lengths':        torch.tensor(mel_lengths,     dtype=torch.long),
+        'phoneme_lengths':    torch.tensor(phoneme_lengths, dtype=torch.long),
+        'texts':              [item['text']       for item in batch],
+        'audio_files':        [item['audio_file'] for item in batch],
     }
-
-
-class LengthBasedBatchSampler(Sampler):
-    """
-    Samples mini-batches of indices for training.
-    The samples are grouped by lengths to minimize padding.
-    Assumes the dataset is already sorted by length.
-    """
-    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False, shuffle: bool = True):
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.drop_last = drop_last
-        self.shuffle = shuffle
-
-        # Create buckets of indices based on length
-        # Since the dataset is pre-sorted by audio_length, we can just group
-        self.batches = self._create_batches()
-
-    def _create_batches(self) -> List[List[int]]:
-        # 1. Get all indices and their lengths
-        idx_and_len = []
-        for i in range(len(self.dataset)):
-            idx_and_len.append((i, self._get_sample_frames(i)))
-
-        # 2. Sort by length (Bucketing) to minimize padding
-        # We add a bit of randomness to the sort if shuffle is True
-        if self.shuffle:
-            random.shuffle(idx_and_len)
-            # Optional: sort into "mega-batches" then shuffle within them
-            idx_and_len.sort(key=lambda x: x[1])
-
-        batches = []
-        current_batch = []
-        max_len_in_batch = 0
-
-        for idx, length in idx_and_len:
-            new_max = max(max_len_in_batch, length)
-            # The GPU cost is the width of the widest sample * number of samples
-            projected_cost = (len(current_batch) + 1) * new_max
-
-            if (projected_cost > self.max_frames or
-                len(current_batch) >= self.max_batch_size):
-
-                if current_batch:
-                    # Check min_batch_size constraint
-                    if len(current_batch) >= self.min_batch_size:
-                        batches.append(current_batch)
-                    elif not self.drop_last:
-                        batches.append(current_batch)
-
-                current_batch = [idx]
-                max_len_in_batch = length
-            else:
-                current_batch.append(idx)
-                max_len_in_batch = new_max
-
-        # Handle the final batch
-        if current_batch:
-            if len(current_batch) >= self.min_batch_size or not self.drop_last:
-                batches.append(current_batch)
-
-        # Shuffle the batches themselves so the model doesn't see
-        # short samples then long samples every epoch
-        if self.shuffle:
-            random.shuffle(batches)
-
-        return batches
-
-    def __iter__(self):
-        # Iterate over the prepared batches
-        for batch in self.batches:
-            yield batch
-
-    def __len__(self) -> int:
-        return len(self.batches)
 
 
 class DynamicFrameBatchSampler(Sampler):
@@ -933,32 +867,69 @@ class DynamicFrameBatchSampler(Sampler):
         batch is closed it's appended to the returned list. The returned
         list is optionally shuffled before being stored on the sampler.
         """
-        indices = list(range(len(self.dataset)))
-        if self.shuffle:
-            random.shuffle(indices)
+        # Build adaptive buckets first so that long and short samples are
+        # batched separately. This reduces padding and ensures the per-batch
+        # expanded-frames worst-case remains bounded by `self.max_frames`.
+        N = len(self.dataset)
+        if N == 0:
+            return []
 
-        batches = []
-        batch = []
-        max_frames_in_batch = 0
+        indices = list(range(N))
 
-        for idx in indices:
-            sample_frames = self._get_sample_frames(idx)
-            new_max = max(max_frames_in_batch, sample_frames)
-            projected_cost = (len(batch) + 1) * new_max
+        # Collect lengths
+        lengths = np.array([self._get_sample_frames(i) for i in indices], dtype=np.int64)
 
-            if batch and (projected_cost > self.max_frames or
-                      len(batch) >= self.max_batch_size):
-                if len(batch) >= self.min_batch_size or not self.drop_last:
-                    batches.append(batch)
-                batch = []
-                max_frames_in_batch = 0
+        # Choose number of buckets adaptively: at most 16, at least 1.
+        # For small datasets, reduce buckets to avoid empty bins.
+        num_buckets = min(16, max(1, int(np.sqrt(N))))
 
-            batch.append(idx)
-            max_frames_in_batch = max(max_frames_in_batch, sample_frames)
+        # Compute quantile cut points to form roughly even-populated buckets
+        try:
+            cut_points = np.percentile(lengths, np.linspace(0, 100, num_buckets + 1))
+        except Exception:
+            # Fallback to simple linear bins if percentile computation fails
+            cut_points = np.linspace(lengths.min(), lengths.max(), num_buckets + 1)
 
-        if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
-            batches.append(batch)
+        # Assign indices to buckets
+        buckets = [[] for _ in range(num_buckets)]
+        for idx, ln in zip(indices, lengths.tolist()):
+            # Find first cut greater than ln (exclude the last edge)
+            b = int(np.searchsorted(cut_points, ln, side='right') - 1)
+            b = max(0, min(num_buckets - 1, b))
+            buckets[b].append(idx)
 
+        batches: List[List[int]] = []
+
+        # For each bucket, shuffle within-bucket (if requested) and greedily pack
+        for bucket in buckets:
+            if not bucket:
+                continue
+            if self.shuffle:
+                random.shuffle(bucket)
+
+            batch: List[int] = []
+            max_frames_in_batch = 0
+
+            for idx in bucket:
+                sample_frames = self._get_sample_frames(idx)
+                new_max = max(max_frames_in_batch, sample_frames)
+                projected_cost = (len(batch) + 1) * new_max
+
+                # If adding would exceed budget or size limit, close current batch
+                if batch and (projected_cost > self.max_frames or len(batch) >= self.max_batch_size):
+                    if len(batch) >= self.min_batch_size or not self.drop_last:
+                        batches.append(batch)
+                    batch = []
+                    max_frames_in_batch = 0
+
+                batch.append(idx)
+                max_frames_in_batch = max(max_frames_in_batch, sample_frames)
+
+            # Flush last batch in this bucket
+            if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
+                batches.append(batch)
+
+        # Optionally shuffle order of batches so training sees varied sizes per epoch
         if self.shuffle:
             random.shuffle(batches)
 
@@ -978,3 +949,37 @@ class DynamicFrameBatchSampler(Sampler):
 
     def __len__(self) -> int:
         return len(self.batches)
+
+
+class LengthBasedBatchSampler(Sampler):
+    """
+    Fixed-batch-size sampler that groups samples by length to minimize padding.
+    Delegates to DynamicFrameBatchSampler with a large frame budget so that
+    batch_size is always the binding constraint rather than frame cost.
+    """
+    def __init__(self, dataset: Dataset, batch_size: int, drop_last: bool = False, shuffle: bool = True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+
+        # Delegate to DynamicFrameBatchSampler.
+        # Set max_frames large enough that it never binds — batch_size is the only cap.
+        max_sample_frames = max(
+            (dataset.samples[i]['audio_length'] for i in range(len(dataset))),
+            default=10000
+        )
+        self._delegate = DynamicFrameBatchSampler(
+            dataset=dataset,
+            max_frames=max_sample_frames * batch_size,  # never the binding constraint
+            min_batch_size=1,
+            max_batch_size=batch_size,
+            drop_last=drop_last,
+            shuffle=shuffle
+        )
+
+    def __iter__(self):
+        yield from self._delegate
+
+    def __len__(self) -> int:
+        return len(self._delegate)
