@@ -465,8 +465,8 @@ class KokoroModel(nn.Module):
 
             # Capture input shapes early so they can be logged even if the
             # original tensors are deleted during processing (prevents F821).
-            phoneme_indices_shape = tuple(phoneme_indices.shape) if 'phoneme_indices' in locals() else None
-            mel_specs_shape = tuple(mel_specs.shape) if 'mel_specs' in locals() else None
+            phoneme_indices_shape = tuple(phoneme_indices.shape)
+            mel_specs_shape = tuple(mel_specs.shape)
 
             if text_padding_mask is None:
                 text_padding_mask = (phoneme_indices == 0).to(torch.bool)
@@ -510,7 +510,7 @@ class KokoroModel(nn.Module):
                     )
 
                     # Free everything consumed by the adaptor
-                    del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations
+                    del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations, text_padding_mask
 
                     expanded_encoder_outputs = adapted_encoder_output
                     encoder_output_padding_mask = frame_mask
@@ -524,7 +524,7 @@ class KokoroModel(nn.Module):
                     expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
                         text_encoded, phoneme_durations.float(), text_padding_mask
                     )
-                    del text_encoded, phoneme_durations
+                    del text_encoded, phoneme_durations, text_padding_mask
 
                 # ── 3. Align expanded output to mel length ──────────────────
                 current_expanded_len = expanded_encoder_outputs.shape[1]
@@ -534,15 +534,20 @@ class KokoroModel(nn.Module):
                         encoder_output_padding_mask = encoder_output_padding_mask[:, :mel_seq_len]
                     else:
                         pad_len = mel_seq_len - current_expanded_len
-                        expanded_encoder_outputs = torch.cat([
-                            expanded_encoder_outputs,
-                            torch.zeros(batch_size, pad_len, self.hidden_dim,
-                                        device=device, dtype=expanded_encoder_outputs.dtype)
-                        ], dim=1)
-                        encoder_output_padding_mask = torch.cat([
-                            encoder_output_padding_mask,
-                            torch.ones(batch_size, pad_len, dtype=torch.bool, device=device)
-                        ], dim=1)
+                        enc_out = torch.zeros(batch_size, mel_seq_len, self.hidden_dim,
+                            device=device, dtype=expanded_encoder_outputs.dtype)
+                        enc_out[:, :current_expanded_len] = expanded_encoder_outputs
+
+                        del expanded_encoder_outputs
+
+                        expanded_encoder_outputs = enc_out
+
+                        mask_out = torch.ones(batch_size, mel_seq_len, dtype=torch.bool, device=device)
+                        mask_out[:, :current_expanded_len] = encoder_output_padding_mask
+
+                        del encoder_output_padding_mask
+
+                        encoder_output_padding_mask = mask_out
 
                 # ── 4. Decoder input ────────────────────────────────────────
                 decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
