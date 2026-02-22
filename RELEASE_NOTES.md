@@ -2,6 +2,19 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.15 (2026-02-22)
+- Implemented adaptive bucketed batching
+
+## 0.0.14 (2026-02-22)
+- Vectorized expansion in length regulator and variance adaptor
+
+## 0.0.13 (2026-02-21)
+- Improved pitch extractor
+- Implemented length regulator
+- Improved checkpointing
+- Improved phoneme processor
+- Vectorized average pitch by duration
+
 ## 0.0.12 (2026-02-18)
 - Fixed pitch and energy normalization bugs
 

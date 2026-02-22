@@ -122,6 +122,7 @@ class KokoroTTS:
             try:
                 checkpoint = load_func()
                 logger.info(f"Successfully loaded checkpoint using method {i+1}.")
+
                 break
             except Exception as e:
                 logger.warning(f"Checkpoint load attempt {i+1} failed: {e}")
@@ -332,6 +333,20 @@ class KokoroTTS:
 
         return chunks
 
+    def denormalize_mel(self, mel: torch.Tensor) -> torch.Tensor:
+        """
+        Converts normalized Mel back to the logarithmic scale.
+        Formula: x_raw = (x_norm * std) + mean
+        """
+        if self.mel_mean is not None and self.mel_std is not None:
+            # Consider the dimensions (B, T, C) or (T, C)
+            return (mel * self.mel_std) + self.mel_mean
+
+        # Fallback: If stats are missing, assume standard Norm->Log scaling
+        # This is a common heuristic for models that produce noise like yours
+        logger.warning("Using fallback denormalization (-5.5 mean, 2.0 std)")
+        return (mel * 2.0) - 5.5
+
     def text_to_speech(
         self,
         text: str,
@@ -393,8 +408,17 @@ class KokoroTTS:
                     logger.error(f"Chunk {i+1} generated empty mel. Skipping.")
                     continue
 
+                # Denormalize mel spectrogram before vocoding
+                # mel_spec = self.denormalize_mel(mel_spec)
+
+                # 2. Add a safety clip to prevent vocoder "explosions"
+                mel_spec = torch.clamp(mel_spec, min=-12.0, max=2.5)
+
                 # Step 4: Vocoding
                 mel_spec = mel_spec.squeeze(0).cpu()
+
+                logger.debug(f"Vocoder Input - Min: {mel_spec.min():.2f}, Max: {mel_spec.max():.2f}, Mean: {mel_spec.mean():.2f}")
+
                 chunk_audio = self.vocoder_manager.mel_to_audio(mel_spec)
                 all_audio_segments.append(chunk_audio)
 
