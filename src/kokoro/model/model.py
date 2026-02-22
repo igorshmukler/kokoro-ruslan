@@ -709,6 +709,8 @@ class KokoroModel(nn.Module):
                     generated_mels = []
                     decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
 
+                    projected_history: list[torch.Tensor] = []
+
                     # Generation loop (no checkpointing needed in eval mode)
                     generation_start_time = time.time()
                     for t in range(max_expected_length):
@@ -717,20 +719,16 @@ class KokoroModel(nn.Module):
                         with torch.profiler.record_function(f"inference_decode_step_{t}"):
                             try:
                                 mel_projected_t = self.mel_projection_in(decoder_input_mel)
+                                projected_history.append(mel_projected_t)
+                                decoder_input_seq = torch.cat(projected_history, dim=1)
 
-                                if t == 0:
-                                    decoder_input_seq = mel_projected_t
-                                else:
-                                    previous_mels = torch.cat(generated_mels, dim=1)
-                                    previous_projected = self.mel_projection_in(previous_mels)
-                                    decoder_input_seq = torch.cat([previous_projected, mel_projected_t], dim=1)
+                                current_seq_len = decoder_input_seq.shape[1]
+                                tgt_mask = self._get_causal_mask(current_seq_len, device)
 
                                 decoder_input_seq_with_pe = self.encoder_positional_encoding(
                                     decoder_input_seq, seq_offset=0
                                 )
-
-                                current_seq_len = decoder_input_seq.shape[1]
-                                tgt_mask = self._get_causal_mask(current_seq_len, device)
+                                del decoder_input_seq
 
                                 decoder_outputs = self.decoder(
                                     tgt=decoder_input_seq_with_pe,
