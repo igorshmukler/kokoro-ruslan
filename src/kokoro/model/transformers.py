@@ -113,19 +113,28 @@ class MultiHeadAttentionImproved(nn.Module):
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 attn_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention (float('-inf'))
-                key_padding_mask: Optional[torch.Tensor] = None # Padding mask (True for padded)
+                key_padding_mask: Optional[torch.Tensor] = None, # Padding mask (True for padded)
+                precomputed_k: Optional[torch.Tensor] = None, # Precomputed K for cross-attention
+                precomputed_v: Optional[torch.Tensor] = None  # Precomputed V for cross-attention
                ) -> Tuple[torch.Tensor, torch.Tensor]: # Return output and attention weights
 
         batch_size, seq_len_q, _ = query.size()
-        seq_len_k = key.size(1)
+        seq_len_k = key.size(1) if precomputed_k is None else precomputed_k.size(2)
         seq_len_v = value.size(1) # Should be same as seq_len_k
 
         context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
         # 1. Linear projections and reshape for multi-head attention
         Q = self.w_q(query).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_q, D_k)
-        K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
-        V = self.w_v(value).view(batch_size, seq_len_v, self.num_heads, self.d_k).transpose(1, 2)  # (B, H, S_v, D_k)
+
+        # K and V: use precomputed projections if provided (e.g. fixed encoder output
+        # during autoregressive inference), otherwise project normally
+        if precomputed_k is not None and precomputed_v is not None:
+            K = precomputed_k
+            V = precomputed_v
+        else:
+            K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
+            V = self.w_v(value).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_v, D_k)
 
         # 2. Prepare attention bias (ALiBi + masks) for Flash Attention
         attn_bias = None
@@ -440,6 +449,20 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         if self.linear2.bias is not None:
             nn.init.zeros_(self.linear2.bias)
 
+    def precompute_cross_attention_kv(self, memory: torch.Tensor):
+        """Cache K and V projections for fixed encoder output during inference."""
+        self._cached_cross_K = self.cross_attn.w_k(memory).view(
+            memory.size(0), memory.size(1), self.cross_attn.num_heads, self.cross_attn.d_k
+        ).transpose(1, 2)
+        self._cached_cross_V = self.cross_attn.w_v(memory).view(
+            memory.size(0), memory.size(1), self.cross_attn.num_heads, self.cross_attn.d_k
+        ).transpose(1, 2)
+
+    def clear_cross_attention_cache(self) -> None:
+        """Release cached K, V after inference completes."""
+        self._cached_cross_K = None
+        self._cached_cross_V = None
+
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
         """GLU-style feed-forward block"""
         x = self.linear1(x)
@@ -460,6 +483,11 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         if memory_key_padding_mask is not None:
             memory_key_padding_mask = memory_key_padding_mask.to(torch.bool)
 
+        # Retrieve cached K, V if available (set by precompute_cross_attention_kv
+        # before the inference loop; None during training so projection runs normally)
+        cached_k = getattr(self, '_cached_cross_K', None)
+        cached_v = getattr(self, '_cached_cross_V', None)
+
         if self.use_prenorm:
             # Pre-normalization
             # Self-attention sub-layer
@@ -474,7 +502,9 @@ class ImprovedTransformerDecoderBlock(nn.Module):
             # Query is from decoder (tgt_norm), Key/Value from encoder (memory)
             cross_attn_output, _ = self.cross_attn(tgt_norm, memory, memory,
                                                    attn_mask=memory_mask, # Usually None
-                                                   key_padding_mask=memory_key_padding_mask)
+                                                   key_padding_mask=memory_key_padding_mask,
+                                                   precomputed_k=cached_k,
+                                                   precomputed_v=cached_v)
 
             dropped_output = self.dropout2(cross_attn_output)
 
@@ -497,7 +527,9 @@ class ImprovedTransformerDecoderBlock(nn.Module):
             # Cross-attention sub-layer
             cross_attn_output, _ = self.cross_attn(tgt, memory, memory,
                                                    attn_mask=memory_mask, # Usually None
-                                                   key_padding_mask=memory_key_padding_mask)
+                                                   key_padding_mask=memory_key_padding_mask,
+                                                   precomputed_k=cached_k,
+                                                   precomputed_v=cached_v)
             tgt = self.norm2(tgt + self.dropout2(cross_attn_output))
 
             # Feed-forward sub-layer
