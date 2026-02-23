@@ -17,7 +17,7 @@ def test_multihead_attention_shape():
     k = torch.randn(B, S_k, d_model)
     v = torch.randn(B, S_k, d_model)
 
-    out, weights = attn(q, k, v)
+    out, weights, _ = attn(q, k, v)
     assert out.shape == (B, S_q, d_model)
     if weights is not None:
         assert weights.shape[0] == B
@@ -40,8 +40,8 @@ def test_precomputed_kv_usage():
     K = attn.w_k(k).view(B, S_k, heads, attn.d_k).transpose(1, 2)
     V = attn.w_v(v).view(B, S_k, heads, attn.d_k).transpose(1, 2)
 
-    out1, _ = attn(q, k, v)
-    out2, _ = attn(q, k, v, precomputed_k=K, precomputed_v=V)
+    out1, _, _ = attn(q, k, v)
+    out2, _, _ = attn(q, k, v, precomputed_k=K, precomputed_v=V)
 
     assert out1.shape == out2.shape
     assert torch.allclose(out1, out2, atol=1e-5)
