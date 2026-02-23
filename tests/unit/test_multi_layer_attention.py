@@ -41,7 +41,7 @@ def test_single_attention_layer():
 
     try:
         print(f"Forward...")
-        output, _ = attn(x, x, x, attn_mask=causal_mask)
+        output, _, _ = attn(x, x, x, attn_mask=causal_mask)
         print(f"  ✅ Forward: {output.shape}")
 
         print(f"Backward...")
@@ -211,7 +211,7 @@ def test_accumulated_gradients():
             x = torch.randn(batch_size, seq_len, d_model, device=device, requires_grad=True)
             causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device) * float('-inf'), diagonal=1)
 
-            output, _ = attn(x, x, x, attn_mask=causal_mask)
+            output, _, _ = attn(x, x, x, attn_mask=causal_mask)
             loss = output.sum() / 4  # Scale for accumulation
             loss.backward()
 
