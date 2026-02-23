@@ -232,6 +232,7 @@ class MultiHeadAttentionImproved(nn.Module):
 
                 Q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
 
+                # Compute attention for this chunk
                 scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
                 if attn_bias is not None:
                     # Only slice bias along query dim if it's actually expanded to full seq_len
