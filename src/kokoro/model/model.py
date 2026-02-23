@@ -220,7 +220,7 @@ class KokoroModel(nn.Module):
             if self.enable_profiling:
                 self.profiler.log_memory_stats("decoder_start")
 
-            result = self.decoder(
+            result, _ = self.decoder(
                 tgt=decoder_input,
                 memory=memory,
                 tgt_mask=tgt_mask,
@@ -240,7 +240,7 @@ class KokoroModel(nn.Module):
         # IMPORTANT: Do not wrap the entire decoder in checkpoint here.
         # `ImprovedTransformerDecoder.forward` already applies per-layer checkpointing,
         # and nesting checkpoint wrappers causes excessive recomputation in backward.
-        result = self.decoder(
+        result, _ = self.decoder(
             tgt=decoder_input,
             memory=memory,
             tgt_mask=tgt_mask,
@@ -693,8 +693,10 @@ class KokoroModel(nn.Module):
 
                     # Initialize generation
                     generated_mels = []
-                    projected_history: list[torch.Tensor] = []
                     decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
+
+                    self.decoder.precompute_cross_attention_kv(expanded_encoder_outputs)
+                    self_attn_kv_caches = [() for _ in range(len(self.decoder.layers))]
 
                     generation_start_time = time.time()
 
@@ -705,29 +707,24 @@ class KokoroModel(nn.Module):
                             try:
                                 # Project current input and cache — O(1) per step, not O(t)
                                 mel_projected_t = self.mel_projection_in(decoder_input_mel)
-                                projected_history.append(mel_projected_t)
-                                decoder_input_seq = torch.cat(projected_history, dim=1)
-
-                                current_seq_len = decoder_input_seq.shape[1]
-                                tgt_mask = self._get_causal_mask(current_seq_len, device)
-
-                                decoder_input_seq_with_pe = self.encoder_positional_encoding(
-                                    decoder_input_seq, seq_offset=0
+                                # Apply PE at absolute position t
+                                mel_projected_t_with_pe = self.encoder_positional_encoding(
+                                    mel_projected_t, seq_offset=t
                                 )
-                                # Free pre-PE tensor before decoder call
-                                del decoder_input_seq
 
-                                decoder_outputs = self.decoder(
-                                    tgt=decoder_input_seq_with_pe,
+                                decoder_outputs, self_attn_kv_caches = self.decoder(
+                                    tgt=mel_projected_t_with_pe,          # single frame only
                                     memory=expanded_encoder_outputs,
-                                    tgt_mask=tgt_mask,
+                                    tgt_mask=None,                         # no causal mask — cache enforces order
                                     memory_key_padding_mask=encoder_output_padding_mask,
-                                    tgt_key_padding_mask=None
+                                    tgt_key_padding_mask=None,
+                                    self_attn_kv_caches=self_attn_kv_caches,
                                 )
+
                                 # Free full decoder output sequence — only need last frame
                                 # clone() detaches the slice from the full decoder_outputs buffer
                                 decoder_out_t = decoder_outputs[:, -1:, :].clone()
-                                del decoder_outputs, decoder_input_seq_with_pe
+                                del decoder_outputs
 
                                 mel_pred_t = self.mel_projection_out(decoder_out_t)
                                 generated_mels.append(mel_pred_t)
@@ -800,6 +797,9 @@ class KokoroModel(nn.Module):
                     if self.enable_profiling:
                         logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
                     return torch.empty(batch_size, 0, self.mel_dim, device=device)
+
+                finally:
+                    self.decoder.clear_cross_attention_cache()
 
 
     def forward(
