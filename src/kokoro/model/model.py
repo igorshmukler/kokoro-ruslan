@@ -306,46 +306,48 @@ class KokoroModel(nn.Module):
 
             durations = torch.clamp(durations, min=1.0)
 
-            # First pass: expand each sample and track max length
-            expanded_list = []
-            max_expanded_len = 0
-
+            # ── Pass 1: compute per-sample output lengths on CPU only ──────────
+            # No GPU tensors created here — just integer arithmetic.
+            lengths = []
+            non_padded_masks = []
             for i in range(batch_size):
-                non_padded = ~text_padding_mask[i].to(torch.bool)
-
-                if not torch.any(non_padded):
-                    logger.warning(f"Batch {i}: All tokens are padding, creating empty sequence")
-                    expanded = torch.empty(0, hidden_dim, device=device)
+                npm = ~text_padding_mask[i].to(torch.bool)
+                non_padded_masks.append(npm)
+                if torch.any(npm):
+                    dur_i = durations[i][npm].clamp(min=1).long()
+                    lengths.append(int(dur_i.sum().item()))
                 else:
-                    filtered_enc = encoder_outputs[i][non_padded]
-                    filtered_dur = torch.clamp(durations[i][non_padded], min=1).long()
-                    try:
-                        expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
-                    except Exception as e:
-                        logger.error(f"Error in repeat_interleave for batch {i}: {e}")
-                        expanded = torch.empty(0, hidden_dim, device=device)
+                    lengths.append(0)
 
-                expanded_list.append(expanded)
-                max_expanded_len = max(max_expanded_len, expanded.shape[0])
+            max_expanded_len = max(max(lengths, default=0), 1)
 
-            if max_expanded_len == 0:
-                logger.warning("All sequences resulted in empty expansion, creating dummy output for stability.")
-                max_expanded_len = 1
-                expanded_list = [
-                    torch.zeros(1, hidden_dim, device=device, dtype=encoder_outputs.dtype)
-                ] * batch_size
-
-            # Pre-allocate output tensors — padding mask starts all-True, valid
-            # frames are written as False (not padding) during the fill loop
-            out = torch.zeros(batch_size, max_expanded_len, hidden_dim,
-                          device=device, dtype=encoder_outputs.dtype)
+            # ── Single allocation ───────────────────────────────────────────────
+            # out  starts zeroed  (correct padding value)
+            # mask starts all-True (all padding); valid frames set to False below
+            out  = torch.zeros(batch_size, max_expanded_len, hidden_dim,
+                           device=device, dtype=encoder_outputs.dtype)
             mask = torch.ones(batch_size, max_expanded_len, dtype=torch.bool, device=device)
 
-            for i, expanded in enumerate(expanded_list):
-                ln = expanded.shape[0]
-                if ln > 0:
-                    out[i, :ln] = expanded
-                    mask[i, :ln] = False  # valid frames
+            # ── Pass 2: expand directly into out, one sample at a time ─────────
+            # Each `expanded` tensor is freed before the next iteration,
+            # so peak extra memory is one sample's expansion, not all B.
+            for i in range(batch_size):
+                if lengths[i] == 0:
+                    logger.warning(f"Batch {i}: All tokens are padding, leaving row zeroed")
+                    continue
+
+                filtered_enc = encoder_outputs[i][non_padded_masks[i]]
+                filtered_dur = durations[i][non_padded_masks[i]].clamp(min=1).long()
+
+                try:
+                    expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
+                    ln = expanded.shape[0]
+                    out[i, :ln]  = expanded
+                    mask[i, :ln] = False        # mark valid frames
+                    del expanded                # free before next sample
+                except Exception as e:
+                    logger.error(f"Error in repeat_interleave for batch {i}: {e}")
+                    # row stays zeroed, mask stays all-True — safely treated as padding
 
             if self.enable_profiling:
                 self.profiler.log_memory_stats("length_regulation_end")
@@ -463,8 +465,8 @@ class KokoroModel(nn.Module):
 
             # Capture input shapes early so they can be logged even if the
             # original tensors are deleted during processing (prevents F821).
-            phoneme_indices_shape = tuple(phoneme_indices.shape) if 'phoneme_indices' in locals() else None
-            mel_specs_shape = tuple(mel_specs.shape) if 'mel_specs' in locals() else None
+            phoneme_indices_shape = tuple(phoneme_indices.shape)
+            mel_specs_shape = tuple(mel_specs.shape)
 
             if text_padding_mask is None:
                 text_padding_mask = (phoneme_indices == 0).to(torch.bool)
@@ -508,7 +510,7 @@ class KokoroModel(nn.Module):
                     )
 
                     # Free everything consumed by the adaptor
-                    del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations
+                    del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations, text_padding_mask
 
                     expanded_encoder_outputs = adapted_encoder_output
                     encoder_output_padding_mask = frame_mask
@@ -522,7 +524,7 @@ class KokoroModel(nn.Module):
                     expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
                         text_encoded, phoneme_durations.float(), text_padding_mask
                     )
-                    del text_encoded, phoneme_durations
+                    del text_encoded, phoneme_durations, text_padding_mask
 
                 # ── 3. Align expanded output to mel length ──────────────────
                 current_expanded_len = expanded_encoder_outputs.shape[1]
@@ -532,15 +534,20 @@ class KokoroModel(nn.Module):
                         encoder_output_padding_mask = encoder_output_padding_mask[:, :mel_seq_len]
                     else:
                         pad_len = mel_seq_len - current_expanded_len
-                        expanded_encoder_outputs = torch.cat([
-                            expanded_encoder_outputs,
-                            torch.zeros(batch_size, pad_len, self.hidden_dim,
-                                        device=device, dtype=expanded_encoder_outputs.dtype)
-                        ], dim=1)
-                        encoder_output_padding_mask = torch.cat([
-                            encoder_output_padding_mask,
-                            torch.ones(batch_size, pad_len, dtype=torch.bool, device=device)
-                        ], dim=1)
+                        enc_out = torch.zeros(batch_size, mel_seq_len, self.hidden_dim,
+                            device=device, dtype=expanded_encoder_outputs.dtype)
+                        enc_out[:, :current_expanded_len] = expanded_encoder_outputs
+
+                        del expanded_encoder_outputs
+
+                        expanded_encoder_outputs = enc_out
+
+                        mask_out = torch.ones(batch_size, mel_seq_len, dtype=torch.bool, device=device)
+                        mask_out[:, :current_expanded_len] = encoder_output_padding_mask
+
+                        del encoder_output_padding_mask
+
+                        encoder_output_padding_mask = mask_out
 
                 # ── 4. Decoder input ────────────────────────────────────────
                 decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
@@ -591,6 +598,7 @@ class KokoroModel(nn.Module):
                 )
                 raise e
 
+
     def forward_inference(
         self,
         phoneme_indices: torch.Tensor,
@@ -613,9 +621,8 @@ class KokoroModel(nn.Module):
             batch_size = phoneme_indices.size(0)
             device = phoneme_indices.device
 
-            self.eval()  # This will disable gradient checkpointing automatically
+            self.eval()
 
-            # Log at beginning of inference (no checkpointing in eval mode)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("inference_start")
 
@@ -627,14 +634,11 @@ class KokoroModel(nn.Module):
                         text_padding_mask = text_padding_mask.to(torch.bool)
 
                     with torch.profiler.record_function("inference_encode_text"):
-                        # Text encoding (no checkpointing in eval mode, logging handled internally)
                         text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
 
                     with torch.profiler.record_function("inference_predict_durations"):
-                        # Duration prediction (no checkpointing in eval mode, logging handled internally)
                         if self.use_variance_predictor:
-                            # variance_adaptor returns five items; we only need durations here
-                                _, predicted_log_durations, _, _, _ = self.variance_adaptor(
+                            _, predicted_log_durations, _, _, _ = self.variance_adaptor(
                                 text_encoded,
                                 mask=text_padding_mask,
                                 pitch_target=None,
@@ -645,16 +649,22 @@ class KokoroModel(nn.Module):
                             predicted_log_durations = self._predict_durations(text_encoded)
 
                         durations_for_length_regulate = torch.exp(predicted_log_durations)
-                        durations_for_length_regulate = torch.clamp(durations_for_length_regulate, min=1.0).long()
+                        durations_for_length_regulate = torch.clamp(
+                            durations_for_length_regulate, min=1.0
+                        ).long()
 
                     with torch.profiler.record_function("inference_length_regulate"):
-                        # Length regulation (logging handled internally)
                         expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
                             text_encoded, durations_for_length_regulate, text_padding_mask
                         )
+                    # text_encoded no longer needed after length regulation
+                    del text_encoded, durations_for_length_regulate
 
                     expected_length = expanded_encoder_outputs.shape[1]
-                    logger.info(f"Starting inference with expanded encoder outputs shape: {expanded_encoder_outputs.shape}")
+                    logger.info(
+                        f"Starting inference with expanded encoder outputs shape: "
+                        f"{expanded_encoder_outputs.shape}"
+                    )
 
                     if self.enable_profiling:
                         self.profiler.log_memory_stats("inference_pre_generation")
@@ -668,21 +678,23 @@ class KokoroModel(nn.Module):
                     if max_expected_length <= min_expected_length:
                         max_expected_length = min(max_len, min_expected_length + 1)
 
-                    logger.info(f"Generation bounds: min={min_expected_length}, max={max_expected_length}")
+                    logger.info(
+                        f"Generation bounds: min={min_expected_length}, max={max_expected_length}"
+                    )
 
                     # Initialize generation
                     generated_mels = []
+                    projected_history: list[torch.Tensor] = []
                     decoder_input_mel = torch.zeros(batch_size, 1, self.mel_dim, device=device)
 
-                    projected_history: list[torch.Tensor] = []
-
-                    # Generation loop (no checkpointing needed in eval mode)
                     generation_start_time = time.time()
+
                     for t in range(max_expected_length):
                         step_start_time = time.time()
 
                         with torch.profiler.record_function(f"inference_decode_step_{t}"):
                             try:
+                                # Project current input and cache — O(1) per step, not O(t)
                                 mel_projected_t = self.mel_projection_in(decoder_input_mel)
                                 projected_history.append(mel_projected_t)
                                 decoder_input_seq = torch.cat(projected_history, dim=1)
@@ -693,6 +705,7 @@ class KokoroModel(nn.Module):
                                 decoder_input_seq_with_pe = self.encoder_positional_encoding(
                                     decoder_input_seq, seq_offset=0
                                 )
+                                # Free pre-PE tensor before decoder call
                                 del decoder_input_seq
 
                                 decoder_outputs = self.decoder(
@@ -702,13 +715,19 @@ class KokoroModel(nn.Module):
                                     memory_key_padding_mask=encoder_output_padding_mask,
                                     tgt_key_padding_mask=None
                                 )
+                                # Free full decoder output sequence — only need last frame
+                                # clone() detaches the slice from the full decoder_outputs buffer
+                                decoder_out_t = decoder_outputs[:, -1:, :].clone()
+                                del decoder_outputs, decoder_input_seq_with_pe
 
-                                decoder_out_t = decoder_outputs[:, -1:, :]
                                 mel_pred_t = self.mel_projection_out(decoder_out_t)
                                 generated_mels.append(mel_pred_t)
 
                                 stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
+                                del decoder_out_t
+
                                 stop_probability = torch.sigmoid(stop_token_logit_t).item()
+                                del stop_token_logit_t
 
                                 if t >= min_expected_length:
                                     effective_stop_threshold = (
@@ -718,46 +737,50 @@ class KokoroModel(nn.Module):
                                     if stop_probability > effective_stop_threshold:
                                         logger.info(
                                             f"Stopping at frame {t} "
-                                            f"(stop_prob: {stop_probability:.4f}, threshold: {effective_stop_threshold:.4f})"
+                                            f"(stop_prob: {stop_probability:.4f}, "
+                                            f"threshold: {effective_stop_threshold:.4f})"
                                         )
                                         break
 
                                 decoder_input_mel = mel_pred_t
 
-                                # Log every 50 steps during inference (outside any checkpointed regions)
                                 if self.enable_profiling and t % 50 == 0:
                                     step_time = (time.time() - step_start_time) * 1000
-                                    logger.debug(f"Generated frame {t}, stop_prob: {stop_probability:.6f}, "
-                                               f"step_time: {step_time:.2f}ms")
+                                    logger.debug(
+                                        f"Generated frame {t}, stop_prob: {stop_probability:.6f}, "
+                                        f"step_time: {step_time:.2f}ms"
+                                    )
                                     self.profiler.log_memory_stats(f"inference_step_{t}")
 
                             except Exception as e:
                                 logger.error(f"Error at generation step {t}: {e}")
                                 if self.enable_profiling:
-                                    logger.error(f"GPU Memory at step {t}: {self.profiler.get_memory_summary()}")
+                                    logger.error(
+                                        f"GPU Memory at step {t}: {self.profiler.get_memory_summary()}"
+                                    )
                                 break
 
                     generation_time = time.time() - generation_start_time
 
+                    # expanded_encoder_outputs held for entire loop — free now
+                    del expanded_encoder_outputs, encoder_output_padding_mask
+
                     if generated_mels:
                         mel_output = torch.cat(generated_mels, dim=1)
+                        mel_output.clamp_(min=-11.5, max=2.0)  # in-place: no extra allocation
 
-                        mel_output = torch.clamp(mel_output, min=-11.5, max=2.0)
-
-                        logger.info(f"Final Mel range: {mel_output.min().item():.2f} to {mel_output.max().item():.2f}")
-
-                        # Apply: (Normalized * Std) + Mean
-                        # mel_output = (mel_output * mel_std) + mel_mean
-                        # Safety clamp to prevent vocoder "explosions"
-                        # mel_output = torch.clamp(mel_output, min=-12.0, max=2.5)
-
-                        logger.info(f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
-                                   f"({mel_output.shape[1]/generation_time:.1f} frames/s)")
+                        logger.info(
+                            f"Final Mel range: {mel_output.min().item():.2f} to "
+                            f"{mel_output.max().item():.2f}"
+                        )
+                        logger.info(
+                            f"Generated {mel_output.shape[1]} mel frames in {generation_time:.2f}s "
+                            f"({mel_output.shape[1]/generation_time:.1f} frames/s)"
+                        )
                     else:
                         logger.warning("No mel frames were generated.")
                         mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
 
-                    # Log at end of inference (outside any checkpointed regions)
                     if self.enable_profiling:
                         self.profiler.log_memory_stats("inference_end")
 
@@ -768,6 +791,7 @@ class KokoroModel(nn.Module):
                     if self.enable_profiling:
                         logger.error(f"GPU Memory at error: {self.profiler.get_memory_summary()}")
                     return torch.empty(batch_size, 0, self.mel_dim, device=device)
+
 
     def forward(
         self,
