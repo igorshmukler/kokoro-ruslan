@@ -76,41 +76,6 @@ class MultiHeadAttentionImproved(nn.Module):
         # Better initialization for linear layers
         self._init_weights()
 
-    @staticmethod
-    def _tensor_layout_metrics(tensor: torch.Tensor) -> str:
-        shape = tuple(tensor.shape)
-        stride = tensor.stride()
-        numel = tensor.numel()
-        elem_size = tensor.element_size()
-        est_bytes = numel * elem_size
-        max_offset = 0
-        for size, step in zip(shape, stride):
-            if size > 0:
-                max_offset += (size - 1) * abs(step)
-        return (
-            f"shape={shape} stride={stride} contiguous={tensor.is_contiguous()} "
-            f"numel={numel:,} elem_size={elem_size} est_bytes={est_bytes:,} "
-            f"max_linear_offset={max_offset:,} dtype={tensor.dtype} device={tensor.device}"
-        )
-
-    def _log_phase(self, context_prefix: str, phase: str, tensor: Optional[torch.Tensor] = None):
-        if tensor is None:
-            logger.info(f"{context_prefix}  [AttentionPhase] {phase}")
-            return
-        logger.info(f"{context_prefix}  [AttentionPhase] {phase}: {self._tensor_layout_metrics(tensor)}")
-
-    def _register_debug_grad_hook(self, tensor: torch.Tensor, hook_name: str, context_prefix: str):
-        if not tensor.requires_grad:
-            return
-
-        def _hook(grad: Optional[torch.Tensor]):
-            if grad is None:
-                logger.info(f"{context_prefix}  [AttentionBW] {hook_name}: grad=None")
-                return
-            logger.info(f"{context_prefix}  [AttentionBW] {hook_name}: {self._tensor_layout_metrics(grad)}")
-
-        tensor.register_hook(_hook)
-
     def _init_weights(self):
         # Glorot (Xavier) uniform for weight matrices
         nn.init.xavier_uniform_(self.w_q.weight)
@@ -148,36 +113,54 @@ class MultiHeadAttentionImproved(nn.Module):
 
     def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor,
                 attn_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention (float('-inf'))
-                key_padding_mask: Optional[torch.Tensor] = None # Padding mask (True for padded)
+                key_padding_mask: Optional[torch.Tensor] = None, # Padding mask (True for padded)
+                precomputed_k: Optional[torch.Tensor] = None, # Precomputed K for cross-attention
+                precomputed_v: Optional[torch.Tensor] = None,  # Precomputed V for cross-attention
+                kv_cache: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
                ) -> Tuple[torch.Tensor, torch.Tensor]: # Return output and attention weights
-
+        """
+        Returns (output, attn_weights, updated_kv_cache).
+        updated_kv_cache is None unless kv_cache was passed in or this is the
+        first step of a cached run (detected by kv_cache=() sentinel — see below).
+        """
         batch_size, seq_len_q, _ = query.size()
-        seq_len_k = key.size(1)
-        seq_len_v = value.size(1) # Should be same as seq_len_k
-        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
-        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
-        if is_batch_281:
-            logger.info(
-                f"{context_prefix}  [Attention] Entry: device={query.device}, dtype={query.dtype}, "
-                f"query={tuple(query.shape)}, key={tuple(key.shape)}, value={tuple(value.shape)}"
-            )
-            logger.info(
-                f"{context_prefix}    heads={self.num_heads}, d_k={self.d_k}, "
-                f"attention_elements={batch_size * self.num_heads * seq_len_q * seq_len_k:,}"
-            )
-            self._log_phase(context_prefix, "entry_query", query)
+        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
         # 1. Linear projections and reshape for multi-head attention
         Q = self.w_q(query).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_q, D_k)
-        K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
-        V = self.w_v(value).view(batch_size, seq_len_v, self.num_heads, self.d_k).transpose(1, 2)  # (B, H, S_v, D_k)
 
-        if is_batch_281:
-            logger.info(
-                f"{context_prefix}    Q={tuple(Q.shape)} K={tuple(K.shape)} V={tuple(V.shape)} "
-                f"(numel: Q={Q.numel():,}, K={K.numel():,}, V={V.numel():,})"
-            )
+        # K and V: use precomputed projections if provided (e.g. fixed encoder output
+        # during autoregressive inference), otherwise project normally
+        if precomputed_k is not None and precomputed_v is not None:
+            # Cross-attention with cached encoder K, V
+            K = precomputed_k
+            V = precomputed_v
+            updated_cache = None
+        elif kv_cache is not None:
+            # Self-attention KV cache path
+            # Project only the new query frame's K and V
+            new_K = self.w_k(key).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2)
+            new_V = self.w_v(value).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2)
+
+            if len(kv_cache) == 0:
+                # First step — cache starts empty, use only current frame
+                K, V = new_K, new_V
+            else:
+                # Append new frame to accumulated history
+                K = torch.cat([kv_cache[0], new_K], dim=2)  # (B, H, t+1, D_k)
+                V = torch.cat([kv_cache[1], new_V], dim=2)
+
+            updated_cache = (K, V)
+
+        else:
+            # Normal path: training or non-cached inference
+            seq_len_k = key.size(1)
+            K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)
+            V = self.w_v(value).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)
+            updated_cache = None
+
+        seq_len_k = K.size(2)
 
         # 2. Prepare attention bias (ALiBi + masks) for Flash Attention
         attn_bias = None
@@ -219,10 +202,8 @@ class MultiHeadAttentionImproved(nn.Module):
         attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
 
         if query.device.type == 'mps' and (seq_len_q > 600 or seq_len_k > 600):
-            if is_batch_281:
-                self._log_phase(context_prefix, "pre_attention_chunked")
             # Ultra-aggressive chunking for MPS to avoid INT_MAX overflow during backward
-            # Batch 281 crash: 398M attention elements crashed with chunk_size=32 (8M elements/chunk)
+            # 398M attention elements crashed with chunk_size=32 (8M elements/chunk)
             # MPS backend creates internal NDArray during backward that overflows INT_MAX
             # Solution: Use even smaller chunks - 16 creates ~4M element chunks
             if attention_size > 300_000_000:
@@ -236,12 +217,6 @@ class MultiHeadAttentionImproved(nn.Module):
 
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
-
-            # BATCH 281 LOGGING - Show fix is active
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                elements_per_chunk = batch_size * self.num_heads * chunk_size * seq_len_k
-                logger.info(f"{context_prefix}  [Attention] MPS Chunking activated (fix for INT_MAX bug)")
-                logger.info(f"{context_prefix}    attention_size: {attention_size:,} elements, chunk_size: {chunk_size}, chunks: {num_chunks}")
 
             # Process chunks without accumulating attention weights to save memory
             for chunk_idx in range(num_chunks):
@@ -274,20 +249,15 @@ class MultiHeadAttentionImproved(nn.Module):
 
                 # Clear intermediate tensors and free MPS cache after each chunk
                 del scores_chunk, attn_weights_chunk, context_chunk
-                if chunk_idx % 4 == 0:  # Periodic cache clearing
-                    torch.mps.empty_cache()
+
+            torch.mps.empty_cache()
 
             context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
-
-            # BATCH 281 LOGGING - Confirm fix worked
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [Attention] Chunked processing complete: {context.shape}")
+            del context_chunks
 
             attn_weights = None  # Don't compute weights during chunked attention to save memory
 
         elif query.device.type == 'mps':
-            if is_batch_281:
-                self._log_phase(context_prefix, "pre_attention_dense")
             # Manual attention implementation for MPS (normal sequences)
             scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
@@ -330,15 +300,6 @@ class MultiHeadAttentionImproved(nn.Module):
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
         context_t = context.transpose(1, 2)
 
-        if is_batch_281:
-            self._log_phase(context_prefix, "pre_contiguous_view_context_t", context_t)
-            self._register_debug_grad_hook(context_t, "bw_context_t", context_prefix)
-            logger.info(
-                f"{context_prefix}  [Attention] Pre-projection: context={tuple(context.shape)}, "
-                f"transposed={tuple(context_t.shape)}, transposed_stride={context_t.stride()}, "
-                f"transposed_contiguous={context_t.is_contiguous()}, numel={context_t.numel():,}"
-            )
-
         try:
             context = context_t.contiguous().view(
                 batch_size, seq_len_q, self.d_model
@@ -350,26 +311,10 @@ class MultiHeadAttentionImproved(nn.Module):
             )
             raise
 
-        if is_batch_281:
-            self._log_phase(context_prefix, "post_contiguous_view_context", context)
-            self._register_debug_grad_hook(context, "bw_context_post_view", context_prefix)
-            logger.info(
-                f"{context_prefix}  [Attention] Post-view: context={tuple(context.shape)}, "
-                f"contiguous={context.is_contiguous()}, stride={context.stride()}"
-            )
-
-        if is_batch_281:
-            self._log_phase(context_prefix, "pre_w_o", context)
-
         output = self.w_o(context)
 
-        if is_batch_281:
-            self._register_debug_grad_hook(output, "bw_output", context_prefix)
-            self._log_phase(context_prefix, "post_w_o", output)
-            logger.info(f"{context_prefix}  [Attention] Output projection complete: output={tuple(output.shape)}")
-
         # Return output and attention weights (None during training with Flash Attention)
-        return output, attn_weights.mean(dim=1) if attn_weights is not None else None
+        return output, attn_weights.mean(dim=1) if attn_weights is not None else None, updated_cache
 
 
 class ImprovedTransformerEncoderBlock(nn.Module):
@@ -446,41 +391,26 @@ class ImprovedTransformerEncoderBlock(nn.Module):
             # Self-attention sub-layer
             src_norm = self.norm1(src) # Apply LayerNorm BEFORE attention
             # MultiHeadAttentionImproved returns (output, attn_weights)
-            attn_output, _ = self.self_attn(src_norm, src_norm, src_norm,
+            attn_output, _, _ = self.self_attn(src_norm, src_norm, src_norm,
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] After self_attn: {attn_output.shape}")
 
             # Apply stochastic depth to attention output
             attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
             src = src + self.dropout1(attn_output) # Residual connection + Dropout
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] After residual: {src.shape}, starting FFN...")
-
             # Feed-forward sub-layer
             src_norm = self.norm2(src) # Apply LayerNorm BEFORE FFN
             ff_output = self._ff_block(src_norm)
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] After FFN: {ff_output.shape}")
 
             # Apply stochastic depth to FFN output
             ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
             src = src + self.dropout2(ff_output) # Residual connection + Dropout
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] Block complete: {src.shape}")
         else:
             # Post-normalization (Original Transformer)
             # Self-attention sub-layer
-            attn_output, _ = self.self_attn(src, src, src,
+            attn_output, _, _ = self.self_attn(src, src, src,
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
             # Apply stochastic depth to attention output
@@ -545,6 +475,20 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         if self.linear2.bias is not None:
             nn.init.zeros_(self.linear2.bias)
 
+    def precompute_cross_attention_kv(self, memory: torch.Tensor) -> None:
+        """Cache K and V projections for fixed encoder output during inference."""
+        self._cached_cross_K = self.cross_attn.w_k(memory).view(
+        memory.size(0), memory.size(1), self.cross_attn.num_heads, self.cross_attn.d_k
+        ).transpose(1, 2)
+        self._cached_cross_V = self.cross_attn.w_v(memory).view(
+            memory.size(0), memory.size(1), self.cross_attn.num_heads, self.cross_attn.d_k
+        ).transpose(1, 2)
+
+    def clear_cross_attention_cache(self) -> None:
+        """Release cached K, V after inference completes."""
+        self._cached_cross_K = None
+        self._cached_cross_V = None
+
     def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
         """GLU-style feed-forward block"""
         x = self.linear1(x)
@@ -556,7 +500,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                 tgt_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention
                 memory_mask: Optional[torch.Tensor] = None, # Not typically used for cross-attention
                 tgt_key_padding_mask: Optional[torch.Tensor] = None, # Padding mask for decoder input
-                memory_key_padding_mask: Optional[torch.Tensor] = None # Padding mask for encoder output
+                memory_key_padding_mask: Optional[torch.Tensor] = None, # Padding mask for encoder output
+                self_attn_kv_cache = None
                ) -> torch.Tensor:
 
         # Ensure masks are boolean at this level
@@ -565,80 +510,54 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         if memory_key_padding_mask is not None:
             memory_key_padding_mask = memory_key_padding_mask.to(torch.bool)
 
-        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
-
-        # BATCH 281 LOGGING - Entry point
-        if hasattr(self, '_batch_281_log') and self._batch_281_log:
-            logger.info(f"{context_prefix}  [DecoderBlock] Entry: tgt={tgt.shape}, memory={memory.shape}")
+        # Retrieve cached K, V if available (set by precompute_cross_attention_kv
+        # before the inference loop; None during training so projection runs normally)
+        cached_k = getattr(self, '_cached_cross_K', None)
+        cached_v = getattr(self, '_cached_cross_V', None)
 
         if self.use_prenorm:
             # Pre-normalization
             # Self-attention sub-layer
             tgt_norm = self.norm1(tgt)
-            attn_output, _ = self.self_attn(tgt_norm, tgt_norm, tgt_norm,
+            attn_output, _, updated_cache = self.self_attn(tgt_norm, tgt_norm, tgt_norm,
                                             attn_mask=tgt_mask,
-                                            key_padding_mask=tgt_key_padding_mask)
+                                            key_padding_mask=tgt_key_padding_mask,
+                                            kv_cache=self_attn_kv_cache
+                                            )
             tgt = tgt + self.dropout1(attn_output)
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After self_attn: {tgt.shape}")
 
             # Cross-attention sub-layer
             tgt_norm = self.norm2(tgt)
             # Query is from decoder (tgt_norm), Key/Value from encoder (memory)
-            cross_attn_output, _ = self.cross_attn(tgt_norm, memory, memory,
+            cross_attn_output, _, _ = self.cross_attn(tgt_norm, memory, memory,
                                                    attn_mask=memory_mask, # Usually None
-                                                   key_padding_mask=memory_key_padding_mask)
+                                                   key_padding_mask=memory_key_padding_mask,
+                                                   precomputed_k=cached_k,
+                                                   precomputed_v=cached_v)
 
-            # BATCH 281 LOGGING - Before residual
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] Cross-attn returned: {cross_attn_output.shape}, applying dropout2...")
+            tgt = tgt + self.dropout2(cross_attn_output)
+            tgt = tgt + self.dropout3(self._ff_block(self.norm3(tgt)))
 
-            dropped_output = self.dropout2(cross_attn_output)
-
-            # BATCH 281 LOGGING - Before addition
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After dropout2, adding to tgt: {tgt.shape} + {dropped_output.shape}")
-
-            tgt = tgt + dropped_output
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After cross_attn residual: {tgt.shape}, starting FFN...")
-
-            # Feed-forward sub-layer
-            tgt_norm = self.norm3(tgt)
-            ff_output = self._ff_block(tgt_norm)
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After FFN: {ff_output.shape}")
-
-            tgt = tgt + self.dropout3(ff_output)
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] Block complete: {tgt.shape}")
         else:
             # Post-normalization
             # Self-attention sub-layer
-            attn_output, _ = self.self_attn(tgt, tgt, tgt,
+            attn_output, _, updated_cache = self.self_attn(tgt, tgt, tgt,
                                             attn_mask=tgt_mask,
-                                            key_padding_mask=tgt_key_padding_mask)
+                                            key_padding_mask=tgt_key_padding_mask,
+                                            kv_cache=self_attn_kv_cache)
             tgt = self.norm1(tgt + self.dropout1(attn_output))
 
             # Cross-attention sub-layer
-            cross_attn_output, _ = self.cross_attn(tgt, memory, memory,
+            cross_attn_output, _, _ = self.cross_attn(tgt, memory, memory,
                                                    attn_mask=memory_mask, # Usually None
-                                                   key_padding_mask=memory_key_padding_mask)
+                                                   key_padding_mask=memory_key_padding_mask,
+                                                   precomputed_k=cached_k,
+                                                   precomputed_v=cached_v)
+
             tgt = self.norm2(tgt + self.dropout2(cross_attn_output))
+            tgt = self.norm3(tgt + self.dropout3(self._ff_block(tgt)))
 
-            # Feed-forward sub-layer
-            ff_output = self._ff_block(tgt)
-            tgt = self.norm3(tgt + self.dropout3(ff_output))
-
-        return tgt
+        return tgt, updated_cache
 
 
 class ImprovedTransformerDecoder(nn.Module):
@@ -663,15 +582,27 @@ class ImprovedTransformerDecoder(nn.Module):
         else:
             self.norm = None # No final norm for post-norm architecture
 
+    def precompute_cross_attention_kv(self, memory: torch.Tensor) -> None:
+        for layer in self.layers:
+            layer.precompute_cross_attention_kv(memory)
+
+    def clear_cross_attention_cache(self) -> None:
+        for layer in self.layers:
+            layer.clear_cross_attention_cache()
+
     def forward(self, tgt: torch.Tensor, memory: torch.Tensor,
                 tgt_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention
                 memory_key_padding_mask: Optional[torch.Tensor] = None, # Padding mask for encoder output
-                tgt_key_padding_mask: Optional[torch.Tensor] = None # Padding mask for decoder input
+                tgt_key_padding_mask: Optional[torch.Tensor] = None, # Padding mask for decoder input
+                self_attn_kv_caches = None
                ) -> torch.Tensor:
 
         output = tgt
+        updated_caches = [] if self_attn_kv_caches is not None else None
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            layer_cache = self_attn_kv_caches[i] if self_attn_kv_caches else None
+
             if self.training:
                 # Use gradient checkpointing during training to save memory
                 # Arguments to checkpoint must be positional and match the layer's forward signature
@@ -683,18 +614,25 @@ class ImprovedTransformerDecoder(nn.Module):
                     tgt_key_padding_mask, memory_key_padding_mask,
                     use_reentrant=False
                 )
+
+                # checkpoint returns (tgt, updated_cache); unpack
+                output, _ = output
             else:
                 # Direct forward pass during inference
-                output = layer(
+                output, new_cache = layer(
                     output, memory, tgt_mask, None,
-                    tgt_key_padding_mask, memory_key_padding_mask
+                    tgt_key_padding_mask, memory_key_padding_mask,
+                    self_attn_kv_cache=layer_cache,
                 )
+
+                if updated_caches is not None:
+                    updated_caches.append(new_cache)
 
         # Apply final normalization if pre-norm architecture is used
         if self.norm is not None:
             output = self.norm(output)
 
-        return output
+        return output, updated_caches
 
 
 # --- Compatibility Layer for Original Model (if needed) ---
