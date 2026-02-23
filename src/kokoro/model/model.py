@@ -9,7 +9,7 @@ import time
 import os
 
 from kokoro.model.positional_encoding import PositionalEncoding
-from kokoro.model.transformers import TransformerDecoder, TransformerEncoderBlock
+from kokoro.model.transformers import TransformerDecoder, TransformerEncoderBlock, MultiHeadAttentionImproved
 from kokoro.utils.gpu_profiler import GPUProfiler
 
 logger = logging.getLogger(__name__)
@@ -659,6 +659,15 @@ class KokoroModel(nn.Module):
                         )
                     # text_encoded no longer needed after length regulation
                     del text_encoded, durations_for_length_regulate
+
+                    # Clear ALiBi distance caches before inference — during generation seq_len
+                    # grows by 1 each step so every key is unique; the cache fills with 10
+                    # stale entries and never hits again. Reset here to avoid holding them
+                    # for the duration of inference.
+                    for module in self.modules():
+                        if isinstance(module, MultiHeadAttentionImproved):
+                            module._distance_cache.clear()
+
 
                     expected_length = expanded_encoder_outputs.shape[1]
                     logger.info(
