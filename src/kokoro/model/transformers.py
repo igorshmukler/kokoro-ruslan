@@ -154,30 +154,13 @@ class MultiHeadAttentionImproved(nn.Module):
         batch_size, seq_len_q, _ = query.size()
         seq_len_k = key.size(1)
         seq_len_v = value.size(1) # Should be same as seq_len_k
-        is_batch_281 = hasattr(self, '_batch_281_log') and self._batch_281_log
-        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
-        if is_batch_281:
-            logger.info(
-                f"{context_prefix}  [Attention] Entry: device={query.device}, dtype={query.dtype}, "
-                f"query={tuple(query.shape)}, key={tuple(key.shape)}, value={tuple(value.shape)}"
-            )
-            logger.info(
-                f"{context_prefix}    heads={self.num_heads}, d_k={self.d_k}, "
-                f"attention_elements={batch_size * self.num_heads * seq_len_q * seq_len_k:,}"
-            )
-            self._log_phase(context_prefix, "entry_query", query)
+        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
         # 1. Linear projections and reshape for multi-head attention
         Q = self.w_q(query).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2) # (B, H, S_q, D_k)
         K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)   # (B, H, S_k, D_k)
         V = self.w_v(value).view(batch_size, seq_len_v, self.num_heads, self.d_k).transpose(1, 2)  # (B, H, S_v, D_k)
-
-        if is_batch_281:
-            logger.info(
-                f"{context_prefix}    Q={tuple(Q.shape)} K={tuple(K.shape)} V={tuple(V.shape)} "
-                f"(numel: Q={Q.numel():,}, K={K.numel():,}, V={V.numel():,})"
-            )
 
         # 2. Prepare attention bias (ALiBi + masks) for Flash Attention
         attn_bias = None
@@ -219,10 +202,8 @@ class MultiHeadAttentionImproved(nn.Module):
         attention_size = batch_size * self.num_heads * seq_len_q * seq_len_k
 
         if query.device.type == 'mps' and (seq_len_q > 600 or seq_len_k > 600):
-            if is_batch_281:
-                self._log_phase(context_prefix, "pre_attention_chunked")
             # Ultra-aggressive chunking for MPS to avoid INT_MAX overflow during backward
-            # Batch 281 crash: 398M attention elements crashed with chunk_size=32 (8M elements/chunk)
+            # 398M attention elements crashed with chunk_size=32 (8M elements/chunk)
             # MPS backend creates internal NDArray during backward that overflows INT_MAX
             # Solution: Use even smaller chunks - 16 creates ~4M element chunks
             if attention_size > 300_000_000:
@@ -236,12 +217,6 @@ class MultiHeadAttentionImproved(nn.Module):
 
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
             context_chunks = []
-
-            # BATCH 281 LOGGING - Show fix is active
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                elements_per_chunk = batch_size * self.num_heads * chunk_size * seq_len_k
-                logger.info(f"{context_prefix}  [Attention] MPS Chunking activated (fix for INT_MAX bug)")
-                logger.info(f"{context_prefix}    attention_size: {attention_size:,} elements, chunk_size: {chunk_size}, chunks: {num_chunks}")
 
             # Process chunks without accumulating attention weights to save memory
             for chunk_idx in range(num_chunks):
@@ -279,15 +254,9 @@ class MultiHeadAttentionImproved(nn.Module):
 
             context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
 
-            # BATCH 281 LOGGING - Confirm fix worked
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [Attention] Chunked processing complete: {context.shape}")
-
             attn_weights = None  # Don't compute weights during chunked attention to save memory
 
         elif query.device.type == 'mps':
-            if is_batch_281:
-                self._log_phase(context_prefix, "pre_attention_dense")
             # Manual attention implementation for MPS (normal sequences)
             scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
 
@@ -330,15 +299,6 @@ class MultiHeadAttentionImproved(nn.Module):
         # Transpose back (B, S_q, H, D_k) -> (B, S_q, D_model)
         context_t = context.transpose(1, 2)
 
-        if is_batch_281:
-            self._log_phase(context_prefix, "pre_contiguous_view_context_t", context_t)
-            self._register_debug_grad_hook(context_t, "bw_context_t", context_prefix)
-            logger.info(
-                f"{context_prefix}  [Attention] Pre-projection: context={tuple(context.shape)}, "
-                f"transposed={tuple(context_t.shape)}, transposed_stride={context_t.stride()}, "
-                f"transposed_contiguous={context_t.is_contiguous()}, numel={context_t.numel():,}"
-            )
-
         try:
             context = context_t.contiguous().view(
                 batch_size, seq_len_q, self.d_model
@@ -350,23 +310,7 @@ class MultiHeadAttentionImproved(nn.Module):
             )
             raise
 
-        if is_batch_281:
-            self._log_phase(context_prefix, "post_contiguous_view_context", context)
-            self._register_debug_grad_hook(context, "bw_context_post_view", context_prefix)
-            logger.info(
-                f"{context_prefix}  [Attention] Post-view: context={tuple(context.shape)}, "
-                f"contiguous={context.is_contiguous()}, stride={context.stride()}"
-            )
-
-        if is_batch_281:
-            self._log_phase(context_prefix, "pre_w_o", context)
-
         output = self.w_o(context)
-
-        if is_batch_281:
-            self._register_debug_grad_hook(output, "bw_output", context_prefix)
-            self._log_phase(context_prefix, "post_w_o", output)
-            logger.info(f"{context_prefix}  [Attention] Output projection complete: output={tuple(output.shape)}")
 
         # Return output and attention weights (None during training with Flash Attention)
         return output, attn_weights.mean(dim=1) if attn_weights is not None else None
@@ -450,33 +394,18 @@ class ImprovedTransformerEncoderBlock(nn.Module):
                                             attn_mask=src_mask,
                                             key_padding_mask=src_key_padding_mask)
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] After self_attn: {attn_output.shape}")
-
             # Apply stochastic depth to attention output
             attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
             src = src + self.dropout1(attn_output) # Residual connection + Dropout
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] After residual: {src.shape}, starting FFN...")
 
             # Feed-forward sub-layer
             src_norm = self.norm2(src) # Apply LayerNorm BEFORE FFN
             ff_output = self._ff_block(src_norm)
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] After FFN: {ff_output.shape}")
-
             # Apply stochastic depth to FFN output
             ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
             src = src + self.dropout2(ff_output) # Residual connection + Dropout
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"  [EncoderBlock] Block complete: {src.shape}")
         else:
             # Post-normalization (Original Transformer)
             # Self-attention sub-layer
@@ -567,10 +496,6 @@ class ImprovedTransformerDecoderBlock(nn.Module):
 
         context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
-        # BATCH 281 LOGGING - Entry point
-        if hasattr(self, '_batch_281_log') and self._batch_281_log:
-            logger.info(f"{context_prefix}  [DecoderBlock] Entry: tgt={tgt.shape}, memory={memory.shape}")
-
         if self.use_prenorm:
             # Pre-normalization
             # Self-attention sub-layer
@@ -580,10 +505,6 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                             key_padding_mask=tgt_key_padding_mask)
             tgt = tgt + self.dropout1(attn_output)
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After self_attn: {tgt.shape}")
-
             # Cross-attention sub-layer
             tgt_norm = self.norm2(tgt)
             # Query is from decoder (tgt_norm), Key/Value from encoder (memory)
@@ -591,35 +512,16 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                    attn_mask=memory_mask, # Usually None
                                                    key_padding_mask=memory_key_padding_mask)
 
-            # BATCH 281 LOGGING - Before residual
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] Cross-attn returned: {cross_attn_output.shape}, applying dropout2...")
-
             dropped_output = self.dropout2(cross_attn_output)
 
-            # BATCH 281 LOGGING - Before addition
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After dropout2, adding to tgt: {tgt.shape} + {dropped_output.shape}")
-
             tgt = tgt + dropped_output
-
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After cross_attn residual: {tgt.shape}, starting FFN...")
 
             # Feed-forward sub-layer
             tgt_norm = self.norm3(tgt)
             ff_output = self._ff_block(tgt_norm)
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] After FFN: {ff_output.shape}")
-
             tgt = tgt + self.dropout3(ff_output)
 
-            # BATCH 281 LOGGING
-            if hasattr(self, '_batch_281_log') and self._batch_281_log:
-                logger.info(f"{context_prefix}  [DecoderBlock] Block complete: {tgt.shape}")
         else:
             # Post-normalization
             # Self-attention sub-layer
