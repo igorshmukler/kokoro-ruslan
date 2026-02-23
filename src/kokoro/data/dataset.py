@@ -58,6 +58,8 @@ class RuslanDataset(Dataset):
 
         # Pre-computed feature caching
         self.use_feature_cache = getattr(config, 'use_feature_cache', True)
+        # Whether to keep an in-memory copy of cached features
+        self.use_memory_cache = getattr(config, 'use_memory_cache', True)
         self.feature_cache_dir = Path(getattr(config, 'feature_cache_dir', self.data_dir / '.feature_cache'))
 
         # XXX - FIXME:
@@ -145,10 +147,13 @@ class RuslanDataset(Dataset):
         if self.use_feature_cache:
             self.feature_cache_dir.mkdir(parents=True, exist_ok=True)
             logger.info(f"Feature caching enabled: {self.feature_cache_dir}")
-            logger.info(
-                f"In-memory feature cache limits: entries={self.feature_cache_max_entries}, "
-                f"size={self.feature_cache_max_mb:.1f} MB"
-            )
+            if self.use_memory_cache:
+                logger.info(
+                    f"In-memory feature cache limits: entries={self.feature_cache_max_entries}, "
+                    f"size={self.feature_cache_max_mb:.1f} MB"
+                )
+            else:
+                logger.info("In-memory feature cache disabled; using on-disk cache only")
             if self.verbose_cache_logging:
                 logger.info(
                     f"Feature cache runtime logging enabled (interval={self.feature_cache_log_interval} requests)"
@@ -473,8 +478,8 @@ class RuslanDataset(Dataset):
         if not self.use_feature_cache:
             return None
 
-        # Check in-memory cache first
-        if audio_file in self.feature_cache:
+        # Check in-memory cache first (if enabled)
+        if self.use_memory_cache and audio_file in self.feature_cache:
             start_ns = time.monotonic_ns()
             cached = self.feature_cache.pop(audio_file)
             self.feature_cache[audio_file] = cached
@@ -486,6 +491,7 @@ class RuslanDataset(Dataset):
             if payload.get('_cache_version') == FEATURE_CACHE_VERSION:
                 self.feature_cache_mem_hits += 1
                 return payload
+            # Stale entry, remove
             self.feature_cache_total_bytes -= cached.get('_cache_mem_bytes', 0)
             self.feature_cache.pop(audio_file, None)
 
@@ -500,8 +506,9 @@ class RuslanDataset(Dataset):
                 self.feature_cache_disk_latency_count += 1
                 if features.get('_cache_version') != FEATURE_CACHE_VERSION:
                     return None
-                # Store in memory cache for faster subsequent access
-                self._put_feature_in_memory_cache(audio_file, features)
+                # Store in memory cache for faster subsequent access (if enabled)
+                if self.use_memory_cache:
+                    self._put_feature_in_memory_cache(audio_file, features)
                 self.feature_cache_disk_hits += 1
                 return features
             except Exception as e:
@@ -518,8 +525,9 @@ class RuslanDataset(Dataset):
         cache_path = self._get_feature_cache_path(audio_file)
         try:
             torch.save(features, cache_path)
-            # Also store in memory cache
-            self._put_feature_in_memory_cache(audio_file, features)
+            # Also store in memory cache (only if enabled)
+            if self.use_memory_cache:
+                self._put_feature_in_memory_cache(audio_file, features)
         except Exception as e:
             logger.warning(f"Failed to save cached features for {audio_file}: {e}")
 

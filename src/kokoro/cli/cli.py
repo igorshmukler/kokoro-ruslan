@@ -203,6 +203,14 @@ Examples:
         help='Enable verbose training diagnostics (including high-risk batch stabilization logs)'
     )
 
+    parser.add_argument(
+        '--no-memory-cache',
+        action='store_false',
+        dest='use_memory_cache',
+        help='Disable in-memory feature caching to reduce host memory usage'
+    )
+
+
     return parser.parse_args()
 
 
@@ -266,4 +274,5 @@ def create_config_from_args(args) -> TrainingConfig:
         use_fused_adamw=(False if args.no_fused_adamw else True if args.fused_adamw else None),
         try_fused_adamw_on_mps=args.try_fused_adamw_mps,
         verbose=args.verbose,
+        use_memory_cache=getattr(args, 'use_memory_cache', True),
     )

@@ -122,6 +122,7 @@ python -m kokoro.cli.training --corpus ./ruslan_corpus
 | `--no-fused-adamw` |  | `False` | Force-disable fused AdamW optimizer |
 | `--try-fused-adamw-mps` |  | `True` | Try fused AdamW on MPS (experimental, enabled by default, auto-fallback if unsupported) |
 | `--verbose` | `-v` | `False` | Enable verbose stabilization diagnostics |
+| `--no-memory-cache` |  | `False` | Disable in-memory feature caching (use on-disk cache only) |
 
 Optimizer flag behavior:
 - If neither `--fused-adamw` nor `--no-fused-adamw` is passed, optimizer selection is automatic.
@@ -136,6 +137,7 @@ From `TrainingConfig` in `src/kokoro/training/config.py`:
 - Linear warmup enabled, `warmup_steps=1200`.
 - Gradient accumulation default: `2`.
 - Dynamic batching default: on.
+- In-memory feature cache: enabled by default. Use `--no-memory-cache` to disable keeping precomputed features in RAM (reduces host memory usage at cost of slightly higher I/O and cache latency).
 - Stability safeguards: projection/attention pre-clipping + warmup-aware explosion thresholds.
 - MPS-aware auto-limits can reduce oversized values (e.g., frame caps/seq length/batch sizes).
 
