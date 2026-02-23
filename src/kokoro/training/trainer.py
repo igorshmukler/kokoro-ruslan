@@ -2217,8 +2217,6 @@ class KokoroTrainer:
                     'mel': loss_mel.detach(),
                     'dur': loss_duration.detach(),
                     'stop': loss_stop_token.detach(),
-                    'pitch': loss_pitch.detach() if loss_pitch is not None else None,
-                    'energy': loss_energy.detach() if loss_energy is not None else None
                 })
 
                 # Sync accumulated losses periodically to reduce overhead
@@ -2230,40 +2228,33 @@ class KokoroTrainer:
                         stop_loss_epoch += acc_loss['stop'].item()
                     accumulated_losses.clear()
 
-                    # Delete tensors and clear MPS cache only when memory pressure is high
-                    # if self.device_type == DeviceType.MPS.value:
-                    #     pressure = cleanup_result.get('pressure_level', 'low')
-                    #     if pressure in ['high', 'critical']:
-                    #         # Explicitly delete large tensors
-                    #         del predicted_mel, predicted_log_durations, predicted_stop_logits
-                    #         if 'predicted_pitch' in locals():
-                    #             del predicted_pitch
-                    #         if 'predicted_energy' in locals():
-                    #             del predicted_energy
-                    #         # Clear cache
-                    #         torch.mps.empty_cache()
-                    #         import gc
-                    #         gc.collect()
-
-                    # Explicitly delete large tensors
-                    del predicted_mel, predicted_log_durations, predicted_stop_logits
-                    if 'predicted_pitch' in locals():
-                        del predicted_pitch
-                    if 'predicted_energy' in locals():
-                        del predicted_energy
-                    # Clear cache
-                    torch.mps.empty_cache()
-                    import gc
-                    gc.collect()
-
-
-                # Get current loss values for progress bar (still need .item() for display)
+                # Capture progress bar values BEFORE deleting tensors
                 current_total_loss = total_loss.item()
                 current_mel_loss = loss_mel.item()
                 current_dur_loss = loss_duration.item()
                 current_stop_loss = loss_stop_token.item()
                 pitch_loss_value = loss_pitch.item() if loss_pitch is not None else 0.0
                 energy_loss_value = loss_energy.item() if loss_energy is not None else 0.0
+                has_pitch_loss = loss_pitch is not None and loss_pitch.item() > 0
+                has_energy_loss = loss_energy is not None and loss_energy.item() > 0
+
+
+                # Free output tensors every batch — large, not needed after loss/backward
+                del predicted_mel, predicted_log_durations, predicted_stop_logits
+                if predicted_pitch is not None:
+                    del predicted_pitch
+                    predicted_pitch = None
+                if predicted_energy is not None:
+                    del predicted_energy
+                    predicted_energy = None
+
+                # MPS cache clear: every 3 batches normally, every batch under pressure
+                if self.device_type == DeviceType.MPS.value:
+                    pressure = cleanup_result.get('pressure_level', 'low')
+                    if pressure in ['high', 'critical'] or batch_idx % 3 == 0:
+                        torch.mps.empty_cache()
+                    if pressure in ['high', 'critical'] or batch_idx % 10 == 0:
+                        gc.collect()
 
                 # Enhanced progress bar with mixed precision info and memory pressure
                 postfix_dict = {
@@ -2275,9 +2266,9 @@ class KokoroTrainer:
                 }
 
                 # Add variance losses if they exist
-                if loss_pitch is not None and loss_pitch.item() > 0:
+                if has_pitch_loss:
                     postfix_dict['pitch_loss'] = pitch_loss_value
-                if loss_energy is not None and loss_energy.item() > 0:
+                if has_energy_loss:
                     postfix_dict['energy_loss'] = energy_loss_value
 
                 if self.use_mixed_precision:
