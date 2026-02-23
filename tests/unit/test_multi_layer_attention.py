@@ -79,7 +79,7 @@ def test_decoder_block():
 
     try:
         print(f"Forward...")
-        output = decoder_block(tgt, memory, tgt_mask=tgt_mask)
+        output, _ = decoder_block(tgt, memory, tgt_mask=tgt_mask)
         print(f"  ✅ Forward: {output.shape}")
 
         print(f"Backward...")
@@ -123,7 +123,7 @@ def test_multiple_decoder_blocks():
         print(f"Forward through {num_layers} layers...")
         x = tgt
         for i, block in enumerate(decoder_blocks):
-            x = block(x, memory, tgt_mask=tgt_mask)
+            x, _ = block(x, memory, tgt_mask=tgt_mask)
             print(f"  Layer {i+1}: {x.shape}")
 
         print(f"\nBackward through {num_layers} layers...")
