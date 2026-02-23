@@ -230,9 +230,9 @@ class MultiHeadAttentionImproved(nn.Module):
                 start_idx = chunk_idx * chunk_size
                 end_idx = min((chunk_idx + 1) * chunk_size, seq_len_q)
 
-                Q_chunk = Q[:, :, start_idx:end_idx, :]
+                Q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
 
-                scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale
+                scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
                 if attn_bias is not None:
                     if attn_bias.shape[2] == seq_len_q:
                         scores_chunk = scores_chunk + attn_bias[:, :, start_idx:end_idx, :]
