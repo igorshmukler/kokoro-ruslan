@@ -76,41 +76,6 @@ class MultiHeadAttentionImproved(nn.Module):
         # Better initialization for linear layers
         self._init_weights()
 
-    @staticmethod
-    def _tensor_layout_metrics(tensor: torch.Tensor) -> str:
-        shape = tuple(tensor.shape)
-        stride = tensor.stride()
-        numel = tensor.numel()
-        elem_size = tensor.element_size()
-        est_bytes = numel * elem_size
-        max_offset = 0
-        for size, step in zip(shape, stride):
-            if size > 0:
-                max_offset += (size - 1) * abs(step)
-        return (
-            f"shape={shape} stride={stride} contiguous={tensor.is_contiguous()} "
-            f"numel={numel:,} elem_size={elem_size} est_bytes={est_bytes:,} "
-            f"max_linear_offset={max_offset:,} dtype={tensor.dtype} device={tensor.device}"
-        )
-
-    def _log_phase(self, context_prefix: str, phase: str, tensor: Optional[torch.Tensor] = None):
-        if tensor is None:
-            logger.info(f"{context_prefix}  [AttentionPhase] {phase}")
-            return
-        logger.info(f"{context_prefix}  [AttentionPhase] {phase}: {self._tensor_layout_metrics(tensor)}")
-
-    def _register_debug_grad_hook(self, tensor: torch.Tensor, hook_name: str, context_prefix: str):
-        if not tensor.requires_grad:
-            return
-
-        def _hook(grad: Optional[torch.Tensor]):
-            if grad is None:
-                logger.info(f"{context_prefix}  [AttentionBW] {hook_name}: grad=None")
-                return
-            logger.info(f"{context_prefix}  [AttentionBW] {hook_name}: {self._tensor_layout_metrics(grad)}")
-
-        tensor.register_hook(_hook)
-
     def _init_weights(self):
         # Glorot (Xavier) uniform for weight matrices
         nn.init.xavier_uniform_(self.w_q.weight)
@@ -249,10 +214,11 @@ class MultiHeadAttentionImproved(nn.Module):
 
                 # Clear intermediate tensors and free MPS cache after each chunk
                 del scores_chunk, attn_weights_chunk, context_chunk
-                if chunk_idx % 4 == 0:  # Periodic cache clearing
-                    torch.mps.empty_cache()
+
+            torch.mps.empty_cache()
 
             context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
+            del context_chunks
 
             attn_weights = None  # Don't compute weights during chunked attention to save memory
 
@@ -493,8 +459,6 @@ class ImprovedTransformerDecoderBlock(nn.Module):
             tgt_key_padding_mask = tgt_key_padding_mask.to(torch.bool)
         if memory_key_padding_mask is not None:
             memory_key_padding_mask = memory_key_padding_mask.to(torch.bool)
-
-        context_prefix = f"{getattr(self, '_crash_context', '')} " if hasattr(self, '_crash_context') else ""
 
         if self.use_prenorm:
             # Pre-normalization
