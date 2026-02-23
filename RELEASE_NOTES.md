@@ -2,6 +2,9 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.16 (2026-02-22)
+- Minor GPU memory optimizations
+
 ## 0.0.15 (2026-02-22)
 - Implemented adaptive bucketed batching
 
