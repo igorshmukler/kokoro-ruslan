@@ -97,6 +97,8 @@ class TrainingConfig:
     use_feature_cache: bool = True  # Cache mel spectrograms, pitch, energy to disk
     feature_cache_dir: str = ""  # Will be set to {data_dir}/.feature_cache if empty
     precompute_features: bool = False  # Precompute all features before training starts
+    # In-memory feature cache (separate from on-disk feature cache)
+    use_memory_cache: bool = True  # Keep features in RAM for faster access; disable to reduce GPU/host memory
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching

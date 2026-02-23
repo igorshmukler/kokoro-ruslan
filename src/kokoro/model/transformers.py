@@ -216,45 +216,40 @@ class MultiHeadAttentionImproved(nn.Module):
                 chunk_size = 128  # Standard aggressive chunking
 
             num_chunks = (seq_len_q + chunk_size - 1) // chunk_size
-            context_chunks = []
 
-            # Process chunks without accumulating attention weights to save memory
+            # Pre-allocate output buffer — avoids accumulating all chunk tensors
+            # simultaneously before cat. For 1800 frames at chunk_size=16:
+            # old: 113 chunks × (B, H, 16, D_k) all live at once before cat (~56MB)
+            # new: one (B, H, S_q, D_k) buffer written in-place, peak = 1 chunk at a time
+            context = torch.zeros(
+                batch_size, self.num_heads, seq_len_q, self.d_k,
+                device=query.device, dtype=Q.dtype
+            )
+
             for chunk_idx in range(num_chunks):
                 start_idx = chunk_idx * chunk_size
                 end_idx = min((chunk_idx + 1) * chunk_size, seq_len_q)
 
-                Q_chunk = Q[:, :, start_idx:end_idx, :]  # (B, H, chunk, D_k)
+                Q_chunk = Q[:, :, start_idx:end_idx, :]
 
-                # Compute attention for this chunk
-                scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
+                scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale
                 if attn_bias is not None:
-                    # Only slice bias along query dim if it's actually expanded to full seq_len
-                    # Padding masks have shape [B, 1, 1, S_k] and should broadcast as-is
                     if attn_bias.shape[2] == seq_len_q:
-                        # Full bias tensor - slice it
-                        bias_chunk = attn_bias[:, :, start_idx:end_idx, :]  # (B, H, chunk, S_k)
-                        scores_chunk = scores_chunk + bias_chunk
+                        scores_chunk = scores_chunk + attn_bias[:, :, start_idx:end_idx, :]
                     elif attn_bias.shape[2] == 1:
-                        # Broadcast bias (e.g., padding mask) - use as-is
                         scores_chunk = scores_chunk + attn_bias
                     else:
-                        # Unexpected shape - log and skip
                         logger.error(f"Unexpected attn_bias shape: {attn_bias.shape}, expected dim 2 to be 1 or {seq_len_q}")
 
                 attn_weights_chunk = F.softmax(scores_chunk, dim=-1)
                 attn_weights_chunk = self.dropout_attn(attn_weights_chunk)
-                context_chunk = torch.matmul(attn_weights_chunk, V)  # (B, H, chunk, D_k)
 
-                context_chunks.append(context_chunk)
+                # Write directly into pre-allocated buffer — no list, no cat
+                context[:, :, start_idx:end_idx, :] = torch.matmul(attn_weights_chunk, V)
 
-                # Clear intermediate tensors and free MPS cache after each chunk
-                del scores_chunk, attn_weights_chunk, context_chunk
+                del scores_chunk, attn_weights_chunk
 
             torch.mps.empty_cache()
-
-            context = torch.cat(context_chunks, dim=2)  # (B, H, S_q, D_k)
-            del context_chunks
-
             attn_weights = None  # Don't compute weights during chunked attention to save memory
 
         elif query.device.type == 'mps':
