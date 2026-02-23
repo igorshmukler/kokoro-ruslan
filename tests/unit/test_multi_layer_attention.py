@@ -165,7 +165,7 @@ def test_with_gradient_checkpointing():
 
     def run_segment(start_idx, end_idx, x):
         for i in range(start_idx, end_idx):
-            x = decoder_blocks[i](x, memory, tgt_mask=tgt_mask)
+            x, _ = decoder_blocks[i](x, memory, tgt_mask=tgt_mask)
         return x
 
     try:
