@@ -234,9 +234,13 @@ class MultiHeadAttentionImproved(nn.Module):
 
                 scores_chunk = torch.matmul(Q_chunk, K.transpose(-2, -1)) / self.scale  # (B, H, chunk, S_k)
                 if attn_bias is not None:
+                    # Only slice bias along query dim if it's actually expanded to full seq_len
+                    # Padding masks have shape [B, 1, 1, S_k] and should broadcast as-is
                     if attn_bias.shape[2] == seq_len_q:
+                        # Full bias tensor - slice it
                         scores_chunk = scores_chunk + attn_bias[:, :, start_idx:end_idx, :]
                     elif attn_bias.shape[2] == 1:
+                        # Broadcast bias (e.g., padding mask) - use as-is
                         scores_chunk = scores_chunk + attn_bias
                     else:
                         logger.error(f"Unexpected attn_bias shape: {attn_bias.shape}, expected dim 2 to be 1 or {seq_len_q}")
@@ -247,6 +251,7 @@ class MultiHeadAttentionImproved(nn.Module):
                 # Write directly into pre-allocated buffer — no list, no cat
                 context[:, :, start_idx:end_idx, :] = torch.matmul(attn_weights_chunk, V)
 
+                # Clear intermediate tensors and free MPS cache after each chunk
                 del scores_chunk, attn_weights_chunk
 
             torch.mps.empty_cache()
