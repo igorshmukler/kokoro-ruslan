@@ -387,7 +387,7 @@ class KokoroTTS:
                 if not phoneme_sequence:
                     continue
 
-                logger.info(f"Chunk {i+1}: Phoneme sequence: {''.join(phoneme_sequence)}")
+                logger.info(f"Chunk {i+1}: Phoneme sequence: {' '.join(phoneme_sequence)}")
 
                 # Step 2: To Indices & Tensor
                 phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(

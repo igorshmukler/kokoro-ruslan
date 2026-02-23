@@ -66,7 +66,7 @@ def test_decoder_block_precompute_and_forward():
     tgt = torch.randn(B, T, d_model)
 
     # Run forward in eval/tracing-friendly path (no checkpointing)
-    out = block(tgt, memory, tgt_mask=None, memory_mask=None)
+    out, _ = block(tgt, memory, tgt_mask=None, memory_mask=None)
     assert out.shape == (B, T, d_model)
 
     # Clear cache
@@ -88,5 +88,5 @@ def test_improved_decoder_forward_eval():
     memory = torch.randn(B, M, d_model)
     tgt = torch.randn(B, T, d_model)
 
-    out = dec(tgt, memory)
+    out, _ = dec(tgt, memory)
     assert out.shape == (B, T, d_model)
