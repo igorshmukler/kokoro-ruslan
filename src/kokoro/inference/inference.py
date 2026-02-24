@@ -52,9 +52,6 @@ class KokoroTTS:
         self.f_min = 0.0
         self.f_max = 8000.0
 
-        self.mel_mean = -5.5
-        self.mel_std = 2.0
-
         # Inference generation controls (auto-tuned from checkpoint unless explicitly provided)
         self.inference_max_len = inference_max_len
         self.inference_stop_threshold = inference_stop_threshold
