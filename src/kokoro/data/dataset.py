@@ -633,6 +633,15 @@ class RuslanDataset(Dataset):
                     padding = torch.full((missing,), avg_dur, dtype=torch.long)
                     phoneme_durations = torch.cat([phoneme_durations, padding])
 
+            # Handle Frame Sum Mismatch (The "Gap")
+            current_sum = phoneme_durations.sum().item()
+            diff = num_mel_frames - current_sum
+
+            if diff != 0 and len(phoneme_durations) > 0:
+                # Add the drift (positive or negative) to the last phoneme
+                # This ensures Sum(durations) == mel_spec.shape[1]
+                phoneme_durations[-1] = max(1, phoneme_durations[-1] + diff)
+
             # Ensure durations are at least 1 frame
             phoneme_durations = torch.clamp(phoneme_durations, min=1)
 

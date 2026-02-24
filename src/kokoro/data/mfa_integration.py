@@ -406,26 +406,17 @@ class MFAIntegration:
             logger.error(f"Error parsing TextGrid {textgrid_path}: {e}")
             return []
 
-    def get_phoneme_durations(self, audio_file_stem: str) -> Optional[List[int]]:
+    def get_phoneme_durations(self, audio_file_stem: str, actual_mel_len: Optional[int] = None) -> Optional[List[int]]:
         """
-        Get phoneme durations in frames for a specific audio file
+        Get phoneme durations and FORCE alignment with Mel length.
 
         Args:
-            audio_file_stem: Base name of audio file (without extension)
-
-        Returns:
-            List of durations in mel spectrogram frames, or None if not found
+            audio_file_stem: Base name of audio file
+            actual_mel_len: The actual number of frames in the Mel spectrogram
         """
-        # Check cache first
-        cache_file = self.cache_dir / f"{audio_file_stem}.pkl"
-        if cache_file.exists():
-            with open(cache_file, 'rb') as f:
-                return pickle.load(f)
-
         # Look for TextGrid file
         textgrid_path = self.alignment_dir / f"{audio_file_stem}.TextGrid"
         if not textgrid_path.exists():
-            logger.warning(f"TextGrid not found: {textgrid_path}")
             return None
 
         # Parse TextGrid
@@ -439,9 +430,18 @@ class MFAIntegration:
             for phoneme_align in word_align.phonemes:
                 durations.append(phoneme_align.duration_frames)
 
-        # Cache the result
-        with open(cache_file, 'wb') as f:
-            pickle.dump(durations, f)
+        # FIX: Align Sum(Durations) to Actual Mel Length
+        if actual_mel_len is not None:
+            current_sum = sum(durations)
+            diff = actual_mel_len - current_sum
+
+            if diff > 0:
+                # Add trailing silence/drift to the last phoneme
+                logger.debug(f"Padding {audio_file_stem}: Adding {diff} frames to last phoneme.")
+                durations[-1] += diff
+            elif diff < 0:
+                # This rarely happens, but if durations > mel, we trim the last one
+                durations[-1] = max(1, durations[-1] + diff)
 
         return durations
 

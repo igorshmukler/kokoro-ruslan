@@ -8,6 +8,8 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+import torchaudio
+import torch
 
 from kokoro.data.mfa_integration import setup_mfa_for_corpus
 
@@ -18,6 +20,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def trim_silence(wav_path: Path, threshold_db: int = -40):
+    waveform, sample_rate = torchaudio.load(wav_path)
+
+    # Use torchaudio's vad (Voice Activity Detection) or a simple trim
+    # This removes silence that MFA ignores but the Spectrogram keeps
+    transform = torchaudio.transforms.Vad(sample_rate=sample_rate)
+    trimmed_waveform = transform(waveform)
+
+    # Overwrite the file or save to a 'cleaned' directory
+    torchaudio.save(wav_path, trimmed_waveform, sample_rate)
 
 def parse_args():
     """Parse command line arguments"""
@@ -156,6 +169,15 @@ def main():
 
         mfa = MFAIntegration(str(corpus_dir), str(output_dir))
         stats = mfa.validate_alignments(str(corpus_dir / args.metadata))
+
+        # Sample check for duration drift
+        sample_pt = list(Path(corpus_dir / ".feature_cache").glob("*.pt"))[0]
+        data = torch.load(sample_pt)
+        gap = data['mel_length'] - data['phoneme_durations'].sum()
+
+        if gap > 5: # If more than 5 frames are missing
+            logger.warning(f"⚠ Alignment drift detected! Last file has {gap} unaligned frames.")
+            logger.warning("This will cause the model to loop during inference.")
 
         logger.info("\n" + "="*70)
         logger.info("Validation Results:")
