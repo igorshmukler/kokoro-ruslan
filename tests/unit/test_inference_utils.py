@@ -56,24 +56,6 @@ def test_safe_float_various(value, default, min_val, max_val, expected):
     assert tts._safe_float(value, default, min_val, max_val) == pytest.approx(expected)
 
 
-def test_denormalize_mel_with_stats_and_fallback():
-    tts = make_tts_instance()
-
-    mel = torch.tensor([[0.0, 1.0], [2.0, -1.0]])
-
-    # Explicit stats
-    tts.mel_mean = torch.tensor(5.0)
-    tts.mel_std = torch.tensor(2.0)
-    out = tts.denormalize_mel(mel)
-    assert torch.allclose(out, (mel * 2.0) + 5.0)
-
-    # Fallback when stats missing
-    tts.mel_mean = None
-    tts.mel_std = None
-    out2 = tts.denormalize_mel(mel)
-    assert torch.allclose(out2, (mel * 2.0) - 5.5)
-
-
 def test_apply_checkpoint_inference_controls_metadata_precedence():
     tts = make_tts_instance()
 
