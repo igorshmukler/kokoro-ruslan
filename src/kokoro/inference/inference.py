@@ -52,6 +52,9 @@ class KokoroTTS:
         self.f_min = 0.0
         self.f_max = 8000.0
 
+        self.mel_mean = -5.5
+        self.mel_std = 2.0
+
         # Inference generation controls (auto-tuned from checkpoint unless explicitly provided)
         self.inference_max_len = inference_max_len
         self.inference_stop_threshold = inference_stop_threshold
@@ -333,19 +336,6 @@ class KokoroTTS:
 
         return chunks
 
-    def denormalize_mel(self, mel: torch.Tensor) -> torch.Tensor:
-        """
-        Converts normalized Mel back to the logarithmic scale.
-        Formula: x_raw = (x_norm * std) + mean
-        """
-        if self.mel_mean is not None and self.mel_std is not None:
-            # Consider the dimensions (B, T, C) or (T, C)
-            return (mel * self.mel_std) + self.mel_mean
-
-        # Fallback: If stats are missing, assume standard Norm->Log scaling
-        # This is a common heuristic for models that produce noise like yours
-        logger.warning("Using fallback denormalization (-5.5 mean, 2.0 std)")
-        return (mel * 2.0) - 5.5
 
     def text_to_speech(
         self,
@@ -356,44 +346,29 @@ class KokoroTTS:
         min_len_ratio: Optional[float] = None,
         min_len_floor: Optional[int] = None,
     ) -> torch.Tensor:
-        """
-        text_to_speech with chunking and error handling.
-        """
         if not text:
-            logger.warning("Received empty text for conversion.")
             return torch.empty(0)
 
-        # Split into manageable chunks to prevent attention drift and OOM
         chunks = self.split_text(text)
         all_audio_segments = []
 
-        # Determine inference parameters once
         eff_stop_threshold = self.inference_stop_threshold if stop_threshold is None else stop_threshold
         eff_max_len = self.inference_max_len if max_len is None else max_len
         eff_min_len_ratio = self.inference_min_len_ratio if min_len_ratio is None else min_len_ratio
         eff_min_len_floor = self.inference_min_len_floor if min_len_floor is None else min_len_floor
 
-        logger.info(f"Converting text in {len(chunks)} chunk(s)")
-
         try:
             for i, chunk in enumerate(chunks):
-                if len(chunks) > 1:
-                    logger.info(f"Processing chunk {i+1}/{len(chunks)}: '{chunk[:40]}...'")
-
-                # Step 1: Phoneme processing
+                # Step 1 & 2: Phoneme Processing
                 raw_processor_output = self.phoneme_processor.process_text(chunk)
                 phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
-
-                if not phoneme_sequence:
-                    continue
-
-                logger.info(f"Chunk {i+1}: Phoneme sequence: {' '.join(phoneme_sequence)}")
-
-                # Step 2: To Indices & Tensor
                 phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
                     phoneme_sequence, self.phoneme_processor.phoneme_to_id
                 )
                 phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
+
+                logger.info(f"--- Processing Chunk {i} ---")
+                logger.info(f"Phoneme sequence length: {len(phoneme_indices)}")
 
                 # Step 3: Generate Mel
                 with torch.no_grad():
@@ -403,46 +378,65 @@ class KokoroTTS:
                         stop_threshold=eff_stop_threshold,
                         min_len_ratio=eff_min_len_ratio,
                         min_len_floor=eff_min_len_floor,
-                        text_padding_mask=None
                     )
 
-                if mel_spec.numel() == 0:
-                    logger.error(f"Chunk {i+1} generated empty mel. Skipping.")
-                    continue
+                # ========================================================
+                # ENHANCED LOGGING & HEALTH CHECK
+                # ========================================================
+                if torch.isnan(mel_spec).any():
+                    logger.error("CRITICAL: Mel-spectrogram contains NaNs!")
 
-                # Denormalize mel spectrogram before vocoding
+                m_min, m_max = mel_spec.min().item(), mel_spec.max().item()
+                m_mean, m_std = mel_spec.mean().item(), mel_spec.std().item()
+
+                logger.info(f"Raw Mel Shape: {mel_spec.shape}")
+                logger.info(f"Value Distribution -> Min: {m_min:.4f}, Max: {m_max:.4f}, Mean: {m_mean:.4f}, Std: {m_std:.4f}")
+
+                # Check for "Dead Model" Syndrome (all values identical or extremely close)
+                if m_std < 1e-5:
+                    logger.warning("WARNING: Mel-spectrogram has near-zero variance. Model output is flat.")
+
+                # 1. Denormalization (SKIPPED based on your Dataset code)
+                # If your dataset uses mel = torch.log(linear + 1e-9), DO NOT denormalize here.
                 # mel_spec = self.denormalize_mel(mel_spec)
 
-                # 2. Add a safety clip to prevent vocoder "explosions"
-                mel_spec = torch.clamp(mel_spec, min=-12.0, max=2.5)
+                # 2. Safety Clip
+                # Based on torch.log(1e-9), the floor is -20.7, but typical speech is -11.5 to 0.
+                mel_spec = torch.clamp(mel_spec, min=-11.5, max=1.0)
+
+                # 3. Transposition Fix
+                if mel_spec.shape[-1] == self.n_mels:
+                    logger.info("Transposing dimensions: [Batch, Time, 80] -> [Batch, 80, Time]")
+                    mel_spec = mel_spec.transpose(1, 2)
+
+                # 4. Squeeze for Vocoder
+                mel_spec_final = mel_spec.squeeze(0).cpu()
+                logger.info(f"Vocoder Input Shape: {mel_spec_final.shape}")
+                # ========================================================
 
                 # Step 4: Vocoding
-                mel_spec = mel_spec.squeeze(0).cpu()
+                chunk_audio = self.vocoder_manager.mel_to_audio(mel_spec_final)
 
-                logger.debug(f"Vocoder Input - Min: {mel_spec.min():.2f}, Max: {mel_spec.max():.2f}, Mean: {mel_spec.mean():.2f}")
+                # Check audio stats
+                a_max = chunk_audio.abs().max().item()
+                logger.info(f"Generated Audio Peak Amplitude: {a_max:.4f}")
+                if a_max < 1e-4:
+                    logger.warning("WARNING: Generated audio is nearly silent.")
 
-                chunk_audio = self.vocoder_manager.mel_to_audio(mel_spec)
                 all_audio_segments.append(chunk_audio)
 
-                # Optional: Add 150ms of silence between chunks for natural phrasing
+                # Add small silence gap (0.15s)
                 silence = torch.zeros(int(self.sample_rate * 0.15))
                 all_audio_segments.append(silence)
 
-            if not all_audio_segments:
-                raise RuntimeError("No audio was generated for any of the text chunks.")
-
-            # Concatenate all segments into one final audio tensor
             final_audio = torch.cat(all_audio_segments, dim=0)
-
-            # Step 5: Save
             if output_path:
                 self.audio_utils.save_audio(final_audio, output_path)
-                logger.info(f"Full audio saved to: {output_path}")
-
+                logger.info(f"Successfully saved to {output_path}")
             return final_audio
 
         except Exception as e:
-            logger.error(f"Error in chunked text_to_speech: {e}")
+            logger.error(f"Inference failed: {e}")
             raise
 
     def batch_text_to_speech(self, texts: List[str], output_dir: str):
@@ -610,7 +604,7 @@ def main():
 
                 # Generate a unique output filename for interactive mode
                 output_path_interactive = f"interactive_output_{abs(hash(text_input)) % 10000}.wav"
-                tts.text_to_speech(text_input, output_path_interactive)
+                tts.text_to_speech(text_input, output_path_interactive, stop_threshold=args.stop_threshold)
                 print(f"Audio saved to: {output_path_interactive}")
 
             except KeyboardInterrupt:
