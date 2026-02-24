@@ -36,6 +36,7 @@ class KokoroTTS:
         inference_stop_threshold: Optional[float] = None,
         inference_min_len_ratio: Optional[float] = None,
         inference_min_len_floor: Optional[int] = None,
+        weights: str = 'auto',
     ):
         self.model_dir = Path(model_dir)
 
@@ -66,6 +67,11 @@ class KokoroTTS:
 
         # Initialize utility classes
         self.audio_utils = AudioUtils(self.sample_rate)
+
+        # Weights preference for inference: 'auto'|'ema'|'model'
+        if weights not in ('auto', 'ema', 'model'):
+            raise ValueError("weights must be one of: 'auto', 'ema', 'model'")
+        self.weights_preference = weights
 
         # Load phoneme processor
         self.phoneme_processor = self._load_phoneme_processor()
@@ -141,6 +147,34 @@ class KokoroTTS:
 
         if state_dict_to_load is None:
             raise RuntimeError("Checkpoint does not contain a recognized model state dictionary (expected 'model_state_dict' or 'model' key, or raw state dict).")
+
+        # Decide which weights to load based on preference
+        if isinstance(checkpoint, dict):
+            pref = getattr(self, 'weights_preference', 'auto')
+            if pref == 'ema':
+                if 'ema_model_state_dict' in checkpoint:
+                    state_dict_to_load = checkpoint['ema_model_state_dict']
+                    logger.info("Using EMA weights from checkpoint for inference (requested 'ema').")
+                else:
+                    raise RuntimeError("EMA weights requested but 'ema_model_state_dict' not found in checkpoint.")
+            elif pref == 'model':
+                # Prefer explicit model key if present
+                if 'model_state_dict' in checkpoint:
+                    state_dict_to_load = checkpoint['model_state_dict']
+                    logger.info("Using model_state_dict from checkpoint for inference (requested 'model').")
+                elif 'model' in checkpoint:
+                    state_dict_to_load = checkpoint['model']
+                    logger.info("Using 'model' entry from checkpoint for inference (requested 'model').")
+                else:
+                    # Leave state_dict_to_load as discovered earlier (maybe raw state_dict)
+                    logger.info("Requested 'model' weights but explicit keys not found; using available state dict.")
+            else:  # auto
+                if 'ema_model_state_dict' in checkpoint:
+                    state_dict_to_load = checkpoint['ema_model_state_dict']
+                    logger.info("EMA weights found in checkpoint — using EMA weights for inference (auto).")
+                else:
+                    # keep state_dict_to_load as discovered earlier
+                    logger.info("No EMA weights in checkpoint — using standard model weights (auto).")
 
         # Prefer explicit architecture metadata saved with checkpoints
         metadata = checkpoint.get('model_metadata') if isinstance(checkpoint, dict) else None
@@ -563,6 +597,13 @@ Examples:
         help='Minimum generated frames floor before allowing stop-token termination (default: auto from checkpoint).'
     )
 
+    parser.add_argument(
+        '--weights',
+        choices=['auto', 'ema', 'model'],
+        default='auto',
+        help="Which weights to use for inference: 'auto' prefers EMA if present, 'ema' requires EMA, 'model' uses the trained model weights."
+    )
+
     return parser.parse_args()
 
 def main():
@@ -579,6 +620,7 @@ def main():
             inference_stop_threshold=args.stop_threshold,
             inference_min_len_ratio=args.min_len_ratio,
             inference_min_len_floor=args.min_len_floor,
+            weights=args.weights,
         )
     except Exception as e:
         logger.critical(f"Fatal error during TTS system initialization: {e}")
