@@ -4,6 +4,7 @@ Command line interface for Kokoro training
 """
 
 import argparse
+from html import parser
 import torch
 from kokoro.training.config import TrainingConfig
 
@@ -208,6 +209,13 @@ Examples:
         action='store_false',
         dest='use_memory_cache',
         help='Disable in-memory feature caching to reduce host memory usage'
+    )
+
+    parser.add_argument(
+        '--stop-threshold',
+        type=float,
+        default=0.1,  # Lowered from 0.45 to be more sensitive
+        help='Threshold for the stop token (lower is more sensitive)'
     )
 
 
