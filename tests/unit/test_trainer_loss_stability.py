@@ -31,7 +31,8 @@ def test_calculate_losses_ignores_nonfinite_values_in_padded_frames():
     predicted_mel[0, 3, 1] = float("nan")
 
     phoneme_durations = torch.tensor([[1, 1, 0]], dtype=torch.long)
-    predicted_log_durations = torch.log(phoneme_durations.float() + 1e-5)
+    # Match trainer's target computation (uses +1.0) so duration loss is zero
+    predicted_log_durations = torch.log(phoneme_durations.float() + 1.0)
 
     stop_token_targets = torch.zeros(1, 4)
     predicted_stop_logits = torch.zeros(1, 4)
