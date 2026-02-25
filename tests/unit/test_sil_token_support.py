@@ -35,3 +35,28 @@ def test_flatten_without_sil_in_vocab_falls_back():
 
     idx = PhonemeProcessorUtils.phonemes_to_indices(seq, phoneme_to_id)
     assert idx == [10, 11, 12, 13]
+
+
+def test_flatten_handles_unexpected_item_types():
+    # Include a non-tuple item (string) to exercise the fallback branch
+    raw_output = [
+        ("ok", ["a"], None),
+        "oops",
+    ]
+
+    phoneme_to_id = {"a": 1, "<sil>": 2}
+
+    seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(raw_output, phoneme_to_id)
+    # The string item should be included via the plain flatten fallback and
+    # not cause a crash; no <sil> is injected before non-tuple items.
+    assert seq == ["a", "oops"]
+
+
+def test_phonemes_to_indices_missing_unk_fallback():
+    # If neither '<unk>' nor '<sil>' exist in the vocab, mapping falls back to 0
+    seq = ["known", "UNKNOWN", "also_known"]
+    phoneme_to_id = {"known": 7, "also_known": 8}
+
+    idx = PhonemeProcessorUtils.phonemes_to_indices(seq, phoneme_to_id)
+    # 'UNKNOWN' should map to the default 0
+    assert idx == [7, 0, 8]
