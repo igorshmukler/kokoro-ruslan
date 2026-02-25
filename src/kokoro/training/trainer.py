@@ -20,11 +20,12 @@ from pathlib import Path
 
 from typing import Tuple, Dict, Any, Optional
 from dataclasses import dataclass
-from enum import Enum
+
+from torch.utils.tensorboard import SummaryWriter
 
 from kokoro.training.config import TrainingConfig
 from kokoro.utils.device_type import DeviceType
-from kokoro.data.dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler
+from kokoro.data.dataset import RuslanDataset, collate_fn, LengthBasedBatchSampler, DynamicFrameBatchSampler
 from kokoro.model.model import KokoroModel
 from kokoro.training.checkpoint_manager import (
     save_phoneme_processor, load_checkpoint, find_latest_checkpoint,
@@ -40,19 +41,6 @@ import math
 
 logger = logging.getLogger(__name__)
 
-
-# def recommended_ema_decay(n_train: int, batch_size: int, k: float = 1.0) -> float:
-#     """
-#     Calculate recommended EMA decay based on dataset size.
-
-#     Alpha is chosen so the EMA half-life equals k epochs,
-#     meaning weights from k epochs ago contribute k% to the current EMA.
-#     Formula: alpha = k ** (batch_size / (k * n_train))
-#     """
-#     # Guard against division by zero
-#     if n_train <= 0 or batch_size <= 0:
-#         return 0.9999
-#     return k ** (batch_size / (k * n_train))
 
 def recommended_ema_decay(n_train: int, batch_size: int, k: float) -> float:
     """
@@ -109,6 +97,14 @@ class KokoroTrainer:
     def __init__(self, config: TrainingConfig):
         self.config = config
         self.device = torch.device(config.device)
+
+        # Create the log directory
+        log_dir = os.path.join(config.output_dir, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+
+        # Initialize the writer
+        self.writer = SummaryWriter(log_dir=log_dir)
+        logger.info(f"Tensorboard log directory created at: {log_dir}")
 
         # Attempt to load checkpoint metadata (weights_only) early so any
         # restored global variance statistics are available before the
@@ -252,8 +248,6 @@ class KokoroTrainer:
         use_dynamic = getattr(config, 'use_dynamic_batching', True)
 
         if use_dynamic:
-            from kokoro.data.dataset import DynamicFrameBatchSampler
-
             logger.info("Using dynamic frame-based batching")
             self.batch_sampler = DynamicFrameBatchSampler(
                 dataset=self.dataset,
@@ -264,8 +258,6 @@ class KokoroTrainer:
                 shuffle=True
             )
         else:
-            from kokoro.data.dataset import LengthBasedBatchSampler
-
             logger.info("Using fixed batch size")
             self.batch_sampler = LengthBasedBatchSampler(
                 dataset=self.dataset,
@@ -292,8 +284,6 @@ class KokoroTrainer:
         if self.val_dataset is not None:
             # Use dynamic batching for validation too
             if use_dynamic:
-                from kokoro.data.dataset import DynamicFrameBatchSampler
-
                 val_batch_sampler = DynamicFrameBatchSampler(
                     dataset=self.val_dataset,
                     max_frames=config.max_frames_per_batch,
@@ -303,8 +293,6 @@ class KokoroTrainer:
                     shuffle=False  # Don't shuffle validation
                 )
             else:
-                from kokoro.data.dataset import LengthBasedBatchSampler
-
                 val_batch_sampler = LengthBasedBatchSampler(
                     dataset=self.val_dataset,
                     batch_size=config.batch_size,
@@ -2111,6 +2099,17 @@ class KokoroTrainer:
                             debug_data['batch_data']['pitches'] = pitches.cpu()
                         if energies is not None:
                             debug_data['batch_data']['energies'] = energies.cpu()
+
+                        # Log every 10 batches
+                        if batch_idx % 10 == 0:
+                            self.writer.add_scalar('loss/total', total_loss.item(), self.global_step)
+                            self.writer.add_scalar('loss/mel', mel_loss.item(), self.global_step)
+                            self.writer.add_scalar('loss/duration', duration_loss.item(), self.global_step)
+                            self.writer.add_scalar('loss/stop', loss_stop_token.item(), self.global_step)
+                            if loss_pitch is not None:
+                                self.writer.add_scalar('loss/pitch', loss_pitch.item(), self.global_step)
+                            if loss_energy is not None:
+                                self.writer.add_scalar('loss/energy', loss_energy.item(), self.global_step)
 
                         torch.save(debug_data, debug_path)
                         logger.error(f"💾 Saved problematic batch data to: {debug_path}")
