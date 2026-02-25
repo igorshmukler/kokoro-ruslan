@@ -38,6 +38,8 @@ from kokoro.utils.adaptive_memory_manager import AdaptiveMemoryManager
 
 import math
 
+# This tells PyTorch it's safe to load our custom config class
+torch.serialization.add_safe_globals([TrainingConfig])
 
 logger = logging.getLogger(__name__)
 
@@ -106,11 +108,8 @@ class KokoroTrainer:
         self.writer = SummaryWriter(log_dir=log_dir)
         logger.info(f"Tensorboard log directory created at: {log_dir}")
 
-        # Attempt to load checkpoint metadata (weights_only) early so any
-        # restored global variance statistics are available before the
-        # dataset is constructed. This avoids the dataset recomputing
-        # normalization/state that should instead be restored from the
-        # checkpoint.
+        # Attempt to load checkpoint metadata early so pitch/energy bounds are
+        # available before the dataset is constructed.
         try:
             resume_checkpoint = getattr(self.config, 'resume_checkpoint', None)
             if resume_checkpoint:
@@ -125,18 +124,6 @@ class KokoroTrainer:
                         # Use weights_only=True to avoid loading large tensors
                         meta = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
                         if isinstance(meta, dict):
-                            # Restore variance_stats into config and trainer
-                            vs = meta.get('variance_stats')
-                            if isinstance(vs, dict):
-                                for k, v in vs.items():
-                                    try:
-                                        setattr(self.config, k, v)
-                                        setattr(self, k, v)
-                                    except Exception:
-                                        logger.debug(f"Could not set variance stat {k} from checkpoint metadata")
-                                logger.info(f"Loaded variance_stats from checkpoint metadata: {list(vs.keys())}")
-
-                            # Also load pitch/energy bounds from saved model metadata (if available)
                             mm = meta.get('model_metadata')
                             if isinstance(mm, dict):
                                 arch = mm.get('architecture', {})
@@ -149,10 +136,9 @@ class KokoroTrainer:
                     except Exception as e:
                         logger.warning(f"Could not pre-load checkpoint metadata: {e}")
         except Exception:
-            # Never fail init because of metadata loading - we'll proceed normally
             logger.debug("Early checkpoint metadata load skipped or failed")
 
-        # Ensure fatal signals (including SIGABRT) dump Python stacks for crash triage
+        # Ensure fatal signals dump Python stacks for crash triage
         try:
             if not faulthandler.is_enabled():
                 faulthandler.enable(all_threads=True)
@@ -167,7 +153,6 @@ class KokoroTrainer:
         self.use_mixed_precision = getattr(config, 'use_mixed_precision', True)
         self.mixed_precision_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
 
-        # Check device support for mixed precision
         if self.use_mixed_precision:
             if self.device.type == DeviceType.CUDA.value:
                 self.scaler = torch.amp.GradScaler('cuda',
@@ -194,7 +179,6 @@ class KokoroTrainer:
                     self.use_mixed_precision = False
                     self.scaler = None
                     self.device_type = DeviceType.MPS.value
-
             else:
                 logger.info(f"Mixed precision not supported on {self.device.type}, disabling")
                 self.use_mixed_precision = False
@@ -209,9 +193,7 @@ class KokoroTrainer:
         if getattr(config, 'precompute_features', False):
             logger.info("Pre-computing features for all samples...")
             from kokoro.cli.precompute_features import precompute_features
-            # Set cache directory if not already set
             if not config.feature_cache_dir:
-                from pathlib import Path
                 config.feature_cache_dir = str(Path(config.data_dir) / ".feature_cache")
             precompute_features(config.data_dir, config, force_recompute=False)
             logger.info("Feature pre-computation complete")
@@ -222,12 +204,11 @@ class KokoroTrainer:
         # Create train/validation split
         val_split = getattr(config, 'validation_split', 0.1)
         if val_split > 0:
-            dataset_size = len(full_dataset.samples)  # Total before filtering
+            dataset_size = len(full_dataset.samples)
             indices = list(range(dataset_size))
 
-            # Shuffle indices for random split
             import random
-            random.seed(42)  # Fixed seed for reproducibility
+            random.seed(42)
             random.shuffle(indices)
 
             split_idx = int(dataset_size * (1 - val_split))
@@ -236,7 +217,6 @@ class KokoroTrainer:
 
             logger.info(f"Dataset split: {len(train_indices)} training, {len(val_indices)} validation samples")
 
-            # Create separate datasets
             self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices)
             self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices)
         else:
@@ -244,7 +224,6 @@ class KokoroTrainer:
             self.dataset = full_dataset
             self.val_dataset = None
 
-        # Initialize batch sampler for training (dynamic or fixed)
         use_dynamic = getattr(config, 'use_dynamic_batching', True)
 
         if use_dynamic:
@@ -289,15 +268,15 @@ class KokoroTrainer:
                     max_frames=config.max_frames_per_batch,
                     min_batch_size=config.min_batch_size,
                     max_batch_size=config.max_batch_size,
-                    drop_last=False,  # Use all validation data
-                    shuffle=False  # Don't shuffle validation
+                    drop_last=False,
+                    shuffle=False
                 )
             else:
                 val_batch_sampler = LengthBasedBatchSampler(
                     dataset=self.val_dataset,
                     batch_size=config.batch_size,
-                    drop_last=False,  # Use all validation data
-                    shuffle=False  # Don't shuffle validation
+                    drop_last=False,
+                    shuffle=False
                 )
 
             self.val_dataloader = DataLoader(
@@ -332,21 +311,18 @@ class KokoroTrainer:
         )
         self.model.to(self.device)
 
-        # Apply torch.compile for optimized training (PyTorch 2.0+)
-        # Note: Disabled for MPS due to float64 support limitations
+        # Apply torch.compile for CUDA only (MPS has limited dtype support)
         use_compile = getattr(config, 'use_torch_compile', False)
         if use_compile and torch.__version__ >= '2.0':
-            # Only enable torch.compile for CUDA - MPS has limited dtype support
             if self.device_type == 'cuda':
                 try:
                     compile_mode = getattr(config, 'torch_compile_mode', 'reduce-overhead')
                     compile_dynamic = getattr(config, 'torch_compile_dynamic', True)
-
                     self.model = torch.compile(
                         self.model,
                         mode=compile_mode,
-                        fullgraph=False,  # Allow graph breaks for complex model architecture
-                        dynamic=compile_dynamic  # Better handling of dynamic shapes
+                        fullgraph=False,
+                        dynamic=compile_dynamic
                     )
                     logger.info(f"Model compiled with torch.compile (mode='{compile_mode}', dynamic={compile_dynamic})")
                 except Exception as e:
@@ -356,11 +332,10 @@ class KokoroTrainer:
         elif use_compile:
             logger.warning(f"torch.compile requested but PyTorch version is {torch.__version__} (requires 2.0+)")
 
-        # Log model information
         model_info = self.model.get_model_info()
         logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
 
-        # Initialize optimizer and loss functions
+        # Initialize optimizer
         default_use_fused = self.device_type == 'cuda' and torch.__version__ >= '2.0'
         forced_use_fused = getattr(config, 'use_fused_adamw', None)
 
@@ -395,9 +370,7 @@ class KokoroTrainer:
                 logger.info("Using standard AdamW optimizer")
         except (TypeError, ValueError, RuntimeError) as e:
             if use_fused:
-                logger.warning(
-                    f"Fused AdamW not available/supported on {self.device_type}: {e}. Falling back to standard AdamW."
-                )
+                logger.warning(f"Fused AdamW not available on {self.device_type}: {e}. Falling back to standard AdamW.")
                 optimizer_kwargs['fused'] = False
                 self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
                 logger.info("Using standard AdamW optimizer (fallback)")
@@ -408,7 +381,6 @@ class KokoroTrainer:
         self.criterion_duration = nn.MSELoss(reduction='none')
         self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
 
-        # Variance losses (pitch and energy)
         if getattr(config, 'use_variance_predictor', True):
             self.criterion_pitch = nn.MSELoss(reduction='none')
             self.criterion_energy = nn.MSELoss(reduction='none')
@@ -420,8 +392,6 @@ class KokoroTrainer:
         # Learning rate scheduler with warmup
         use_onecycle = getattr(config, 'use_onecycle_lr', True)
         if use_onecycle:
-            # Calculate total training steps for OneCycleLR
-            # With gradient accumulation, optimizer steps = batches / accumulation_steps
             steps_per_epoch = len(self.dataloader)
             gradient_accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
             optimizer_steps_per_epoch = (steps_per_epoch + gradient_accumulation_steps - 1) // gradient_accumulation_steps
@@ -430,12 +400,11 @@ class KokoroTrainer:
             max_lr = config.learning_rate * getattr(config, 'max_lr_multiplier', 5.0)
             pct_start = getattr(config, 'pct_start', 0.3)
 
-            # Warmup configuration
             self.use_warmup = getattr(config, 'use_warmup', True)
             self.warmup_steps = getattr(config, 'warmup_steps', 500)
             self.warmup_start_lr = config.learning_rate * getattr(config, 'warmup_start_lr_ratio', 0.01)
-            self.warmup_target_lr = config.learning_rate  # Warmup ends at base learning_rate
-            self.current_optimizer_step = 0  # Track optimizer steps (not batches)
+            self.warmup_target_lr = config.learning_rate
+            self.current_optimizer_step = 0
 
             if self.use_warmup:
                 # OneCycleLR starts after warmup, so adjust total_steps
@@ -453,15 +422,14 @@ class KokoroTrainer:
                 cycle_momentum=False,
                 base_momentum=0.85,
                 max_momentum=0.95,
-                div_factor=3.0,  # initial_lr = max_lr / div_factor (aligns with warmup target LR)
-                final_div_factor=10000.0,  # min_lr = initial_lr / final_div_factor
-                last_epoch=-1  # Start from beginning
+                div_factor=3.0,
+                final_div_factor=10000.0,
+                last_epoch=-1
             )
             self.scheduler_per_batch = True
             logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={onecycle_steps} "
                        f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
         else:
-            # Legacy CosineAnnealingWarmRestarts (no warmup)
             self.use_warmup = False
             self.current_optimizer_step = 0
             self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
@@ -478,16 +446,14 @@ class KokoroTrainer:
         self.best_loss = float('inf')
         self.best_val_loss = float('inf')
         self.epochs_without_improvement = 0
-        self.validation_losses = []  # Track validation loss history
+        self.validation_losses = []
 
         # EMA (Exponential Moving Average) of model weights
         self.use_ema = getattr(config, 'use_ema', True)
-        # Compute EMA decay if not provided in config
         cfg_ema = getattr(config, 'ema_decay', None)
         self.ema_update_every = getattr(config, 'ema_update_every', 1)
 
         if cfg_ema is None and self.use_ema:
-            # Use training dataset size and effective batch size (including grad accumulation)
             try:
                 n_train = len(self.dataset)
             except Exception:
@@ -495,54 +461,24 @@ class KokoroTrainer:
 
             effective_batch = int(getattr(config, 'batch_size', 1) * getattr(config, 'gradient_accumulation_steps', 1))
             k = float(getattr(config, 'ema_half_life_epochs', 1.0))
-            computed = recommended_ema_decay(n_train=n_train, batch_size=effective_batch, k=k)
-            self.ema_decay = computed
-            # Persist back to config for visibility
+            self.ema_decay = recommended_ema_decay(n_train=n_train, batch_size=effective_batch, k=k)
             try:
-                config.ema_decay = computed
+                config.ema_decay = self.ema_decay
             except Exception:
                 pass
-
-            # Record computed metadata for richer startup logging
-            self.ema_decay_source = 'computed'
-            self.ema_n_train = n_train
-            self.ema_effective_batch = effective_batch
-            self.ema_half_life_epochs = k
-
             logger.info(f"Computed EMA decay: {self.ema_decay:.6f} (n_train={n_train}, eff_batch={effective_batch}, k={k})")
         else:
             self.ema_decay = float(cfg_ema) if cfg_ema is not None else 0.9999
-            self.ema_decay_source = 'config' if cfg_ema is not None else 'default'
-            self.ema_n_train = None
-            self.ema_effective_batch = None
-            self.ema_half_life_epochs = getattr(config, 'ema_half_life_epochs', 1.0)
-        self.ema_updates = 0  # Track number of EMA updates
+            logger.info(f"EMA decay: {self.ema_decay:.6f} (source={'config' if cfg_ema is not None else 'default'})")
+
+        self.ema_updates = 0
 
         if self.use_ema:
-            # Initialize EMA model as a deep copy of the current model
-            # This ensures all model parameters and configuration are correctly copied
-            # If model gets very large, this will become a problem
-            # One option is to move the model to CPU before copying and then back to device
-            # That adds some complexity and overhead
             self.ema_model = copy.deepcopy(self.model).to(self.device)
-            self.ema_model.eval()  # EMA model is always in eval mode
-
-            # Freeze EMA model (no gradients needed)
+            self.ema_model.eval()
             for param in self.ema_model.parameters():
                 param.requires_grad = False
-
-            # Detailed logging: show source of decay and relevant computed values
-            if getattr(self, 'ema_decay_source', None) == 'computed':
-                logger.info(
-                    f"EMA initialized: decay={self.ema_decay:.6f} (computed from n_train={self.ema_n_train}, "
-                    f"eff_batch={self.ema_effective_batch}, half_life_epochs={self.ema_half_life_epochs}), "
-                    f"update_every={self.ema_update_every}"
-                )
-            else:
-                logger.info(
-                    f"EMA initialized: decay={self.ema_decay:.6f} (source={self.ema_decay_source}), "
-                    f"half_life_epochs={self.ema_half_life_epochs}, update_every={self.ema_update_every}"
-                )
+            logger.info(f"EMA initialized: decay={self.ema_decay:.6f}, update_every={self.ema_update_every}")
         else:
             self.ema_model = None
             logger.info("EMA disabled")
@@ -556,21 +492,20 @@ class KokoroTrainer:
             'skipped_steps': 0
         }
 
-        # Enhanced profiler setup
+        # Profiler setup
         self.profiler = None
         self.profiling_stats = {}
         self.memory_snapshots = []
         self.log_dir = os.path.join(config.output_dir, "profiler_logs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
         os.makedirs(self.log_dir, exist_ok=True)
 
-        # Initialize interbatch profiler
         self.interbatch_profiler = InterbatchProfiler(config)
 
-        # Adaptive memory management configuration
+        # Adaptive memory management
         self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
         self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
 
-        # Gradient explosion tracking (adaptive threshold)
+        # Gradient explosion tracking
         self.grad_explosion_norm_ema = None
         self.grad_explosion_ema_alpha = getattr(config, 'grad_explosion_ema_alpha', 0.95)
         self.grad_explosion_abs_floor = getattr(config, 'grad_explosion_abs_floor', 1000.0)
@@ -581,11 +516,10 @@ class KokoroTrainer:
         self.grad_explosion_ema_steps = 0
         self.grad_explosion_streak = 0
 
-        # Localized gradient spike mitigation for mel projection layers
+        # Localized gradient spike clipping
         self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
         self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
 
-        # Optimizer-step counter independent of scheduler mode
         self.optimizer_steps_completed = 0
 
     def get_autocast_context(self):
@@ -1133,10 +1067,10 @@ class KokoroTrainer:
                          predicted_pitch=None, predicted_energy=None,
                          pitch_targets=None, energy_targets=None):
         """Calculate losses with optimized masking"""
-        batch_size = mel_specs.size(0)
+        # batch_size = mel_specs.size(0)
         max_mel_len = mel_specs.size(1)
         max_phoneme_len = phoneme_durations.size(1)
-        n_mels = mel_specs.size(2)
+        # n_mels = mel_specs.size(2)
 
         # Create base masks efficiently (2D only, no feature dimension expansion yet)
         # Use direct comparison without intermediate .expand() to save memory
@@ -1144,8 +1078,8 @@ class KokoroTrainer:
         phoneme_mask_2d = torch.arange(max_phoneme_len, device=self.device).unsqueeze(0) < phoneme_lengths.unsqueeze(1)
 
         # Pre-compute mask normalization factors (reused across losses)
-        mel_mask_count = mel_mask_2d.sum().clamp(min=1)
-        phoneme_mask_count = phoneme_mask_2d.sum().clamp(min=1)
+        # mel_mask_count = mel_mask_2d.sum().clamp(min=1)
+        # phoneme_mask_count = phoneme_mask_2d.sum().clamp(min=1)
 
         # Mel Spectrogram Loss
         loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
@@ -1157,7 +1091,7 @@ class KokoroTrainer:
             loss_mel = torch.tensor(0.0, device=self.device)
 
         # Duration Loss - convert to float once
-        phoneme_mask_float = phoneme_mask_2d.float()
+        # phoneme_mask_float = phoneme_mask_2d.float()
         target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
         loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
         duration_valid = phoneme_mask_2d & torch.isfinite(loss_duration_unreduced)
@@ -1330,39 +1264,6 @@ class KokoroTrainer:
                 logger.info(f"Restored optimizer_steps_completed={self.optimizer_steps_completed}")
             else:
                 logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
-
-            # Restore persisted variance statistics if present
-            if 'variance_stats' in checkpoint:
-                vs = checkpoint['variance_stats']
-                for k, v in vs.items():
-                    try:
-                        setattr(self, k, v)
-                    except Exception:
-                        logger.warning(f"Failed to restore variance stat {k}")
-                logger.info(f"Restored variance_stats: {list(vs.keys())}")
-
-                # Propagate restored globals to dataset and model when available
-                try:
-                    if hasattr(self, 'dataset') and self.dataset is not None:
-                        for k, v in vs.items():
-                            try:
-                                setattr(self.dataset, k, v)
-                            except Exception:
-                                logger.debug(f"Could not set {k} on dataset")
-                    if hasattr(self, 'model') and self.model is not None:
-                        # Also set on model and variance_adaptor if present
-                        for k, v in vs.items():
-                            try:
-                                setattr(self.model, k, v)
-                            except Exception:
-                                logger.debug(f"Could not set {k} on model")
-                            if hasattr(self.model, 'variance_adaptor') and self.model.variance_adaptor is not None:
-                                try:
-                                    setattr(self.model.variance_adaptor, k, v)
-                                except Exception:
-                                    logger.debug(f"Could not set {k} on model.variance_adaptor")
-                except Exception as e:
-                    logger.debug(f"Error propagating variance_stats to components: {e}")
 
         self.dataset.phoneme_processor = phoneme_processor
 
@@ -1565,19 +1466,10 @@ class KokoroTrainer:
             'model_metadata': model_metadata,
         }
 
-        # Persist running variance statistics if present on the trainer.
-        variance_stats = {}
-        for k in ('pitch_running_mean', 'pitch_running_std', 'energy_running_mean', 'energy_running_std'):
-            if hasattr(self, k):
-                variance_stats[k] = getattr(self, k)
-        if variance_stats:
-            checkpoint['variance_stats'] = variance_stats
-
         if self.use_mixed_precision and self.scaler:
             checkpoint['scaler'] = self.scaler.state_dict()
-            checkpoint['device_type'] = self.device_type  # Store device type for proper restoration
+            checkpoint['device_type'] = self.device_type
 
-        # Save EMA model weights if enabled
         if self.use_ema and self.ema_model is not None:
             checkpoint['ema_model_state_dict'] = self.ema_model.state_dict()
             checkpoint['ema_updates'] = self.ema_updates
@@ -2100,17 +1992,6 @@ class KokoroTrainer:
                         if energies is not None:
                             debug_data['batch_data']['energies'] = energies.cpu()
 
-                        # Log every 10 batches
-                        if batch_idx % 10 == 0:
-                            self.writer.add_scalar('loss/total', total_loss.item(), self.global_step)
-                            self.writer.add_scalar('loss/mel', mel_loss.item(), self.global_step)
-                            self.writer.add_scalar('loss/duration', duration_loss.item(), self.global_step)
-                            self.writer.add_scalar('loss/stop', loss_stop_token.item(), self.global_step)
-                            if loss_pitch is not None:
-                                self.writer.add_scalar('loss/pitch', loss_pitch.item(), self.global_step)
-                            if loss_energy is not None:
-                                self.writer.add_scalar('loss/energy', loss_energy.item(), self.global_step)
-
                         torch.save(debug_data, debug_path)
                         logger.error(f"💾 Saved problematic batch data to: {debug_path}")
                     except Exception as e:
@@ -2195,6 +2076,23 @@ class KokoroTrainer:
                         self._update_ema()
 
                     self.optimizer_steps_completed += 1
+
+                    # Log every 10 steps
+                    if self.optimizer_steps_completed % 10 == 0:
+                        self.writer.add_scalar('loss/total', total_loss.item(), self.optimizer_steps_completed)
+                        self.writer.add_scalar('loss/mel', loss_mel.item(), self.optimizer_steps_completed)
+                        self.writer.add_scalar('loss/duration', loss_duration.item(), self.optimizer_steps_completed)
+                        self.writer.add_scalar('loss/stop', loss_stop_token.item(), self.optimizer_steps_completed)
+                        if loss_pitch is not None:
+                            self.writer.add_scalar('loss/pitch', loss_pitch.item(), self.optimizer_steps_completed)
+                        if loss_energy is not None:
+                            self.writer.add_scalar('loss/energy', loss_energy.item(), self.optimizer_steps_completed)
+                        # Learning Rate to track the scheduler
+                        current_lr = self.optimizer.param_groups[0]['lr']
+                        self.writer.add_scalar('stats/learning_rate', current_lr, self.optimizer_steps_completed)
+
+                        # Force TensorBoard to update the file
+                        self.writer.flush()
 
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
@@ -2924,71 +2822,79 @@ class KokoroTrainer:
             start_time = time.time()
 
             try:
-                # Start interbatch profiling
                 self.interbatch_profiler.start_batch()
-
-                # Adaptive memory cleanup check during profiling
                 cleanup_result = self.adaptive_memory_cleanup(batch_idx)
-
-                # Profile step
                 self.profile_step()
 
-                # Data loading profiling
+                non_blocking = self.device.type == 'cuda'
                 self.interbatch_profiler.start_data_loading()
                 with torch.profiler.record_function("Data_Loading"):
-                    mel_specs = batch['mel_specs'].to(self.device, non_blocking=self.device.type=='cuda')
-                    phoneme_indices = batch['phoneme_indices'].to(self.device, non_blocking=self.device.type=='cuda')
-                    phoneme_durations = batch['phoneme_durations'].to(self.device, non_blocking=self.device.type=='cuda')
-                    stop_token_targets = batch['stop_token_targets'].to(self.device, non_blocking=self.device.type=='cuda')
-                    mel_lengths = batch['mel_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
-                    phoneme_lengths = batch['phoneme_lengths'].to(self.device, non_blocking=self.device.type=='cuda')
+                    tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
+                                   'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
+                    transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
+                                   for k in tensor_keys}
+                    mel_specs = transferred['mel_specs']
+                    phoneme_indices = transferred['phoneme_indices']
+                    phoneme_durations = transferred['phoneme_durations']
+                    stop_token_targets = transferred['stop_token_targets']
+                    mel_lengths = transferred['mel_lengths']
+                    phoneme_lengths = transferred['phoneme_lengths']
 
-                    # Validate tensor dimensions to prevent MPS overflow (INT_MAX limit)
-                    # max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
-                    # if max_dim > 2000:  # Safety threshold
-                    #     logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
-                    #     continue
-
+                    pitches = batch.get('pitches', None)
+                    energies = batch.get('energies', None)
+                    if pitches is not None:
+                        pitches = pitches.to(self.device, non_blocking=non_blocking)
+                    if energies is not None:
+                        energies = energies.to(self.device, non_blocking=non_blocking)
                 self.interbatch_profiler.end_data_loading()
-
                 self.log_memory_stats("data_loading")
 
                 with torch.profiler.record_function("Zero_Grad"):
                     self.optimizer.zero_grad()
 
-                # Forward pass with mixed precision
                 self.interbatch_profiler.start_forward_pass()
                 with torch.profiler.record_function("Model_Forward"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                           pitch_targets=pitches, energy_targets=energies)
                     else:
                         predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets)
+                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                       pitch_targets=pitches, energy_targets=energies)
                 self.interbatch_profiler.end_forward_pass()
-
                 self.log_memory_stats("forward_pass")
 
-                # Loss calculation with mixed precision
+                phoneme_pitches = None
+                phoneme_energies = None
+                if pitches is not None and predicted_pitch is not None:
+                    phoneme_pitches = self._average_pitch_energy_by_duration(
+                        pitches, phoneme_durations, phoneme_lengths
+                    )
+                if energies is not None and predicted_energy is not None:
+                    phoneme_energies = self._average_pitch_energy_by_duration(
+                        energies, phoneme_durations, phoneme_lengths
+                    )
+
                 with torch.profiler.record_function("Loss_Calculation"):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
-                            total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                            total_loss, _, _, _, _, _ = self._calculate_losses(
                                 predicted_mel, predicted_log_durations, predicted_stop_logits,
                                 mel_specs, phoneme_durations, stop_token_targets,
-                                mel_lengths, phoneme_lengths
+                                mel_lengths, phoneme_lengths,
+                                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
                             )
                     else:
-                        total_loss, loss_mel, loss_duration, loss_stop_token = self._calculate_losses(
+                        total_loss, _, _, _, _, _ = self._calculate_losses(
                             predicted_mel, predicted_log_durations, predicted_stop_logits,
                             mel_specs, phoneme_durations, stop_token_targets,
-                            mel_lengths, phoneme_lengths
+                            mel_lengths, phoneme_lengths,
+                            predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
                         )
-
                 self.log_memory_stats("loss_calculation")
 
-                # Backward pass with mixed precision
                 self.interbatch_profiler.start_backward_pass()
                 with torch.profiler.record_function("Backward_Pass"):
                     if self.use_mixed_precision:
@@ -2996,23 +2902,17 @@ class KokoroTrainer:
                     else:
                         total_loss.backward()
                 self.interbatch_profiler.end_backward_pass()
-
                 self.log_memory_stats("backward_pass")
 
-                # Optimizer step with mixed precision
                 with torch.profiler.record_function("Optimizer_Step"):
                     if self.use_mixed_precision:
                         if self.device_type == 'cuda':
-                            # CUDA path with built-in GradScaler
                             self.scaler.unscale_(self.optimizer)
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-
                             old_scale = self.scaler.get_scale()
                             self.scaler.step(self.optimizer)
                             self.scaler.update()
                             new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
                             if new_scale != old_scale:
                                 self.mixed_precision_stats['scale_updates'] += 1
                                 if new_scale < old_scale:
@@ -3022,23 +2922,17 @@ class KokoroTrainer:
                                     self.mixed_precision_stats['successful_steps'] += 1
                             else:
                                 self.mixed_precision_stats['successful_steps'] += 1
-
-                        else:  # MPS path with custom scaler
-                            # Clip gradients before unscaling for MPS
+                        else:  # MPS
                             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-
                             old_scale = self.scaler.get_scale()
                             step_successful = self.scaler.step(self.optimizer)
                             self.scaler.update()
                             new_scale = self.scaler.get_scale()
-
-                            # Update mixed precision stats
                             if step_successful:
                                 self.mixed_precision_stats['successful_steps'] += 1
                             else:
                                 self.mixed_precision_stats['skipped_steps'] += 1
                                 self.mixed_precision_stats['overflow_count'] += 1
-
                             if new_scale != old_scale:
                                 self.mixed_precision_stats['scale_updates'] += 1
                                 if new_scale < old_scale:
@@ -3046,12 +2940,9 @@ class KokoroTrainer:
                     else:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
                         self.optimizer.step()
-
                 self.log_memory_stats("optimizer_step")
 
-                # End batch profiling
-                batch_size = mel_specs.size(0)
-                self.interbatch_profiler.end_batch(batch_size)
+                self.interbatch_profiler.end_batch(mel_specs.size(0))
 
                 step_time = time.time() - start_time
                 total_time += step_time
@@ -3071,21 +2962,16 @@ class KokoroTrainer:
 
         self.stop_torch_profiler()
 
-        # Generate and analyze report
         report = self.get_profiling_report()
         logger.info(f"Training profiling completed. Total time: {total_time:.2f}s, "
                    f"Avg time per step: {total_time/step_count:.3f}s")
-
-        # Print analysis
         self.analyze_profiling_results(report)
 
-        # Print memory management report if enabled
         if self.enable_adaptive_memory:
             logger.info("Memory Management Report during profiling:")
             self.print_memory_management_report()
 
         return report
-
 
 def train_model(config: TrainingConfig):
     """Main training function - backward compatibility wrapper"""
