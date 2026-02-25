@@ -2,6 +2,16 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.20 (2026-02-25)
+- Added unit tests for `<sil>` token handling and fallback behavior
+- Added diagnostic logging for duration predictions vs. targets in the trainer (`_calculate_losses`), gated by `config.verbose` for local debugging of duration-loss convergence
+- Fixed unit test expectations to match the trainer's current log-duration target computation (uses +1.0 in the log target), preventing false failures in CI/local runs
+
+## 0.0.19 (2026-02-24)
+- Improved preprocessing with better silence support
+- Lowered default MPS_MAX_FRAMES_PER_BATCH
+- Cleanup
+
 ## 0.0.18 (2026-02-23)
 - Pre-allocate chunk slices to reduce memory pressure
 
