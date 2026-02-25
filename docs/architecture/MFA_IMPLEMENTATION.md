@@ -228,7 +228,7 @@ The implementation is **backward compatible**:
 ### Immediate Usage
 ```bash
 # Install MFA
-conda install -c conda-forge montreal-forced-aligner
+conda install -c conda-forge montreal-forced-aligner kalpy kaldi
 
 # Run preprocessing
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output

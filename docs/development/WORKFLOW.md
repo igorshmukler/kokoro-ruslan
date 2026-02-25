@@ -9,7 +9,7 @@ This guide walks you through the complete process from corpus to trained TTS mod
 pip install -r requirements.txt
 
 # Install MFA (choose one method)
-conda install -c conda-forge montreal-forced-aligner  # Recommended
+conda install -c conda-forge montreal-forced-aligner kalpy kaldi  # Recommended
 # OR
 pip install montreal-forced-aligner
 ```

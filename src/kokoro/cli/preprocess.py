@@ -216,7 +216,7 @@ def main():
         logger.error("\n✗ MFA alignment failed!")
         logger.error("Check the logs above for errors")
         logger.error("\nCommon issues:")
-        logger.error("  1. MFA not installed: conda install -c conda-forge montreal-forced-aligner")
+        logger.error("  1. MFA not installed: conda install -c conda-forge montreal-forced-aligner kalpy kaldi")
         logger.error("  2. Audio/text mismatch in corpus")
         logger.error("  3. Incorrect metadata format")
         return 1

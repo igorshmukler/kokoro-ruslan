@@ -17,6 +17,7 @@ grpcio>=1.48.2
 werkzeug>=1.0.1
 pillow
 absl-py>=0.4
+matplotlib>=3.5.0
 
 [dev]
 pytest>=7.0.0

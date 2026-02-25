@@ -15,7 +15,7 @@ Montreal Forced Aligner provides **accurate phoneme-level alignments** by analyz
 ### Option 1: Conda (Recommended)
 
 ```bash
-conda install -c conda-forge montreal-forced-aligner
+conda install -c conda-forge montreal-forced-aligner kalpy kaldi
 ```
 
 ### Option 2: Pip

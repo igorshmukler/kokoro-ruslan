@@ -10,7 +10,7 @@ python verify_setup.py
 ## One-Command Setup
 ```bash
 # Install MFA
-conda install -c conda-forge montreal-forced-aligner
+conda install -c conda-forge montreal-forced-aligner kalpy kaldi
 
 # Run preprocessing
 kokoro-preprocess --corpus ./ruslan_corpus
@@ -135,7 +135,7 @@ kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 
 ### "MFA not found"
 ```bash
-conda install -c conda-forge montreal-forced-aligner
+conda install -c conda-forge montreal-forced-aligner kalpy kaldi
 ```
 
 ### "tgt could not be resolved"

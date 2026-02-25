@@ -84,7 +84,7 @@ def main():
 
         if not mfa_ok:
             print("  # Install MFA (choose one):")
-            print("  conda install -c conda-forge montreal-forced-aligner")
+            print("  conda install -c conda-forge montreal-forced-aligner kalpy kaldi")
             print("  # OR")
             print("  pip install montreal-forced-aligner")
             print()

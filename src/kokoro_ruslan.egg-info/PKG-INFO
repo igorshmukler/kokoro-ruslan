@@ -1,11 +1,11 @@
 Metadata-Version: 2.4
 Name: kokoro-ruslan
-Version: 0.0.3
+Version: 0.0.18
 Summary: Transformer-based Russian Text-to-Speech System
-Home-page: https://github.com/yourusername/kokoro-ruslan
+Home-page: https://github.com/igorshmukler/kokoro-ruslan
 Author: Igor Shmukler
-Project-URL: Bug Reports, https://github.com/yourusername/kokoro-ruslan/issues
-Project-URL: Source, https://github.com/yourusername/kokoro-ruslan
+Project-URL: Bug Reports, https://github.com/igorshmukler/kokoro-ruslan/issues
+Project-URL: Source, https://github.com/igorshmukler/kokoro-ruslan
 Keywords: tts text-to-speech russian transformer pytorch
 Classifier: Development Status :: 3 - Alpha
 Classifier: Intended Audience :: Science/Research
@@ -38,6 +38,7 @@ Requires-Dist: grpcio>=1.48.2
 Requires-Dist: werkzeug>=1.0.1
 Requires-Dist: pillow
 Requires-Dist: absl-py>=0.4
+Requires-Dist: matplotlib>=3.5.0
 Provides-Extra: dev
 Requires-Dist: pytest>=7.0.0; extra == "dev"
 Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
@@ -60,409 +61,204 @@ Dynamic: requires-dist
 Dynamic: requires-python
 Dynamic: summary
 
-# Kokoro-Ruslan: Russian TTS Training Script
+# Kokoro-Ruslan
 
-A Text-to-Speech (TTS) training script for Russian language using the Kokoro architecture, optimized for Mac MPS acceleration and compatible with the Ruslan corpus dataset.
+Russian TTS training pipeline based on the Kokoro architecture, with strong Apple Silicon (MPS) support, MFA duration alignment, feature caching, and stability-focused training defaults.
 
-## Features
+## What’s New
 
-- **Mac MPS optimized**: Full support for Apple Silicon GPU acceleration
-- **Pre-computed feature caching**: 5-10x faster training with cached mel spectrograms
-- **No espeak dependency**: Uses rule-based Russian phoneme processing
-- **Montreal Forced Aligner integration**: Extract accurate phoneme durations for high-quality TTS
-- **Variance prediction**: Pitch and energy modeling for natural prosody (FastSpeech 2 style)
-- **Validation & early stopping**: Monitor overfitting with automatic train/validation split
-- **Checkpoint support**: Resume training from any saved checkpoint
-- **Memory efficient**: Optimized for limited VRAM with gradient clipping and memory management
-- **Flexible configuration**: Command-line arguments for easy customization
+- Stabilized training defaults for fewer practical gradient spikes (longer warmup + lower OneCycle peak LR pressure).
+- Built-in spike safeguards for projection/attention layers and warmup-aware gradient explosion detection.
+- Dynamic frame-based batching enabled by default with MPS-aware auto-caps.
+- Cleaner diagnostics: detailed stabilization logs are now behind `--verbose`.
+- Better CI portability in tests (device-safe behavior when MPS is unavailable).
+
+## Key Features
+
+- MPS-first training flow (with CUDA/CPU fallback).
+- MFA integration for phoneme-duration supervision.
+- Precomputed feature caching for faster epochs.
+- Variance prediction (pitch + energy) for improved prosody.
+- Validation + early stopping + checkpoint resume.
+- Gradient checkpointing and adaptive memory management.
 
 ## Documentation
 
-- **[WORKFLOW.md](docs/development/WORKFLOW.md)** - Complete step-by-step guide from corpus to trained model
-- **[FEATURE_CACHING.md](docs/FEATURE_CACHING.md)** - Pre-computed features for 5-10x faster training
-- **[MFA_SETUP.md](docs/setup/MFA_SETUP.md)** - Detailed Montreal Forced Aligner setup and usage
-- **[VARIANCE_PREDICTOR.md](docs/architecture/VARIANCE_PREDICTOR.md)** - Pitch and energy prediction for better prosody
-- **[VALIDATION.md](docs/development/VALIDATION.md)** - Validation loop and overfitting monitoring
-- **[inference.md](docs/setup/inference.md)** - Model deployment and inference guide
+- [Workflow](docs/development/WORKFLOW.md)
+- [Feature Caching](docs/FEATURE_CACHING.md)
+- [MFA Setup](docs/setup/MFA_SETUP.md)
+- [Variance Predictor](docs/architecture/VARIANCE_PREDICTOR.md)
+- [Validation](docs/development/VALIDATION.md)
+- [MPS OOM Solutions](docs/MPS_OOM_SOLUTIONS.md)
+- [Inference](docs/setup/inference.md)
 
 ## Installation
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
-
-# Install the kokoro package (enables kokoro-train, kokoro-preprocess commands)
 pip install -e .
 ```
 
-### Optional: Montreal Forced Aligner (MFA) for High-Quality Duration Extraction
-
-For best TTS quality, install MFA to extract accurate phoneme durations:
+Optional dev extras:
 
 ```bash
-# Via conda (recommended)
-conda install -c conda-forge montreal-forced-aligner
-
-# Via pip
-pip install montreal-forced-aligner
-
-# Install TextGrid parser
-pip install tgt
-
-# Verify installation
-python3 verify_setup.py
+pip install -e .[dev]
 ```
 
-**See [MFA_SETUP.md](docs/setup/MFA_SETUP.md) for detailed setup instructions.**
+## Dataset Layout
 
-## Dataset Structure
+Expected corpus structure:
 
-The script expects the Ruslan corpus to be organized as follows:
-
-```
+```text
 ruslan_corpus/
-├── metadata_RUSLAN_22200.csv  # Main metadata file
-├── wavs/                      # Audio files directory
-│   ├── 005559_RUSLAN.wav
-│   ├── 005560_RUSLAN.wav
-│   └── ...
-└── texts/                     # Optional: individual text files
-    ├── 005559_RUSLAN.txt
-    ├── 005560_RUSLAN.txt
+├── metadata_RUSLAN_22200.csv
+└── wavs/
+    ├── 000001_RUSLAN.wav
     └── ...
 ```
 
-The metadata CSV should be formatted as: `audio_filename|transcription`
+Metadata format:
+
+```text
+audio_filename|transcription
+```
 
 ## Quick Start
 
-### Step 0: Pre-compute Features (Optional but Recommended)
-
-For 5-10x faster training, pre-compute mel spectrograms before training:
+### 1) (Recommended) Precompute features
 
 ```bash
-# Pre-compute all features (mel spectrograms, pitch, energy)
 kokoro-precompute --corpus ./ruslan_corpus
-
-# This caches features to disk - first epoch and all subsequent epochs will be much faster!
-# Cache location: ruslan_corpus/.feature_cache/
 ```
 
-**See [FEATURE_CACHING.md](docs/FEATURE_CACHING.md) for detailed information.**
-
-### Step 1: Prepare Phoneme Alignments (Recommended)
-
-For high-quality TTS, first run Montreal Forced Aligner to extract accurate phoneme durations:
+### 2) (Recommended) Run MFA alignment
 
 ```bash
-# Run MFA alignment on your corpus
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
-
-# Or using module syntax:
-python3 -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output
-
-# This will:
-# 1. Download Russian MFA models
-# 2. Align your corpus
-# 3. Extract phoneme durations
 ```
 
-**Skip this step** if you want to start quickly (will use estimated durations with lower quality).
-
-### Step 2: Train the Model
+### 3) Train
 
 ```bash
-# Using default settings (with MFA alignments)
-kokoro-train
-
-# Specify custom corpus and output directories
-kokoro-train --corpus /path/to/ruslan_corpus --output ./my_russian_model
-
-# Without MFA (estimated durations - lower quality)
-kokoro-train --no-mfa
-
-# For Mac users with MPS issues
-PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train
-
-# Or using module syntax:
-python3 -m kokoro.cli.training
+kokoro-train --corpus ./ruslan_corpus --output ./models/kokoro_russian
 ```
 
-## Training Examples
+If you hit occasional MPS backend fallback issues:
 
 ```bash
-# Custom batch size and epochs
-kokoro-train --batch-size 16 --epochs 50
-
-# Custom learning rate and save frequency
-kokoro-train --learning-rate 0.0001 --save-every 5
-
-# Full custom configuration
-kokoro-train \
-    --corpus ./data/ruslan_corpus \
-    --output ./models/kokoro_russian \
-    --batch-size 12 \
-    --epochs 100 \
-    --learning-rate 1e-4 \
-    --save-every 2
+PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train --corpus ./ruslan_corpus
 ```
 
-## Resume Training
+Module equivalents:
 
 ```bash
-# Auto-resume from latest checkpoint
-kokoro-train --resume auto
-
-# Resume from specific checkpoint
-kokoro-train --resume ./models/checkpoint_epoch_10.pth
-
-# Resume with different parameters
-kokoro-train --resume auto --batch-size 16 --epochs 200
+python -m kokoro.cli.precompute_features --corpus ./ruslan_corpus
+python -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output
+python -m kokoro.cli.training --corpus ./ruslan_corpus
 ```
 
-## Command Line Arguments
+## `kokoro-train` CLI
 
 | Argument | Short | Default | Description |
-|----------|-------|---------|-------------|
-| `--corpus` | `-c` | `./ruslan_corpus` | Path to the corpus directory |
-| `--output` | `-o` | `./kokoro_russian_model` | Path to the output model directory |
-| `--resume` | `-r` | `None` | Resume from checkpoint (auto or path to .pth file) |
-| `--batch-size` | `-b` | `8` | Batch size for training |
-| `--epochs` | `-e` | `100` | Number of training epochs |
-| `--learning-rate` | `-lr` | `1e-4` | Learning rate |
+|---|---|---|---|
+| `--corpus` | `-c` | `./ruslan_corpus` | Corpus directory |
+| `--output` | `-o` | `./kokoro_russian_model` | Output model directory |
+| `--resume` | `-r` | `None` | Resume from `auto` or checkpoint path |
+| `--batch-size` | `-b` | `8` | Batch size |
+| `--epochs` | `-e` | `50` | Number of epochs |
+| `--learning-rate` | `-lr` | `1e-4` | Base learning rate |
 | `--save-every` |  | `2` | Save checkpoint every N epochs |
-| `--mfa-alignments` |  | `./mfa_output/alignments` | Path to MFA alignment directory |
-| `--no-mfa` |  | `False` | Disable MFA alignments (use estimated durations) |
-| `--val-split` |  | `0.1` | Validation split ratio (0.0-1.0) |
-| `--no-validation` |  | `False` | Disable validation (use all data for training) |
-| `--validation-interval` |  | `1` | Run validation every N epochs |
-| `--early-stopping-patience` |  | `10` | Stop training after N epochs without improvement |
+| `--mfa-alignments` |  | `auto` | MFA alignments directory |
+| `--no-mfa` |  | `False` | Disable MFA durations |
+| `--val-split` |  | `0.1` | Validation split |
+| `--no-validation` |  | `False` | Disable validation |
+| `--validation-interval` |  | `1` | Validate every N epochs |
+| `--early-stopping-patience` |  | `10` | Early stopping patience |
+| `--dynamic-batching` |  | `True` | Enable frame-based dynamic batching |
+| `--no-dynamic-batching` |  | `False` | Use fixed-size batching |
+| `--max-frames` |  | `config-driven` | Max mel frames per batch |
+| `--min-batch-size` |  | `4` | Min dynamic batch size |
+| `--max-batch-size` |  | `32` | Max dynamic batch size (may be auto-capped on MPS) |
+| `--profile-amp` |  | `False` | Run AMP speed profiling before training |
+| `--profile-amp-batches` |  | `10` | Number of AMP profiling batches |
+| `--fused-adamw` |  | `False` | Force-enable fused AdamW optimizer (experimental on non-CUDA backends) |
+| `--no-fused-adamw` |  | `False` | Force-disable fused AdamW optimizer |
+| `--try-fused-adamw-mps` |  | `True` | Try fused AdamW on MPS (experimental, enabled by default, auto-fallback if unsupported) |
+| `--verbose` | `-v` | `False` | Enable verbose stabilization diagnostics |
+| `--no-memory-cache` |  | `False` | Disable in-memory feature caching (use on-disk cache only) |
 
-## Validation and Overfitting Prevention
+Optimizer flag behavior:
+- If neither `--fused-adamw` nor `--no-fused-adamw` is passed, optimizer selection is automatic.
+- `--fused-adamw` takes priority unless `--no-fused-adamw` is also passed (which forces disable).
+- `--try-fused-adamw-mps` only affects MPS and is enabled by default.
 
-The training includes automatic validation to prevent overfitting:
+## Training Defaults (Current)
+
+From `TrainingConfig` in `src/kokoro/training/config.py`:
+
+- OneCycle LR enabled, `max_lr_multiplier=3.0`.
+- Linear warmup enabled, `warmup_steps=1200`.
+- Gradient accumulation default: `2`.
+- Dynamic batching default: on.
+- In-memory feature cache: enabled by default. Use `--no-memory-cache` to disable keeping precomputed features in RAM (reduces host memory usage at cost of slightly higher I/O and cache latency).
+- Stability safeguards: projection/attention pre-clipping + warmup-aware explosion thresholds.
+- MPS-aware auto-limits can reduce oversized values (e.g., frame caps/seq length/batch sizes).
+
+## Useful Commands
 
 ```bash
-# Default: 10% validation split with early stopping
-kokoro-train --corpus ./ruslan_corpus
+# Verify feature cache health before training
+python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
 
-# Custom validation split (20%)
-kokoro-train --val-split 0.2
+# Resume automatically from latest checkpoint
+kokoro-train --corpus ./ruslan_corpus --output ./models/kokoro_russian --resume auto
 
-# Disable validation for final training on all data
-kokoro-train --no-validation
+# Train without MFA durations
+kokoro-train --corpus ./ruslan_corpus --no-mfa
 
-# Adjust early stopping patience
-kokoro-train --early-stopping-patience 15
-```
+# Train with explicit dynamic batching bounds
+kokoro-train --corpus ./ruslan_corpus --max-frames 18000 --min-batch-size 4 --max-batch-size 12
 
-**See [VALIDATION.md](docs/development/VALIDATION.md) for detailed information about validation monitoring.**
+# Force fused AdamW (or force-disable it)
+kokoro-train --corpus ./ruslan_corpus --fused-adamw
+kokoro-train --corpus ./ruslan_corpus --no-fused-adamw
 
-## Model Architecture
+# Fused AdamW on MPS is enabled by default (experimental)
+kokoro-train --corpus ./ruslan_corpus --try-fused-adamw-mps
 
-The Kokoro model implements a modern Transformer-based sequence-to-sequence architecture with:
+# Inference from final model or latest checkpoint in a model directory
+python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps
 
-### Core Components
+# Inference tuning (helps early checkpoints avoid very short outputs)
+python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps --stop-threshold 0.6 --min-len-ratio 0.9 --max-len 1600
 
-- **Text Encoder**: Stack of Transformer encoder blocks with multi-head self-attention
-- **Duration Predictor**: Multi-layer perceptron for phoneme duration prediction
-- **Length Regulator**: Expands encoder outputs based on predicted/ground-truth durations
-- **Decoder**: Stack of Transformer decoder blocks with masked self-attention and cross-attention
-- **Stop Token Predictor**: Linear layer for end-of-sequence prediction
-
-### Phoneme Duration Extraction
-
-The model supports two modes for phoneme durations:
-
-#### MFA-based Durations (Recommended - High Quality)
-- Uses Montreal Forced Aligner to extract actual phoneme timings from audio
-- Provides accurate, natural duration variations
-- Captures stress, speech rate, and prosodic patterns
-- **Results in 20-40% better naturalness scores**
-- See [MFA_SETUP.md](docs/setup/MFA_SETUP.md) for setup instructions
-
-#### Estimated Durations (Fallback)
-- Distributes mel frames uniformly across phonemes
-- Quick to set up, no preprocessing required
-- Lower quality but sufficient for initial experiments
-- Automatically used when MFA alignments are not available
-
-### Architecture Details
-
-- **Encoder Layers**: 6 Transformer encoder blocks (configurable)
-- **Decoder Layers**: 6 Transformer decoder blocks (configurable)
-- **Attention Heads**: 8 multi-head attention heads (configurable)
-- **Hidden Dimensions**: 512 (d_model for Transformer layers)
-- **Feed-Forward Dimensions**: 2048 for encoder, 2048 for decoder
-- **Positional Encoding**: Sinusoidal encoding with dropout
-- **Gradient Checkpointing**: Enabled for memory efficiency during training
-
-### Audio Configuration
-
-- **Sample Rate**: 22,050 Hz
-- **Mel Channels**: 80
-- **FFT Size**: 1024
-- **Hop Length**: 256 samples (~11.6ms)
-- **Maximum Sequence Length**: 1420 mel frames (configurable)
-
-### Training Modes
-
-The model supports two distinct forward pass modes:
-
-#### Training Mode (Teacher Forcing)
-- Uses ground-truth mel spectrograms as decoder input
-- Applies causal masking for autoregressive training
-- Predicts mel frames, durations, and stop tokens simultaneously
-- Supports gradient checkpointing for memory efficiency
-
-#### Inference Mode (Autoregressive)
-- Generates mel spectrograms step-by-step
-- Uses predicted durations for length regulation
-- Implements stop token prediction for sequence termination
-- Configurable generation length and stop threshold
-
-### Memory Optimizations
-
-The model includes several optimizations for efficient training:
-
-- **Gradient Checkpointing**: Applied to all Transformer layers to reduce memory usage
-- **Padding Masks**: Support for variable-length sequences with proper masking
-- **Length Regulation**: Efficient expansion of encoder outputs based on durations
-- **Causal Masking**: Proper masking for autoregressive decoder training
-- **MPS Acceleration**: Optimized for Apple Silicon GPU training
-
-### Key Features
-
-- **Flexible Architecture**: Configurable number of layers, heads, and dimensions
-- **Modern Design**: Full Transformer architecture replacing legacy LSTM components
-- **Production Ready**: Supports both training and inference with proper masking
-- **Memory Efficient**: Gradient checkpointing and optimized attention mechanisms
-- **Robust Training**: Teacher forcing with ground-truth alignment during training
-
-The training script generates several files in the output directory:
-
-```
-kokoro_russian_model/
-├── checkpoint_epoch_2.pth      # Regular checkpoints
-├── checkpoint_epoch_4.pth
-├── ...
-├── phoneme_processor.pkl       # Russian phoneme processor
-└── kokoro_russian_final.pth    # Final trained model
-```
-
-Each checkpoint contains:
-- Model state dictionary
-- Optimizer state
-- Learning rate scheduler state
-- Training configuration
-- Current epoch and loss
-
-## Memory Optimizations
-
-The script includes several optimizations for limited memory:
-
-- **Gradient Clipping**: Prevents exploding gradients (max norm: 1.0)
-- **Sequence Limiting**: Maximum 1420 mel frames per sample
-- **Cache Clearing**: Automatic MPS cache clearing every 50 batches
-- **Mixed Precision**: Enabled for MPS acceleration
-
-## Russian Phoneme Processing
-
-The script uses a rule-based Russian grapheme-to-phoneme converter:
-
-- **Vowels**: а, о, у, ы, э, я, ё, ю, и, е
-- **Consonants**: б, в, г, д, ж, з, к, л, м, н, п, р, с, т, ф, х, ц, ч, ш, щ
-- **Special**: ь, ъ (soft/hard signs), punctuation, spaces
-
-### Example
-
-```
-Russian: "Привет мир"
-Phonemes: ['p', 'r', 'i', 'v', 'je', 't', ' ', 'm', 'i', 'r']
-```
-
-## Training Logs
-
-The script provides detailed logging:
-
-```
-INFO:__main__:Loaded 1234 samples from corpus at ./ruslan_corpus
-INFO:__main__:Starting training on device: mps
-INFO:__main__:Training from epoch 1 to 100
-Epoch 1/100: 100%|██████████| 154/154 [05:23<00:00, 0.48it/s, loss=2.345]
-INFO:__main__:Epoch 1 completed. Average loss: 2.345
-INFO:__main__:Checkpoint saved: ./kokoro_russian_model/checkpoint_epoch_2.pth
+# Run focused unit tests
+python -m pytest tests/unit/test_attention_operations.py tests/unit/test_multi_layer_attention.py tests/unit/test_trainer_adaptive_stabilization.py -q
 ```
 
 ## Troubleshooting
 
-### Common Issues
+- MPS out-of-memory: lower `--max-frames` and/or `--batch-size`; see [MPS OOM Solutions](docs/MPS_OOM_SOLUTIONS.md).
+- Missing metadata/audio: verify corpus layout and `metadata_RUSLAN_22200.csv`.
+- Slower-than-expected startup: first epoch may build caches; precompute features to speed up.
+- Gradient spike warnings: use defaults first, then reduce `--learning-rate` or `--max-frames` if needed.
 
-- **MPS Backend Error**: Use `PYTORCH_ENABLE_MPS_FALLBACK=1` environment variable
-- **Out of Memory**: Reduce `--batch-size` (try 4 or 6)
-- **Audio Loading Error**: Ensure `soundfile` and `librosa` are installed
-- **Missing Metadata**: Check that `metadata_RUSLAN_22200.csv` exists in corpus directory
+## Output Artifacts
 
-### Performance Tips
+Typical output directory:
 
-- **Mac M1/M2**: Use batch size 8-12 for optimal performance
-- **Limited RAM**: Reduce batch size and enable `num_workers=0`
-- **Fast Storage**: Keep corpus on SSD for faster data loading
-- **Long Training**: Use `--save-every 1` for frequent checkpoints
-
-## Usage Examples
-
-### Basic Training
-
-```bash
-# Download and prepare Ruslan corpus, then:
-kokoro-train --corpus ./ruslan_corpus --epochs 10
+```text
+models/kokoro_russian/
+├── checkpoint_epoch_2.pth
+├── checkpoint_epoch_4.pth
+├── ...
+└── kokoro_russian_final.pth
 ```
-
-### Production Training
-
-```bash
-# Full training run with checkpointing
-PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train \
-    --corpus ./data/ruslan_corpus \
-    --output ./models/kokoro_russian_v1 \
-    --batch-size 10 \
-    --epochs 200 \
-    --learning-rate 5e-5 \
-    --save-every 5
-```
-
-### Resume Training
-
-```bash
-# Auto-resume from latest checkpoint
-PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train \
-    --corpus ./data/ruslan_corpus \
-    --output ./models/kokoro_russian_v1 \
-    --resume auto
-```
-
-## Requirements
-
-- Python 3.9+
-- PyTorch 2.0+ with MPS support
-- torchaudio 2.0+
-- NumPy 1.21+
-- soundfile 0.12+
-- librosa 0.9+
-- tqdm 4.64+
-
-For inference and deployment of trained models, check out:
-
-- [Kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M) - The main Kokoro model on Hugging Face
-- [Kokoros (Rust)](https://github.com/lucasjinreal/Kokoros) - Fast inference engine in Rust
-- [Kokoro FastAPI](https://github.com/remsky/Kokoro-FastAPI) - Dockerized API wrapper
-- [StreamingKokoroJS](https://github.com/rhulha/StreamingKokoroJS) - Browser-based inference
-
-## License
-
-This training script is designed for use with the Ruslan Russian speech corpus and implements the Text-To-Speech model architecture for educational and research purposes. For commercial license contact the author.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
+PRs are welcome. For larger changes, open an issue first so implementation direction is aligned.
+
+## License
+
+This project is intended for educational and research use with the Ruslan corpus and Kokoro-style TTS training workflows.
