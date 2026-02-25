@@ -189,15 +189,21 @@ class PhonemeProcessorUtils:
 
     @staticmethod
     def phonemes_to_indices(phoneme_sequence: list, phoneme_to_id: dict) -> list:
-        """Convert phoneme strings to indices using vocabulary"""
-        phoneme_indices = [
-            phoneme_to_id[p]
-            for p in phoneme_sequence
-            if p in phoneme_to_id
-        ]
+        """Convert phoneme strings to indices, ensuring 1:1 length mapping"""
+        phoneme_indices = []
+
+        # Get ID for unknown or silence as fallback
+        unk_id = phoneme_to_id.get('<unk>', phoneme_to_id.get('<sil>', 0))
+
+        for p in phoneme_sequence:
+            if p in phoneme_to_id:
+                phoneme_indices.append(phoneme_to_id[p])
+            else:
+                logger.warning(f"Phoneme '{p}' not in vocab! Mapping to ID {unk_id}")
+                phoneme_indices.append(unk_id)
 
         if not phoneme_indices:
-            logger.error("No valid phoneme indices generated. Check phoneme processor and vocabulary.")
+            logger.error("No valid phoneme indices generated.")
             raise ValueError("No valid phoneme indices generated.")
 
         return phoneme_indices

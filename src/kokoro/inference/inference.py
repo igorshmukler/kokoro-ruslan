@@ -19,6 +19,11 @@ from kokoro.data.audio_utils import AudioUtils, PhonemeProcessorUtils
 
 import re
 
+from kokoro.training.trainer import TrainingConfig
+
+# This tells PyTorch it's safe to load our custom config class
+torch.serialization.add_safe_globals([TrainingConfig])
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
