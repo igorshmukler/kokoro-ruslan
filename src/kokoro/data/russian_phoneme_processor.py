@@ -653,6 +653,9 @@ class RussianPhonemeProcessor:
         """Build complete phoneme vocabulary"""
         phoneme_set = set()
 
+        # ADD SPECIAL TOKENS FIRST
+        phoneme_set.update(['<pad>', '<sil>', '<sp>'])
+
         # Add base phonemes
         phoneme_set.update(self.vowels.values())
         phoneme_set.update(self.consonants.values())

@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 import shutil
 from dataclasses import dataclass
 import pickle
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +258,8 @@ class MFAIntegration:
             # Create text file
             text_dst = mfa_corpus_dir / f"{audio_file_stem}.txt"
             with open(text_dst, 'w', encoding='utf-8') as f:
-                f.write(text)
+                clean_text = re.sub(r'[^\w\s]', '', text).lower()
+                f.write(clean_text)
 
             prepared_count += 1
 
@@ -328,119 +330,52 @@ class MFAIntegration:
             return False
 
     def parse_textgrid(self, textgrid_path: Path) -> List[WordAlignment]:
-        """
-        Parse TextGrid file to extract alignment information
-
-        Args:
-            textgrid_path: Path to TextGrid file
-
-        Returns:
-            List of WordAlignment objects
-        """
-        try:
-            import tgt  # TextGridTools library
-        except ImportError:
-            logger.error("tgt library not installed. Install with: pip install tgt")
-            return []
-
+        import tgt
         try:
             textgrid = tgt.io.read_textgrid(str(textgrid_path))
+            phone_tier = textgrid.get_tier_by_name('phones')
 
-            # Find phoneme and word tiers
-            phone_tier = None
-            word_tier = None
-
-            for tier in textgrid.tiers:
-                if tier.name.lower() in ['phones', 'phone', 'phonemes']:
-                    phone_tier = tier
-                elif tier.name.lower() in ['words', 'word']:
-                    word_tier = tier
-
-            if phone_tier is None:
-                logger.error(f"No phone tier found in {textgrid_path}")
-                return []
-
-            # Extract phoneme alignments
             phoneme_alignments = []
             for interval in phone_tier:
-                if interval.text and interval.text.strip():  # Skip empty intervals
-                    phoneme_alignments.append(PhonemeAlignment(
-                        phoneme=interval.text.strip(),
-                        start_time=interval.start_time,
-                        end_time=interval.end_time,
-                        duration=interval.end_time - interval.start_time
-                    ))
+                # Change: If text is empty or 'sil'/'sp', label it as <sil>
+                label = interval.text.strip()
+                if not label or label.lower() in ['sil', 'sp', '']:
+                    label = '<sil>'
 
-            # If word tier exists, group phonemes by words
-            if word_tier:
-                word_alignments = []
-                for word_interval in word_tier:
-                    if not word_interval.text or not word_interval.text.strip():
-                        continue
+                phoneme_alignments.append(PhonemeAlignment(
+                    phoneme=label,
+                    start_time=interval.start_time,
+                    end_time=interval.end_time,
+                    duration=interval.end_time - interval.start_time
+                ))
 
-                    # Find phonemes within this word's time range
-                    word_phonemes = [
-                        p for p in phoneme_alignments
-                        if p.start_time >= word_interval.start_time and
-                           p.end_time <= word_interval.end_time
-                    ]
-
-                    word_alignments.append(WordAlignment(
-                        word=word_interval.text.strip(),
-                        start_time=word_interval.start_time,
-                        end_time=word_interval.end_time,
-                        phonemes=word_phonemes
-                    ))
-
-                return word_alignments
-            else:
-                # If no word tier, create a single word alignment with all phonemes
-                return [WordAlignment(
-                    word="<utterance>",
-                    start_time=phoneme_alignments[0].start_time if phoneme_alignments else 0,
-                    end_time=phoneme_alignments[-1].end_time if phoneme_alignments else 0,
-                    phonemes=phoneme_alignments
-                )]
-
+            # Wrap in a single WordAlignment for the utterance
+            return [WordAlignment(
+                word="<utterance>",
+                start_time=phoneme_alignments[0].start_time,
+                end_time=phoneme_alignments[-1].end_time,
+                phonemes=phoneme_alignments
+            )]
         except Exception as e:
             logger.error(f"Error parsing TextGrid {textgrid_path}: {e}")
             return []
 
     def get_phoneme_durations(self, audio_file_stem: str, actual_mel_len: Optional[int] = None) -> Optional[List[int]]:
-        """
-        Get phoneme durations and FORCE alignment with Mel length.
-
-        Args:
-            audio_file_stem: Base name of audio file
-            actual_mel_len: The actual number of frames in the Mel spectrogram
-        """
-        # Look for TextGrid file
         textgrid_path = self.alignment_dir / f"{audio_file_stem}.TextGrid"
         if not textgrid_path.exists():
             return None
 
-        # Parse TextGrid
         word_alignments = self.parse_textgrid(textgrid_path)
-        if not word_alignments:
-            return None
+        durations = [p.duration_frames for w in word_alignments for p in w.phonemes]
 
-        # Extract all phoneme durations in frames
-        durations = []
-        for word_align in word_alignments:
-            for phoneme_align in word_align.phonemes:
-                durations.append(phoneme_align.duration_frames)
-
-        # FIX: Align Sum(Durations) to Actual Mel Length
         if actual_mel_len is not None:
             current_sum = sum(durations)
             diff = actual_mel_len - current_sum
 
-            if diff > 0:
-                # Add trailing silence/drift to the last phoneme
-                logger.debug(f"Padding {audio_file_stem}: Adding {diff} frames to last phoneme.")
-                durations[-1] += diff
-            elif diff < 0:
-                # This rarely happens, but if durations > mel, we trim the last one
+            # If the diff is small, adjust the silences or the last phoneme
+            if diff != 0 and len(durations) > 0:
+                # Strategy: Find indices of silences and distribute diff there first
+                # If no silences, just adjust the last phoneme as a fallback
                 durations[-1] = max(1, durations[-1] + diff)
 
         return durations

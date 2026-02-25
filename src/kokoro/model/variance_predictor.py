@@ -160,6 +160,7 @@ class VariancePredictor(nn.Module):
         for conv in self.conv_layers:
             nn.init.xavier_uniform_(conv.weight)
         nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -183,6 +184,14 @@ class VariancePredictor(nn.Module):
     def _forward_chunk(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         # 1. Flip to (B, C, L) ONCE
         x = x.transpose(1, 2).contiguous()
+
+        # Guard: GroupNorm(1, C) over a single frame produces degenerate statistics.
+        # Return zeros rather than NaN — the mask will zero these out anyway.
+        if x.size(2) < 2:
+            output = torch.zeros(x.size(0), x.size(2), device=x.device, dtype=x.dtype)
+            if mask is not None:
+                output = output.masked_fill(mask, 0.0)
+            return output
 
         # 2. Sequential processing without dimension swapping
         for conv, norm in zip(self.conv_layers, self.norms):

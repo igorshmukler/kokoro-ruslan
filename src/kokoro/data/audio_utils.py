@@ -188,16 +188,75 @@ class PhonemeProcessorUtils:
         return phoneme_sequence
 
     @staticmethod
+    def flatten_phoneme_output_with_sil(raw_output, phoneme_to_id: dict) -> list:
+        """
+        Flatten process_text() output, inserting <sil> between words.
+
+        During training, MFA alignments include <sil> tokens at word boundaries.
+        This method replicates that distribution at inference time so the model
+        sees the same token patterns it was trained on.
+
+        Falls back to plain flattening with a WARNING if <sil> is absent from
+        phoneme_to_id (processor predates the <sil> vocab addition).
+
+        Args:
+            raw_output: Output of RussianPhonemeProcessor.process_text() —
+                        list of (word, [phonemes], stress_info) tuples.
+            phoneme_to_id: Vocabulary mapping from the loaded processor.
+        """
+        if '<sil>' not in phoneme_to_id:
+            logger.warning(
+                "flatten_phoneme_output_with_sil: '<sil>' not in phoneme_to_id. "
+                "Falling back to plain flatten. Reload with a processor whose "
+                "_build_vocab includes '<sil>' to enable silence injection."
+            )
+            return PhonemeProcessorUtils.flatten_phoneme_output(raw_output)
+
+        result = []
+        word_count = 0
+
+        for item in raw_output:
+            if isinstance(item, tuple) and len(item) == 3:
+                word, word_phonemes, _ = item
+                if not isinstance(word_phonemes, list):
+                    logger.warning(
+                        f"flatten_phoneme_output_with_sil: unexpected phoneme list "
+                        f"type for word '{word}': {type(word_phonemes)}"
+                    )
+                    continue
+                if word_count > 0:        # <sil> before every word except the first
+                    result.append('<sil>')
+                for ph in word_phonemes:
+                    if isinstance(ph, str) and ph:
+                        result.append(ph)
+                word_count += 1
+            else:
+                # Non-tuple: fall back to plain logic for this element
+                logger.warning(
+                    f"flatten_phoneme_output_with_sil: unexpected item type "
+                    f"{type(item)}, skipping sil injection for this item"
+                )
+                result.extend(PhonemeProcessorUtils.flatten_phoneme_output([item]))
+
+        return result
+
+    @staticmethod
     def phonemes_to_indices(phoneme_sequence: list, phoneme_to_id: dict) -> list:
-        """Convert phoneme strings to indices using vocabulary"""
-        phoneme_indices = [
-            phoneme_to_id[p]
-            for p in phoneme_sequence
-            if p in phoneme_to_id
-        ]
+        """Convert phoneme strings to indices, ensuring 1:1 length mapping"""
+        phoneme_indices = []
+
+        # Get ID for unknown or silence as fallback
+        unk_id = phoneme_to_id.get('<unk>', phoneme_to_id.get('<sil>', 0))
+
+        for p in phoneme_sequence:
+            if p in phoneme_to_id:
+                phoneme_indices.append(phoneme_to_id[p])
+            else:
+                logger.warning(f"Phoneme '{p}' not in vocab! Mapping to ID {unk_id}")
+                phoneme_indices.append(unk_id)
 
         if not phoneme_indices:
-            logger.error("No valid phoneme indices generated. Check phoneme processor and vocabulary.")
+            logger.error("No valid phoneme indices generated.")
             raise ValueError("No valid phoneme indices generated.")
 
         return phoneme_indices

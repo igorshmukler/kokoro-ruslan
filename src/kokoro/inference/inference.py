@@ -19,6 +19,11 @@ from kokoro.data.audio_utils import AudioUtils, PhonemeProcessorUtils
 
 import re
 
+from kokoro.training.trainer import TrainingConfig
+
+# This tells PyTorch it's safe to load our custom config class
+torch.serialization.add_safe_globals([TrainingConfig])
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -392,7 +397,13 @@ class KokoroTTS:
             for i, chunk in enumerate(chunks):
                 # Step 1 & 2: Phoneme Processing
                 raw_processor_output = self.phoneme_processor.process_text(chunk)
-                phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output(raw_processor_output)
+
+                # Inject <sil> between words to match MFA training distribution.
+                # Falls back to plain flatten automatically if vocab predates <sil>.
+                phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+                    raw_processor_output, self.phoneme_processor.phoneme_to_id
+                )
+
                 phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
                     phoneme_sequence, self.phoneme_processor.phoneme_to_id
                 )
@@ -457,8 +468,10 @@ class KokoroTTS:
                 all_audio_segments.append(chunk_audio)
 
                 # Add small silence gap (0.15s)
-                silence = torch.zeros(int(self.sample_rate * 0.15))
-                all_audio_segments.append(silence)
+                all_audio_segments.append(chunk_audio)
+                if i < len(chunks) - 1:   # only between chunks, not after the last one
+                    silence = torch.zeros(int(self.sample_rate * 0.15))
+                    all_audio_segments.append(silence)
 
             final_audio = torch.cat(all_audio_segments, dim=0)
             if output_path:
