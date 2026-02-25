@@ -414,13 +414,23 @@ class KokoroTTS:
 
                 # Step 3: Generate Mel
                 with torch.no_grad():
-                    mel_spec = self.model.forward_inference(
-                        phoneme_indices=phoneme_tensor,
-                        max_len=eff_max_len,
-                        stop_threshold=eff_stop_threshold,
-                        min_len_ratio=eff_min_len_ratio,
-                        min_len_floor=eff_min_len_floor,
-                    )
+                    # If the stop threshold was explicitly provided by the user (either at
+                    # initialization via CLI or as an argument to text_to_speech), ensure
+                    # the post-expected-length threshold used by the model is not a lower
+                    # default that would silently clamp the user's intent. Pass the
+                    # same value for `post_expected_stop_threshold` when explicit.
+                    explicit_stop = (stop_threshold is not None) or getattr(self, '_explicit_inference_stop_threshold', False)
+                    kwargs = {
+                        'phoneme_indices': phoneme_tensor,
+                        'max_len': eff_max_len,
+                        'stop_threshold': eff_stop_threshold,
+                        'min_len_ratio': eff_min_len_ratio,
+                        'min_len_floor': eff_min_len_floor,
+                    }
+                    if explicit_stop:
+                        kwargs['post_expected_stop_threshold'] = eff_stop_threshold
+
+                    mel_spec = self.model.forward_inference(**kwargs)
 
                 # ========================================================
                 # ENHANCED LOGGING & HEALTH CHECK
@@ -575,6 +585,7 @@ Examples:
 
     parser.add_argument(
         '--stop-threshold',
+        dest='stop_threshold',
         type=float,
         default=None,
         help='Stop-token threshold for autoregressive decoding (default: auto from checkpoint).'
