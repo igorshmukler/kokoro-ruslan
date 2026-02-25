@@ -62,16 +62,16 @@ audio_filename|transcription
 
 ## Quick Start
 
-### 1) (Recommended) Precompute features
-
-```bash
-kokoro-precompute --corpus ./ruslan_corpus
-```
-
-### 2) (Recommended) Run MFA alignment
+### 1) (Recommended) Run MFA alignment
 
 ```bash
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
+```
+
+### 2) (Recommended) Precompute features
+
+```bash
+kokoro-precompute --corpus ./ruslan_corpus
 ```
 
 ### 3) Train

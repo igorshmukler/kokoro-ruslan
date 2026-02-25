@@ -14,6 +14,8 @@ src/kokoro/data/russian_phoneme_processor.py
 src/kokoro/inference/__init__.py
 src/kokoro/inference/hifigan_vocoder.py
 src/kokoro/inference/inference.py
+src/kokoro/inference/melgan_model.py
+src/kokoro/inference/melgan_vocoder.py
 src/kokoro/inference/vocoder_manager.py
 src/kokoro/model/__init__.py
 src/kokoro/model/model.py
