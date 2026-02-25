@@ -180,7 +180,7 @@ class TrainingConfig:
             from pathlib import Path
             self.feature_cache_dir = str(Path(self.data_dir) / ".feature_cache")
 
-        MPS_MAX_FRAMES_PER_BATCH = 22000
+        MPS_MAX_FRAMES_PER_BATCH = 20000
         MPS_MAX_BATCH_SIZE = 16
 
         # MPS-specific memory optimizations

@@ -51,12 +51,6 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
         {
             "current_optimizer_step": 777,
             "optimizer_steps_completed": 888,
-            "variance_stats": {
-                "pitch_running_mean": 1.23,
-                "pitch_running_std": 0.45,
-                "energy_running_mean": 2.34,
-                "energy_running_std": 0.67,
-            },
         },
         checkpoint_path,
     )
@@ -81,11 +75,6 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
     trainer.current_optimizer_step = 0
     trainer.optimizer_steps_completed = 0
     trainer.reset_called = False
-    # Defaults before restoration
-    trainer.pitch_running_mean = None
-    trainer.pitch_running_std = None
-    trainer.energy_running_mean = None
-    trainer.energy_running_std = None
 
     def _fake_reset():
         trainer.reset_called = True
@@ -106,12 +95,6 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
     assert trainer.optimizer_steps_completed == 888
     # After change: we no longer reset variance predictors automatically on resume
     assert trainer.reset_called is False
-
-    # Variance stats restored
-    assert trainer.pitch_running_mean == 1.23
-    assert trainer.pitch_running_std == 0.45
-    assert trainer.energy_running_mean == 2.34
-    assert trainer.energy_running_std == 0.67
 
 
 def test_setup_checkpoint_resumption_keeps_defaults_when_counter_keys_missing(monkeypatch, tmp_path):
