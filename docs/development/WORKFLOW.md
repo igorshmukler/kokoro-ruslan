@@ -4,7 +4,7 @@ This guide walks you through the complete process from corpus to trained TTS mod
 
 ## Prerequisites
 
-```bash
+```shell
 # Install dependencies
 pip install -r requirements.txt
 
@@ -37,7 +37,7 @@ ruslan_corpus/
 
 ### Step 2: Run Preprocessing (Extract Phoneme Alignments)
 
-```bash
+```shell
 # Option A: Use the preprocessing script (recommended)
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 8
 
@@ -58,7 +58,7 @@ python -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output -
 
 ### Step 3: Start Training
 
-```bash
+```shell
 # Basic training with MFA alignments
 kokoro-train --corpus ./ruslan_corpus --output ./my_model
 
@@ -98,7 +98,7 @@ Learning Rate: 0.0001000
 
 During training, periodically run inference to check quality:
 
-```bash
+```shell
 # Generate test samples
 python -m kokoro.inference.inference \
     --model ./my_model \
@@ -124,7 +124,7 @@ my_model/
 
 If you want to start quickly without waiting for alignment:
 
-```bash
+```shell
 # Install dependencies
 pip install -r requirements.txt
 
@@ -136,7 +136,7 @@ kokoro-train --corpus ./ruslan_corpus --no-mfa
 
 Later, you can run MFA and restart training with better data:
 
-```bash
+```shell
 # Run MFA alignment
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
@@ -148,7 +148,7 @@ kokoro-train --corpus ./ruslan_corpus --resume auto
 
 ### Fast Experimentation
 
-```bash
+```shell
 # Small subset for testing (create subset first)
 kokoro-train \
     --corpus ./ruslan_corpus_subset \
@@ -159,7 +159,7 @@ kokoro-train \
 
 ### Production Training
 
-```bash
+```shell
 # Step 1: Full preprocessing
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output --jobs 16
 
@@ -175,7 +175,7 @@ kokoro-train \
 
 ### Resume After Interruption
 
-```bash
+```shell
 # Auto-resume from latest checkpoint
 kokoro-train --corpus ./ruslan_corpus --resume auto
 
@@ -187,7 +187,7 @@ kokoro-train --corpus ./ruslan_corpus --resume ./my_model/checkpoint_epoch_50.pt
 
 ### MFA Alignment Fails
 
-```bash
+```shell
 # Validate corpus first
 kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 
@@ -200,7 +200,7 @@ kokoro-preprocess --corpus ./ruslan_corpus --jobs 2
 
 ### Training Out of Memory
 
-```bash
+```shell
 # Reduce batch size
 kokoro-train --corpus ./ruslan_corpus --batch-size 4
 
@@ -219,7 +219,7 @@ kokoro-train --corpus ./ruslan_corpus --batch-size 4
 
 ### MPS Device Issues (Mac)
 
-```bash
+```shell
 # Enable MPS fallback
 PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train --corpus ./ruslan_corpus
 ```

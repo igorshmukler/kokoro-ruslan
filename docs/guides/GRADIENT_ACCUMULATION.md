@@ -128,7 +128,7 @@ Epoch 1/100: 100%|████████| 625/625 [20:45<00:00]
 ### Verification
 
 Run the test script to verify configuration:
-```bash
+```shell
 python3 test_gradient_accumulation.py
 ```
 

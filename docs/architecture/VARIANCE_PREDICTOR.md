@@ -80,7 +80,7 @@ energy_loss_weight: float = 0.1
 ### Training
 Variance prediction is enabled by default:
 
-```bash
+```shell
 # Standard training with variance predictors
 kokoro-train --corpus ./ruslan_corpus
 
@@ -259,7 +259,7 @@ with torch.no_grad():
 ## Validation
 
 Run the test suite:
-```bash
+```shell
 python variance_predictor.py
 ```
 

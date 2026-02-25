@@ -94,14 +94,14 @@ Russian TTS training pipeline based on the Kokoro architecture, with strong Appl
 
 ## Installation
 
-```bash
+```shell
 pip install -r requirements.txt
 pip install -e .
 ```
 
 Optional dev extras:
 
-```bash
+```shell
 pip install -e .[dev]
 ```
 
@@ -127,31 +127,31 @@ audio_filename|transcription
 
 ### 1) (Recommended) Precompute features
 
-```bash
+```shell
 kokoro-precompute --corpus ./ruslan_corpus
 ```
 
 ### 2) (Recommended) Run MFA alignment
 
-```bash
+```shell
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 ```
 
 ### 3) Train
 
-```bash
+```shell
 kokoro-train --corpus ./ruslan_corpus --output ./models/kokoro_russian
 ```
 
 If you hit occasional MPS backend fallback issues:
 
-```bash
+```shell
 PYTORCH_ENABLE_MPS_FALLBACK=1 kokoro-train --corpus ./ruslan_corpus
 ```
 
 Module equivalents:
 
-```bash
+```shell
 python -m kokoro.cli.precompute_features --corpus ./ruslan_corpus
 python -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output
 python -m kokoro.cli.training --corpus ./ruslan_corpus
@@ -206,7 +206,7 @@ From `TrainingConfig` in `src/kokoro/training/config.py`:
 
 ## Useful Commands
 
-```bash
+```shell
 # Verify feature cache health before training
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
 

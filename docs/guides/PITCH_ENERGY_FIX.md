@@ -137,7 +137,7 @@ Created `test_pitch_energy_conversion.py` to verify:
 ## Testing
 
 Run training to verify the fix:
-```bash
+```shell
 kokoro-train --corpus ./ruslan_corpus --val-split 0.1
 ```
 

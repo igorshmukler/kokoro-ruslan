@@ -50,13 +50,13 @@ Most definitive check for over-smoothing: inspect the Mel-spectrogram (visual ch
 ## Example commands to generate test samples
 Long test (Russian):
 
-```bash
+```shell
 python -m kokoro.inference.inference --model ./my_model --text "В дебрях заброшенного леса слышны странные звуки, не так ли?" --output output.wav --device mps
 ```
 
 Short test (Russian):
 
-```bash
+```shell
 python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps
 ```
 

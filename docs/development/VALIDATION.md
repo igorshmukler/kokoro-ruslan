@@ -27,7 +27,7 @@ early_stopping_min_delta: float = 0.001  # Minimum improvement to count
 
 ### Command Line Arguments
 
-```bash
+```shell
 # Train with 10% validation split (default)
 kokoro-train --corpus ./ruslan_corpus --output ./my_model
 
@@ -222,7 +222,7 @@ Train Loss: 1.50, Val Loss: 2.50  → Gap: 66.7%
 
 Once you've tuned hyperparameters with validation, you can train a final model on all data:
 
-```bash
+```shell
 kokoro-train --corpus ./ruslan_corpus --no-validation --epochs 100
 ```
 
@@ -230,7 +230,7 @@ kokoro-train --corpus ./ruslan_corpus --no-validation --epochs 100
 
 When resuming training, validation state is preserved:
 
-```bash
+```shell
 kokoro-train --corpus ./ruslan_corpus --resume auto
 ```
 
@@ -272,7 +272,7 @@ With proper validation monitoring, you should see:
 
 ## Example Training Session
 
-```bash
+```shell
 # Start training with validation
 kokoro-train --corpus ./ruslan_corpus --output ./my_model --val-split 0.1
 

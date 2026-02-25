@@ -133,7 +133,7 @@ except Exception as e:
 ### Improvement Opportunities
 
 **1. Add Type Checking with mypy**
-```bash
+```shell
 # Add to requirements-dev.txt
 mypy>=1.0.0
 types-torch
@@ -147,7 +147,7 @@ disallow_untyped_defs = True
 ```
 
 **2. Add Code Formatting Standards**
-```bash
+```shell
 # requirements-dev.txt
 black>=23.0.0
 isort>=5.12.0

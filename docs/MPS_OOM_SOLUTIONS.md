@@ -4,7 +4,7 @@
 
 If you're getting OOM errors on Apple Silicon (MPS), run this **before training**:
 
-```bash
+```shell
 # Set environment variable to allow more memory usage
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7
 
@@ -42,7 +42,7 @@ The code now **automatically** applies these settings when MPS is detected:
 
 ### Option 1: Environment Variable
 
-```bash
+```shell
 # Lower watermark ratio to allow more memory
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.6
 
@@ -51,14 +51,14 @@ export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0
 ```
 
 Add to `~/.zshrc` to make permanent:
-```bash
+```shell
 echo 'export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7' >> ~/.zshrc
 source ~/.zshrc
 ```
 
 ### Option 2: Further Reduce Batch Size
 
-```bash
+```shell
 kokoro-train \
   --corpus ./ruslan_corpus \
     --batch-size 4
@@ -138,7 +138,7 @@ mem=cri*  🚨 Critical + cleanup occurred
 
 Pre-computing features reduces memory usage during training:
 
-```bash
+```shell
 # Pre-compute once
 kokoro-precompute --corpus ./ruslan_corpus
 
@@ -154,7 +154,7 @@ Benefits:
 ## Troubleshooting Steps
 
 ### Step 1: Check System Memory
-```bash
+```shell
 python3 -m kokoro.utils.mps_optimizer
 ```
 
@@ -163,17 +163,17 @@ python3 -m kokoro.utils.mps_optimizer
 - Free up system memory for training
 
 ### Step 3: Pre-compute Features
-```bash
+```shell
 kokoro-precompute --corpus ./ruslan_corpus
 ```
 
 ### Step 4: Set Environment Variable
-```bash
+```shell
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7
 ```
 
 ### Step 5: Reduce Batch Size
-```bash
+```shell
 kokoro-train --corpus ./ruslan_corpus --batch-size 4
 ```
 
@@ -229,7 +229,7 @@ MPS is excellent for inference and smaller training runs, but large TTS models m
 
 **Quick commands to prevent OOM:**
 
-```bash
+```shell
 # 1. Set environment variable
 export PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.7
 
