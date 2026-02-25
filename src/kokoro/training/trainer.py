@@ -2557,6 +2557,7 @@ class KokoroTrainer:
             logger.info("Final Memory Management Report:")
             self.print_memory_management_report()
 
+        # TODO: Add support for SIGKILL
         self.writer.close()
         logger.info("TensorBoard writer closed.")
 
