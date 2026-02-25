@@ -281,7 +281,7 @@ class RuslanDataset(Dataset):
                             # Clip extremely long sequences to prevent memory issues during training
                             original_frames = audio_length_frames
                             if audio_length_frames > self.config.max_seq_length:
-                                logger.warning(f"Clipping {audio_file_stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
+                                logger.debug(f"Clipping {audio_file_stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
                                 audio_length_frames = self.config.max_seq_length
                                 # Also adjust phoneme length if it's too long, proportionally
                                 if phoneme_length > 0 and original_frames > 0:

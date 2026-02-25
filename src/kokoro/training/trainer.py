@@ -1092,12 +1092,58 @@ class KokoroTrainer:
 
         # Duration Loss - convert to float once
         # phoneme_mask_float = phoneme_mask_2d.float()
-        target_log_durations = torch.log(phoneme_durations.float() + 1e-5)
+        target_log_durations = torch.log(phoneme_durations.float() + 1.0)
+
+        # Debugging: log predicted vs target duration stats (mean/std/min/max)
+        try:
+            pred = predicted_log_durations.detach()
+            targ = target_log_durations.detach()
+            pred_valid_mask = torch.isfinite(pred)
+            targ_valid_mask = torch.isfinite(targ)
+
+            if pred_valid_mask.any():
+                p = pred[pred_valid_mask]
+                p_mean = float(p.mean().item())
+                p_std = float(p.std().item())
+                p_min = float(p.min().item())
+                p_max = float(p.max().item())
+            else:
+                p_mean = p_std = p_min = p_max = float('nan')
+
+            if targ_valid_mask.any():
+                t = targ[targ_valid_mask]
+                t_mean = float(t.mean().item())
+                t_std = float(t.std().item())
+                t_min = float(t.min().item())
+                t_max = float(t.max().item())
+            else:
+                t_mean = t_std = t_min = t_max = float('nan')
+
+            logger.info(
+                f"Duration pred: mean={p_mean:.4f} std={p_std:.4f} min={p_min:.4f} max={p_max:.4f} | "
+                f"target: mean={t_mean:.4f} std={t_std:.4f} min={t_min:.4f} max={t_max:.4f}"
+            )
+        except Exception as _e:
+            logger.debug(f"Failed to log duration stats: {_e}")
+
         loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-        duration_valid = phoneme_mask_2d & torch.isfinite(loss_duration_unreduced)
+
+        # Only calculate loss on phonemes that actually exist in the mask
+        # AND (optionally) have a duration > 0 if you find silences are still noisy
+        duration_valid = phoneme_mask_2d & (phoneme_durations > 0)
+
+        # Debugging: report how many phoneme positions exist and how many are used for duration loss
+        try:
+            phoneme_mask_count = int(phoneme_mask_2d.sum().item())
+            duration_valid_count = int(duration_valid.sum().item())
+            logger.info(f"Phoneme mask total positions={phoneme_mask_count}, duration_valid positions={duration_valid_count}")
+        except Exception:
+            logger.debug("Could not compute phoneme/duration mask counts for logging")
         if duration_valid.any():
             loss_duration = loss_duration_unreduced[duration_valid].mean()
         else:
+            # Log that duration loss has no valid positions for this batch
+            logger.warning("Duration loss: no valid phoneme positions found for this batch; using 0.0 as loss")
             loss_duration = torch.tensor(0.0, device=self.device)
 
         # Stop Token Loss - reuse mel_mask_2d directly (no need to slice from 3D)
