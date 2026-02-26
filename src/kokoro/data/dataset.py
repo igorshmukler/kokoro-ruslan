@@ -687,9 +687,14 @@ class RuslanDataset(Dataset):
                     padding = torch.zeros(num_mel_frames - len(pitch), device=pitch.device)
                     pitch = torch.cat([pitch, padding])
 
-                # Extract energy from linear mel spectrogram (returns normalized [0, 1])
-                # Explicit log_domain=False because mel_spec_linear is pre-log (linear power).
-                energy = EnergyExtractor.extract_energy_from_mel(mel_spec_linear, log_domain=False)
+                # Extract energy from linear mel spectrogram (returns normalized [0, 1]).
+                # mel_spec_linear is (n_mels=80, T_frames); EnergyExtractor.extract_energy_from_mel
+                # expects (..., n_mels) as the last dimension so it can mean over mel bins to get
+                # a per-frame scalar.  Transpose + clip to the mel-clipped frame count.
+                # Explicit log_domain=False because values are linear power (pre-log).
+                energy = EnergyExtractor.extract_energy_from_mel(
+                    mel_spec_linear[:, :num_mel_frames].T, log_domain=False
+                )
 
                 # Ensure energy matches mel frames
                 if len(energy) > num_mel_frames:
