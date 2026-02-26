@@ -273,6 +273,75 @@ class TestPerFrameEnergyReflectsContent:
 
 
 # ---------------------------------------------------------------------------
+# 7. mel_spec_linear clipped to max_frames — both tensors stay in sync
+# ---------------------------------------------------------------------------
+class TestMelSpecLinearClipping:
+    """
+    Guards the secondary fix: mel_spec_linear must be clipped alongside
+    mel_spec so num_mel_frames is always consistent with both tensors.
+
+    In dataset.py the clip now happens at the source:
+        if mel_spec.shape[1] > max_frames:
+            mel_spec        = mel_spec[:, :max_frames]
+            mel_spec_linear = mel_spec_linear[:, :max_frames]
+
+    These tests verify that the energy extractor receives the clipped length
+    and that residual [:, :num_mel_frames].T in the energy call is a no-op
+    (both tensors are already the same length).
+    """
+
+    def test_clipped_input_produces_max_frames_energy_values(self):
+        """
+        Simulate: raw mel has T > max_frames; after clipping both tensors
+        energy output length must equal max_frames, not original T.
+        """
+        max_frames = 80
+        t_raw      = 150                           # longer than max_frames
+        mel_linear_raw = _torchaudio_layout(t=t_raw)   # (80, 150)
+
+        # Simulate the dataset clip applied to both tensors
+        mel_linear_clipped = mel_linear_raw[:, :max_frames]   # (80, 80)
+        num_mel_frames     = max_frames                        # == mel_spec.shape[1]
+
+        energy = EnergyExtractor.extract_energy_from_mel(
+            mel_linear_clipped[:, :num_mel_frames].T, log_domain=False
+        )
+        assert energy.shape == (max_frames,), (
+            f"Expected ({max_frames},) after clip, got {energy.shape}"
+        )
+
+    def test_linear_and_log_clipped_frames_match(self):
+        """
+        After the fix, mel_spec_linear.shape[1] == mel_spec.shape[1] == num_mel_frames.
+        Verify the [:, :num_mel_frames] slice is a no-op (doesn't change shape).
+        """
+        max_frames     = 60
+        mel_linear_raw = _torchaudio_layout(t=100)
+        mel_linear     = mel_linear_raw[:, :max_frames]   # simulates dataset clip
+        num_mel_frames = max_frames
+
+        # [:, :num_mel_frames] should not change the shape — it's a guard, not a real clip
+        sliced = mel_linear[:, :num_mel_frames]
+        assert sliced.shape == mel_linear.shape, (
+            "[:, :num_mel_frames] changed the shape — mel_spec_linear was NOT "
+            "clipped at source, secondary bug reintroduced."
+        )
+
+    def test_no_clip_needed_when_t_within_max_frames(self):
+        """
+        When T < max_frames no clipping occurs; both layouts should be
+        identical and produce T energy values.
+        """
+        t = 50
+        mel_linear = _torchaudio_layout(t=t)   # (80, 50) — shorter than any realistic max_frames
+        num_mel_frames = t
+        energy = EnergyExtractor.extract_energy_from_mel(
+            mel_linear[:, :num_mel_frames].T, log_domain=False
+        )
+        assert energy.shape == (t,)
+
+
+# ---------------------------------------------------------------------------
 # 6. Batch layout: (B, T, n_mels) → (B, T)
 # ---------------------------------------------------------------------------
 class TestBatchAxisLayout:

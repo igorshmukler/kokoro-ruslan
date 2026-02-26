@@ -593,10 +593,15 @@ class RuslanDataset(Dataset):
         # Convert to log scale and normalize
         mel_spec = torch.log(mel_spec_linear + 1e-9)  # Add small epsilon to avoid log(0)
 
-        # Clip extremely long sequences to prevent memory issues
+        # Clip extremely long sequences to prevent memory issues.
+        # mel_spec_linear and mel_spec must be clipped together so that
+        # num_mel_frames (derived from mel_spec below) is always consistent
+        # with both tensors, and mel_spec_linear doesn't carry excess frames
+        # that would inflate peak memory during energy extraction.
         max_frames = self.config.max_seq_length
         if mel_spec.shape[1] > max_frames:
             mel_spec = mel_spec[:, :max_frames]
+            mel_spec_linear = mel_spec_linear[:, :max_frames]
 
         # Process text to phonemes using the dedicated processor
         phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
