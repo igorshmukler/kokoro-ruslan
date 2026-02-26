@@ -65,6 +65,14 @@ class TrainingConfig:
     stop_token_loss_weight: float = 1.0
     pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
+    # Stop token class-imbalance correction.
+    # BCE on stop tokens is extremely skewed: only 1 positive frame per sequence
+    # among ~T negatives (T ≈ average mel length).  Without pos_weight the model
+    # learns to always output 0 and achieves near-zero BCE loss without ever
+    # detecting end-of-utterance.  Set to approximately the average sequence
+    # length in frames (negative:positive ratio).  For this corpus ~150 is
+    # reasonable; increase toward 300 if the stop token still doesn't fire.
+    stop_token_pos_weight: float = 150.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset

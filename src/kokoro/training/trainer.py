@@ -379,7 +379,17 @@ class KokoroTrainer:
 
         self.criterion_mel = nn.L1Loss(reduction='none')
         self.criterion_duration = nn.MSELoss(reduction='none')
-        self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
+        # pos_weight corrects the severe class imbalance in stop token targets:
+        # only the final frame of each sequence is positive (1.0); all others
+        # are negative (0.0).  Without this the model learns to always predict 0
+        # and achieves near-zero BCE loss while never detecting end-of-utterance.
+        _stop_pos_w = torch.tensor(
+            [getattr(config, 'stop_token_pos_weight', 150.0)],
+            device=self.device
+        )
+        self.criterion_stop_token = nn.BCEWithLogitsLoss(
+            reduction='none', pos_weight=_stop_pos_w
+        )
 
         if getattr(config, 'use_variance_predictor', True):
             self.criterion_pitch = nn.MSELoss(reduction='none')
