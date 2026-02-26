@@ -475,8 +475,6 @@ class KokoroTTS:
                 if a_max < 1e-4:
                     logger.warning("WARNING: Generated audio is nearly silent.")
 
-                all_audio_segments.append(chunk_audio)
-
                 # Add small silence gap (0.15s)
                 all_audio_segments.append(chunk_audio)
                 if i < len(chunks) - 1:   # only between chunks, not after the last one
