@@ -25,7 +25,7 @@ from kokoro.data.mfa_integration import MFAIntegration
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 2
+FEATURE_CACHE_VERSION = 3  # bumped: energy axis layout fix (mel_spec_linear.T)
 
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
