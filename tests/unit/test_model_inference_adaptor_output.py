@@ -148,7 +148,7 @@ def test_variance_adaptor_called_exactly_once_during_inference():
     model = _tiny_model(use_variance_predictor=True)
 
     with patch.object(
-        model, 'variance_adaptor', wraps=model.variance_adaptor
+        model.variance_adaptor, 'forward', wraps=model.variance_adaptor.forward
     ) as mock_va:
         model.forward_inference(_PHONEMES, max_len=5, stop_threshold=2.0)
         assert mock_va.call_count == 1, (
