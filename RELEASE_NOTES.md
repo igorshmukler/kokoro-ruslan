@@ -2,6 +2,21 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.21 (2026-02-26)
+
+### Critical bug fixes (pipeline correctness)
+
+- **Energy axis layout fix** (`dataset.py`): `torchaudio.MelSpectrogram` returns `(n_mels, T)` after squeeze; `EnergyExtractor.extract_energy_from_mel` expects `(..., n_mels)` on the last axis. Without the transpose, `mean(dim=-1)` averaged over the time axis and produced 80 per-band scalars instead of `T` per-frame energy values. Fixed by passing `mel_spec_linear[:, :num_mel_frames].T`.
+- **`mel_spec_linear` clip sync fix** (`dataset.py`): `mel_spec` was clipped to `max_seq_length` frames but `mel_spec_linear` was not, leaving the two tensors out of sync. Both are now clipped together at the source.
+- **`FEATURE_CACHE_VERSION` bumped to 3** (`dataset.py`): All cache entries written before the axis layout and clip fixes contain corrupted energy values. Bumping the version forces automatic re-computation of any stale cache entry rather than silently serving wrong data.
+- **`duration_target` expansion bug** (`model.py`): `VarianceAdaptor.LengthRegulator` casts durations to `.long()` immediately. The old code passed `torch.log1p(phoneme_durations)` (e.g. `1.79` for a 5-frame phoneme), which truncated to `1` frame per phoneme. Fixed by passing raw integer frame counts `phoneme_durations.float()`; the log-domain target for the duration MSE loss is computed separately in the trainer.
+- **Auto-recovery attribute path fix** (`trainer.py`): `self.model.pitch_predictor._init_weights()` was a silent no-op because `KokoroModel` has no top-level `pitch_predictor`. Fixed to `self.model.variance_adaptor.pitch_predictor._init_weights()`.
+- **`forward_inference` discarded pitch/energy embeddings** (`model.py`): The inference path called `variance_adaptor` only to obtain predicted durations, then discarded `adapted_output` and re-ran `_length_regulate` on the bare encoder output — dropping all pitch and energy embeddings. Fixed by using `adapted_encoder_output` directly, matching training behavior.
+
+### Unit tests added
+- `tests/unit/test_dataset_energy_axis_layout.py` — 21 tests covering the `(n_mels, T)→(T, n_mels)` transpose contract, the pre-clip slice pattern `[:, :num_mel_frames].T`, per-frame energy content correctness, batch layout, and documentation of the pre-fix wrong-shape behaviour as a regression canary.
+- `tests/unit/test_model_inference_adaptor_output.py` — fixed `test_variance_adaptor_called_exactly_once_during_inference`: replaced `patch.object(model, 'variance_adaptor', ...)` (rejected by `nn.Module.__setattr__`) with `patch.object(model.variance_adaptor, 'forward', ...)`.
+
 ## 0.0.20 (2026-02-25)
 - Added unit tests for `<sil>` token handling and fallback behavior
 - Added diagnostic logging for duration predictions vs. targets in the trainer (`_calculate_losses`), gated by `config.verbose` for local debugging of duration-loss convergence
