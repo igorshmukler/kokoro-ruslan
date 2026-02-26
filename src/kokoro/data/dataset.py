@@ -688,7 +688,8 @@ class RuslanDataset(Dataset):
                     pitch = torch.cat([pitch, padding])
 
                 # Extract energy from linear mel spectrogram (returns normalized [0, 1])
-                energy = EnergyExtractor.extract_energy_from_mel(mel_spec_linear)
+                # Explicit log_domain=False because mel_spec_linear is pre-log (linear power).
+                energy = EnergyExtractor.extract_energy_from_mel(mel_spec_linear, log_domain=False)
 
                 # Ensure energy matches mel frames
                 if len(energy) > num_mel_frames:

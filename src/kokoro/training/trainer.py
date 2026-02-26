@@ -407,8 +407,10 @@ class KokoroTrainer:
             self.current_optimizer_step = 0
 
             if self.use_warmup:
-                # OneCycleLR starts after warmup, so adjust total_steps
-                onecycle_steps = total_steps - self.warmup_steps
+                # OneCycleLR starts after warmup, so adjust total_steps.
+                self.warmup_steps, onecycle_steps = KokoroTrainer._apply_warmup_guard(
+                    self.warmup_steps, total_steps
+                )
                 logger.info(f"Linear warmup enabled: {self.warmup_steps} steps ({self.warmup_start_lr:.2e} → {self.warmup_target_lr:.2e})")
             else:
                 onecycle_steps = total_steps
@@ -1241,6 +1243,23 @@ class KokoroTrainer:
                           f"pitch={loss_pitch:.2f}, energy={loss_energy:.2f}")
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
+
+    @staticmethod
+    def _apply_warmup_guard(warmup_steps: int, total_steps: int) -> Tuple[int, int]:
+        """
+        Guard warmup_steps so that OneCycleLR always receives a positive total_steps.
+
+        Returns:
+            (clamped_warmup_steps, onecycle_steps) where onecycle_steps >= 1.
+        """
+        if warmup_steps >= total_steps:
+            logger.warning(
+                f"warmup_steps ({warmup_steps}) >= total_steps ({total_steps}). "
+                "Clamping warmup to total_steps - 1 to avoid OneCycleLR crash."
+            )
+            warmup_steps = max(0, total_steps - 1)
+        onecycle_steps = max(1, total_steps - warmup_steps)
+        return warmup_steps, onecycle_steps
 
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""

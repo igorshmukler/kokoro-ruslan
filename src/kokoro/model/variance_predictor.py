@@ -420,9 +420,10 @@ class VarianceAdaptor(nn.Module):
         if duration_target is not None:
             durations_to_use = duration_target
         else:
-            # Inference: use predicted durations (assumed to be raw frame counts,
-            # not log-domain — apply exp() upstream if your predictor uses log targets)
-            durations_to_use = torch.clamp(torch.round(duration_pred), min=0)
+            # Inference: duration predictor is trained on log1p targets, so we must
+            # apply exp() before rounding to recover actual frame counts.
+            # e.g. log1p(7) ≈ 2.08 → exp(2.08) ≈ 8.0 → 8 frames
+            durations_to_use = torch.clamp(torch.round(torch.exp(duration_pred)), min=0)
 
         durations_to_use = durations_to_use.to(device)
 
@@ -828,9 +829,9 @@ if __name__ == "__main__":
     pitch = PitchExtractor.extract_pitch(waveform, sample_rate=22050, hop_length=DEFAULT_HOP_LENGTH)
     print(f"Pitch shape: {pitch.shape}")
 
-    # EnergyExtractor
-    mel_spec = torch.randn(80, 100)
-    energy = EnergyExtractor.extract_energy_from_mel(mel_spec)
+    # EnergyExtractor — use explicit log_domain=False; random randn is near zero-mean
+    mel_spec = torch.abs(torch.randn(80, 100))  # positive linear-scale mock
+    energy = EnergyExtractor.extract_energy_from_mel(mel_spec, log_domain=False)
     print(f"Energy shape: {energy.shape}")
 
     logger.info("All variance predictor tests passed!")
