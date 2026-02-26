@@ -454,7 +454,7 @@ class KokoroTTS:
 
                 # 2. Safety Clip
                 # Based on torch.log(1e-9), the floor is -20.7, but typical speech is -11.5 to 0.
-                mel_spec = torch.clamp(mel_spec, min=-11.5, max=1.0)
+                mel_spec = torch.clamp(mel_spec, min=-11.5, max=2.0)
 
                 # 3. Transposition Fix
                 if mel_spec.shape[-1] == self.n_mels:

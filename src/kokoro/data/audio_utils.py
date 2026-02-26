@@ -68,9 +68,15 @@ class AudioUtils:
         return success
 
     def _save_with_torchaudio(self, audio: torch.Tensor, output_path: Path) -> bool:
-        """Try saving with torchaudio"""
         try:
-            torchaudio.save(str(output_path), audio.unsqueeze(0), self.sample_rate, format="wav")
+            torchaudio.save(
+                str(output_path),
+                audio.unsqueeze(0),
+                self.sample_rate,
+                format="wav",
+                encoding="PCM_S",
+                bits_per_sample=16,
+            )
             logger.info(f"Audio saved using torchaudio: {output_path}")
             return True
         except Exception as e:
