@@ -506,7 +506,7 @@ class KokoroModel(nn.Module):
                         mask=text_padding_mask,
                         pitch_target=phoneme_pitch,
                         energy_target=phoneme_energy,
-                        duration_target=phoneme_durations.float()
+                        duration_target=torch.log1p(phoneme_durations.float())
                     )
 
                     # Free everything consumed by the adaptor
