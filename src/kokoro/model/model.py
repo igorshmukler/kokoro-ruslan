@@ -732,7 +732,7 @@ class KokoroModel(nn.Module):
                                 stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
                                 del decoder_out_t
 
-                                stop_probability = torch.sigmoid(stop_token_logit_t).item()
+                                stop_probability = torch.sigmoid(stop_token_logit_t).mean().item()
                                 del stop_token_logit_t
 
                                 if t >= min_expected_length:
