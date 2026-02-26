@@ -235,6 +235,9 @@ kokoro-train --corpus ./ruslan_corpus --try-fused-adamw-mps
 python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps
 
 # Inference tuning (helps early checkpoints avoid very short outputs)
+# Note: an explicit `--stop-threshold` passed on the CLI overrides any
+# checkpoint-tuned or internal model default and will be honored during
+# generation.
 python -m kokoro.inference.inference --model ./my_model --text "Привет, это тест." --output output.wav --device mps --stop-threshold 0.6 --min-len-ratio 0.9 --max-len 1600
 
 # Run focused unit tests
