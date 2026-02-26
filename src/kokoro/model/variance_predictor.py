@@ -675,25 +675,47 @@ class EnergyExtractor:
     """
 
     @staticmethod
-    def extract_energy_from_mel(mel_spec: torch.Tensor) -> torch.Tensor:
+    def extract_energy_from_mel(mel_spec: torch.Tensor,
+                                 log_domain: Optional[bool] = None) -> torch.Tensor:
         """
         Extract energy from mel spectrogram, normalized to [0, 1].
 
         Args:
-            mel_spec: Mel spectrogram (batch, frames, n_mels) or (frames, n_mels)
+            mel_spec: Mel spectrogram (batch, frames, n_mels) or (frames, n_mels).
+                      Values are expected to be in **log** domain (standard TTS pipeline).
+            log_domain: Explicitly declare whether mel_spec is in log domain.
+                        True  → exp() to recover linear magnitudes before averaging.
+                        False → treat as already linear.
+                        None  → heuristic: assume log if median < -1 (conservative).
+                        Always prefer passing this explicitly to avoid silent mismatches.
 
         Returns:
             Energy contour normalized to [0, 1] (batch, frames) or (frames,)
         """
-        # Convert to linear domain if input appears to be log-mel
-        mel_linear = torch.exp(mel_spec) if mel_spec.min() < 0 else mel_spec
+        if log_domain is None:
+            # Conservative heuristic: log-mel from a typical TTS pipeline has median
+            # well below -1. A clipped or shifted log-mel may still have min >= 0,
+            # so median is more robust than min.
+            log_domain = mel_spec.median().item() < -1.0
 
-        # average over mel bins to get a single energy value per frame, then apply log compression
-        energy = torch.mean(mel_linear, dim=-1)
-        energy = torch.log1p(torch.clamp(energy, min=0.0))
+        if log_domain:
+            # Log-mel: average over mel bins in log domain.
+            # mean(log_mel) = log of the geometric mean of linear mels — preserves
+            # dynamic range without the double-compression that exp()->mean()->log1p()
+            # produces when linear values are near zero (as with mean log-mel ≈ -8).
+            energy = mel_spec.mean(dim=-1)          # (B, T) or (T,); loud frames are less negative
+        else:
+            # Linear mel: mean power per frame then log-compress
+            energy = torch.mean(mel_spec, dim=-1)
+            energy = torch.log1p(torch.clamp(energy, min=0.0))
 
-        floor = torch.quantile(energy, 0.05, dim=-1, keepdim=True)
-        ceil  = torch.quantile(energy, 0.95, dim=-1, keepdim=True)
+        # Percentile normalisation — robust to outliers, keeps output in [0, 1]
+        if energy.dim() == 1:
+            floor = torch.quantile(energy, 0.05)
+            ceil  = torch.quantile(energy, 0.95)
+        else:
+            floor = torch.quantile(energy, 0.05, dim=-1, keepdim=True)
+            ceil  = torch.quantile(energy, 0.95, dim=-1, keepdim=True)
         energy = (energy - floor) / torch.clamp(ceil - floor, min=1e-8)
 
         return torch.clamp(energy, 0.0, 1.0)
