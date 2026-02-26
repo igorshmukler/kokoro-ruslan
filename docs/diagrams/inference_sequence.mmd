@@ -1,0 +1,27 @@
+%% Kokoro - Inference Sequence Diagram
+sequenceDiagram
+  autonumber
+  participant User
+  participant CLI
+  participant KokoroTTS
+  participant PhonemeProc
+  participant Model as KokoroModel
+  participant Vocoder
+  participant Audio
+
+  User->>CLI: run inference (args)
+  CLI->>KokoroTTS: init(args, model_dir)
+  KokoroTTS->>PhonemeProc: load phoneme_processor.pkl
+  KokoroTTS->>Model: load checkpoint (weights + metadata)
+  User->>KokoroTTS: text_to_speech(text, stop_threshold=opt)
+  KokoroTTS->>PhonemeProc: process_text(text)
+  PhonemeProc->>KokoroTTS: phoneme sequence
+  KokoroTTS->>Model: forward_inference(phonemes, stop_threshold, post_expected_stop_threshold?)
+  Model->>Model: encode -> variance -> length_regulate -> decode
+  Model-->>KokoroTTS: mel_spec
+  KokoroTTS->>Vocoder: mel_to_audio(mel_spec)
+  Vocoder-->>Audio: waveform
+  Audio-->>User: saved output.wav
+
+  Note over Model,KokoroTTS: If CLI/per-call stop_threshold explicit,
+  Note over Model,KokoroTTS: post_expected_stop_threshold is set to it (no silent clamp)

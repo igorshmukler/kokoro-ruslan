@@ -1,0 +1,57 @@
+%% Kokoro - Detailed Block Schema
+flowchart TB
+  subgraph CLI/API
+    CLI[CLI: python -m kokoro.inference.inference]
+    API[Python API: KokoroTTS]
+  end
+  CLI --> API
+
+  subgraph Artifacts
+    PP["phoneme_processor.pkl"]
+    CKPT["kokoro_russian_final.pth / checkpoint_epoch_*.pth"]
+    VOC["vocoder_models / HiFi-GAN"]
+  end
+  API --> PP
+  API --> CKPT
+  API --> VOC
+
+  subgraph Phoneme
+    PP_PROC[RussianPhonemeProcessor]
+    PP_UTIL[PhonemeProcessorUtils]
+  end
+  PP --> PP_PROC --> PP_UTIL
+
+  subgraph KokoroModel [KokoroModel Internals]
+    Enc[Encoder]
+    Var["VarianceAdaptor (pitch energy duration preds)"]
+    LR[LengthRegulator]
+    Dec[Decoder]
+    Stop[Stop-token Predictor]
+    MelOut["Mel Projection"]
+  end
+  PP_UTIL --> Enc
+  CKPT -->|weights & metadata| KokoroModel
+  Enc --> Var --> LR --> Dec --> MelOut
+  Dec --> Stop
+
+  subgraph InferenceControls
+    CLI_flags[--stop-threshold, --max-len, --min-len-ratio, --min-len-floor]
+    CKPT_controls[checkpoint inference_controls / config]
+  end
+  CLI --> CLI_flags
+  CKPT --> CKPT_controls
+  CLI_flags --> API
+  CKPT_controls --> API
+  CLI_flags --> KokoroModel
+
+  KokoroModel --> Vocoder[VocoderManager]
+  Vocoder --> Audio["AudioUtils / save_audio"]
+
+  KokoroModel --> Logs[Logging & Metrics]
+  API --> Tests[Unit & Runtime Tests]
+  API --> Docs[README.md / docs/setup/inference.md]
+
+  style KokoroModel fill:#ddeeff,stroke:#333,stroke-width:1px
+  style Artifacts fill:#fff2cc,stroke:#333,stroke-width:1px
+  style CLI/API fill:#f2e6ff,stroke:#333
+  style InferenceControls fill:#e6fff2,stroke:#333
