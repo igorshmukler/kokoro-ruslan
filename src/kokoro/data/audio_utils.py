@@ -30,7 +30,10 @@ class AudioUtils:
     @staticmethod
     def normalize_audio(audio: torch.Tensor) -> torch.Tensor:
         """Normalize audio to prevent clipping"""
-        return audio / torch.max(torch.abs(audio))
+        max_val = torch.max(torch.abs(audio))
+        if max_val < 1e-8:
+            return audio
+        return audio / max_val
 
     @staticmethod
     def ensure_mono(audio: torch.Tensor) -> torch.Tensor:
