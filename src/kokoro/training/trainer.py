@@ -1210,11 +1210,14 @@ class KokoroTrainer:
 
             logger.warning(f"   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
 
-            # Reset variance predictor weights to initial state
-            if hasattr(self.model, 'pitch_predictor') and self.model.pitch_predictor is not None:
-                self.model.pitch_predictor._init_weights()
-            if hasattr(self.model, 'energy_predictor') and self.model.energy_predictor is not None:
-                self.model.energy_predictor._init_weights()
+            # Reset variance predictor weights to initial state.
+            # The predictors live under model.variance_adaptor, not at model top-level.
+            va = getattr(self.model, 'variance_adaptor', None)
+            if va is not None:
+                if hasattr(va, 'pitch_predictor') and va.pitch_predictor is not None:
+                    va.pitch_predictor._init_weights()
+                if hasattr(va, 'energy_predictor') and va.energy_predictor is not None:
+                    va.energy_predictor._init_weights()
 
             # Zero out these losses for this batch to prevent gradient explosion
             loss_pitch = torch.tensor(0.0, device=self.device)

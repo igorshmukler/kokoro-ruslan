@@ -497,6 +497,12 @@ class KokoroModel(nn.Module):
                         )
                         del energy_targets
 
+                    # Pass raw frame counts (not log1p) as duration_target.
+                    # VarianceAdaptor's LengthRegulator casts to .long() internally,
+                    # so it needs actual integer frame counts (e.g. 5), not log1p
+                    # values (e.g. 1.79) which would be truncated to 1-2 frames.
+                    # The duration *loss* target (log1p for the predictor head) is
+                    # computed separately in the trainer from predicted_log_durations.
                     (adapted_encoder_output,
                      predicted_log_durations,
                      predicted_pitch,
@@ -506,7 +512,7 @@ class KokoroModel(nn.Module):
                         mask=text_padding_mask,
                         pitch_target=phoneme_pitch,
                         energy_target=phoneme_energy,
-                        duration_target=torch.log1p(phoneme_durations.float())
+                        duration_target=phoneme_durations.float()
                     )
 
                     # Free everything consumed by the adaptor
