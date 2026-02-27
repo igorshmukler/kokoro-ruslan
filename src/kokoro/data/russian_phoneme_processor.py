@@ -33,6 +33,11 @@ class RussianPhonemeProcessor:
     STRESS_MARKS = ['\u0301', '\u0300', '\u0341']  # Acute, grave, combining acute
     VOWEL_LETTERS = {'а', 'о', 'у', 'ы', 'э', 'я', 'ё', 'ю', 'и', 'е'}
 
+    # Terminal / clause punctuation mapped to prosody-conditioning tokens.
+    # These tokens are injected into the phoneme sequence at word boundaries
+    # so the model can condition duration, pitch and energy on sentence type.
+    PUNCT_MAP = {'.': '<period>', '?': '<question>', '!': '<exclaim>', ',': '<comma>'}
+
     def __init__(self, stress_dict_path: Optional[str] = None):
         """
         Initialize the processor.
@@ -553,21 +558,67 @@ class RussianPhonemeProcessor:
         phonemes, stress_info = self._process_normalized_word(normalized)
         return list(phonemes), stress_info
 
-    def process_text(self, text: str) -> List[Tuple[str, List[str], StressInfo]]:
-        """Process full text and return word-phoneme-stress tuples."""
+    @staticmethod
+    def _extract_punct_after_words(text: str) -> List[Optional[str]]:
+        """
+        Scan *raw* text character-by-character and return, in order, the first
+        PUNCT_MAP token that appears after each Cyrillic word before the next
+        Cyrillic word (or end of string).  Returns None for words with no
+        following punctuation.
+
+        Example:  "Привет, как дела?"  →  ['<comma>', None, '<question>']
+        """
+        punct_map = RussianPhonemeProcessor.PUNCT_MAP
+        result: List[Optional[str]] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            # Advance past non-Cyrillic characters
+            if not ('\u0400' <= text[i] <= '\u04FF'):
+                i += 1
+                continue
+            # Consume one Cyrillic word (base letters + combining stress marks)
+            while i < n and ('\u0400' <= text[i] <= '\u04FF' or text[i] in '\u0301\u0300\u0341'):
+                i += 1
+            # Collect the first matching punctuation before the next Cyrillic word
+            punct: Optional[str] = None
+            while i < n and not ('\u0400' <= text[i] <= '\u04FF'):
+                if punct is None and text[i] in punct_map:
+                    punct = punct_map[text[i]]
+                i += 1
+            result.append(punct)
+        return result
+
+    def process_text(self, text: str) -> List[Tuple]:
+        """
+        Process full text and return tuples of
+        ``(word, phonemes, stress_info, punct_token_or_None)``.
+
+        The optional 4th element is a prosody token from PUNCT_MAP ('<period>',
+        '<question>', '<exclaim>', '<comma>') when a punctuation mark follows
+        the word in the raw input, otherwise ``None``.  Callers that only need
+        the first three fields can use extended unpacking::
+
+            word, phonemes, stress, *_ = item
+        """
         if not text:
             return []
+
+        # Extract punctuation associations from the raw text BEFORE normalization
+        # strips all non-Cyrillic characters.
+        punct_list = self._extract_punct_after_words(text)
 
         normalized_text = self.normalize_text(text)
         results = []
 
-        for word in normalized_text.split():
+        for idx, word in enumerate(normalized_text.split()):
             try:
                 phonemes, stress_info = self._process_normalized_word(word)
-                results.append((word, list(phonemes), stress_info))
             except Exception as e:
                 logger.error(f"Error processing word '{word}': {e}")
-                results.append((word, [], StressInfo(0, 0, False)))
+                phonemes, stress_info = (), StressInfo(0, 0, False)
+            punct_token: Optional[str] = punct_list[idx] if idx < len(punct_list) else None
+            results.append((word, list(phonemes), stress_info, punct_token))
 
         return results
 
@@ -623,7 +674,7 @@ class RussianPhonemeProcessor:
         results = self.process_text(text)
         stress_pattern = []
 
-        for word_orig, phonemes, stress_info in results:
+        for word_orig, phonemes, stress_info, *_ in results:
             word_phoneme_stress = [0] * len(phonemes)
 
             vowel_phoneme_count = 0
@@ -655,6 +706,9 @@ class RussianPhonemeProcessor:
 
         # ADD SPECIAL TOKENS FIRST
         phoneme_set.update(['<pad>', '<sil>', '<sp>'])
+
+        # Prosody-conditioning punctuation tokens
+        phoneme_set.update(['<period>', '<question>', '<exclaim>', '<comma>'])
 
         # Add base phonemes
         phoneme_set.update(self.vowels.values())
@@ -688,7 +742,7 @@ class RussianPhonemeProcessor:
         results = self.process_text(text)
         indices = []
 
-        for word, phonemes, _ in results:
+        for word, phonemes, *_ in results:
             for phoneme in phonemes:
                 idx = self.phoneme_to_id.get(phoneme)
                 if idx is not None:
@@ -738,6 +792,19 @@ class RussianPhonemeProcessor:
         instance.stress_patterns = data.get("stress_patterns", {})
         instance.exceptions = data.get("exceptions", {})
         instance.phoneme_to_id = data.get("phoneme_to_id", {})
+
+        # Forward-compatibility patch: if the pickled vocab pre-dates the
+        # prosody-token addition, inject the missing tokens with fresh IDs so
+        # they are always usable at inference time without retraining.
+        punct_tokens = list(RussianPhonemeProcessor.PUNCT_MAP.values())
+        # Also ensure the base special tokens are present.
+        required_tokens = ['<pad>', '<sil>', '<sp>'] + punct_tokens
+        next_id = max(instance.phoneme_to_id.values(), default=-1) + 1
+        for tok in required_tokens:
+            if tok not in instance.phoneme_to_id:
+                instance.phoneme_to_id[tok] = next_id
+                next_id += 1
+
         return instance
 
     def clear_cache(self):
@@ -801,7 +868,7 @@ if __name__ == "__main__":
     print("=" * 50)
 
     results = processor.process_text(input_text)
-    for word, phonemes, stress_info in results:
+    for word, phonemes, stress_info, *_ in results:
         ipa = processor.to_ipa(phonemes)
         print(f"Word: {word}")
         print(f"  Phonemes: {phonemes}")

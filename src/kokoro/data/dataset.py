@@ -26,7 +26,7 @@ from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 4  # bumped: phoneme sequence now includes <sil> between words
+FEATURE_CACHE_VERSION = 5  # bumped: phoneme sequence now includes prosody punctuation tokens
 
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor

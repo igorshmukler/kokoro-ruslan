@@ -178,14 +178,17 @@ class PhonemeProcessorUtils:
                                     logger.warning(f"Unexpected item type in deepest level: {type(deepest_item)} - {deepest_item}")
                         else:
                             logger.warning(f"Unexpected item type in sub_item: {type(sub_item)} - {sub_item}")
-                elif isinstance(item, tuple) and len(item) == 3:
-                    # Tuple format: (word, word_phonemes, stress_info)
+                elif isinstance(item, tuple) and len(item) >= 3:
+                    # Tuple format: (word, word_phonemes, stress_info[, punct_token])
                     if isinstance(item[1], list):
                         for sub_phoneme in item[1]:
                             if isinstance(sub_phoneme, str):
                                 phoneme_sequence.append(sub_phoneme)
                             else:
                                 logger.warning(f"Unexpected phoneme type in tuple's phoneme list: {type(sub_phoneme)} - {sub_phoneme}")
+                        # Emit prosody punct token if present (4th element)
+                        if len(item) >= 4 and isinstance(item[3], str) and item[3]:
+                            phoneme_sequence.append(item[3])
                     else:
                         logger.warning(f"Unexpected type for word_phonemes in tuple: {type(item[1])} - {item[1]}")
                 else:
@@ -199,18 +202,22 @@ class PhonemeProcessorUtils:
     @staticmethod
     def flatten_phoneme_output_with_sil(raw_output, phoneme_to_id: dict) -> list:
         """
-        Flatten process_text() output, inserting <sil> between words.
+        Flatten process_text() output, inserting <sil> between words and
+        prosody tokens (e.g. '<period>', '<question>') after punctuated words.
 
         During training, MFA alignments include <sil> tokens at word boundaries.
         This method replicates that distribution at inference time so the model
         sees the same token patterns it was trained on.
+
+        Token order for a word with trailing punctuation:
+            [word_phonemes...] [<punct>] [<sil>] [next_word_phonemes...]
 
         Falls back to plain flattening with a WARNING if <sil> is absent from
         phoneme_to_id (processor predates the <sil> vocab addition).
 
         Args:
             raw_output: Output of RussianPhonemeProcessor.process_text() —
-                        list of (word, [phonemes], stress_info) tuples.
+                        list of (word, [phonemes], stress_info[, punct]) tuples.
             phoneme_to_id: Vocabulary mapping from the loaded processor.
         """
         if '<sil>' not in phoneme_to_id:
@@ -225,8 +232,10 @@ class PhonemeProcessorUtils:
         word_count = 0
 
         for item in raw_output:
-            if isinstance(item, tuple) and len(item) == 3:
-                word, word_phonemes, _ = item
+            if isinstance(item, tuple) and len(item) >= 3:
+                word, word_phonemes = item[0], item[1]
+                # 4th element (index 3) is an optional prosody punct token
+                punct_token: Optional[str] = item[3] if len(item) >= 4 and isinstance(item[3], str) else None
                 if not isinstance(word_phonemes, list):
                     logger.warning(
                         f"flatten_phoneme_output_with_sil: unexpected phoneme list "
@@ -238,6 +247,9 @@ class PhonemeProcessorUtils:
                 for ph in word_phonemes:
                     if isinstance(ph, str) and ph:
                         result.append(ph)
+                # Inject punct token AFTER word phonemes, BEFORE next <sil>
+                if punct_token:
+                    result.append(punct_token)
                 word_count += 1
             else:
                 # Non-tuple: fall back to plain logic for this element

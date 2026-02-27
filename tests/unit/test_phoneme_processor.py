@@ -64,7 +64,15 @@ def test_process_text_end_to_end():
     text = "Привет, как дела?"
     results = p.process_text(text)
     assert len(results) == 3
-    for word, phonemes, stress in results:
+    for item in results:
+        # process_text returns 4-tuples: (word, phonemes, stress_info, punct_or_None)
+        assert len(item) == 4
+        word, phonemes, stress, punct = item
         assert isinstance(word, str)
         assert isinstance(phonemes, list)
         assert isinstance(stress.position, int)
+        assert punct is None or isinstance(punct, str)
+    # Punctuation tokens injected correctly
+    assert results[0][3] == '<comma>'   # "Привет,"
+    assert results[1][3] is None         # "как"
+    assert results[2][3] == '<question>' # "дела?"
