@@ -23,7 +23,7 @@ if readme_file.exists():
 
 setup(
     name="kokoro-ruslan",
-    version="0.0.21",
+    version="0.0.22",
     author="Igor Shmukler",
     description="Transformer-based Russian Text-to-Speech System",
     long_description=long_description,

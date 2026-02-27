@@ -360,22 +360,59 @@ class MFAIntegration:
             logger.error(f"Error parsing TextGrid {textgrid_path}: {e}")
             return []
 
-    def get_phoneme_durations(self, audio_file_stem: str, actual_mel_len: Optional[int] = None) -> Optional[List[int]]:
+    def get_phoneme_durations(
+        self,
+        audio_file_stem: str,
+        actual_mel_len: Optional[int] = None,
+        strip_outer_silences: bool = False,
+    ) -> Optional[List[int]]:
+        """Return per-phoneme frame counts from the TextGrid alignment.
+
+        Args:
+            audio_file_stem: Base name of the audio file (no extension).
+            actual_mel_len: When provided, the last duration is adjusted so
+                that sum(durations) == actual_mel_len.
+            strip_outer_silences: When True, leading and trailing <sil>
+                intervals are removed and their frame counts are absorbed into
+                the first/last real phoneme respectively.  This makes the
+                returned list consistent with flatten_phoneme_output_with_sil(),
+                which inserts <sil> only between words, never at the utterance
+                boundaries.
+        """
         textgrid_path = self.alignment_dir / f"{audio_file_stem}.TextGrid"
         if not textgrid_path.exists():
             return None
 
         word_alignments = self.parse_textgrid(textgrid_path)
-        durations = [p.duration_frames for w in word_alignments for p in w.phonemes]
+
+        # Build flat (label, frames) list for the whole utterance.
+        flat: List[Tuple[str, int]] = [
+            (p.phoneme, p.duration_frames)
+            for w in word_alignments
+            for p in w.phonemes
+        ]
+
+        if strip_outer_silences and flat:
+            # Absorb leading <sil> intervals into the first non-sil entry so
+            # that the sequence starts on a real phoneme — matching the output
+            # of flatten_phoneme_output_with_sil() which never prepends <sil>.
+            while len(flat) > 1 and flat[0][0] == '<sil>':
+                _, sil_dur = flat.pop(0)
+                lbl, dur = flat[0]
+                flat[0] = (lbl, dur + sil_dur)
+
+            # Same treatment for trailing silences.
+            while len(flat) > 1 and flat[-1][0] == '<sil>':
+                _, sil_dur = flat.pop()
+                lbl, dur = flat[-1]
+                flat[-1] = (lbl, dur + sil_dur)
+
+        durations = [dur for _, dur in flat]
 
         if actual_mel_len is not None:
             current_sum = sum(durations)
             diff = actual_mel_len - current_sum
-
-            # If the diff is small, adjust the silences or the last phoneme
             if diff != 0 and len(durations) > 0:
-                # Strategy: Find indices of silences and distribute diff there first
-                # If no silences, just adjust the last phoneme as a fallback
                 durations[-1] = max(1, durations[-1] + diff)
 
         return durations

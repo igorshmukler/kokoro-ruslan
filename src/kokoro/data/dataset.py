@@ -22,10 +22,11 @@ import time
 from kokoro.training.config import TrainingConfig
 from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 from kokoro.data.mfa_integration import MFAIntegration
+from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 3  # bumped: energy axis layout fix (mel_spec_linear.T)
+FEATURE_CACHE_VERSION = 4  # bumped: phoneme sequence now includes <sil> between words
 
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
@@ -274,9 +275,13 @@ class RuslanDataset(Dataset):
                             if audio_length_frames < 1:
                                 audio_length_frames = 1
 
-                            # Pre-calculate phoneme length
-                            phoneme_indices = self.phoneme_processor.text_to_indices(text)
-                            phoneme_length = len(phoneme_indices)
+                            # Pre-calculate phoneme length (including inter-word <sil> tokens
+                            # so the estimate matches what __getitem__ will produce).
+                            _raw = self.phoneme_processor.process_text(text)
+                            _seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+                                _raw, self.phoneme_processor.phoneme_to_id
+                            )
+                            phoneme_length = len(_seq)
 
                             # Clip extremely long sequences to prevent memory issues during training
                             original_frames = audio_length_frames
@@ -324,9 +329,13 @@ class RuslanDataset(Dataset):
                         if audio_length_frames < 1:
                             audio_length_frames = 1
 
-                        # Pre-calculate phoneme length
-                        phoneme_indices = self.phoneme_processor.text_to_indices(text)
-                        phoneme_length = len(phoneme_indices)
+                        # Pre-calculate phoneme length (including inter-word <sil> tokens
+                        # so the estimate matches what __getitem__ will produce).
+                        _raw = self.phoneme_processor.process_text(text)
+                        _seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+                            _raw, self.phoneme_processor.phoneme_to_id
+                        )
+                        phoneme_length = len(_seq)
 
                         # Clip extremely long sequences
                         original_frames = audio_length_frames
@@ -603,18 +612,35 @@ class RuslanDataset(Dataset):
             mel_spec = mel_spec[:, :max_frames]
             mel_spec_linear = mel_spec_linear[:, :max_frames]
 
-        # Process text to phonemes using the dedicated processor
-        phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
+        # Process text to phonemes, inserting <sil> between words to match the
+        # MFA alignment structure (MFA records inter-word silences as explicit
+        # phone-tier intervals, so our input sequence must include them too).
+        # This is identical to what the inference pipeline does, eliminating the
+        # training/inference phoneme-sequence mismatch.
+        _raw_text_output = self.phoneme_processor.process_text(sample['text'])
+        phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+            _raw_text_output, self.phoneme_processor.phoneme_to_id
+        )
+        phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
+            phoneme_sequence, self.phoneme_processor.phoneme_to_id
+        )
         phoneme_indices_tensor = torch.tensor(phoneme_indices, dtype=torch.long)
 
         # --- Get Phoneme Durations (MFA or Estimated) ---
         num_mel_frames = mel_spec.shape[1]
         num_phonemes = phoneme_indices_tensor.shape[0]
 
-        # Try to get MFA alignments first
+        # Try to get MFA alignments first.
+        # strip_outer_silences=True absorbs MFA's leading/trailing <sil> intervals
+        # into the first/last real phoneme frames.  After stripping, the MFA
+        # duration list contains exactly the same slots as our phoneme_sequence
+        # (word phonemes + inter-word <sil> tokens), so lengths match without
+        # requiring truncation/padding in the common case.
         mfa_durations = None
         if self.mfa is not None:
-            mfa_durations = self.mfa.get_phoneme_durations(sample['audio_file'])
+            mfa_durations = self.mfa.get_phoneme_durations(
+                sample['audio_file'], strip_outer_silences=True
+            )
 
         if mfa_durations is not None and len(mfa_durations) > 0:
             # Use MFA durations
