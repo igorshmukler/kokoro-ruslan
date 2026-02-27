@@ -38,6 +38,68 @@ class RussianPhonemeProcessor:
     # so the model can condition duration, pitch and energy on sentence type.
     PUNCT_MAP = {'.': '<period>', '?': '<question>', '!': '<exclaim>', ',': '<comma>'}
 
+    # ── Number-to-words tables (Russian nominative case) ─────────────────────
+    _UNITS_M = ('ноль', 'один', 'два', 'три', 'четыре', 'пять', 'шесть',
+                'семь', 'восемь', 'девять')
+    _UNITS_F = ('ноль', 'одна', 'две', 'три', 'четыре', 'пять', 'шесть',
+                'семь', 'восемь', 'девять')
+    _TEENS   = ('десять', 'одиннадцать', 'двенадцать', 'тринадцать',
+                'четырнадцать', 'пятнадцать', 'шестнадцать', 'семнадцать',
+                'восемнадцать', 'девятнадцать')
+    _TENS    = ('', '', 'двадцать', 'тридцать', 'сорок', 'пятьдесят',
+                'шестьдесят', 'семьдесят', 'восемьдесят', 'девяносто')
+    _HUNDREDS = ('', 'сто', 'двести', 'триста', 'четыреста', 'пятьсот',
+                 'шестьсот', 'семьсот', 'восемьсот', 'девятьсот')
+
+    # ── Abbreviation expansion table (longest / most specific first) ─────────
+    # Each entry is (compiled_regex, replacement_string).
+    # Patterns use word boundaries and are case-insensitive Cyrillic.
+    _ABBREV_TABLE = [
+        (re.compile(r'\bт\.\s*е\.', re.IGNORECASE),   'то есть'),
+        (re.compile(r'\bт\.\s*д\.', re.IGNORECASE),   'так далее'),
+        (re.compile(r'\bт\.\s*п\.', re.IGNORECASE),   'тому подобное'),
+        (re.compile(r'\bмлрд\b',     re.IGNORECASE),   'миллиардов'),
+        (re.compile(r'\bмлн\b',      re.IGNORECASE),   'миллионов'),
+        (re.compile(r'\bтыс\b',      re.IGNORECASE),   'тысяч'),
+        (re.compile(r'\bкм\b',       re.IGNORECASE),   'километров'),
+        (re.compile(r'\bкг\b',       re.IGNORECASE),   'килограммов'),
+        (re.compile(r'\bмм\b',       re.IGNORECASE),   'миллиметров'),
+        (re.compile(r'\bсм\b',       re.IGNORECASE),   'сантиметров'),
+        (re.compile(r'\bкв\b',       re.IGNORECASE),   'квадратных'),
+        (re.compile(r'\bруб\b',      re.IGNORECASE),   'рублей'),
+        (re.compile(r'\bкоп\b',      re.IGNORECASE),   'копеек'),
+        (re.compile(r'\bмин\b',      re.IGNORECASE),   'минут'),
+        (re.compile(r'\bсек\b',      re.IGNORECASE),   'секунд'),
+        (re.compile(r'\bчел\b',      re.IGNORECASE),   'человек'),
+        (re.compile(r'\bул\b',       re.IGNORECASE),   'улица'),
+        (re.compile(r'\bпр\b',       re.IGNORECASE),   'проспект'),
+    ]
+
+    # ── Numeric unit forms: (is_feminine, nominative_sg, genitive_sg, genitive_pl)
+    # Used by expand_digits_and_abbrevs to pick the correct case based on number.
+    # Multiplier abbreviations (тыс/млн/млрд) are included here so that
+    # "N млн" is handled by the same _select_case path as physical units,
+    # avoiding the need to compute N×10^6 (which can overflow _int_to_words).
+    _UNIT_FORMS: Dict[str, tuple] = {
+        # Multipliers
+        'млрд': (False, 'миллиард',   'миллиарда',   'миллиардов'),
+        'млн':  (False, 'миллион',    'миллиона',    'миллионов'),
+        'тыс':  (True,  'тысяча',     'тысячи',      'тысяч'),
+        # Physical / monetary units
+        'км':   (False, 'километр',   'километра',   'километров'),
+        'кг':   (False, 'килограмм',  'килограмма',  'килограммов'),
+        'мм':   (False, 'миллиметр',  'миллиметра',  'миллиметров'),
+        'см':   (False, 'сантиметр',  'сантиметра',  'сантиметров'),
+        'руб':  (False, 'рубль',      'рубля',       'рублей'),
+        'коп':  (True,  'копейка',    'копейки',     'копеек'),
+        'мин':  (True,  'минута',     'минуты',      'минут'),
+        'сек':  (True,  'секунда',    'секунды',     'секунд'),
+        'чел':  (False, 'человек',    'человека',    'человек'),
+        'г':    (False, 'грамм',      'грамма',      'граммов'),
+        'м':    (False, 'метр',       'метра',       'метров'),
+        'л':    (False, 'литр',       'литра',       'литров'),
+    }
+
     def __init__(self, stress_dict_path: Optional[str] = None):
         """
         Initialize the processor.
@@ -151,6 +213,136 @@ class RussianPhonemeProcessor:
 
         return patterns
 
+    # ── Text pre-processing helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _int_to_words(n: int, feminine: bool = False) -> str:
+        """Expand a non-negative integer to Russian words (nominative case).
+
+        Handles 0 – 999 999 999 999 correctly.  Numbers ≥ 10^12 fall back to
+        digit-by-digit spelling as a safe upper bound.  The ``feminine`` flag
+        switches unit words 1/2 to their feminine forms (одна/две), needed
+        for thousands and feminine units (тысяча, минута, etc.).
+        """
+        if n < 0:
+            return 'минус ' + RussianPhonemeProcessor._int_to_words(-n, feminine)
+        if n == 0:
+            return 'ноль'
+        # Extremely large numbers (>999 billion): spell each digit individually
+        # as a safe fallback.  All practical numbers (up to hundreds of billions)
+        # are covered by the millions/thousands recursion above.
+        if n >= 1_000_000_000_000:
+            return ' '.join(
+                RussianPhonemeProcessor._UNITS_M[int(d)]
+                for d in str(n) if d.isdigit()
+            )
+
+        units = RussianPhonemeProcessor._UNITS_F if feminine else RussianPhonemeProcessor._UNITS_M
+        parts: List[str] = []
+
+        # Millions (1-9)
+        if n >= 1_000_000:
+            m = n // 1_000_000
+            n %= 1_000_000
+            m_word = RussianPhonemeProcessor._int_to_words(m, feminine=False)
+            last2, last1 = m % 100, m % 10
+            if 11 <= last2 <= 19:     suffix = 'миллионов'
+            elif last1 == 1:          suffix = 'миллион'
+            elif 2 <= last1 <= 4:     suffix = 'миллиона'
+            else:                     suffix = 'миллионов'
+            parts.append(f'{m_word} {suffix}')
+
+        # Thousands
+        if n >= 1_000:
+            k = n // 1_000
+            n %= 1_000
+            k_word = RussianPhonemeProcessor._int_to_words(k, feminine=True)
+            last2, last1 = k % 100, k % 10
+            if 11 <= last2 <= 19:     suffix = 'тысяч'
+            elif last1 == 1:          suffix = 'тысяча'
+            elif 2 <= last1 <= 4:     suffix = 'тысячи'
+            else:                     suffix = 'тысяч'
+            parts.append(f'{k_word} {suffix}')
+
+        # Hundreds
+        if n >= 100:
+            parts.append(RussianPhonemeProcessor._HUNDREDS[n // 100])
+            n %= 100
+
+        # Tens and units
+        if n >= 20:
+            parts.append(RussianPhonemeProcessor._TENS[n // 10])
+            n %= 10
+        if n >= 10:
+            parts.append(RussianPhonemeProcessor._TEENS[n - 10])
+            n = 0
+        if n > 0:
+            parts.append(units[n])
+
+        return ' '.join(p for p in parts if p)
+
+    @staticmethod
+    def _select_case(n: int, singular: str, paucal: str, plural: str) -> str:
+        """Pick the correct Russian noun form based on the governing number.
+
+        Returns *singular* for 1, *paucal* (genitive singular) for 2-4,
+        and *plural* (genitive plural) for 0 and 5+.  Teen numbers (11-19)
+        always take the plural form.
+        """
+        last2 = abs(n) % 100
+        if 11 <= last2 <= 19:
+            return plural
+        last1 = abs(n) % 10
+        if last1 == 1:
+            return singular
+        if 2 <= last1 <= 4:
+            return paucal
+        return plural
+
+    def expand_digits_and_abbrevs(self, text: str) -> str:
+        """Pre-pass applied *before* ``normalize_text``.
+
+        Expands:
+
+        * **Cardinal digits** – ``"12 км"`` → ``"двенадцать километров"``
+        * **Common Cyrillic abbreviations** – ``"руб"`` → ``"рублей"``
+
+        Punctuation is intentionally left intact so that
+        ``_extract_punct_after_words()`` can still capture it afterwards.
+        Numbers ≥ 10^12 fall back to digit-by-digit spelling.
+        """
+        if not text:
+            return text
+
+        # 1. Expand numeric unit/multiplier compounds: "N км" → "пять километров",
+        #    "2 тыс" → "две тысячи", "100 млн" → "сто миллионов".
+        #    Unit keys are sorted by length (longest first) to prevent
+        #    single-char keys like "м" from shadowing "мм", "мин", "млн", etc.
+        def _expand_unit(m: re.Match) -> str:
+            n = int(m.group(1))
+            fem, sg, pauc, pl = self._UNIT_FORMS[m.group(2).lower()]
+            num_word  = self._int_to_words(n, feminine=fem)
+            unit_word = self._select_case(n, sg, pauc, pl)
+            return f'{num_word} {unit_word}'
+
+        _unit_keys = '|'.join(sorted(self._UNIT_FORMS, key=len, reverse=True))
+        text = re.sub(
+            rf'(\d+)\s*({_unit_keys})\b',
+            _expand_unit,
+            text,
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+
+        # 3. Expand remaining non-numeric abbreviations (т.е., ул., etc.) and
+        #    standalone unit/multiplier abbreviations without a preceding digit.
+        for pattern, replacement in self._ABBREV_TABLE:
+            text = pattern.sub(replacement, text)
+
+        # 4. Expand any remaining bare digit runs.
+        text = re.sub(r'\d+', lambda m: self._int_to_words(int(m.group())), text)
+
+        return text
+
     @lru_cache(maxsize=1000)
     def normalize_text(self, text: str) -> str:
         """
@@ -178,9 +370,13 @@ class RussianPhonemeProcessor:
                 clean_text_chars.append(char)
             elif char in self.STRESS_MARKS:
                 clean_text_chars.append(char)
+            elif char == '\u0306':
+                # Combining breve — the NFD decomposition of й is и + U+0306.
+                # Preserve it so the NFC recomposition below can restore й.
+                clean_text_chars.append(char)
             # else: skip other non-allowed combining marks or punctuation
 
-        text = ''.join(clean_text_chars)
+        text = unicodedata.normalize('NFC', ''.join(clean_text_chars))
 
         # Remove any remaining punctuation that wasn't filtered by the NFD and allowed_chars logic
         # and wasn't a stress mark. Using a more targeted regex.
@@ -603,6 +799,11 @@ class RussianPhonemeProcessor:
         """
         if not text:
             return []
+
+        # Pre-pass: expand digits and abbreviations while punctuation is still
+        # present, so that _extract_punct_after_words sees the correct token
+        # boundaries and normalize_text receives clean Cyrillic words.
+        text = self.expand_digits_and_abbrevs(text)
 
         # Extract punctuation associations from the raw text BEFORE normalization
         # strips all non-Cyrillic characters.
