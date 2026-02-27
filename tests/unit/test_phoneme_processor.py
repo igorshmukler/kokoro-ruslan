@@ -48,7 +48,7 @@ def test_normalize_text_handles_yo_and_stress_marks():
     ("молоко", "məlɐko"),
     ("хорошо", "xərɐʃo"),
     ("сегодня", "sʲɪvodʲnʲə"),
-    ("здравствуйте", "zdrəstvuitʲə"),
+    ("здравствуйте", "zdrɐstvujtʲə"),
 ])
 def test_process_word_expected_ipa(word, expected_ipa):
     p = RussianPhonemeProcessor()

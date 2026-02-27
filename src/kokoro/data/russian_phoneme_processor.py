@@ -240,7 +240,19 @@ class RussianPhonemeProcessor:
         units = RussianPhonemeProcessor._UNITS_F if feminine else RussianPhonemeProcessor._UNITS_M
         parts: List[str] = []
 
-        # Millions (1-9)
+        # Billions
+        if n >= 1_000_000_000:
+            b = n // 1_000_000_000
+            n %= 1_000_000_000
+            b_word = RussianPhonemeProcessor._int_to_words(b, feminine=False)
+            last2, last1 = b % 100, b % 10
+            if 11 <= last2 <= 19:     suffix = 'миллиардов'
+            elif last1 == 1:          suffix = 'миллиард'
+            elif 2 <= last1 <= 4:     suffix = 'миллиарда'
+            else:                     suffix = 'миллиардов'
+            parts.append(f'{b_word} {suffix}')
+
+        # Millions
         if n >= 1_000_000:
             m = n // 1_000_000
             n %= 1_000_000
