@@ -1405,11 +1405,15 @@ class KokoroTrainer:
                         pitches = pitches.to(self.device, non_blocking=non_blocking)
                     if energies is not None:
                         energies = energies.to(self.device, non_blocking=non_blocking)
+                    stress_indices = batch.get('stress_indices', None)
+                    if stress_indices is not None:
+                        stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
 
                     # Forward pass (without mixed precision for validation consistency)
                     predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                         model_to_validate(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                 pitch_targets=pitches, energy_targets=energies)
+                                 pitch_targets=pitches, energy_targets=energies,
+                                 stress_indices=stress_indices)
 
                     # Convert mel-frame level pitch/energy to phoneme level for loss calculation
                     phoneme_pitches = None
@@ -1650,6 +1654,9 @@ class KokoroTrainer:
                             pitches = pitches.to(self.device, non_blocking=non_blocking)
                         if energies is not None:
                             energies = energies.to(self.device, non_blocking=non_blocking)
+                        stress_indices = batch.get('stress_indices', None)
+                        if stress_indices is not None:
+                            stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
                 else:
                     # No profiler overhead
                     non_blocking = self.device.type == 'cuda'
@@ -1673,6 +1680,9 @@ class KokoroTrainer:
                         pitches = pitches.to(self.device, non_blocking=non_blocking)
                     if energies is not None:
                         energies = energies.to(self.device, non_blocking=non_blocking)
+                    stress_indices = batch.get('stress_indices', None)
+                    if stress_indices is not None:
+                        stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
 
                     # Validate tensor dimensions to prevent MPS overflow
                     max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
@@ -1766,21 +1776,25 @@ class KokoroTrainer:
                             with self.get_autocast_context():
                                 predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                                     self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                             pitch_targets=pitches, energy_targets=energies)
+                                             pitch_targets=pitches, energy_targets=energies,
+                                             stress_indices=stress_indices)
                         else:
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                         pitch_targets=pitches, energy_targets=energies)
+                                         pitch_targets=pitches, energy_targets=energies,
+                                         stress_indices=stress_indices)
                 else:
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                         pitch_targets=pitches, energy_targets=energies)
+                                         pitch_targets=pitches, energy_targets=energies,
+                                         stress_indices=stress_indices)
                     else:
                         predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                     pitch_targets=pitches, energy_targets=energies)
+                                     pitch_targets=pitches, energy_targets=energies,
+                                     stress_indices=stress_indices)
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_forward_pass()
@@ -2753,6 +2767,9 @@ class KokoroTrainer:
             pitches = pitches.to(self.device, non_blocking=non_blocking)
         if energies is not None:
             energies = energies.to(self.device, non_blocking=non_blocking)
+        stress_indices = batch.get('stress_indices', None)
+        if stress_indices is not None:
+            stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
 
         self.optimizer.zero_grad()
 
@@ -2761,7 +2778,8 @@ class KokoroTrainer:
             with self.get_autocast_context():
                 predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                     self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                             pitch_targets=pitches, energy_targets=energies)
+                             pitch_targets=pitches, energy_targets=energies,
+                             stress_indices=stress_indices)
 
                 # Convert pitch/energy to phoneme level
                 phoneme_pitches = None
@@ -2791,7 +2809,8 @@ class KokoroTrainer:
             # No AMP
             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                         pitch_targets=pitches, energy_targets=energies)
+                         pitch_targets=pitches, energy_targets=energies,
+                         stress_indices=stress_indices)
 
             # Convert pitch/energy to phoneme level
             phoneme_pitches = None

@@ -19,6 +19,7 @@ class _CountingModel(nn.Module):
         stop_token_targets,
         pitch_targets=None,
         energy_targets=None,
+        stress_indices=None,
     ):
         self.forward_calls += 1
         batch_size = mel_specs.size(0)

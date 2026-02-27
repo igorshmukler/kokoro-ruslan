@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
@@ -32,6 +30,73 @@ class RussianPhonemeProcessor:
     # Class constants to avoid repeated dict creation
     STRESS_MARKS = ['\u0301', '\u0300', '\u0341']  # Acute, grave, combining acute
     VOWEL_LETTERS = {'а', 'о', 'у', 'ы', 'э', 'я', 'ё', 'ю', 'и', 'е'}
+
+    # Terminal / clause punctuation mapped to prosody-conditioning tokens.
+    # These tokens are injected into the phoneme sequence at word boundaries
+    # so the model can condition duration, pitch and energy on sentence type.
+    PUNCT_MAP = {'.': '<period>', '?': '<question>', '!': '<exclaim>', ',': '<comma>'}
+
+    # ── Number-to-words tables (Russian nominative case) ─────────────────────
+    _UNITS_M = ('ноль', 'один', 'два', 'три', 'четыре', 'пять', 'шесть',
+                'семь', 'восемь', 'девять')
+    _UNITS_F = ('ноль', 'одна', 'две', 'три', 'четыре', 'пять', 'шесть',
+                'семь', 'восемь', 'девять')
+    _TEENS   = ('десять', 'одиннадцать', 'двенадцать', 'тринадцать',
+                'четырнадцать', 'пятнадцать', 'шестнадцать', 'семнадцать',
+                'восемнадцать', 'девятнадцать')
+    _TENS    = ('', '', 'двадцать', 'тридцать', 'сорок', 'пятьдесят',
+                'шестьдесят', 'семьдесят', 'восемьдесят', 'девяносто')
+    _HUNDREDS = ('', 'сто', 'двести', 'триста', 'четыреста', 'пятьсот',
+                 'шестьсот', 'семьсот', 'восемьсот', 'девятьсот')
+
+    # ── Abbreviation expansion table (longest / most specific first) ─────────
+    # Each entry is (compiled_regex, replacement_string).
+    # Patterns use word boundaries and are case-insensitive Cyrillic.
+    _ABBREV_TABLE = [
+        (re.compile(r'\bт\.\s*е\.', re.IGNORECASE),   'то есть'),
+        (re.compile(r'\bт\.\s*д\.', re.IGNORECASE),   'так далее'),
+        (re.compile(r'\bт\.\s*п\.', re.IGNORECASE),   'тому подобное'),
+        (re.compile(r'\bмлрд\b',     re.IGNORECASE),   'миллиардов'),
+        (re.compile(r'\bмлн\b',      re.IGNORECASE),   'миллионов'),
+        (re.compile(r'\bтыс\b',      re.IGNORECASE),   'тысяч'),
+        (re.compile(r'\bкм\b',       re.IGNORECASE),   'километров'),
+        (re.compile(r'\bкг\b',       re.IGNORECASE),   'килограммов'),
+        (re.compile(r'\bмм\b',       re.IGNORECASE),   'миллиметров'),
+        (re.compile(r'\bсм\b',       re.IGNORECASE),   'сантиметров'),
+        (re.compile(r'\bкв\b',       re.IGNORECASE),   'квадратных'),
+        (re.compile(r'\bруб\b',      re.IGNORECASE),   'рублей'),
+        (re.compile(r'\bкоп\b',      re.IGNORECASE),   'копеек'),
+        (re.compile(r'\bмин\b',      re.IGNORECASE),   'минут'),
+        (re.compile(r'\bсек\b',      re.IGNORECASE),   'секунд'),
+        (re.compile(r'\bчел\b',      re.IGNORECASE),   'человек'),
+        (re.compile(r'\bул\b',       re.IGNORECASE),   'улица'),
+        (re.compile(r'\bпр\b',       re.IGNORECASE),   'проспект'),
+    ]
+
+    # ── Numeric unit forms: (is_feminine, nominative_sg, genitive_sg, genitive_pl)
+    # Used by expand_digits_and_abbrevs to pick the correct case based on number.
+    # Multiplier abbreviations (тыс/млн/млрд) are included here so that
+    # "N млн" is handled by the same _select_case path as physical units,
+    # avoiding the need to compute N×10^6 (which can overflow _int_to_words).
+    _UNIT_FORMS: Dict[str, tuple] = {
+        # Multipliers
+        'млрд': (False, 'миллиард',   'миллиарда',   'миллиардов'),
+        'млн':  (False, 'миллион',    'миллиона',    'миллионов'),
+        'тыс':  (True,  'тысяча',     'тысячи',      'тысяч'),
+        # Physical / monetary units
+        'км':   (False, 'километр',   'километра',   'километров'),
+        'кг':   (False, 'килограмм',  'килограмма',  'килограммов'),
+        'мм':   (False, 'миллиметр',  'миллиметра',  'миллиметров'),
+        'см':   (False, 'сантиметр',  'сантиметра',  'сантиметров'),
+        'руб':  (False, 'рубль',      'рубля',       'рублей'),
+        'коп':  (True,  'копейка',    'копейки',     'копеек'),
+        'мин':  (True,  'минута',     'минуты',      'минут'),
+        'сек':  (True,  'секунда',    'секунды',     'секунд'),
+        'чел':  (False, 'человек',    'человека',    'человек'),
+        'г':    (False, 'грамм',      'грамма',      'граммов'),
+        'м':    (False, 'метр',       'метра',       'метров'),
+        'л':    (False, 'литр',       'литра',       'литров'),
+    }
 
     def __init__(self, stress_dict_path: Optional[str] = None):
         """
@@ -63,7 +128,8 @@ class RussianPhonemeProcessor:
 
         self._multi_char_phonemes = sorted(
             list(self.palatalized.values()) +
-            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
+            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ',
+             'ja', 'jo', 'ju', 'je', 'jɐ', 'jɪ', 'jə'],
             key=len, reverse=True
         )
 
@@ -97,6 +163,12 @@ class RussianPhonemeProcessor:
 
         # Build vocabulary after all mappings are set
         self.phoneme_to_id = self._build_vocab()
+
+        # Per-instance LRU caches — stored on the instance rather than the class so
+        # that `self` is not permanently retained in a class-level cache key, which
+        # would prevent garbage collection when multiple processor instances are used.
+        self.normalize_text = lru_cache(maxsize=1000)(self._normalize_text_impl)
+        self._process_normalized_word = lru_cache(maxsize=500)(self._process_normalized_word_impl)
 
     def _load_stress_patterns(self, dict_path: Optional[str] = None) -> Dict[str, int]:
         """
@@ -146,11 +218,152 @@ class RussianPhonemeProcessor:
 
         return patterns
 
-    @lru_cache(maxsize=1000)
-    def normalize_text(self, text: str) -> str:
+    # ── Text pre-processing helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _int_to_words(n: int, feminine: bool = False) -> str:
+        """Expand a non-negative integer to Russian words (nominative case).
+
+        Handles 0 – 999 999 999 999 correctly.  Numbers ≥ 10^12 fall back to
+        digit-by-digit spelling as a safe upper bound.  The ``feminine`` flag
+        switches unit words 1/2 to their feminine forms (одна/две), needed
+        for thousands and feminine units (тысяча, минута, etc.).
+        """
+        if n < 0:
+            return 'минус ' + RussianPhonemeProcessor._int_to_words(-n, feminine)
+        if n == 0:
+            return 'ноль'
+        # Extremely large numbers (>999 billion): spell each digit individually
+        # as a safe fallback.  All practical numbers (up to hundreds of billions)
+        # are covered by the millions/thousands recursion above.
+        if n >= 1_000_000_000_000:
+            return ' '.join(
+                RussianPhonemeProcessor._UNITS_M[int(d)]
+                for d in str(n) if d.isdigit()
+            )
+
+        units = RussianPhonemeProcessor._UNITS_F if feminine else RussianPhonemeProcessor._UNITS_M
+        parts: List[str] = []
+
+        # Billions
+        if n >= 1_000_000_000:
+            b = n // 1_000_000_000
+            n %= 1_000_000_000
+            b_word = RussianPhonemeProcessor._int_to_words(b, feminine=False)
+            last2, last1 = b % 100, b % 10
+            if 11 <= last2 <= 19:     suffix = 'миллиардов'
+            elif last1 == 1:          suffix = 'миллиард'
+            elif 2 <= last1 <= 4:     suffix = 'миллиарда'
+            else:                     suffix = 'миллиардов'
+            parts.append(f'{b_word} {suffix}')
+
+        # Millions
+        if n >= 1_000_000:
+            m = n // 1_000_000
+            n %= 1_000_000
+            m_word = RussianPhonemeProcessor._int_to_words(m, feminine=False)
+            last2, last1 = m % 100, m % 10
+            if 11 <= last2 <= 19:     suffix = 'миллионов'
+            elif last1 == 1:          suffix = 'миллион'
+            elif 2 <= last1 <= 4:     suffix = 'миллиона'
+            else:                     suffix = 'миллионов'
+            parts.append(f'{m_word} {suffix}')
+
+        # Thousands
+        if n >= 1_000:
+            k = n // 1_000
+            n %= 1_000
+            k_word = RussianPhonemeProcessor._int_to_words(k, feminine=True)
+            last2, last1 = k % 100, k % 10
+            if 11 <= last2 <= 19:     suffix = 'тысяч'
+            elif last1 == 1:          suffix = 'тысяча'
+            elif 2 <= last1 <= 4:     suffix = 'тысячи'
+            else:                     suffix = 'тысяч'
+            parts.append(f'{k_word} {suffix}')
+
+        # Hundreds
+        if n >= 100:
+            parts.append(RussianPhonemeProcessor._HUNDREDS[n // 100])
+            n %= 100
+
+        # Tens and units
+        if n >= 20:
+            parts.append(RussianPhonemeProcessor._TENS[n // 10])
+            n %= 10
+        if n >= 10:
+            parts.append(RussianPhonemeProcessor._TEENS[n - 10])
+            n = 0
+        if n > 0:
+            parts.append(units[n])
+
+        return ' '.join(p for p in parts if p)
+
+    @staticmethod
+    def _select_case(n: int, singular: str, paucal: str, plural: str) -> str:
+        """Pick the correct Russian noun form based on the governing number.
+
+        Returns *singular* for 1, *paucal* (genitive singular) for 2-4,
+        and *plural* (genitive plural) for 0 and 5+.  Teen numbers (11-19)
+        always take the plural form.
+        """
+        last2 = abs(n) % 100
+        if 11 <= last2 <= 19:
+            return plural
+        last1 = abs(n) % 10
+        if last1 == 1:
+            return singular
+        if 2 <= last1 <= 4:
+            return paucal
+        return plural
+
+    def expand_digits_and_abbrevs(self, text: str) -> str:
+        """Pre-pass applied *before* ``normalize_text``.
+
+        Expands:
+
+        * **Cardinal digits** – ``"12 км"`` → ``"двенадцать километров"``
+        * **Common Cyrillic abbreviations** – ``"руб"`` → ``"рублей"``
+
+        Punctuation is intentionally left intact so that
+        ``_extract_punct_after_words()`` can still capture it afterwards.
+        Numbers ≥ 10^12 fall back to digit-by-digit spelling.
+        """
+        if not text:
+            return text
+
+        # 1. Expand numeric unit/multiplier compounds: "N км" → "пять километров",
+        #    "2 тыс" → "две тысячи", "100 млн" → "сто миллионов".
+        #    Unit keys are sorted by length (longest first) to prevent
+        #    single-char keys like "м" from shadowing "мм", "мин", "млн", etc.
+        def _expand_unit(m: re.Match) -> str:
+            n = int(m.group(1))
+            fem, sg, pauc, pl = self._UNIT_FORMS[m.group(2).lower()]
+            num_word  = self._int_to_words(n, feminine=fem)
+            unit_word = self._select_case(n, sg, pauc, pl)
+            return f'{num_word} {unit_word}'
+
+        _unit_keys = '|'.join(sorted(self._UNIT_FORMS, key=len, reverse=True))
+        text = re.sub(
+            rf'(\d+)\s*({_unit_keys})\b',
+            _expand_unit,
+            text,
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+
+        # 3. Expand remaining non-numeric abbreviations (т.е., ул., etc.) and
+        #    standalone unit/multiplier abbreviations without a preceding digit.
+        for pattern, replacement in self._ABBREV_TABLE:
+            text = pattern.sub(replacement, text)
+
+        # 4. Expand any remaining bare digit runs.
+        text = re.sub(r'\d+', lambda m: self._int_to_words(int(m.group())), text)
+
+        return text
+
+    def _normalize_text_impl(self, text: str) -> str:
         """
         Normalize Russian text for phoneme processing.
-        Cached for performance on repeated texts.
+        Called through the per-instance LRU cache ``self.normalize_text``.
         """
         if not text:
             return ""
@@ -173,9 +386,13 @@ class RussianPhonemeProcessor:
                 clean_text_chars.append(char)
             elif char in self.STRESS_MARKS:
                 clean_text_chars.append(char)
+            elif char == '\u0306':
+                # Combining breve — the NFD decomposition of й is и + U+0306.
+                # Preserve it so the NFC recomposition below can restore й.
+                clean_text_chars.append(char)
             # else: skip other non-allowed combining marks or punctuation
 
-        text = ''.join(clean_text_chars)
+        text = unicodedata.normalize('NFC', ''.join(clean_text_chars))
 
         # Remove any remaining punctuation that wasn't filtered by the NFD and allowed_chars logic
         # and wasn't a stress mark. Using a more targeted regex.
@@ -313,14 +530,17 @@ class RussianPhonemeProcessor:
             if ph in VOWEL_BASES:
                 if syllable != stress_syllable_idx:
                     dist = stress_syllable_idx - syllable
-                    base = ph[1:] if ph.startswith('j') else ph
+                    is_iotated = ph.startswith('j')
+                    base = ph[1:] if is_iotated else ph
                     if syllable < stress_syllable_idx:
                         if dist == 1:
-                            reduced[i] = 'ɐ' if base in ('o', 'a') else 'ɪ' if base in ('e', 'i') else ph
+                            reduced_base = 'ɐ' if base in ('o', 'a') else 'ɪ' if base in ('e', 'i') else None
                         else:
-                            reduced[i] = 'ə' if base in ('o', 'a', 'e', 'i') else ph
+                            reduced_base = 'ə' if base in ('o', 'a', 'e', 'i') else None
                     else:
-                        reduced[i] = 'ə' if base in ('o', 'a', 'e', 'i') else ph
+                        reduced_base = 'ə' if base in ('o', 'a', 'e', 'i') else None
+                    if reduced_base is not None:
+                        reduced[i] = ('j' + reduced_base) if is_iotated else reduced_base
                 syllable += 1
         return reduced
 
@@ -331,6 +551,10 @@ class RussianPhonemeProcessor:
         in apply_palatalization.
         """
         word = word.lower()
+        # Strip combining marks (stress marks, etc.) before any Cyrillic substitutions
+        # so that cluster patterns like 'вств' match even when a vowel in the word
+        # carries an explicit stress mark that would otherwise split the sequence.
+        word = re.sub(r'[\u0300-\u036f]', '', word)
 
         # --- 1. The "Г" Exceptions ---
 
@@ -389,9 +613,6 @@ class RussianPhonemeProcessor:
 
         # 'лнц' — silent л (e.g. солнце)
         word = word.replace('лнц', 'нц')
-
-        # remove combining marks for assimilation logic, but keep the base characters
-        word = re.sub(r'[\u0300-\u036f]', '', word.lower())
 
         # --- Voicing assimilation (regressive, right-to-left) ---
         chars = list(word)
@@ -510,10 +731,10 @@ class RussianPhonemeProcessor:
 
 
 
-    @lru_cache(maxsize=500)
-    def _process_normalized_word(self, word: str) -> Tuple[Tuple[str, ...], StressInfo]:
+    def _process_normalized_word_impl(self, word: str) -> Tuple[Tuple[str, ...], StressInfo]:
         """
-        Process a single already-normalized word. Cached on the normalized form.
+        Process a single already-normalized word. Called through the per-instance LRU
+        cache ``self._process_normalized_word``.
         Returns a tuple of phonemes (not a list) because lru_cache requires hashable
         return values to avoid cache mutation bugs. Callers convert to list at the boundary.
         """
@@ -553,21 +774,72 @@ class RussianPhonemeProcessor:
         phonemes, stress_info = self._process_normalized_word(normalized)
         return list(phonemes), stress_info
 
-    def process_text(self, text: str) -> List[Tuple[str, List[str], StressInfo]]:
-        """Process full text and return word-phoneme-stress tuples."""
+    @staticmethod
+    def _extract_punct_after_words(text: str) -> List[Optional[str]]:
+        """
+        Scan *raw* text character-by-character and return, in order, the first
+        PUNCT_MAP token that appears after each Cyrillic word before the next
+        Cyrillic word (or end of string).  Returns None for words with no
+        following punctuation.
+
+        Example:  "Привет, как дела?"  →  ['<comma>', None, '<question>']
+        """
+        punct_map = RussianPhonemeProcessor.PUNCT_MAP
+        result: List[Optional[str]] = []
+        i = 0
+        n = len(text)
+        while i < n:
+            # Advance past non-Cyrillic characters
+            if not ('\u0400' <= text[i] <= '\u04FF'):
+                i += 1
+                continue
+            # Consume one Cyrillic word (base letters + combining stress marks)
+            while i < n and ('\u0400' <= text[i] <= '\u04FF' or text[i] in '\u0301\u0300\u0341'):
+                i += 1
+            # Collect the first matching punctuation before the next Cyrillic word
+            punct: Optional[str] = None
+            while i < n and not ('\u0400' <= text[i] <= '\u04FF'):
+                if punct is None and text[i] in punct_map:
+                    punct = punct_map[text[i]]
+                i += 1
+            result.append(punct)
+        return result
+
+    def process_text(self, text: str) -> List[Tuple]:
+        """
+        Process full text and return tuples of
+        ``(word, phonemes, stress_info, punct_token_or_None)``.
+
+        The optional 4th element is a prosody token from PUNCT_MAP ('<period>',
+        '<question>', '<exclaim>', '<comma>') when a punctuation mark follows
+        the word in the raw input, otherwise ``None``.  Callers that only need
+        the first three fields can use extended unpacking::
+
+            word, phonemes, stress, *_ = item
+        """
         if not text:
             return []
+
+        # Pre-pass: expand digits and abbreviations while punctuation is still
+        # present, so that _extract_punct_after_words sees the correct token
+        # boundaries and normalize_text receives clean Cyrillic words.
+        text = self.expand_digits_and_abbrevs(text)
+
+        # Extract punctuation associations from the raw text BEFORE normalization
+        # strips all non-Cyrillic characters.
+        punct_list = self._extract_punct_after_words(text)
 
         normalized_text = self.normalize_text(text)
         results = []
 
-        for word in normalized_text.split():
+        for idx, word in enumerate(normalized_text.split()):
             try:
                 phonemes, stress_info = self._process_normalized_word(word)
-                results.append((word, list(phonemes), stress_info))
             except Exception as e:
                 logger.error(f"Error processing word '{word}': {e}")
-                results.append((word, [], StressInfo(0, 0, False)))
+                phonemes, stress_info = (), StressInfo(0, 0, False)
+            punct_token: Optional[str] = punct_list[idx] if idx < len(punct_list) else None
+            results.append((word, list(phonemes), stress_info, punct_token))
 
         return results
 
@@ -623,7 +895,7 @@ class RussianPhonemeProcessor:
         results = self.process_text(text)
         stress_pattern = []
 
-        for word_orig, phonemes, stress_info in results:
+        for word_orig, phonemes, stress_info, *_ in results:
             word_phoneme_stress = [0] * len(phonemes)
 
             vowel_phoneme_count = 0
@@ -656,13 +928,16 @@ class RussianPhonemeProcessor:
         # ADD SPECIAL TOKENS FIRST
         phoneme_set.update(['<pad>', '<sil>', '<sp>'])
 
+        # Prosody-conditioning punctuation tokens
+        phoneme_set.update(['<period>', '<question>', '<exclaim>', '<comma>'])
+
         # Add base phonemes
         phoneme_set.update(self.vowels.values())
         phoneme_set.update(self.consonants.values())
         phoneme_set.update(self.palatalized.values())
 
-        # Add reduced vowels
-        phoneme_set.update(['ə', 'ɪ', 'ɐ'])
+        # Add reduced vowels (plain and iotated)
+        phoneme_set.update(['ə', 'ɪ', 'ɐ', 'jɐ', 'jɪ', 'jə'])
 
         # Add phonemes from exceptions (tokenized)
         for ipa_string in self.exceptions.values():
@@ -688,7 +963,7 @@ class RussianPhonemeProcessor:
         results = self.process_text(text)
         indices = []
 
-        for word, phonemes, _ in results:
+        for word, phonemes, *_ in results:
             for phoneme in phonemes:
                 idx = self.phoneme_to_id.get(phoneme)
                 if idx is not None:
@@ -725,7 +1000,14 @@ class RussianPhonemeProcessor:
             ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
             key=len, reverse=True
         )
-        instance.multi_char_phonemes = instance._multi_char_phonemes
+        # Rebuild to include iotated reduced vowels added after the original
+        # _multi_char_phonemes was serialised.
+        instance._multi_char_phonemes = sorted(
+            list(instance.palatalized.values()) +
+            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ',
+             'ja', 'jo', 'ju', 'je', 'jɐ', 'jɪ', 'jə'],
+            key=len, reverse=True
+        )
 
         # Restore all attributes, ensuring sets are converted from lists
         instance.vowels = data.get("vowels", {})
@@ -738,6 +1020,23 @@ class RussianPhonemeProcessor:
         instance.stress_patterns = data.get("stress_patterns", {})
         instance.exceptions = data.get("exceptions", {})
         instance.phoneme_to_id = data.get("phoneme_to_id", {})
+
+        # Forward-compatibility patch: if the pickled vocab pre-dates the
+        # prosody-token addition or the iotated-reduced-vowel addition,
+        # inject the missing tokens with fresh IDs so they are always usable
+        # at inference time without retraining.
+        punct_tokens = list(RussianPhonemeProcessor.PUNCT_MAP.values())
+        # Also ensure the base special tokens and reduced iotated vowels are present.
+        required_tokens = ['<pad>', '<sil>', '<sp>'] + punct_tokens + ['jɐ', 'jɪ', 'jə']
+        next_id = max(instance.phoneme_to_id.values(), default=-1) + 1
+        for tok in required_tokens:
+            if tok not in instance.phoneme_to_id:
+                instance.phoneme_to_id[tok] = next_id
+                next_id += 1
+
+        # Flush any cached results from __init__'s default state; the restored
+        # exceptions/stress_patterns may differ from the constructor defaults.
+        instance.clear_cache()
         return instance
 
     def clear_cache(self):
@@ -801,7 +1100,7 @@ if __name__ == "__main__":
     print("=" * 50)
 
     results = processor.process_text(input_text)
-    for word, phonemes, stress_info in results:
+    for word, phonemes, stress_info, *_ in results:
         ipa = processor.to_ipa(phonemes)
         print(f"Word: {word}")
         print(f"  Phonemes: {phonemes}")

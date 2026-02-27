@@ -154,15 +154,26 @@ class ModelLoader:
             else:
                 logger.warning(f"Skipping unknown key from checkpoint: {k}")
 
-        # Load filtered state dict
-        try:
-            model.load_state_dict(filtered_state_dict, strict=True)
-            logger.info("Model loaded successfully with filtered state_dict (strict=True).")
-        except RuntimeError as e:
-            logger.error(f"Failed to load model state dict even after filtering: {e}")
-            # Fallback to strict=False if anything else causes a problem
+        # Detect model parameters absent from the checkpoint (expected for newly-added
+        # modules such as stress_embedding that old checkpoints pre-date).
+        missing_in_checkpoint = [k for k in model_keys if k not in filtered_state_dict]
+        if missing_in_checkpoint:
+            logger.info(
+                "Loading model with strict=False — the following model keys are absent "
+                "from the checkpoint (newly-added parameters will use their initialised "
+                f"values): {missing_in_checkpoint}"
+            )
             model.load_state_dict(filtered_state_dict, strict=False)
-            logger.warning("Loaded model with filtered state_dict (strict=False) as a fallback.")
+            logger.info("Model loaded successfully with filtered state_dict (strict=False, new params initialised).")
+        else:
+            try:
+                model.load_state_dict(filtered_state_dict, strict=True)
+                logger.info("Model loaded successfully with filtered state_dict (strict=True).")
+            except RuntimeError as e:
+                logger.error(f"Failed to load model state dict even after filtering: {e}")
+                # Fallback to strict=False if anything else causes a problem
+                model.load_state_dict(filtered_state_dict, strict=False)
+                logger.warning("Loaded model with filtered state_dict (strict=False) as a fallback.")
 
         return model
 

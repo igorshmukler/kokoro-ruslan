@@ -22,10 +22,11 @@ import time
 from kokoro.training.config import TrainingConfig
 from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 from kokoro.data.mfa_integration import MFAIntegration
+from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 3  # bumped: energy axis layout fix (mel_spec_linear.T)
+FEATURE_CACHE_VERSION = 6  # bumped: stress_indices added as a parallel phoneme-level tensor
 
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
@@ -274,9 +275,13 @@ class RuslanDataset(Dataset):
                             if audio_length_frames < 1:
                                 audio_length_frames = 1
 
-                            # Pre-calculate phoneme length
-                            phoneme_indices = self.phoneme_processor.text_to_indices(text)
-                            phoneme_length = len(phoneme_indices)
+                            # Pre-calculate phoneme length (including inter-word <sil> tokens
+                            # so the estimate matches what __getitem__ will produce).
+                            _raw = self.phoneme_processor.process_text(text)
+                            _seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+                                _raw, self.phoneme_processor.phoneme_to_id
+                            )
+                            phoneme_length = len(_seq)
 
                             # Clip extremely long sequences to prevent memory issues during training
                             original_frames = audio_length_frames
@@ -324,9 +329,13 @@ class RuslanDataset(Dataset):
                         if audio_length_frames < 1:
                             audio_length_frames = 1
 
-                        # Pre-calculate phoneme length
-                        phoneme_indices = self.phoneme_processor.text_to_indices(text)
-                        phoneme_length = len(phoneme_indices)
+                        # Pre-calculate phoneme length (including inter-word <sil> tokens
+                        # so the estimate matches what __getitem__ will produce).
+                        _raw = self.phoneme_processor.process_text(text)
+                        _seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+                            _raw, self.phoneme_processor.phoneme_to_id
+                        )
+                        phoneme_length = len(_seq)
 
                         # Clip extremely long sequences
                         original_frames = audio_length_frames
@@ -603,18 +612,49 @@ class RuslanDataset(Dataset):
             mel_spec = mel_spec[:, :max_frames]
             mel_spec_linear = mel_spec_linear[:, :max_frames]
 
-        # Process text to phonemes using the dedicated processor
-        phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
+        # Process text to phonemes, inserting <sil> between words to match the
+        # MFA alignment structure (MFA records inter-word silences as explicit
+        # phone-tier intervals, so our input sequence must include them too).
+        # This is identical to what the inference pipeline does, eliminating the
+        # training/inference phoneme-sequence mismatch.
+        _raw_text_output = self.phoneme_processor.process_text(sample['text'])
+        phoneme_sequence = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+            _raw_text_output, self.phoneme_processor.phoneme_to_id
+        )
+        phoneme_indices = PhonemeProcessorUtils.phonemes_to_indices(
+            phoneme_sequence, self.phoneme_processor.phoneme_to_id
+        )
         phoneme_indices_tensor = torch.tensor(phoneme_indices, dtype=torch.long)
+
+        # Stress IDs parallel to phoneme_indices_tensor:
+        # 0=unstressed/special, 1=primary_stress, 2=secondary_stress (reserved).
+        # Uses the same inter-word <sil> injection logic as flatten_phoneme_output_with_sil
+        # so the two sequences are always co-aligned.
+        _stress_ids = PhonemeProcessorUtils.get_stress_indices_with_sil(
+            _raw_text_output, self.phoneme_processor.phoneme_to_id
+        )
+        # Pad / truncate to match phoneme_indices length (should always agree)
+        if len(_stress_ids) < len(phoneme_indices):
+            _stress_ids += [0] * (len(phoneme_indices) - len(_stress_ids))
+        elif len(_stress_ids) > len(phoneme_indices):
+            _stress_ids = _stress_ids[:len(phoneme_indices)]
+        stress_indices_tensor = torch.tensor(_stress_ids, dtype=torch.long)
 
         # --- Get Phoneme Durations (MFA or Estimated) ---
         num_mel_frames = mel_spec.shape[1]
         num_phonemes = phoneme_indices_tensor.shape[0]
 
-        # Try to get MFA alignments first
+        # Try to get MFA alignments first.
+        # strip_outer_silences=True absorbs MFA's leading/trailing <sil> intervals
+        # into the first/last real phoneme frames.  After stripping, the MFA
+        # duration list contains exactly the same slots as our phoneme_sequence
+        # (word phonemes + inter-word <sil> tokens), so lengths match without
+        # requiring truncation/padding in the common case.
         mfa_durations = None
         if self.mfa is not None:
-            mfa_durations = self.mfa.get_phoneme_durations(sample['audio_file'])
+            mfa_durations = self.mfa.get_phoneme_durations(
+                sample['audio_file'], strip_outer_silences=True
+            )
 
         if mfa_durations is not None and len(mfa_durations) > 0:
             # Use MFA durations
@@ -736,6 +776,7 @@ class RuslanDataset(Dataset):
         features = {
             'mel_spec': mel_spec,
             'phoneme_indices': phoneme_indices_tensor,
+            'stress_indices': stress_indices_tensor,
             'phoneme_durations': phoneme_durations,
             'stop_token_targets': stop_token_targets,
             'pitch': pitch,
@@ -776,6 +817,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
     stop_tokens_out    = torch.zeros(B, max_mel_T)
     phoneme_idx_out    = torch.zeros(B, max_phoneme_T, dtype=torch.long)
     phoneme_dur_out    = torch.zeros(B, max_phoneme_T, dtype=torch.long)
+    stress_idx_out     = torch.zeros(B, max_phoneme_T, dtype=torch.long)
 
     for i, item in enumerate(batch):
         mel_T = mel_lengths[i]
@@ -788,10 +830,12 @@ def collate_fn(batch: List[Dict]) -> Dict:
         stop_tokens_out[i, :mel_T]    = item['stop_token_targets']
         phoneme_idx_out[i, :ph_T]     = item['phoneme_indices']
         phoneme_dur_out[i, :ph_T]     = item['phoneme_durations']
+        stress_idx_out[i, :ph_T]      = item['stress_indices']
 
     return {
         'mel_specs':          mel_specs_out,         # (B, T, n_mels)
         'phoneme_indices':    phoneme_idx_out,       # (B, P)
+        'stress_indices':     stress_idx_out,        # (B, P)  {0=unstressed, 1=primary, 2=secondary}
         'phoneme_durations':  phoneme_dur_out,       # (B, P)
         'stop_token_targets': stop_tokens_out,       # (B, T)
         'pitches':            pitches_out,           # (B, T)
