@@ -409,6 +409,20 @@ class KokoroTTS:
                 )
                 phoneme_tensor = torch.tensor(phoneme_indices, dtype=torch.long).unsqueeze(0).to(self.device)
 
+                # Stress IDs parallel to phoneme_tensor (0=unstressed, 1=primary, 2=secondary).
+                # Uses the same inter-word <sil> injection logic as flatten_phoneme_output_with_sil
+                # so the two sequences are always co-aligned.
+                _stress_ids = PhonemeProcessorUtils.get_stress_indices_with_sil(
+                    raw_processor_output, self.phoneme_processor.phoneme_to_id
+                )
+                # Safety: pad/truncate to match phoneme_indices length
+                _ph_len = len(phoneme_indices)
+                if len(_stress_ids) < _ph_len:
+                    _stress_ids += [0] * (_ph_len - len(_stress_ids))
+                elif len(_stress_ids) > _ph_len:
+                    _stress_ids = _stress_ids[:_ph_len]
+                stress_tensor = torch.tensor(_stress_ids, dtype=torch.long).unsqueeze(0).to(self.device)
+
                 logger.info(f"--- Processing Chunk {i} ---")
                 logger.info(f"Phoneme sequence length: {len(phoneme_indices)}")
 
@@ -422,6 +436,7 @@ class KokoroTTS:
                     explicit_stop = (stop_threshold is not None) or getattr(self, '_explicit_inference_stop_threshold', False)
                     kwargs = {
                         'phoneme_indices': phoneme_tensor,
+                        'stress_indices': stress_tensor,
                         'max_len': eff_max_len,
                         'stop_threshold': eff_stop_threshold,
                         'min_len_ratio': eff_min_len_ratio,

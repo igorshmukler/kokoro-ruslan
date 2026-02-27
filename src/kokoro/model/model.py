@@ -37,7 +37,8 @@ class KokoroModel(nn.Module):
                  variance_kernel_size: int = 3, variance_dropout: float = 0.1,
                  n_variance_bins: int = 256, pitch_min: float = 50.0,
                  pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0,
-                 use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1):
+                 use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1,
+                 use_stress_embedding: bool = True):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
@@ -65,6 +66,15 @@ class KokoroModel(nn.Module):
 
         # Text encoder: Embedding + Positional Encoding + Stack of Transformer Blocks
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
+
+        # Stress embedding: 3 entries {0=unstressed, 1=primary_stress, 2=secondary_stress}.
+        # Added to (not concatenated with) the phoneme embedding at the encoder input so
+        # that duration/pitch/energy predictors receive an explicit, interpretable
+        # stress conditioning signal without changing the hidden dimension.
+        self.use_stress_embedding = use_stress_embedding
+        if use_stress_embedding:
+            self.stress_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
+
         self.encoder_positional_encoding = PositionalEncoding(
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
         )
@@ -256,14 +266,26 @@ class KokoroModel(nn.Module):
         return result
 
     def encode_text(self, phoneme_indices: torch.Tensor,
+                    stress_indices: Optional[torch.Tensor] = None,
                     mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Encode text with gradient checkpointing and proper scaling"""
+        """Encode text with gradient checkpointing and proper scaling.
+
+        Args:
+            phoneme_indices: (B, T) LongTensor of phoneme IDs.
+            stress_indices:  (B, T) LongTensor of stress IDs
+                             {0=unstressed, 1=primary, 2=secondary}.
+                             When provided, the stress embedding is added to
+                             the phoneme embedding before positional encoding.
+            mask: (B, T) BoolTensor — True where positions are padding.
+        """
         with torch.profiler.record_function("encode_text"):
             # Log before text embedding (outside any checkpointed regions)
             if self.enable_profiling:
                 self.profiler.log_memory_stats("text_embedding_start")
 
             text_emb = self.text_embedding(phoneme_indices) * (self.hidden_dim ** 0.5)
+            if self.use_stress_embedding and stress_indices is not None:
+                text_emb = text_emb + self.stress_embedding(stress_indices)
             text_emb = self.encoder_positional_encoding(text_emb, seq_offset=0)
 
             if self.enable_profiling:
@@ -457,7 +479,8 @@ class KokoroModel(nn.Module):
         pitch_targets: Optional[torch.Tensor] = None,
         energy_targets: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
-        mel_padding_mask: Optional[torch.Tensor] = None
+        mel_padding_mask: Optional[torch.Tensor] = None,
+        stress_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         with torch.profiler.record_function("forward_training"):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
@@ -475,9 +498,13 @@ class KokoroModel(nn.Module):
 
             try:
                 # ── 1. Encode text ──────────────────────────────────────────
-                text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
-                # phoneme_indices no longer needed
+                text_encoded = self.encode_text(
+                    phoneme_indices, stress_indices=stress_indices, mask=text_padding_mask
+                )
+                # phoneme_indices / stress_indices no longer needed
                 del phoneme_indices
+                if stress_indices is not None:
+                    del stress_indices
 
                 # ── 2. Variance adaptor ─────────────────────────────────────
                 if self.use_variance_predictor:
@@ -616,6 +643,7 @@ class KokoroModel(nn.Module):
         max_len_ratio: float = 3.0,
         max_len_cap: int = 1600,
         post_expected_stop_threshold: float = 0.2,
+        stress_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Inference mode (gradient checkpointing automatically disabled)
@@ -640,7 +668,9 @@ class KokoroModel(nn.Module):
                         text_padding_mask = text_padding_mask.to(torch.bool)
 
                     with torch.profiler.record_function("inference_encode_text"):
-                        text_encoded = self.encode_text(phoneme_indices, mask=text_padding_mask)
+                        text_encoded = self.encode_text(
+                            phoneme_indices, stress_indices=stress_indices, mask=text_padding_mask
+                        )
 
                     with torch.profiler.record_function("inference_predict_durations"):
                         if self.use_variance_predictor:
@@ -823,7 +853,8 @@ class KokoroModel(nn.Module):
         pitch_targets: Optional[torch.Tensor] = None,
         energy_targets: Optional[torch.Tensor] = None,
         text_padding_mask: Optional[torch.Tensor] = None,
-        mel_padding_mask: Optional[torch.Tensor] = None
+        mel_padding_mask: Optional[torch.Tensor] = None,
+        stress_indices: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Main forward pass that dispatches to training or inference mode.
@@ -835,13 +866,15 @@ class KokoroModel(nn.Module):
             return self.forward_training(
                 phoneme_indices, mel_specs, phoneme_durations,
                 stop_token_targets, pitch_targets, energy_targets,
-                text_padding_mask, mel_padding_mask
+                text_padding_mask, mel_padding_mask,
+                stress_indices=stress_indices,
             )
         else:
             self.eval()
             return self.forward_inference(
                 phoneme_indices, max_len=self.max_decoder_seq_len,
-                text_padding_mask=text_padding_mask
+                text_padding_mask=text_padding_mask,
+                stress_indices=stress_indices,
             )
 
     def get_model_info(self) -> dict:

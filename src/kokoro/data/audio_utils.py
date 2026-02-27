@@ -262,6 +262,77 @@ class PhonemeProcessorUtils:
         return result
 
     @staticmethod
+    def get_stress_indices_with_sil(raw_output, phoneme_to_id: dict) -> list:
+        """Return a stress-ID sequence exactly parallel to flatten_phoneme_output_with_sil().
+
+        Values:
+            0 – unstressed / special token (<sil>, <pad>, punctuation tokens, …)
+            1 – primary stress (the vowel carrying word-level stress)
+            2 – secondary stress (reserved; not yet assigned by current heuristics)
+
+        The returned list has the same length as the list produced by
+        flatten_phoneme_output_with_sil() for the same raw_output, so it can
+        be used directly as a parallel stress_indices tensor to the phoneme
+        embedding in the encoder.
+
+        Args:
+            raw_output: list of (word, phonemes, stress_info[, punct_token]) tuples
+                        — the direct output of RussianPhonemeProcessor.process_text().
+            phoneme_to_id: vocabulary dict from the processor (used only to check
+                           whether '<sil>' is present, matching the flatten logic).
+        """
+        # Longest multi-char vowel prefixes must come before their single-char
+        # sub-strings so that e.g. 'ja' is matched before 'a' could shadow it.
+        _VOWEL_PREFIXES = ('ja', 'jo', 'ju', 'je', 'a', 'o', 'u', 'ɨ', 'e', 'i', 'ə', 'ɐ', 'ɪ')
+
+        def _is_vowel(ph: str) -> bool:
+            return any(ph.startswith(v) for v in _VOWEL_PREFIXES)
+
+        has_sil = '<sil>' in phoneme_to_id
+        result: list = []
+        word_count = 0
+
+        for item in raw_output:
+            if not (isinstance(item, tuple) and len(item) >= 3):
+                continue
+            word_phonemes = item[1]
+            stress_info   = item[2]
+            punct_token: Optional[str] = (
+                item[3] if len(item) >= 4 and isinstance(item[3], str) else None
+            )
+
+            if not isinstance(word_phonemes, list):
+                continue
+
+            # <sil> before every word except the first — mirrors flatten_phoneme_output_with_sil
+            if has_sil and word_count > 0:
+                result.append(0)
+
+            # Stress labels for the word's phonemes
+            vowel_count = 0
+            stressed_emitted = False
+            for ph in word_phonemes:
+                if not isinstance(ph, str) or not ph:
+                    continue
+                if _is_vowel(ph):
+                    if not stressed_emitted and vowel_count == stress_info.position:
+                        result.append(1)   # primary stress
+                        stressed_emitted = True
+                    else:
+                        result.append(0)
+                    vowel_count += 1
+                else:
+                    result.append(0)   # consonant or modifier phoneme
+
+            # Punct token after the word (same position as in flatten_phoneme_output_with_sil)
+            if punct_token:
+                result.append(0)   # punctuation tokens are always unstressed
+
+            word_count += 1
+
+        return result
+
+    @staticmethod
     def phonemes_to_indices(phoneme_sequence: list, phoneme_to_id: dict) -> list:
         """Convert phoneme strings to indices, ensuring 1:1 length mapping"""
         phoneme_indices = []
