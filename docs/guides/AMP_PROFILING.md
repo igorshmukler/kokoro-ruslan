@@ -41,7 +41,7 @@ AMP performance varies based on:
 
 Profile AMP benefits before training:
 
-```bash
+```shell
 # Basic profiling (10 batches)
 python3 training.py --corpus ./ruslan_corpus --profile-amp
 
@@ -56,7 +56,7 @@ python3 training.py --corpus ./ruslan_corpus --profile-amp --epochs 100
 
 Test AMP profiling without full training setup:
 
-```bash
+```shell
 python3 test_amp_profiling.py
 ```
 
@@ -219,7 +219,7 @@ config = TrainingConfig(
 
 ### CLI Arguments
 
-```bash
+```shell
 --profile-amp               # Enable AMP profiling before training
 --profile-amp-batches N     # Number of batches to profile (default: 10)
 ```
@@ -230,7 +230,7 @@ config = TrainingConfig(
 
 More batches = more accurate results but longer profiling time:
 
-```bash
+```shell
 # Quick test (less accurate, ~30 seconds)
 python3 training.py --corpus ./ruslan_corpus --profile-amp --profile-amp-batches 5
 
@@ -245,7 +245,7 @@ python3 training.py --corpus ./ruslan_corpus --profile-amp --profile-amp-batches
 
 AMP benefits increase with larger batches:
 
-```bash
+```shell
 # Small batches (may show less speedup)
 python3 training.py --corpus ./ruslan_corpus --profile-amp --batch-size 4
 
@@ -315,7 +315,7 @@ config.use_mixed_precision = False
 5. **Driver issues**: Update GPU drivers
 
 **Check:**
-```bash
+```shell
 # Verify device and PyTorch version
 python3 -c "import torch; print(torch.cuda.is_available())"  # CUDA
 python3 -c "import torch; print(torch.backends.mps.is_available())"  # MPS
@@ -394,7 +394,7 @@ The profiling is accurate because:
 ### Recommended Workflow
 
 1. **Profile first**:
-   ```bash
+   ```shell
    python3 training.py --corpus ./ruslan_corpus --profile-amp --profile-amp-batches 20
    ```
 
@@ -407,7 +407,7 @@ The profiling is accurate because:
    ```
 
 4. **Train**:
-   ```bash
+   ```shell
    python3 training.py --corpus ./ruslan_corpus --epochs 100
    ```
 

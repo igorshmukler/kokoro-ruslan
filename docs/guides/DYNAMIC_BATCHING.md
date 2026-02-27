@@ -72,7 +72,7 @@ max_batch_size = 32  # Never exceed 32 samples
 
 Dynamic batching is **enabled by default** in the latest version:
 
-```bash
+```shell
 # Uses default settings (max_frames=20000)
 kokoro-train --corpus ./ruslan_corpus
 ```
@@ -81,7 +81,7 @@ kokoro-train --corpus ./ruslan_corpus
 
 Adjust the frame budget based on your GPU memory:
 
-```bash
+```shell
 # For GPUs with more memory (e.g., A100, V100)
 kokoro-train --max-frames 30000
 
@@ -96,7 +96,7 @@ kokoro-train --max-frames 10000
 
 Control the range of batch sizes:
 
-```bash
+```shell
 kokoro-train \
     --max-frames 20000 \
     --min-batch-size 8 \
@@ -107,7 +107,7 @@ kokoro-train \
 
 Use fixed batch size if preferred:
 
-```bash
+```shell
 kokoro-train --no-dynamic-batching --batch-size 16
 ```
 
@@ -141,7 +141,7 @@ class TrainingConfig:
 
 Run the test script to find optimal settings:
 
-```bash
+```shell
 python test_dynamic_batching.py
 ```
 
@@ -153,22 +153,22 @@ This will:
 ### Step 2: Adjust Based on GPU Memory
 
 **16GB VRAM** (RTX 4080, V100):
-```bash
+```shell
 kokoro-train --max-frames 25000 --max-batch-size 48
 ```
 
 **12GB VRAM** (RTX 3080, RTX 4070):
-```bash
+```shell
 kokoro-train --max-frames 20000 --max-batch-size 32
 ```
 
 **8GB VRAM** (RTX 3060, RTX 4060):
-```bash
+```shell
 kokoro-train --max-frames 15000 --max-batch-size 24
 ```
 
 **6GB VRAM** (GTX 1060, RTX 3050):
-```bash
+```shell
 kokoro-train --max-frames 10000 --max-batch-size 16
 ```
 
@@ -257,7 +257,7 @@ Monitor these to ensure efficient batching.
 
 Begin with smaller `max_frames` and increase gradually:
 
-```bash
+```shell
 # Start here
 kokoro-train --max-frames 15000
 
@@ -312,7 +312,7 @@ A: No. The model sees the same data, just grouped differently. Convergence is no
 **Q: What if I get OOM errors?**
 
 A: Reduce `max_frames` by 20-30% and try again:
-```bash
+```shell
 kokoro-train --max-frames 15000
 ```
 
@@ -327,7 +327,7 @@ A: Dynamic batching is for training only. Inference typically uses single sample
 **Cause:** `max_frames` is too small for your data
 
 **Solution:**
-```bash
+```shell
 kokoro-train --max-frames 25000  # Increase budget
 ```
 
@@ -336,7 +336,7 @@ kokoro-train --max-frames 25000  # Increase budget
 **Cause:** Very mixed utterance lengths
 
 **Solution:** Tighten the batch size range:
-```bash
+```shell
 kokoro-train --min-batch-size 8 --max-batch-size 24
 ```
 
@@ -345,7 +345,7 @@ kokoro-train --min-batch-size 8 --max-batch-size 24
 **Cause:** `max_frames` exceeds GPU capacity
 
 **Solution:** Reduce frame budget:
-```bash
+```shell
 kokoro-train --max-frames 15000  # Reduce by 25%
 ```
 
@@ -354,7 +354,7 @@ kokoro-train --max-frames 15000  # Reduce by 25%
 **Cause:** Dataset too uniform or overhead from dynamic calculation
 
 **Solution:** Use fixed batching for very uniform datasets:
-```bash
+```shell
 kokoro-train --no-dynamic-batching --batch-size 16
 ```
 

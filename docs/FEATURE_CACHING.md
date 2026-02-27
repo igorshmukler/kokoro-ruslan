@@ -21,7 +21,7 @@ The feature caching system pre-computes and caches mel spectrograms, pitch, and 
 
 ### Option 1: Pre-compute Before Training (Recommended)
 
-```bash
+```shell
 # Pre-compute all features before training starts
 kokoro-precompute --corpus ./ruslan_corpus
 
@@ -31,7 +31,7 @@ kokoro-train --corpus ./ruslan_corpus
 
 ### Option 2: Compute During First Epoch
 
-```bash
+```shell
 # Features will be cached automatically during first epoch
 kokoro-train --corpus ./ruslan_corpus
 
@@ -41,7 +41,7 @@ kokoro-train --corpus ./ruslan_corpus
 
 ### Option 3: Disable Caching
 
-```bash
+```shell
 # Disable feature caching in TrainingConfig (no dedicated train CLI flag)
 python -c "from kokoro.training.config import TrainingConfig; print(TrainingConfig(use_feature_cache=False))"
 ```
@@ -50,7 +50,7 @@ python -c "from kokoro.training.config import TrainingConfig; print(TrainingConf
 
 ### Pre-compute Features
 
-```bash
+```shell
 # Basic usage
 kokoro-precompute --corpus ./ruslan_corpus
 
@@ -69,13 +69,13 @@ kokoro-precompute --corpus ./ruslan_corpus --use-mfa --mfa-alignment-dir ./mfa_o
 
 Module form:
 
-```bash
+```shell
 python -m kokoro.cli.precompute_features --corpus ./ruslan_corpus
 ```
 
 ### Check Cache Status
 
-```bash
+```shell
 # View cache statistics
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
 
@@ -92,7 +92,7 @@ python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
 
 ### Clear Cache
 
-```bash
+```shell
 # Clear all cached features
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --clear
 
@@ -186,7 +186,7 @@ Each `.pt` file contains:
 
 For very large datasets, you can split pre-computation across multiple processes:
 
-```bash
+```shell
 # Split dataset into chunks and process in parallel
 # (Implementation coming soon)
 ```
@@ -215,7 +215,7 @@ dataset.preload_cache_to_memory()
 
 If you're not seeing speedups:
 
-```bash
+```shell
 # Check cache status
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
 
@@ -230,7 +230,7 @@ kokoro-precompute --corpus ./ruslan_corpus --force
 
 If running out of disk space:
 
-```bash
+```shell
 # Clear cache
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --clear
 
@@ -245,7 +245,7 @@ kokoro-precompute --corpus ./ruslan_corpus --cache-dir /external/cache
 
 If you modify audio files or configuration:
 
-```bash
+```shell
 # Clear old cache
 python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --clear
 
@@ -256,23 +256,23 @@ kokoro-precompute --corpus ./ruslan_corpus
 ## Best Practices
 
 1. **Pre-compute before long training runs**
-   ```bash
+   ```shell
    kokoro-precompute --corpus ./ruslan_corpus
    kokoro-train --corpus ./ruslan_corpus --epochs 100
    ```
 
 2. **Use dedicated cache directory for large datasets**
-   ```bash
+   ```shell
    kokoro-precompute --corpus ./ruslan_corpus --cache-dir /fast-ssd/cache
    ```
 
 3. **Verify cache before training**
-   ```bash
+   ```shell
    python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --status
    ```
 
 4. **Clear cache after major config changes**
-   ```bash
+   ```shell
    # If you change sample_rate, n_mels, hop_length, etc.
    python3 -m kokoro.utils.cache_manager --corpus ./ruslan_corpus --clear
    kokoro-precompute --corpus ./ruslan_corpus

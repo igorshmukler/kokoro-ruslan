@@ -2,7 +2,7 @@
 
 ## One-Line Usage
 
-```bash
+```shell
 # Profile and train
 python3 training.py --corpus ./ruslan_corpus --profile-amp
 ```
@@ -33,7 +33,7 @@ Speedup:     1.80x ← YOUR ACTUAL SPEEDUP
 
 ## Common Commands
 
-```bash
+```shell
 # Basic profiling (10 batches, ~1 minute)
 python3 training.py --corpus ./ruslan_corpus --profile-amp
 

@@ -25,7 +25,7 @@ from kokoro.data.mfa_integration import MFAIntegration
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 2
+FEATURE_CACHE_VERSION = 3  # bumped: energy axis layout fix (mel_spec_linear.T)
 
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
@@ -593,10 +593,15 @@ class RuslanDataset(Dataset):
         # Convert to log scale and normalize
         mel_spec = torch.log(mel_spec_linear + 1e-9)  # Add small epsilon to avoid log(0)
 
-        # Clip extremely long sequences to prevent memory issues
+        # Clip extremely long sequences to prevent memory issues.
+        # mel_spec_linear and mel_spec must be clipped together so that
+        # num_mel_frames (derived from mel_spec below) is always consistent
+        # with both tensors, and mel_spec_linear doesn't carry excess frames
+        # that would inflate peak memory during energy extraction.
         max_frames = self.config.max_seq_length
         if mel_spec.shape[1] > max_frames:
             mel_spec = mel_spec[:, :max_frames]
+            mel_spec_linear = mel_spec_linear[:, :max_frames]
 
         # Process text to phonemes using the dedicated processor
         phoneme_indices = self.phoneme_processor.text_to_indices(sample['text'])
@@ -687,8 +692,14 @@ class RuslanDataset(Dataset):
                     padding = torch.zeros(num_mel_frames - len(pitch), device=pitch.device)
                     pitch = torch.cat([pitch, padding])
 
-                # Extract energy from linear mel spectrogram (returns normalized [0, 1])
-                energy = EnergyExtractor.extract_energy_from_mel(mel_spec_linear)
+                # Extract energy from linear mel spectrogram (returns normalized [0, 1]).
+                # mel_spec_linear is (n_mels=80, T_frames); EnergyExtractor.extract_energy_from_mel
+                # expects (..., n_mels) as the last dimension so it can mean over mel bins to get
+                # a per-frame scalar.  Transpose + clip to the mel-clipped frame count.
+                # Explicit log_domain=False because values are linear power (pre-log).
+                energy = EnergyExtractor.extract_energy_from_mel(
+                    mel_spec_linear[:, :num_mel_frames].T, log_domain=False
+                )
 
                 # Ensure energy matches mel frames
                 if len(energy) > num_mel_frames:

@@ -109,7 +109,7 @@ if epochs_without_improvement >= patience:
 ## Usage Examples
 
 ### Basic Usage
-```bash
+```shell
 # Default: 10% validation, early stopping after 10 epochs
 kokoro-train --corpus ./ruslan_corpus
 
@@ -121,7 +121,7 @@ kokoro-train --no-validation
 ```
 
 ### Advanced Usage
-```bash
+```shell
 # Strict early stopping
 kokoro-train --val-split 0.15 --early-stopping-patience 5
 
@@ -212,7 +212,7 @@ The implementation is fully backward compatible:
 
 To test the validation system:
 
-```bash
+```shell
 # 1. Quick test with small dataset
 kokoro-train --corpus ./ruslan_corpus --epochs 5 --val-split 0.2
 

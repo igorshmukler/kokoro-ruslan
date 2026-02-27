@@ -3,12 +3,12 @@
 > **Note:** After package restructuring, use `kokoro-train`, `kokoro-preprocess`, etc. commands (after `pip install -e .`), or Python modules: `python3 -m kokoro.cli.training`
 
 ## Installation Check
-```bash
+```shell
 python verify_setup.py
 ```
 
 ## One-Command Setup
-```bash
+```shell
 # Install MFA
 conda install -c conda-forge montreal-forced-aligner kalpy kaldi
 
@@ -24,7 +24,7 @@ kokoro-train
 ## Command Reference
 
 ### Preprocessing
-```bash
+```shell
 # Basic (using installed command)
 kokoro-preprocess --corpus ./ruslan_corpus
 
@@ -45,7 +45,7 @@ kokoro-preprocess --corpus ./ruslan_corpus --skip-mfa
 ```
 
 ### Training
-```bash
+```shell
 # With MFA (default) - using installed command
 kokoro-train
 
@@ -69,7 +69,7 @@ kokoro-train \
 
 ### Programmatic MFA utilities
 
-```bash
+```shell
 # Python module utilities
 python3 -m kokoro.data.mfa_integration
 
@@ -105,17 +105,17 @@ mfa_alignment_dir="./mfa_output/alignments"
 ## Status Checks
 
 ### Check MFA Installation
-```bash
+```shell
 mfa version
 ```
 
 ### Validate Alignments
-```bash
+```shell
 kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 ```
 
 ### Check Training Mode
-```bash
+```shell
 # Look for this in training logs:
 # "Using MFA forced alignment for phoneme durations (high quality)"
 # OR
@@ -134,23 +134,23 @@ kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 ## Troubleshooting Quick Fixes
 
 ### "MFA not found"
-```bash
+```shell
 conda install -c conda-forge montreal-forced-aligner kalpy kaldi
 ```
 
 ### "tgt could not be resolved"
-```bash
+```shell
 pip install tgt
 ```
 
 ### "Alignment directory not found"
-```bash
+```shell
 # Run preprocessing first
 kokoro-preprocess --corpus ./ruslan_corpus
 ```
 
 ### "Low alignment rate (<90%)"
-```bash
+```shell
 # Check corpus structure
 ls -l ruslan_corpus/wavs/ | head
 cat ruslan_corpus/metadata_RUSLAN_22200.csv | head
@@ -160,7 +160,7 @@ kokoro-preprocess --corpus ./ruslan_corpus --validate-only
 ```
 
 ### Out of Memory During Alignment
-```bash
+```shell
 # Reduce parallel jobs
 kokoro-preprocess --corpus ./ruslan_corpus --jobs 2
 ```
@@ -222,7 +222,7 @@ CLI args > Config file > Defaults
 ## Common Workflows
 
 ### First Time Setup
-```bash
+```shell
 # Install package
 pip install -e .
 
@@ -237,18 +237,18 @@ kokoro-train
 ```
 
 ### Quick Test (No MFA)
-```bash
+```shell
 kokoro-train --no-mfa --epochs 5
 ```
 
 ### Production Training
-```bash
+```shell
 kokoro-preprocess --corpus . --jobs 16
 kokoro-train --batch-size 16 --epochs 200
 ```
 
 ### After Code Update
-```bash
+```shell
 # Alignments are cached, just restart training
 kokoro-train --resume auto
 ```

@@ -5,12 +5,22 @@ import torch.nn as nn
 from kokoro.training.trainer import KokoroTrainer
 
 
-def _build_minimal_trainer() -> KokoroTrainer:
+def _build_minimal_trainer(stop_pos_weight: float = 1.0) -> KokoroTrainer:
+    """Build a minimal trainer for unit tests.
+
+    stop_pos_weight defaults to 1.0 (no imbalance correction) so that tests
+    which assert exact numerical loss values are not affected by the class-
+    imbalance correction added in 0.0.21.  Pass the real default (150.0) when
+    specifically testing stop-token behaviour.
+    """
     trainer = KokoroTrainer.__new__(KokoroTrainer)
     trainer.device = torch.device("cpu")
     trainer.criterion_mel = torch.nn.L1Loss(reduction="none")
     trainer.criterion_duration = torch.nn.MSELoss(reduction="none")
-    trainer.criterion_stop_token = torch.nn.BCEWithLogitsLoss(reduction="none")
+    _pos_w = torch.tensor([stop_pos_weight])
+    trainer.criterion_stop_token = torch.nn.BCEWithLogitsLoss(
+        reduction="none", pos_weight=_pos_w
+    )
     trainer.criterion_pitch = None
     trainer.criterion_energy = None
     trainer.config = SimpleNamespace(

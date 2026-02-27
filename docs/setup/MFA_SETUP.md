@@ -14,20 +14,45 @@ Montreal Forced Aligner provides **accurate phoneme-level alignments** by analyz
 
 ### Option 1: Conda (Recommended)
 
-```bash
-conda install -c conda-forge montreal-forced-aligner kalpy kaldi
+Conda provides the most reliable and reproducible installation for MFA and Kaldi dependencies (recommended for Linux and macOS):
+
+```shell
+# Create a dedicated environment (recommended Python 3.11)
+conda create -n kokoro python=3.11 -y
+conda activate kokoro
+
+# Install MFA + Kaldi and helper packages from conda-forge
+conda install -c conda-forge montreal-forced-aligner kalpy kaldi -y
+
+# Optional: install TextGrid parsing helper
+pip install tgt
 ```
 
-### Option 2: Pip
+Notes:
+- `kaldi` is large and easiest to install via `conda-forge`.
+- Use the conda environment when running `kokoro-preprocess`/`kokoro-train` so the MFA binaries are on `PATH`.
 
-```bash
-pip install montreal-forced-aligner
+### Option 2: Pip (works but less predictable)
+
+Installing via `pip` can work on many systems but often requires a system-level Kaldi installation or the use of prebuilt wheels. Use this if you cannot use conda:
+
+```shell
+python -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip setuptools wheel
+pip install montreal-forced-aligner tgt
 ```
 
-### Install Additional Dependencies
+If `pip` install fails due to missing Kaldi or system libraries, prefer the `conda` approach or use the Docker image below.
 
-```bash
-pip install tgt  # TextGrid parsing library
+### Option 3: Docker (isolated, reproducible)
+
+If you cannot modify the host environment, use the official MFA Docker image or a community image with Kaldi preinstalled. This is robust for CI or heterogeneous compute.
+
+```shell
+# Example (pseudo-commands; adapt to MFA docker image you choose):
+docker run --rm -v $(pwd):/data montreal-forced-aligner/montreal-forced-aligner:latest \
+    align /data/ruslan_corpus /data/mfa_output --config /data/mfa_config.json
 ```
 
 ## Quick Start
@@ -36,7 +61,7 @@ pip install tgt  # TextGrid parsing library
 
 Use the standalone script to align your corpus:
 
-```bash
+```shell
 # Basic usage
 kokoro-preprocess --corpus ./ruslan_corpus --output ./mfa_output
 
@@ -57,7 +82,7 @@ python -m kokoro.cli.preprocess --corpus ./ruslan_corpus --output ./mfa_output -
 
 Once alignment is complete, training automatically uses the alignments:
 
-```bash
+```shell
 # MFA is enabled by default
 kokoro-train --corpus ./ruslan_corpus --output ./my_model
 
@@ -86,9 +111,43 @@ mfa_output/
 │   ├── 005560_RUSLAN.pkl
 │   └── ...
 └── mfa_corpus/             # Temporary MFA-formatted corpus
-    ├── 005559_RUSLAN.wav
-    ├── 005559_RUSLAN.txt
-    └── ...
+        ├── 005559_RUSLAN.wav
+        ├── 005559_RUSLAN.txt
+        └── ...
+```
+
+Important filesystem conventions and what `kokoro` expects
+
+- Default alignment directory used by `kokoro-preprocess` / `kokoro-train` is `./mfa_output/alignments` (TextGrid files).
+- `kokoro` also creates/reads `./mfa_output/alignment_cache` containing pickled duration tensors for fast loading during training.
+- File name matching: `kokoro` expects TextGrid stems to match the `audio_filename` values listed in your `metadata_*.csv` file (audio stem, without extension). Example:
+    - metadata entry: `005559_RUSLAN.wav|Привет`
+    - expected TextGrid: `mfa_output/alignments/005559_RUSLAN.TextGrid`
+    - expected cache: `mfa_output/alignment_cache/005559_RUSLAN.pkl`
+- TextGrid parsing is case-sensitive on some filesystems; ensure consistent stems and extensions.
+
+How to point `kokoro-train` at a custom alignment directory:
+
+```shell
+kokoro-train --corpus ./ruslan_corpus --output ./my_model --mfa-alignments ./custom_mfa/alignments
+```
+
+Quick verification commands after alignment:
+
+```shell
+# Count TextGrid files
+ls -1 mfa_output/alignments | wc -l
+
+# Check that cached .pkl files exist and match count
+ls -1 mfa_output/alignment_cache | wc -l
+
+# Print a small excerpt of a TextGrid to confirm formatting
+python - <<PY
+from pathlib import Path
+from tgt import read_textgrid
+tg = read_textgrid('mfa_output/alignments/005559_RUSLAN.TextGrid')
+print(tg.get_tier_by_name('phones').get_intervals()[:5])
+PY
 ```
 
 ## Validation
@@ -111,7 +170,7 @@ Average phoneme duration: 8.3 frames
 
 ### MFA Command Not Found
 
-```bash
+```shell
 # Check if MFA is installed
 mfa version
 
@@ -121,7 +180,7 @@ conda install -c conda-forge montreal-forced-aligner
 
 ### Model Download Fails
 
-```bash
+```shell
 # Manually download models
 mfa model download acoustic russian_mfa
 mfa model download dictionary russian_mfa
@@ -183,7 +242,7 @@ for word in alignments:
 
 For very large datasets:
 
-```bash
+```shell
 # Use more parallel jobs
 kokoro-preprocess --corpus ./large_corpus --output ./mfa_output --jobs 16
 

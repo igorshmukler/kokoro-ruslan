@@ -379,7 +379,17 @@ class KokoroTrainer:
 
         self.criterion_mel = nn.L1Loss(reduction='none')
         self.criterion_duration = nn.MSELoss(reduction='none')
-        self.criterion_stop_token = nn.BCEWithLogitsLoss(reduction='none')
+        # pos_weight corrects the severe class imbalance in stop token targets:
+        # only the final frame of each sequence is positive (1.0); all others
+        # are negative (0.0).  Without this the model learns to always predict 0
+        # and achieves near-zero BCE loss while never detecting end-of-utterance.
+        _stop_pos_w = torch.tensor(
+            [getattr(config, 'stop_token_pos_weight', 150.0)],
+            device=self.device
+        )
+        self.criterion_stop_token = nn.BCEWithLogitsLoss(
+            reduction='none', pos_weight=_stop_pos_w
+        )
 
         if getattr(config, 'use_variance_predictor', True):
             self.criterion_pitch = nn.MSELoss(reduction='none')
@@ -407,8 +417,10 @@ class KokoroTrainer:
             self.current_optimizer_step = 0
 
             if self.use_warmup:
-                # OneCycleLR starts after warmup, so adjust total_steps
-                onecycle_steps = total_steps - self.warmup_steps
+                # OneCycleLR starts after warmup, so adjust total_steps.
+                self.warmup_steps, onecycle_steps = KokoroTrainer._apply_warmup_guard(
+                    self.warmup_steps, total_steps
+                )
                 logger.info(f"Linear warmup enabled: {self.warmup_steps} steps ({self.warmup_start_lr:.2e} → {self.warmup_target_lr:.2e})")
             else:
                 onecycle_steps = total_steps
@@ -1208,11 +1220,14 @@ class KokoroTrainer:
 
             logger.warning(f"   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
 
-            # Reset variance predictor weights to initial state
-            if hasattr(self.model, 'pitch_predictor') and self.model.pitch_predictor is not None:
-                self.model.pitch_predictor._init_weights()
-            if hasattr(self.model, 'energy_predictor') and self.model.energy_predictor is not None:
-                self.model.energy_predictor._init_weights()
+            # Reset variance predictor weights to initial state.
+            # The predictors live under model.variance_adaptor, not at model top-level.
+            va = getattr(self.model, 'variance_adaptor', None)
+            if va is not None:
+                if hasattr(va, 'pitch_predictor') and va.pitch_predictor is not None:
+                    va.pitch_predictor._init_weights()
+                if hasattr(va, 'energy_predictor') and va.energy_predictor is not None:
+                    va.energy_predictor._init_weights()
 
             # Zero out these losses for this batch to prevent gradient explosion
             loss_pitch = torch.tensor(0.0, device=self.device)
@@ -1241,6 +1256,23 @@ class KokoroTrainer:
                           f"pitch={loss_pitch:.2f}, energy={loss_energy:.2f}")
 
         return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
+
+    @staticmethod
+    def _apply_warmup_guard(warmup_steps: int, total_steps: int) -> Tuple[int, int]:
+        """
+        Guard warmup_steps so that OneCycleLR always receives a positive total_steps.
+
+        Returns:
+            (clamped_warmup_steps, onecycle_steps) where onecycle_steps >= 1.
+        """
+        if warmup_steps >= total_steps:
+            logger.warning(
+                f"warmup_steps ({warmup_steps}) >= total_steps ({total_steps}). "
+                "Clamping warmup to total_steps - 1 to avoid OneCycleLR crash."
+            )
+            warmup_steps = max(0, total_steps - 1)
+        onecycle_steps = max(1, total_steps - warmup_steps)
+        return warmup_steps, onecycle_steps
 
     def setup_checkpoint_resumption(self):
         """Handle checkpoint resumption with mixed precision state"""

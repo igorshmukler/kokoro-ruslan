@@ -497,6 +497,12 @@ class KokoroModel(nn.Module):
                         )
                         del energy_targets
 
+                    # Pass raw frame counts (not log1p) as duration_target.
+                    # VarianceAdaptor's LengthRegulator casts to .long() internally,
+                    # so it needs actual integer frame counts (e.g. 5), not log1p
+                    # values (e.g. 1.79) which would be truncated to 1-2 frames.
+                    # The duration *loss* target (log1p for the predictor head) is
+                    # computed separately in the trainer from predicted_log_durations.
                     (adapted_encoder_output,
                      predicted_log_durations,
                      predicted_pitch,
@@ -638,27 +644,33 @@ class KokoroModel(nn.Module):
 
                     with torch.profiler.record_function("inference_predict_durations"):
                         if self.use_variance_predictor:
-                            _, predicted_log_durations, _, _, _ = self.variance_adaptor(
+                            # Use the full adapted output so pitch/energy embeddings
+                            # are applied — matching exactly what forward_training does.
+                            # VarianceAdaptor now applies exp() internally before rounding
+                            # when duration_target is None, so frame counts are correct.
+                            (adapted_encoder_output,
+                             predicted_log_durations,
+                             _pitch_pred, _energy_pred,
+                             frame_mask) = self.variance_adaptor(
                                 text_encoded,
                                 mask=text_padding_mask,
                                 pitch_target=None,
                                 energy_target=None,
                                 duration_target=None
                             )
+                            del text_encoded
+                            expanded_encoder_outputs = adapted_encoder_output
+                            encoder_output_padding_mask = frame_mask
+                            del adapted_encoder_output, frame_mask
                         else:
                             predicted_log_durations = self._predict_durations(text_encoded)
-
-                        durations_for_length_regulate = torch.exp(predicted_log_durations)
-                        durations_for_length_regulate = torch.clamp(
-                            durations_for_length_regulate, min=1.0
-                        ).long()
-
-                    with torch.profiler.record_function("inference_length_regulate"):
-                        expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                            text_encoded, durations_for_length_regulate, text_padding_mask
-                        )
-                    # text_encoded no longer needed after length regulation
-                    del text_encoded, durations_for_length_regulate
+                            durations_for_length_regulate = torch.clamp(
+                                torch.exp(predicted_log_durations), min=1.0
+                            ).long()
+                            expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                                text_encoded, durations_for_length_regulate, text_padding_mask
+                            )
+                            del text_encoded, durations_for_length_regulate
 
                     # Clear ALiBi distance caches before inference — during generation seq_len
                     # grows by 1 each step so every key is unique; the cache fills with 10
@@ -732,7 +744,7 @@ class KokoroModel(nn.Module):
                                 stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
                                 del decoder_out_t
 
-                                stop_probability = torch.sigmoid(stop_token_logit_t).item()
+                                stop_probability = torch.sigmoid(stop_token_logit_t).mean().item()
                                 del stop_token_logit_t
 
                                 if t >= min_expected_length:

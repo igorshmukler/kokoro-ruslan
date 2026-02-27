@@ -30,7 +30,10 @@ class AudioUtils:
     @staticmethod
     def normalize_audio(audio: torch.Tensor) -> torch.Tensor:
         """Normalize audio to prevent clipping"""
-        return audio / torch.max(torch.abs(audio))
+        max_val = torch.max(torch.abs(audio))
+        if max_val < 1e-8:
+            return audio
+        return audio / max_val
 
     @staticmethod
     def ensure_mono(audio: torch.Tensor) -> torch.Tensor:
@@ -65,9 +68,15 @@ class AudioUtils:
         return success
 
     def _save_with_torchaudio(self, audio: torch.Tensor, output_path: Path) -> bool:
-        """Try saving with torchaudio"""
         try:
-            torchaudio.save(str(output_path), audio.unsqueeze(0), self.sample_rate, format="wav")
+            torchaudio.save(
+                str(output_path),
+                audio.unsqueeze(0),
+                self.sample_rate,
+                format="wav",
+                encoding="PCM_S",
+                bits_per_sample=16,
+            )
             logger.info(f"Audio saved using torchaudio: {output_path}")
             return True
         except Exception as e:

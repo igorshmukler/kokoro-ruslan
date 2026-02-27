@@ -39,3 +39,4 @@ logs/profiling/*
 
 # Examples outputs
 examples/outputs/
+node_modules

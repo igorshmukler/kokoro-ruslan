@@ -168,6 +168,13 @@ Stop behavior details:
 - If generation passes expected duration-based length, stop criterion is relaxed to avoid unnatural run-on speech.
 - If output still sounds too short, increase `--stop-threshold` and/or `--min-len-ratio`.
 
+Note on precedence: an explicit `--stop-threshold` passed on the CLI (or the
+per-call `stop_threshold` argument when using the `KokoroTTS` API) takes
+precedence over any checkpoint-tuned or internal model defaults and will be
+applied consistently during generation (including the post-expected-length
+stopping heuristic). This prevents the model from silently clamping an
+explicitly supplied value to an internal default.
+
 ## Improving Audio Quality
 
 Default inference uses HiFi-GAN for mel-to-audio conversion. If a HiFi-GAN checkpoint is unavailable, use `--vocoder griffin_lim`.

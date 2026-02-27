@@ -213,6 +213,7 @@ Examples:
 
     parser.add_argument(
         '--stop-threshold',
+        dest='stop_threshold',
         type=float,
         default=0.1,  # Lowered from 0.45 to be more sensitive
         help='Threshold for the stop token (lower is more sensitive)'
