@@ -312,8 +312,8 @@ class TestMfaDurationLengthMatchesSilPath:
 
         # Build synthetic MFA alignment:
         #   leading <sil>, phonemes for word 1, inner <sil>, phonemes for word 2, trailing <sil>
-        _, word1_phones, _ = raw[0]
-        _, word2_phones, _ = raw[1]
+        _, word1_phones, *_ = raw[0]
+        _, word2_phones, *_ = raw[1]
 
         intervals: List[Tuple[str, float]] = [('<sil>', 0.10)]
         for ph in word1_phones:
@@ -343,7 +343,7 @@ class TestMfaDurationLengthMatchesSilPath:
         )
         n_phonemes = len(seq)
 
-        _, word_phones, _ = raw[0]
+        _, word_phones, *_ = raw[0]
         intervals: List[Tuple[str, float]] = [('<sil>', 0.10)]
         for ph in word_phones:
             intervals.append((ph, 0.05))
@@ -416,10 +416,10 @@ class TestCacheVersionBump:
 
     def test_feature_cache_version_is_4(self):
         from kokoro.data.dataset import FEATURE_CACHE_VERSION
-        assert FEATURE_CACHE_VERSION == 4, (
-            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 4.  "
+        assert FEATURE_CACHE_VERSION == 5, (
+            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 5.  "
             "Bump it when the phoneme sequence format changes so stale cache "
-            "entries containing the old (no-sil) sequences are invalidated."
+            "entries containing the old sequences are invalidated."
         )
 
     def test_cache_version_is_integer(self):
