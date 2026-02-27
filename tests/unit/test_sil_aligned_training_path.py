@@ -416,8 +416,8 @@ class TestCacheVersionBump:
 
     def test_feature_cache_version_is_4(self):
         from kokoro.data.dataset import FEATURE_CACHE_VERSION
-        assert FEATURE_CACHE_VERSION == 5, (
-            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 5.  "
+        assert FEATURE_CACHE_VERSION == 6, (
+            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 6.  "
             "Bump it when the phoneme sequence format changes so stale cache "
             "entries containing the old sequences are invalidated."
         )

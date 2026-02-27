@@ -309,13 +309,15 @@ class PhonemeProcessorUtils:
                 result.append(0)
 
             # Stress labels for the word's phonemes
+            # stress_info may be None in mocked / legacy processors — treat as all-unstressed.
+            stress_position = stress_info.position if stress_info is not None else -1
             vowel_count = 0
             stressed_emitted = False
             for ph in word_phonemes:
                 if not isinstance(ph, str) or not ph:
                     continue
                 if _is_vowel(ph):
-                    if not stressed_emitted and vowel_count == stress_info.position:
+                    if not stressed_emitted and vowel_count == stress_position:
                         result.append(1)   # primary stress
                         stressed_emitted = True
                     else:

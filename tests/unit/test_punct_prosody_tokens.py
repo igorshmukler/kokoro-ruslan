@@ -446,8 +446,8 @@ class TestEndToEndTokenSequence:
 class TestCacheVersion:
 
     def test_feature_cache_version_is_5(self):
-        assert FEATURE_CACHE_VERSION == 5, (
-            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 5. "
+        assert FEATURE_CACHE_VERSION == 6, (
+            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 6. "
             "It must be bumped whenever the phoneme sequence format changes "
             "so stale cache entries are invalidated."
         )
