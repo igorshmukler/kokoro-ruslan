@@ -128,7 +128,8 @@ class RussianPhonemeProcessor:
 
         self._multi_char_phonemes = sorted(
             list(self.palatalized.values()) +
-            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
+            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ',
+             'ja', 'jo', 'ju', 'je', 'jɐ', 'jɪ', 'jə'],
             key=len, reverse=True
         )
 
@@ -529,14 +530,17 @@ class RussianPhonemeProcessor:
             if ph in VOWEL_BASES:
                 if syllable != stress_syllable_idx:
                     dist = stress_syllable_idx - syllable
-                    base = ph[1:] if ph.startswith('j') else ph
+                    is_iotated = ph.startswith('j')
+                    base = ph[1:] if is_iotated else ph
                     if syllable < stress_syllable_idx:
                         if dist == 1:
-                            reduced[i] = 'ɐ' if base in ('o', 'a') else 'ɪ' if base in ('e', 'i') else ph
+                            reduced_base = 'ɐ' if base in ('o', 'a') else 'ɪ' if base in ('e', 'i') else None
                         else:
-                            reduced[i] = 'ə' if base in ('o', 'a', 'e', 'i') else ph
+                            reduced_base = 'ə' if base in ('o', 'a', 'e', 'i') else None
                     else:
-                        reduced[i] = 'ə' if base in ('o', 'a', 'e', 'i') else ph
+                        reduced_base = 'ə' if base in ('o', 'a', 'e', 'i') else None
+                    if reduced_base is not None:
+                        reduced[i] = ('j' + reduced_base) if is_iotated else reduced_base
                 syllable += 1
         return reduced
 
@@ -932,8 +936,8 @@ class RussianPhonemeProcessor:
         phoneme_set.update(self.consonants.values())
         phoneme_set.update(self.palatalized.values())
 
-        # Add reduced vowels
-        phoneme_set.update(['ə', 'ɪ', 'ɐ'])
+        # Add reduced vowels (plain and iotated)
+        phoneme_set.update(['ə', 'ɪ', 'ɐ', 'jɐ', 'jɪ', 'jə'])
 
         # Add phonemes from exceptions (tokenized)
         for ipa_string in self.exceptions.values():
@@ -996,7 +1000,14 @@ class RussianPhonemeProcessor:
             ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ', 'ja', 'jo', 'ju', 'je'],
             key=len, reverse=True
         )
-        instance.multi_char_phonemes = instance._multi_char_phonemes
+        # Rebuild to include iotated reduced vowels added after the original
+        # _multi_char_phonemes was serialised.
+        instance._multi_char_phonemes = sorted(
+            list(instance.palatalized.values()) +
+            ['ts', 'tʃ', 'ʃtʃ', 'dʑ', 'dz', 'tɕ', 'ɐ', 'ə', 'ɪ', 'ɨ',
+             'ja', 'jo', 'ju', 'je', 'jɐ', 'jɪ', 'jə'],
+            key=len, reverse=True
+        )
 
         # Restore all attributes, ensuring sets are converted from lists
         instance.vowels = data.get("vowels", {})
@@ -1011,11 +1022,12 @@ class RussianPhonemeProcessor:
         instance.phoneme_to_id = data.get("phoneme_to_id", {})
 
         # Forward-compatibility patch: if the pickled vocab pre-dates the
-        # prosody-token addition, inject the missing tokens with fresh IDs so
-        # they are always usable at inference time without retraining.
+        # prosody-token addition or the iotated-reduced-vowel addition,
+        # inject the missing tokens with fresh IDs so they are always usable
+        # at inference time without retraining.
         punct_tokens = list(RussianPhonemeProcessor.PUNCT_MAP.values())
-        # Also ensure the base special tokens are present.
-        required_tokens = ['<pad>', '<sil>', '<sp>'] + punct_tokens
+        # Also ensure the base special tokens and reduced iotated vowels are present.
+        required_tokens = ['<pad>', '<sil>', '<sp>'] + punct_tokens + ['jɐ', 'jɪ', 'jə']
         next_id = max(instance.phoneme_to_id.values(), default=-1) + 1
         for tok in required_tokens:
             if tok not in instance.phoneme_to_id:

@@ -211,3 +211,112 @@ class TestStressMarkStrippedBeforeAssimilation:
                 f"process_word({word!r}) → {ipa!r}: 'вств' cluster was not "
                 "simplified — stress-mark stripping may have failed."
             )
+
+
+class TestIotatedJPrefixPreservedInReduction:
+    """
+    Fix 4 – Iotated vowel j-prefix silently dropped in apply_vowel_reduction.
+
+    Before the fix, unstressed 'ja'/'je'/'jo' were reduced to bare 'ɐ'/'ɪ'/'ɐ'
+    (dropping the j).  After the fix they become 'jɐ'/'jɪ'/'jɐ' (j preserved).
+    """
+
+    def _p(self):
+        return RussianPhonemeProcessor()
+
+    # ── Direct apply_vowel_reduction tests ──────────────────────────────────
+
+    def test_ja_pre_stress_adjacent_becomes_jɐ(self):
+        """'ja' immediately before stressed syllable → 'jɐ', not 'ɐ'."""
+        p = self._p()
+        # stress at syllable 1; 'ja' is syllable 0 (distance 1 → 'ɐ' tier)
+        phonemes = ['ja', 'z', 'a']   # syllable 0=ja, 1=a
+        reduced = p.apply_vowel_reduction(phonemes, stress_syllable_idx=1)
+        assert reduced[0] == 'jɐ', (
+            f"'ja' pre-stress adjacent should reduce to 'jɐ', got {reduced[0]!r}")
+        assert reduced[2] == 'a', "stressed vowel must not be reduced"
+
+    def test_je_pre_stress_adjacent_becomes_jɪ(self):
+        """'je' immediately before stressed syllable → 'jɪ', not 'ɪ'."""
+        p = self._p()
+        phonemes = ['je', 'z', 'a']
+        reduced = p.apply_vowel_reduction(phonemes, stress_syllable_idx=1)
+        assert reduced[0] == 'jɪ', (
+            f"'je' pre-stress adjacent should reduce to 'jɪ', got {reduced[0]!r}")
+
+    def test_jo_pre_stress_adjacent_becomes_jɐ(self):
+        """'jo' immediately before stressed syllable → 'jɐ', not 'ɐ'."""
+        p = self._p()
+        phonemes = ['jo', 'z', 'a']
+        reduced = p.apply_vowel_reduction(phonemes, stress_syllable_idx=1)
+        assert reduced[0] == 'jɐ', (
+            f"'jo' pre-stress adjacent should reduce to 'jɐ', got {reduced[0]!r}")
+
+    def test_ja_far_pre_stress_becomes_jə(self):
+        """'ja' two+ syllables before stress → 'jə', not 'ə'."""
+        p = self._p()
+        # syllables: 0=ja, 1=a, 2=a (stressed)
+        phonemes = ['ja', 'z', 'a', 'z', 'a']
+        reduced = p.apply_vowel_reduction(phonemes, stress_syllable_idx=2)
+        assert reduced[0] == 'jə', (
+            f"'ja' far from stress should reduce to 'jə', got {reduced[0]!r}")
+
+    def test_ja_post_stress_becomes_jə(self):
+        """'ja' after the stressed syllable → 'jə', not 'ə'."""
+        p = self._p()
+        # syllables: 0=a (stressed), 1=ja
+        phonemes = ['a', 'z', 'ja']
+        reduced = p.apply_vowel_reduction(phonemes, stress_syllable_idx=0)
+        assert reduced[2] == 'jə', (
+            f"'ja' post-stress should reduce to 'jə', got {reduced[2]!r}")
+        assert reduced[0] == 'a', "stressed vowel must not be reduced"
+
+    def test_ju_not_reduced(self):
+        """'ju' (у sound) is not in the reduction set — must remain 'ju'."""
+        p = self._p()
+        phonemes = ['ju', 'z', 'a']
+        reduced = p.apply_vowel_reduction(phonemes, stress_syllable_idx=1)
+        assert reduced[0] == 'ju', (
+            f"'ju' should not be reduced (у doesn't map to ə/ɐ/ɪ), got {reduced[0]!r}")
+
+    # ── Vocab / tokenizer regression ─────────────────────────────────────────
+
+    def test_reduced_iotated_phonemes_in_vocab(self):
+        """'jɐ', 'jɪ', 'jə' must have entries in phoneme_to_id."""
+        p = self._p()
+        for ph in ('jɐ', 'jɪ', 'jə'):
+            assert ph in p.phoneme_to_id, (
+                f"Reduced iotated phoneme {ph!r} missing from phoneme_to_id")
+
+    def test_reduced_iotated_phonemes_in_multi_char_list(self):
+        """'jɐ', 'jɪ', 'jə' must appear in _multi_char_phonemes so the IPA
+        tokenizer can round-trip them without splitting 'j' and the vowel."""
+        p = self._p()
+        for ph in ('jɐ', 'jɪ', 'jə'):
+            assert ph in p._multi_char_phonemes, (
+                f"Reduced iotated phoneme {ph!r} missing from _multi_char_phonemes")
+
+    # ── End-to-end word tests ─────────────────────────────────────────────────
+
+    def test_yazyk_first_syllable_is_jɐ(self):
+        """язы́к: initial 'я' is unstressed pre-stress adjacent → 'jɐ'."""
+        p = self._p()
+        # Force stress on syllable 1 (ы́) via dict so the test is deterministic
+        p.stress_patterns['язык'] = 1
+        p.normalize_text.cache_clear()
+        p._process_normalized_word.cache_clear()
+        phonemes, _ = p.process_word('язык')
+        assert phonemes[0] == 'jɐ', (
+            f"язык: first phoneme should be 'jɐ', got {phonemes[0]!r} "
+            f"(full: {phonemes})")
+
+    def test_yabloko_first_syllable_is_ja(self):
+        """я́блоко: initial 'я' is stressed → stays 'ja' (no reduction)."""
+        p = self._p()
+        p.stress_patterns['яблоко'] = 0
+        p.normalize_text.cache_clear()
+        p._process_normalized_word.cache_clear()
+        phonemes, _ = p.process_word('яблоко')
+        assert phonemes[0] == 'ja', (
+            f"яблоко: stressed 'я' should remain 'ja', got {phonemes[0]!r} "
+            f"(full: {phonemes})")
