@@ -5,8 +5,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
@@ -164,6 +162,12 @@ class RussianPhonemeProcessor:
 
         # Build vocabulary after all mappings are set
         self.phoneme_to_id = self._build_vocab()
+
+        # Per-instance LRU caches — stored on the instance rather than the class so
+        # that `self` is not permanently retained in a class-level cache key, which
+        # would prevent garbage collection when multiple processor instances are used.
+        self.normalize_text = lru_cache(maxsize=1000)(self._normalize_text_impl)
+        self._process_normalized_word = lru_cache(maxsize=500)(self._process_normalized_word_impl)
 
     def _load_stress_patterns(self, dict_path: Optional[str] = None) -> Dict[str, int]:
         """
@@ -355,11 +359,10 @@ class RussianPhonemeProcessor:
 
         return text
 
-    @lru_cache(maxsize=1000)
-    def normalize_text(self, text: str) -> str:
+    def _normalize_text_impl(self, text: str) -> str:
         """
         Normalize Russian text for phoneme processing.
-        Cached for performance on repeated texts.
+        Called through the per-instance LRU cache ``self.normalize_text``.
         """
         if not text:
             return ""
@@ -544,6 +547,10 @@ class RussianPhonemeProcessor:
         in apply_palatalization.
         """
         word = word.lower()
+        # Strip combining marks (stress marks, etc.) before any Cyrillic substitutions
+        # so that cluster patterns like 'вств' match even when a vowel in the word
+        # carries an explicit stress mark that would otherwise split the sequence.
+        word = re.sub(r'[\u0300-\u036f]', '', word)
 
         # --- 1. The "Г" Exceptions ---
 
@@ -602,9 +609,6 @@ class RussianPhonemeProcessor:
 
         # 'лнц' — silent л (e.g. солнце)
         word = word.replace('лнц', 'нц')
-
-        # remove combining marks for assimilation logic, but keep the base characters
-        word = re.sub(r'[\u0300-\u036f]', '', word.lower())
 
         # --- Voicing assimilation (regressive, right-to-left) ---
         chars = list(word)
@@ -723,10 +727,10 @@ class RussianPhonemeProcessor:
 
 
 
-    @lru_cache(maxsize=500)
-    def _process_normalized_word(self, word: str) -> Tuple[Tuple[str, ...], StressInfo]:
+    def _process_normalized_word_impl(self, word: str) -> Tuple[Tuple[str, ...], StressInfo]:
         """
-        Process a single already-normalized word. Cached on the normalized form.
+        Process a single already-normalized word. Called through the per-instance LRU
+        cache ``self._process_normalized_word``.
         Returns a tuple of phonemes (not a list) because lru_cache requires hashable
         return values to avoid cache mutation bugs. Callers convert to list at the boundary.
         """
@@ -1018,6 +1022,9 @@ class RussianPhonemeProcessor:
                 instance.phoneme_to_id[tok] = next_id
                 next_id += 1
 
+        # Flush any cached results from __init__'s default state; the restored
+        # exceptions/stress_patterns may differ from the constructor defaults.
+        instance.clear_cache()
         return instance
 
     def clear_cache(self):
