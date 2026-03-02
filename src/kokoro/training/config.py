@@ -117,6 +117,8 @@ class TrainingConfig:
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 20.0
+    # Per-layer clip norm for decoder/encoder FFN linear1 (consistent regression driver)
+    ffn_spike_clip_norm: float = 15.0
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100

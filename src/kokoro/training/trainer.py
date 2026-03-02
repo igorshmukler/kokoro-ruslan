@@ -531,6 +531,7 @@ class KokoroTrainer:
         # Localized gradient spike clipping
         self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
         self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
+        self.ffn_spike_clip_norm = getattr(config, 'ffn_spike_clip_norm', 15.0)
 
         self.optimizer_steps_completed = 0
 
@@ -933,8 +934,8 @@ class KokoroTrainer:
         return threshold, dynamic_abs_floor, ema_ready
 
     def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
-        """Clip localized spikes in mel projection/attention gradients before global norm checks."""
-        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0:
+        """Clip localized spikes in mel projection/attention/FFN gradients before global norm checks."""
+        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0 and self.ffn_spike_clip_norm <= 0:
             return {}
 
         projection_params = {
@@ -955,9 +956,14 @@ class KokoroTrainer:
             '.cross_attn.w_o.weight',
         )
 
+        # linear1 and linear2 in decoder and encoder FFN layers are the consistent
+        # high-delta culprits identified via checkpoint regression analysis.
+        ffn_name_fragments = ('.linear1.weight', '.linear2.weight')
+
         clipped: Dict[str, Tuple[float, float]] = {}
         projection_max_norm = float(self.projection_spike_clip_norm)
         attention_max_norm = float(self.attention_spike_clip_norm)
+        ffn_max_norm = float(self.ffn_spike_clip_norm)
 
         for name, param in self.model.named_parameters():
             if param.grad is None:
@@ -968,6 +974,8 @@ class KokoroTrainer:
                 max_norm = projection_max_norm
             elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
                 max_norm = attention_max_norm
+            elif ffn_max_norm > 0 and any(fragment in name for fragment in ffn_name_fragments):
+                max_norm = ffn_max_norm
 
             if max_norm is None:
                 continue
