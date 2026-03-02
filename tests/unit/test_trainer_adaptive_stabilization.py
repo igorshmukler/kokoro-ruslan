@@ -56,6 +56,7 @@ def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> Kokor
     trainer.grad_explosion_streak = 0
     trainer.projection_spike_clip_norm = 30.0
     trainer.attention_spike_clip_norm = 20.0
+    trainer.ffn_spike_clip_norm = 15.0
     trainer.optimizer_steps_completed = 0
     trainer.mixed_precision_stats = {
         "scale_updates": 0,
@@ -66,6 +67,12 @@ def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> Kokor
     }
 
     noop = lambda *args, **kwargs: None
+    trainer.writer = SimpleNamespace(
+        add_scalar=noop,
+        add_histogram=noop,
+        add_image=noop,
+        flush=noop,
+    )
     trainer.log_memory_stats = noop
     trainer.clear_device_cache = noop
     trainer._update_ema = noop

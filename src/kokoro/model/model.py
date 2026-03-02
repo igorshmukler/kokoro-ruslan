@@ -790,6 +790,21 @@ class KokoroModel(nn.Module):
                                         )
                                         break
 
+                                    # Energy-based fallback stop: once we are past expected_length,
+                                    # check whether the last 30 frames are all near-silence.
+                                    # The stop token predictor may not have converged at early
+                                    # checkpoints, so this prevents generating hundreds of blank
+                                    # frames that inflate the output with silence.
+                                    if t > expected_length and len(generated_mels) >= 30:
+                                        recent_frames = torch.cat(generated_mels[-30:], dim=1)  # (1, 30, mel_dim)
+                                        recent_energy = recent_frames.mean().item()
+                                        if recent_energy < -9.5:
+                                            logger.info(
+                                                f"Energy-based early stop at frame {t} "
+                                                f"(recent 30-frame mean energy: {recent_energy:.3f} < -9.5)"
+                                            )
+                                            break
+
                                 decoder_input_mel = mel_pred_t
 
                                 if self.enable_profiling and t % 50 == 0:

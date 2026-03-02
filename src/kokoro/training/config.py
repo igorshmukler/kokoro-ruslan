@@ -25,8 +25,8 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 3.0  # Max LR = learning_rate * this value
-    pct_start: float = 0.4  # Percentage of cycle spent increasing LR (warmup)
+    max_lr_multiplier: float = 2.0  # Max LR = learning_rate * this value
+    pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -115,8 +115,10 @@ class TrainingConfig:
     max_batch_size: int = 8  # Maximum samples per batch
 
     # Gradient stability safeguards
-    projection_spike_clip_norm: float = 30.0
+    projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 20.0
+    # Per-layer clip norm for decoder/encoder FFN linear1 (consistent regression driver)
+    ffn_spike_clip_norm: float = 15.0
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100
