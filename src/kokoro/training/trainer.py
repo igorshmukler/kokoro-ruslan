@@ -103,6 +103,7 @@ class KokoroTrainer:
         # Create the log directory
         log_dir = os.path.join(config.output_dir, 'logs')
         os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir  # stored for writer re-creation on resume
 
         # Initialize the writer
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -439,6 +440,10 @@ class KokoroTrainer:
                 last_epoch=-1
             )
             self.scheduler_per_batch = True
+            # Store parameters needed to reconstruct the scheduler after checkpoint resume
+            self._onecycle_steps = onecycle_steps
+            self._onecycle_max_lr = max_lr
+            self._onecycle_pct_start = pct_start
             logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={onecycle_steps} "
                        f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
         else:
@@ -1357,6 +1362,111 @@ class KokoroTrainer:
 
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
+        # Purge stale TensorBoard events from epochs after the resume point.
+        # All writer calls (both per-batch and per-epoch) now use
+        # optimizer_steps_completed as the global step, so a single purge_step
+        # covers every tag.  Anything written at step >= purge_step by a prior
+        # run will be hidden in TensorBoard; the new run will re-fill those steps.
+        purge_step = self.current_optimizer_step + 1
+        self.writer.close()
+        self.writer = SummaryWriter(log_dir=self.log_dir, purge_step=purge_step)
+        logger.info(
+            f"TensorBoard writer reopened with purge_step={purge_step} "
+            f"(hiding stale events from optimizer_step >= {purge_step})"
+        )
+
+        # Reconstruct the OneCycleLR from the CURRENT config to avoid stale phase
+        # definitions loaded via load_state_dict() from a checkpoint that may have
+        # been saved with different max_lr / pct_start values.
+        #
+        # Strategy: create the scheduler cleanly at last_epoch=-1 (which wipes out
+        # all old param_group keys like initial_lr / max_lr set by the old schedule),
+        # then MANUALLY advance its internal position counter and optimizer lr without
+        # going through __init__'s step() call.  This avoids the bug where
+        # optimizer.load_state_dict() restores old initial_lr/max_lr metadata that
+        # OneCycleLR.__init__ refuses to overwrite, causing the schedule to run off
+        # the old boundaries instead of the new config's boundaries.
+        if self.scheduler_per_batch and isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            import math
+            onecycle_steps = getattr(self, '_onecycle_steps', None)
+            max_lr = getattr(self, '_onecycle_max_lr', None)
+            pct_start = getattr(self, '_onecycle_pct_start', 0.3)
+            if onecycle_steps is not None and max_lr is not None:
+                # The optimizer state was just restored by load_checkpoint, so
+                # param_groups[0]['lr'] is the exact LR that training ended at.
+                last_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+                base_lr   = max_lr / 3.0          # div_factor=3.0
+                final_lr  = max_lr / 10000.0      # final_div_factor=10000.0
+                peak_step = int(pct_start * onecycle_steps)
+
+                # Find which step on the NEW schedule matches last_lr. When
+                # last_lr exceeds the new max, pin to the peak so we descend
+                # from new max_lr immediately.
+                if last_lr >= max_lr:
+                    target_step = peak_step
+                    resume_lr   = max_lr
+                    logger.info(
+                        f"Resume LR ({last_lr:.2e}) >= new max_lr ({max_lr:.2e}); "
+                        f"positioning OneCycleLR at peak (step {peak_step})."
+                    )
+                elif last_lr >= base_lr:
+                    # Ascending cosine: lr = base + (max-base)*(1-cos(π*t))/2  → solve for t
+                    ratio = (last_lr - base_lr) / (max_lr - base_lr)
+                    t = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * ratio))) / math.pi
+                    target_step = int(round(t * peak_step))
+                    target_step = max(0, min(peak_step, target_step))
+                    resume_lr   = last_lr
+                elif last_lr >= final_lr:
+                    # Descending cosine: lr = final + (max-final)*(1+cos(π*t))/2 → solve for t
+                    decay_steps = onecycle_steps - peak_step
+                    ratio = (last_lr - final_lr) / (max_lr - final_lr)
+                    t = math.acos(max(-1.0, min(1.0, 2.0 * ratio - 1.0))) / math.pi
+                    target_step = peak_step + int(round(t * decay_steps))
+                    target_step = max(peak_step, min(onecycle_steps - 1, target_step))
+                    resume_lr   = last_lr
+                else:
+                    target_step = onecycle_steps - 1
+                    resume_lr   = final_lr
+
+                # Build the scheduler fresh with last_epoch=-1 so __init__ writes
+                # clean initial_lr / max_lr / min_lr into the param groups.
+                # Temporarily save and restore optimizer lr so the clean init does
+                # not clobber the value we are about to inject.
+                saved_lr = [g['lr'] for g in self.optimizer.param_groups]
+                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    self.optimizer,
+                    max_lr=max_lr,
+                    total_steps=onecycle_steps,
+                    pct_start=pct_start,
+                    anneal_strategy='cos',
+                    cycle_momentum=False,
+                    base_momentum=0.85,
+                    max_momentum=0.95,
+                    div_factor=3.0,
+                    final_div_factor=10000.0,
+                    last_epoch=-1,
+                )
+                # __init__ with last_epoch=-1 called step() and set lr=base_lr.
+                # Now manually teleport the scheduler to target_step by setting
+                # the internal counter and writing the correct lr directly.
+                # The next training step() call will advance to target_step+1.
+                self.scheduler.last_epoch = target_step
+                resume_lr = min(resume_lr, max_lr)  # hard-cap to new max
+                for g in self.optimizer.param_groups:
+                    g['lr'] = resume_lr
+                self.scheduler._last_lr = [resume_lr for _ in self.optimizer.param_groups]
+
+                logger.info(
+                    f"OneCycleLR reconstructed from current config after resume: "
+                    f"max_lr={max_lr:.2e}, total_steps={onecycle_steps}, pct_start={pct_start}, "
+                    f"last_lr={last_lr:.2e} → positioned at step {target_step}/{onecycle_steps}, "
+                    f"resume_lr={resume_lr:.2e}"
+                )
+                del saved_lr  # was only needed to document the value; optimizer lr already set above
+            else:
+                logger.warning("Could not reconstruct OneCycleLR after resume: missing _onecycle_steps or _onecycle_max_lr")
+
     def _log_histograms_epoch(self, epoch: int) -> None:
         """Log weight histograms for all named model parameters to TensorBoard (once per epoch)."""
         try:
@@ -1364,7 +1474,7 @@ class KokoroTrainer:
                 tag_name = name.replace('.', '/')
                 if param.data is not None:
                     self.writer.add_histogram(
-                        f'weights/{tag_name}', param.data.cpu().float(), epoch
+                        f'weights/{tag_name}', param.data.cpu().float(), self.optimizer_steps_completed
                     )
             self.writer.flush()
         except Exception as e:
@@ -1465,8 +1575,8 @@ class KokoroTrainer:
                         try:
                             pred_mel_img = predicted_mel[0].detach().cpu().T.unsqueeze(0)
                             gt_mel_img   = mel_specs[0].detach().cpu().T.unsqueeze(0)
-                            self.writer.add_image('spectrogram/val_predicted',     pred_mel_img, epoch, dataformats='CHW')
-                            self.writer.add_image('spectrogram/val_ground_truth',  gt_mel_img,   epoch, dataformats='CHW')
+                            self.writer.add_image('spectrogram/val_predicted',     pred_mel_img, self.optimizer_steps_completed, dataformats='CHW')
+                            self.writer.add_image('spectrogram/val_ground_truth',  gt_mel_img,   self.optimizer_steps_completed, dataformats='CHW')
                             self.writer.flush()
                         except Exception as e:
                             logger.debug(f"Failed to log val spectrogram: {e}")
@@ -1569,26 +1679,26 @@ class KokoroTrainer:
                        f"Stop: {avg_stop_loss:.4f}")
             if avg_pitch_loss > 0:
                 logger.info(f"  Pitch: {avg_pitch_loss:.4f}, Energy: {avg_energy_loss:.4f}")
-                self.writer.add_scalar('loss/val_pitch', avg_pitch_loss, epoch)
-                self.writer.add_scalar('loss/val_energy', avg_energy_loss, epoch)
+                self.writer.add_scalar('loss/val_pitch', avg_pitch_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_energy', avg_energy_loss, self.optimizer_steps_completed)
             if avg_spectral_conv is not None:
                 logger.info(f"  SpectralConv: {avg_spectral_conv:.6f}")
-                self.writer.add_scalar('metrics/val_spectral_convergence', avg_spectral_conv, epoch)
+                self.writer.add_scalar('metrics/val_spectral_convergence', avg_spectral_conv, self.optimizer_steps_completed)
             if avg_f0_rmse is not None:
                 logger.info(f"  f0_RMSE: {avg_f0_rmse:.6f}")
-                self.writer.add_scalar('metrics/val_f0_rmse', avg_f0_rmse, epoch)
+                self.writer.add_scalar('metrics/val_f0_rmse', avg_f0_rmse, self.optimizer_steps_completed)
 
             # Log histograms of predicted distributions over the full validation set
             try:
                 if hist_pred_log_durations:
                     all_log_dur = torch.cat([t.reshape(-1) for t in hist_pred_log_durations])
-                    self.writer.add_histogram('val_predictions/log_durations', all_log_dur, epoch)
+                    self.writer.add_histogram('val_predictions/log_durations', all_log_dur, self.optimizer_steps_completed)
                 if hist_pred_pitch:
                     all_pitch = torch.cat([t.reshape(-1) for t in hist_pred_pitch])
-                    self.writer.add_histogram('val_predictions/pitch', all_pitch, epoch)
+                    self.writer.add_histogram('val_predictions/pitch', all_pitch, self.optimizer_steps_completed)
                 if hist_pred_energy:
                     all_energy = torch.cat([t.reshape(-1) for t in hist_pred_energy])
-                    self.writer.add_histogram('val_predictions/energy', all_energy, epoch)
+                    self.writer.add_histogram('val_predictions/energy', all_energy, self.optimizer_steps_completed)
             except Exception as e:
                 logger.debug(f"Failed to log val prediction histograms: {e}")
 
