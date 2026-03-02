@@ -66,6 +66,12 @@ def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> Kokor
     }
 
     noop = lambda *args, **kwargs: None
+    trainer.writer = SimpleNamespace(
+        add_scalar=noop,
+        add_histogram=noop,
+        add_image=noop,
+        flush=noop,
+    )
     trainer.log_memory_stats = noop
     trainer.clear_device_cache = noop
     trainer._update_ema = noop
