@@ -590,14 +590,18 @@ class KokoroModel(nn.Module):
                 decoder_input_projected = self.mel_projection_in(decoder_input_mels)
                 del decoder_input_mels
 
-                # Pre-net dropout (Tacotron 2 trick): randomly zero ~50 % of the projected
-                # decoder input DURING TRAINING ONLY.  This prevents the decoder from
-                # over-relying on the previous ground-truth mel frame (teacher forcing) and
-                # forces it to attend to encoder context.  At inference the decoder feeds back
-                # its own predictions; without this dropout the train/inference mismatch causes
-                # the decoder to collapse after the first few voiced frames.
+                # Pre-net dropout (Tacotron 2 trick): randomly zero a fraction of the
+                # projected decoder input DURING TRAINING ONLY.  This prevents the decoder
+                # from over-relying on the previous ground-truth mel frame (teacher forcing)
+                # and forces it to attend to encoder context.  At inference the decoder feeds
+                # back its own predictions; without this dropout the train/inference mismatch
+                # causes the decoder to collapse after the first few voiced frames.
+                # Rate: 0.3 (not 0.5) — the OneCycleLR is still ascending toward its peak
+                # LR at ~epoch 30; using 0.5 while the LR is high causes the encoder to
+                # spike and loss to rise.  0.3 provides train/inference decoupling without
+                # over-perturbing gradients during the warmup phase.
                 decoder_input_projected = torch.nn.functional.dropout(
-                    decoder_input_projected, p=0.5, training=self.training
+                    decoder_input_projected, p=0.3, training=self.training
                 )
 
                 decoder_input_projected_with_pe = self.encoder_positional_encoding(
