@@ -1194,5 +1194,3 @@ class KokoroModel(nn.Module):
 
         return strategy_info
 
-
-# KokoroGenerator moved to src/kokoro/model/generator.py
