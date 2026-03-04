@@ -155,6 +155,11 @@ class KokoroModel(nn.Module):
         self.gradient_checkpointing = False
         logger.info("Gradient checkpointing disabled")
 
+    def _log_memory(self, stage: str) -> None:
+        """Log memory stats for the given stage if profiling is enabled."""
+        if self.enable_profiling:
+            self.profiler.log_memory_stats(stage)
+
     def _checkpoint_encoder_layers(self, x: torch.Tensor, layers: nn.ModuleList,
                                  mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -166,7 +171,7 @@ class KokoroModel(nn.Module):
                 with torch.profiler.record_function(f"encoder_layer_{i}"):
                     # Log memory before layer (outside profiling context)
                     if self.enable_profiling and i % 2 == 0:
-                        self.profiler.log_memory_stats(f"encoder_layer_{i}_start")
+                        self._log_memory(f"encoder_layer_{i}_start")
 
                     if mask is not None:
                         x = layer(x, src_key_padding_mask=mask.to(torch.bool))
@@ -175,7 +180,7 @@ class KokoroModel(nn.Module):
 
                     # Log memory after layer (outside profiling context)
                     if self.enable_profiling and i % 2 == 0:
-                        self.profiler.log_memory_stats(f"encoder_layer_{i}_end")
+                        self._log_memory(f"encoder_layer_{i}_end")
             return x
 
         # Gradient checkpointing enabled - log at segment boundaries only
@@ -189,7 +194,7 @@ class KokoroModel(nn.Module):
             # Log memory before segment (outside checkpoint)
             if self.enable_profiling:
                 segment_name = f"encoder_segment_{segment_idx//segment_size}"
-                self.profiler.log_memory_stats(f"{segment_name}_start")
+                self._log_memory(f"{segment_name}_start")
 
             def create_segment_forward(segment_layers_list, segment_start_idx):
                 def segment_forward(x_seg, mask_seg=None):
@@ -213,7 +218,7 @@ class KokoroModel(nn.Module):
 
             # Log memory after segment (outside checkpoint)
             if self.enable_profiling:
-                self.profiler.log_memory_stats(f"{segment_name}_end")
+                self._log_memory(f"{segment_name}_end")
                 logger.debug(f"Completed {segment_name} (layers {segment_idx}-{segment_end-1})")
 
         return x
@@ -227,8 +232,7 @@ class KokoroModel(nn.Module):
         """
         if not self.gradient_checkpointing or not self.training:
             # Standard forward pass without checkpointing
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("decoder_start")
+            self._log_memory("decoder_start")
 
             result, _ = self.decoder(
                 tgt=decoder_input,
@@ -238,14 +242,12 @@ class KokoroModel(nn.Module):
                 tgt_key_padding_mask=tgt_key_padding_mask
             )
 
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("decoder_end")
+            self._log_memory("decoder_end")
 
             return result
 
         # Log before checkpointed decoder path
-        if self.enable_profiling:
-            self.profiler.log_memory_stats("decoder_checkpoint_start")
+        self._log_memory("decoder_checkpoint_start")
 
         # IMPORTANT: Do not wrap the entire decoder in checkpoint here.
         # `ImprovedTransformerDecoder.forward` already applies per-layer checkpointing,
@@ -259,8 +261,8 @@ class KokoroModel(nn.Module):
         )
 
         # Log after checkpointed decoder (outside checkpoint)
+        self._log_memory("decoder_checkpoint_end")
         if self.enable_profiling:
-            self.profiler.log_memory_stats("decoder_checkpoint_end")
             logger.debug("Completed decoder checkpoint")
 
         return result
@@ -280,16 +282,14 @@ class KokoroModel(nn.Module):
         """
         with torch.profiler.record_function("encode_text"):
             # Log before text embedding (outside any checkpointed regions)
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("text_embedding_start")
+            self._log_memory("text_embedding_start")
 
             text_emb = self.text_embedding(phoneme_indices) * (self.hidden_dim ** 0.5)
             if self.use_stress_embedding and stress_indices is not None:
                 text_emb = text_emb + self.stress_embedding(stress_indices)
             text_emb = self.encoder_positional_encoding(text_emb, seq_offset=0)
 
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("text_embedding_end")
+            self._log_memory("text_embedding_end")
 
             # Use checkpointed encoder layers (logging handled internally)
             x = self._checkpoint_encoder_layers(text_emb, self.transformer_encoder_layers, mask)
@@ -302,8 +302,7 @@ class KokoroModel(nn.Module):
         """
         with torch.profiler.record_function("predict_durations"):
             # Log before duration prediction (outside any checkpointed regions)
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("duration_prediction_start")
+            self._log_memory("duration_prediction_start")
 
             if self.gradient_checkpointing and self.training:
                 # Apply checkpointing to duration predictor
@@ -312,16 +311,14 @@ class KokoroModel(nn.Module):
                 log_durations = self.duration_predictor(text_encoded).squeeze(-1)
 
             # Log after duration prediction (outside any checkpointed regions)
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("duration_prediction_end")
+            self._log_memory("duration_prediction_end")
 
             return log_durations
 
 
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
         with torch.profiler.record_function("length_regulate"):
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("length_regulation_start")
+            self._log_memory("length_regulation_start")
 
             batch_size, max_text_len, hidden_dim = encoder_outputs.shape
             device = encoder_outputs.device
@@ -371,8 +368,7 @@ class KokoroModel(nn.Module):
                     logger.error(f"Error in repeat_interleave for batch {i}: {e}")
                     # row stays zeroed, mask stays all-True — safely treated as padding
 
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("length_regulation_end")
+            self._log_memory("length_regulation_end")
 
             logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {out.shape}")
 
@@ -671,8 +667,7 @@ class KokoroModel(nn.Module):
 
             self.eval()
 
-            if self.enable_profiling:
-                self.profiler.log_memory_stats("inference_start")
+            self._log_memory("inference_start")
 
             with torch.no_grad():
                 try:
@@ -731,8 +726,7 @@ class KokoroModel(nn.Module):
                         f"{expanded_encoder_outputs.shape}"
                     )
 
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("inference_pre_generation")
+                    self._log_memory("inference_pre_generation")
 
                     min_expected_length = max(min_len_floor, int(expected_length * min_len_ratio))
                     max_expected_length = min(
@@ -829,7 +823,7 @@ class KokoroModel(nn.Module):
                                         f"Generated frame {t}, stop_prob: {stop_probability:.6f}, "
                                         f"step_time: {step_time:.2f}ms"
                                     )
-                                    self.profiler.log_memory_stats(f"inference_step_{t}")
+                                    self._log_memory(f"inference_step_{t}")
 
                             except Exception as e:
                                 logger.error(f"Error at generation step {t}: {e}")
@@ -860,8 +854,7 @@ class KokoroModel(nn.Module):
                         logger.warning("No mel frames were generated.")
                         mel_output = torch.empty(batch_size, 0, self.mel_dim, device=device)
 
-                    if self.enable_profiling:
-                        self.profiler.log_memory_stats("inference_end")
+                    self._log_memory("inference_end")
 
                     return mel_output
 
