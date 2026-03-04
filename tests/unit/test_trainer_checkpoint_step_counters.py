@@ -75,6 +75,11 @@ def test_setup_checkpoint_resumption_restores_step_counters(monkeypatch, tmp_pat
     trainer.current_optimizer_step = 0
     trainer.optimizer_steps_completed = 0
     trainer.reset_called = False
+    trainer.log_dir = str(tmp_path / "logs")
+    trainer.scheduler_per_batch = False
+    trainer.writer = SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(trainer_module, "SummaryWriter", lambda **kwargs: SimpleNamespace(close=lambda: None))
 
     def _fake_reset():
         trainer.reset_called = True
@@ -120,6 +125,11 @@ def test_setup_checkpoint_resumption_keeps_defaults_when_counter_keys_missing(mo
 
     trainer.current_optimizer_step = 11
     trainer.optimizer_steps_completed = 22
+    trainer.log_dir = str(tmp_path / "logs")
+    trainer.scheduler_per_batch = False
+    trainer.writer = SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(trainer_module, "SummaryWriter", lambda **kwargs: SimpleNamespace(close=lambda: None))
 
     def _fake_load_checkpoint(path, model, optimizer, scheduler, output_dir):
         assert path == str(checkpoint_path)

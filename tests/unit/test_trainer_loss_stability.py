@@ -120,8 +120,27 @@ def test_train_epoch_skips_optimizer_step_on_nonfinite_gradients():
     }
     trainer.current_optimizer_step = 0
     trainer.profiler = None
+    trainer.grad_explosion_norm_ema = None
+    trainer.grad_explosion_ema_alpha = 0.95
+    trainer.grad_explosion_abs_floor = 1000.0
+    trainer.grad_explosion_multiplier = 3.0
+    trainer.grad_explosion_warmup_steps = 0
+    trainer.grad_explosion_warmup_floor = 1000.0
+    trainer.grad_explosion_min_ema_steps = 0
+    trainer.grad_explosion_ema_steps = 0
+    trainer.grad_explosion_streak = 0
+    trainer.projection_spike_clip_norm = 30.0
+    trainer.attention_spike_clip_norm = 20.0
+    trainer.ffn_spike_clip_norm = 15.0
+    trainer.optimizer_steps_completed = 0
 
     noop = lambda *args, **kwargs: None
+    trainer.writer = SimpleNamespace(
+        add_scalar=noop,
+        add_histogram=noop,
+        add_image=noop,
+        flush=noop,
+    )
     trainer.log_memory_stats = noop
     trainer.clear_device_cache = noop
     trainer._update_ema = noop

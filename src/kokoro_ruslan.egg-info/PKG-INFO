@@ -196,7 +196,7 @@ Optimizer flag behavior:
 
 From `TrainingConfig` in `src/kokoro/training/config.py`:
 
-- OneCycle LR enabled, `max_lr_multiplier=3.0`.
+- OneCycle LR enabled, `max_lr_multiplier=2.0`.
 - Linear warmup enabled, `warmup_steps=1200`.
 - Gradient accumulation default: `2`.
 - Dynamic batching default: on.

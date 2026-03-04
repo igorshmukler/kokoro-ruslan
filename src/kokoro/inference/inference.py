@@ -244,16 +244,46 @@ class KokoroTTS:
             **model_kwargs
         )
 
-        # Strict load only: fail fast on architecture/state mismatch
+        # Strict load preferred: fail fast on real architecture/state mismatches,
+        # but be tolerant of newly-added parameters (e.g. new LayerNorms) by
+        # falling back to a filtered load with strict=False when strict=True
+        # fails. This keeps inference robust for older checkpoints.
         try:
             model.load_state_dict(state_dict_to_load, strict=True)
             logger.info("Model state dictionary loaded successfully (strict=True).")
         except RuntimeError as e:
-            raise RuntimeError(
-                "Strict model load failed due to architecture/state mismatch. "
-                "Use a checkpoint and phoneme processor from the same run, and ensure metadata matches. "
-                f"Original error: {e}"
-            ) from e
+            logger.warning(
+                "Strict model load failed: %s. Attempting filtered load (strict=False) to allow "
+                "missing/newly-added parameters to be initialised from defaults.",
+                e,
+            )
+
+            # Filter checkpoint parameters to only those matching the current model
+            filtered_state_dict = {}
+            model_keys = model.state_dict()
+            for k, v in state_dict_to_load.items():
+                if k in model_keys:
+                    if model_keys[k].shape == v.shape:
+                        filtered_state_dict[k] = v
+                    else:
+                        logger.warning(
+                            "Size mismatch for key %s: checkpoint shape %s, model shape %s. Skipping.",
+                            k,
+                            getattr(v, 'shape', None),
+                            tuple(model_keys[k].shape),
+                        )
+                else:
+                    logger.debug("Skipping unknown key from checkpoint: %s", k)
+
+            missing_in_checkpoint = [k for k in model_keys.keys() if k not in filtered_state_dict]
+            logger.info(
+                "Proceeding to load model with strict=False. The following model keys are absent from the checkpoint "
+                "and will be initialised with default values: %s",
+                missing_in_checkpoint,
+            )
+
+            model.load_state_dict(filtered_state_dict, strict=False)
+            logger.info("Model loaded with filtered state_dict (strict=False) as a fallback.")
 
         model.to(self.device)
         model.eval() # Set model to evaluation mode
@@ -470,6 +500,32 @@ class KokoroTTS:
                 # 2. Safety Clip
                 # Based on torch.log(1e-9), the floor is -20.7, but typical speech is -11.5 to 0.
                 mel_spec = torch.clamp(mel_spec, min=-11.5, max=2.0)
+
+                # 2b. Trim trailing (and leading) silence frames before vocoding.
+                # Frames where all 80 mel bins are near the silence floor (-11.5) carry no
+                # speech content and only add silence to the output audio.  We keep a frame
+                # if its per-frame mean is above a conservative threshold (-9.5 works well
+                # for natural-log scaled mels; voiced speech averages around -4 to -6).
+                # Shape at this point: (1, T, 80) — batch dim still present.
+                silence_threshold = -9.5
+                frame_means = mel_spec[0].mean(dim=-1)  # (T,)
+                voiced_mask = frame_means > silence_threshold
+                voiced_indices = voiced_mask.nonzero(as_tuple=False).squeeze(-1)
+                if voiced_indices.numel() > 0:
+                    first_voiced = int(voiced_indices[0].item())
+                    last_voiced = int(voiced_indices[-1].item())
+                    # Keep a small silence margin (10 frames ≈ 116 ms at hop=256/sr=22050)
+                    margin = 10
+                    t_start = max(0, first_voiced - margin)
+                    t_end = min(mel_spec.shape[1], last_voiced + margin + 1)
+                    trimmed = mel_spec[:, t_start:t_end, :]
+                    logger.info(
+                        f"Silence trim: {mel_spec.shape[1]} → {trimmed.shape[1]} frames "
+                        f"(kept [{t_start}:{t_end}], threshold={silence_threshold})"
+                    )
+                    mel_spec = trimmed
+                else:
+                    logger.warning("All mel frames are below silence threshold — output may be silent.")
 
                 # 3. Transposition Fix
                 if mel_spec.shape[-1] == self.n_mels:

@@ -238,5 +238,34 @@ def load_hifigan_model(
     generator.eval()
     generator.to(device)
 
-    logger.info(f"Loaded HiFi-GAN model from: {model_path}")
+    # Post-load diagnostics: check for NaNs/Infs in parameters
+    try:
+        nan_params = []
+        inf_params = []
+        zero_std_params = []
+        total = 0
+        for name, p in generator.named_parameters():
+            total += p.numel()
+            try:
+                if torch.isnan(p).any():
+                    nan_params.append((name, tuple(p.shape)))
+                if torch.isinf(p).any():
+                    inf_params.append((name, tuple(p.shape)))
+                if p.data.numel() > 0:
+                    if float(p.data.std().item()) == 0.0:
+                        zero_std_params.append((name, tuple(p.shape)))
+            except Exception:
+                # Some parameter tensors may be pinned or unusual; skip silently
+                pass
+
+        if nan_params or inf_params:
+            logger.error(f"HiFi-GAN generator contains invalid parameter values: nan_count={len(nan_params)}, inf_count={len(inf_params)}")
+            logger.error(f"Sample problematic params (up to 10): {nan_params[:10] + inf_params[:10]}")
+            logger.error("This indicates the vocoder checkpoint may be corrupted or improperly saved. Consider re-downloading the vocoder checkpoint or using --vocoder griffin_lim as a fallback.")
+        else:
+            logger.info(f"Loaded HiFi-GAN model from: {model_path} (total_params={total:,}, nan=0, inf=0, zero_std_params={len(zero_std_params)})")
+
+    except Exception as diag_e:
+        logger.warning(f"Vocoder post-load diagnostics failed: {diag_e}")
+
     return generator

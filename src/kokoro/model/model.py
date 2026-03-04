@@ -590,6 +590,20 @@ class KokoroModel(nn.Module):
                 decoder_input_projected = self.mel_projection_in(decoder_input_mels)
                 del decoder_input_mels
 
+                # Pre-net dropout (Tacotron 2 trick): randomly zero a fraction of the
+                # projected decoder input DURING TRAINING ONLY.  This prevents the decoder
+                # from over-relying on the previous ground-truth mel frame (teacher forcing)
+                # and forces it to attend to encoder context.  At inference the decoder feeds
+                # back its own predictions; without this dropout the train/inference mismatch
+                # causes the decoder to collapse after the first few voiced frames.
+                # Rate: 0.3 (not 0.5) — the OneCycleLR is still ascending toward its peak
+                # LR at ~epoch 30; using 0.5 while the LR is high causes the encoder to
+                # spike and loss to rise.  0.3 provides train/inference decoupling without
+                # over-perturbing gradients during the warmup phase.
+                decoder_input_projected = torch.nn.functional.dropout(
+                    decoder_input_projected, p=0.3, training=self.training
+                )
+
                 decoder_input_projected_with_pe = self.encoder_positional_encoding(
                     decoder_input_projected, seq_offset=0
                 )
@@ -789,6 +803,23 @@ class KokoroModel(nn.Module):
                                             f"threshold: {effective_stop_threshold:.4f})"
                                         )
                                         break
+
+                                    # Energy-based fallback stop: if the last 30 frames are all
+                                    # near-silence, the decoder has collapsed and won't recover
+                                    # (autoregressive feedback reinforces silence).  Fire this
+                                    # check as soon as we are past min_expected_length — not just
+                                    # after expected_length — so we don't waste inference time
+                                    # generating hundreds of silent frames.
+                                    if len(generated_mels) >= 30:
+                                        recent_frames = torch.cat(generated_mels[-30:], dim=1)  # (1, 30, mel_dim)
+                                        recent_energy = recent_frames.mean().item()
+                                        if recent_energy < -9.5:
+                                            logger.info(
+                                                f"Energy-based early stop at frame {t} "
+                                                f"(recent 30-frame mean energy: {recent_energy:.3f} < -9.5); "
+                                                f"decoder appears to have collapsed — consider training more epochs"
+                                            )
+                                            break
 
                                 decoder_input_mel = mel_pred_t
 

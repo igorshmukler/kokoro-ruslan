@@ -103,6 +103,7 @@ class KokoroTrainer:
         # Create the log directory
         log_dir = os.path.join(config.output_dir, 'logs')
         os.makedirs(log_dir, exist_ok=True)
+        self.log_dir = log_dir  # stored for writer re-creation on resume
 
         # Initialize the writer
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -439,6 +440,10 @@ class KokoroTrainer:
                 last_epoch=-1
             )
             self.scheduler_per_batch = True
+            # Store parameters needed to reconstruct the scheduler after checkpoint resume
+            self._onecycle_steps = onecycle_steps
+            self._onecycle_max_lr = max_lr
+            self._onecycle_pct_start = pct_start
             logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={onecycle_steps} "
                        f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
         else:
@@ -531,6 +536,7 @@ class KokoroTrainer:
         # Localized gradient spike clipping
         self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
         self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
+        self.ffn_spike_clip_norm = getattr(config, 'ffn_spike_clip_norm', 15.0)
 
         self.optimizer_steps_completed = 0
 
@@ -933,8 +939,8 @@ class KokoroTrainer:
         return threshold, dynamic_abs_floor, ema_ready
 
     def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
-        """Clip localized spikes in mel projection/attention gradients before global norm checks."""
-        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0:
+        """Clip localized spikes in mel projection/attention/FFN gradients before global norm checks."""
+        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0 and self.ffn_spike_clip_norm <= 0:
             return {}
 
         projection_params = {
@@ -955,9 +961,15 @@ class KokoroTrainer:
             '.cross_attn.w_o.weight',
         )
 
+        # linear1 and linear2 in decoder and encoder FFN layers are the consistent
+        # high-delta culprits identified via checkpoint regression analysis.
+        ffn_name_fragments = ('.linear1.weight', '.linear2.weight')
+
         clipped: Dict[str, Tuple[float, float]] = {}
         projection_max_norm = float(self.projection_spike_clip_norm)
         attention_max_norm = float(self.attention_spike_clip_norm)
+        ffn_max_norm = float(self.ffn_spike_clip_norm)
+        encoder_ffn_max_norm = float(getattr(self.config, 'encoder_ffn_spike_clip_norm', 10.0))
 
         for name, param in self.model.named_parameters():
             if param.grad is None:
@@ -968,6 +980,11 @@ class KokoroTrainer:
                 max_norm = projection_max_norm
             elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
                 max_norm = attention_max_norm
+            elif encoder_ffn_max_norm > 0 and name.startswith('transformer_encoder_layers.') and any(fragment in name for fragment in ffn_name_fragments):
+                # Encoder FFN layers are the primary spike source — use tighter clip
+                max_norm = encoder_ffn_max_norm
+            elif ffn_max_norm > 0 and any(fragment in name for fragment in ffn_name_fragments):
+                max_norm = ffn_max_norm
 
             if max_norm is None:
                 continue
@@ -1349,6 +1366,124 @@ class KokoroTrainer:
 
         logger.info(f"Resumed from epoch {self.start_epoch}, best loss {self.best_loss:.4f}")
 
+        # Purge stale TensorBoard events from epochs after the resume point.
+        # All writer calls (both per-batch and per-epoch) now use
+        # optimizer_steps_completed as the global step, so a single purge_step
+        # covers every tag.  Anything written at step >= purge_step by a prior
+        # run will be hidden in TensorBoard; the new run will re-fill those steps.
+        purge_step = self.current_optimizer_step + 1
+        self.writer.close()
+        self.writer = SummaryWriter(log_dir=self.log_dir, purge_step=purge_step)
+        logger.info(
+            f"TensorBoard writer reopened with purge_step={purge_step} "
+            f"(hiding stale events from optimizer_step >= {purge_step})"
+        )
+
+        # Reconstruct the OneCycleLR from the CURRENT config to avoid stale phase
+        # definitions loaded via load_state_dict() from a checkpoint that may have
+        # been saved with different max_lr / pct_start values.
+        #
+        # Strategy: create the scheduler cleanly at last_epoch=-1 (which wipes out
+        # all old param_group keys like initial_lr / max_lr set by the old schedule),
+        # then MANUALLY advance its internal position counter and optimizer lr without
+        # going through __init__'s step() call.  This avoids the bug where
+        # optimizer.load_state_dict() restores old initial_lr/max_lr metadata that
+        # OneCycleLR.__init__ refuses to overwrite, causing the schedule to run off
+        # the old boundaries instead of the new config's boundaries.
+        if self.scheduler_per_batch and isinstance(self.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+            import math
+            onecycle_steps = getattr(self, '_onecycle_steps', None)
+            max_lr = getattr(self, '_onecycle_max_lr', None)
+            pct_start = getattr(self, '_onecycle_pct_start', 0.3)
+            if onecycle_steps is not None and max_lr is not None:
+                # The optimizer state was just restored by load_checkpoint, so
+                # param_groups[0]['lr'] is the exact LR that training ended at.
+                last_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
+
+                base_lr   = max_lr / 3.0          # div_factor=3.0
+                final_lr  = max_lr / 10000.0      # final_div_factor=10000.0
+                peak_step = int(pct_start * onecycle_steps)
+
+                # Find which step on the NEW schedule matches last_lr. When
+                # last_lr exceeds the new max, pin to the peak so we descend
+                # from new max_lr immediately.
+                if last_lr >= max_lr:
+                    target_step = peak_step
+                    resume_lr   = max_lr
+                    logger.info(
+                        f"Resume LR ({last_lr:.2e}) >= new max_lr ({max_lr:.2e}); "
+                        f"positioning OneCycleLR at peak (step {peak_step})."
+                    )
+                elif last_lr >= base_lr:
+                    # Ascending cosine: lr = base + (max-base)*(1-cos(π*t))/2  → solve for t
+                    ratio = (last_lr - base_lr) / (max_lr - base_lr)
+                    t = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * ratio))) / math.pi
+                    target_step = int(round(t * peak_step))
+                    target_step = max(0, min(peak_step, target_step))
+                    resume_lr   = last_lr
+                elif last_lr >= final_lr:
+                    # Descending cosine: lr = final + (max-final)*(1+cos(π*t))/2 → solve for t
+                    decay_steps = onecycle_steps - peak_step
+                    ratio = (last_lr - final_lr) / (max_lr - final_lr)
+                    t = math.acos(max(-1.0, min(1.0, 2.0 * ratio - 1.0))) / math.pi
+                    target_step = peak_step + int(round(t * decay_steps))
+                    target_step = max(peak_step, min(onecycle_steps - 1, target_step))
+                    resume_lr   = last_lr
+                else:
+                    target_step = onecycle_steps - 1
+                    resume_lr   = final_lr
+
+                # Build the scheduler fresh with last_epoch=-1 so __init__ writes
+                # clean initial_lr / max_lr / min_lr into the param groups.
+                # Temporarily save and restore optimizer lr so the clean init does
+                # not clobber the value we are about to inject.
+                saved_lr = [g['lr'] for g in self.optimizer.param_groups]
+                self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                    self.optimizer,
+                    max_lr=max_lr,
+                    total_steps=onecycle_steps,
+                    pct_start=pct_start,
+                    anneal_strategy='cos',
+                    cycle_momentum=False,
+                    base_momentum=0.85,
+                    max_momentum=0.95,
+                    div_factor=3.0,
+                    final_div_factor=10000.0,
+                    last_epoch=-1,
+                )
+                # __init__ with last_epoch=-1 called step() and set lr=base_lr.
+                # Now manually teleport the scheduler to target_step by setting
+                # the internal counter and writing the correct lr directly.
+                # The next training step() call will advance to target_step+1.
+                self.scheduler.last_epoch = target_step
+                resume_lr = min(resume_lr, max_lr)  # hard-cap to new max
+                for g in self.optimizer.param_groups:
+                    g['lr'] = resume_lr
+                self.scheduler._last_lr = [resume_lr for _ in self.optimizer.param_groups]
+
+                logger.info(
+                    f"OneCycleLR reconstructed from current config after resume: "
+                    f"max_lr={max_lr:.2e}, total_steps={onecycle_steps}, pct_start={pct_start}, "
+                    f"last_lr={last_lr:.2e} → positioned at step {target_step}/{onecycle_steps}, "
+                    f"resume_lr={resume_lr:.2e}"
+                )
+                del saved_lr  # was only needed to document the value; optimizer lr already set above
+            else:
+                logger.warning("Could not reconstruct OneCycleLR after resume: missing _onecycle_steps or _onecycle_max_lr")
+
+    def _log_histograms_epoch(self, epoch: int) -> None:
+        """Log weight histograms for all named model parameters to TensorBoard (once per epoch)."""
+        try:
+            for name, param in self.model.named_parameters():
+                tag_name = name.replace('.', '/')
+                if param.data is not None:
+                    self.writer.add_histogram(
+                        f'weights/{tag_name}', param.data.cpu().float(), self.optimizer_steps_completed
+                    )
+            self.writer.flush()
+        except Exception as e:
+            logger.debug(f"Failed to log weight histograms: {e}")
+
     def validate_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
         """
         Run validation loop to monitor overfitting.
@@ -1377,6 +1512,10 @@ class KokoroTrainer:
         f0_rmse_sum = 0.0
         f0_rmse_count = 0
         num_batches = 0
+        # Histogram accumulators for predicted distributions
+        hist_pred_log_durations: list = []
+        hist_pred_pitch: list = []
+        hist_pred_energy: list = []
 
         with torch.no_grad():  # Disable gradient computation
             progress_bar = tqdm(self.val_dataloader, desc=f"Validation Epoch {epoch+1}")
@@ -1435,6 +1574,17 @@ class KokoroTrainer:
                         predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
                     )
 
+                    # Log spectrograms for first validation batch only
+                    if batch_idx == 0:
+                        try:
+                            pred_mel_img = predicted_mel[0].detach().cpu().T.unsqueeze(0)
+                            gt_mel_img   = mel_specs[0].detach().cpu().T.unsqueeze(0)
+                            self.writer.add_image('spectrogram/val_predicted',     pred_mel_img, self.optimizer_steps_completed, dataformats='CHW')
+                            self.writer.add_image('spectrogram/val_ground_truth',  gt_mel_img,   self.optimizer_steps_completed, dataformats='CHW')
+                            self.writer.flush()
+                        except Exception as e:
+                            logger.debug(f"Failed to log val spectrogram: {e}")
+
                     # Accumulate losses
                     total_loss_epoch += total_loss.item()
                     mel_loss_epoch += loss_mel.item()
@@ -1445,6 +1595,13 @@ class KokoroTrainer:
                     if loss_energy is not None:
                         energy_loss_epoch += loss_energy.item()
                     num_batches += 1
+
+                    # Accumulate predictions for histogram logging
+                    hist_pred_log_durations.append(predicted_log_durations.detach().cpu().float())
+                    if predicted_pitch is not None:
+                        hist_pred_pitch.append(predicted_pitch.detach().cpu().float())
+                    if predicted_energy is not None:
+                        hist_pred_energy.append(predicted_energy.detach().cpu().float())
 
                     # --- Spectral convergence (on mel spectrograms) ---
                     try:
@@ -1526,16 +1683,36 @@ class KokoroTrainer:
                        f"Stop: {avg_stop_loss:.4f}")
             if avg_pitch_loss > 0:
                 logger.info(f"  Pitch: {avg_pitch_loss:.4f}, Energy: {avg_energy_loss:.4f}")
+                self.writer.add_scalar('loss/val_pitch', avg_pitch_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_energy', avg_energy_loss, self.optimizer_steps_completed)
             if avg_spectral_conv is not None:
                 logger.info(f"  SpectralConv: {avg_spectral_conv:.6f}")
+                self.writer.add_scalar('metrics/val_spectral_convergence', avg_spectral_conv, self.optimizer_steps_completed)
             if avg_f0_rmse is not None:
                 logger.info(f"  f0_RMSE: {avg_f0_rmse:.6f}")
+                self.writer.add_scalar('metrics/val_f0_rmse', avg_f0_rmse, self.optimizer_steps_completed)
+
+            # Log histograms of predicted distributions over the full validation set
+            try:
+                if hist_pred_log_durations:
+                    all_log_dur = torch.cat([t.reshape(-1) for t in hist_pred_log_durations])
+                    self.writer.add_histogram('val_predictions/log_durations', all_log_dur, self.optimizer_steps_completed)
+                if hist_pred_pitch:
+                    all_pitch = torch.cat([t.reshape(-1) for t in hist_pred_pitch])
+                    self.writer.add_histogram('val_predictions/pitch', all_pitch, self.optimizer_steps_completed)
+                if hist_pred_energy:
+                    all_energy = torch.cat([t.reshape(-1) for t in hist_pred_energy])
+                    self.writer.add_histogram('val_predictions/energy', all_energy, self.optimizer_steps_completed)
+            except Exception as e:
+                logger.debug(f"Failed to log val prediction histograms: {e}")
+
+            self.writer.flush()
 
             return (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
         else:
             return (0.0, 0.0, 0.0, 0.0)
 
-    def save_checkpoint_with_scaler(self, epoch: int, loss: float):
+    def save_checkpoint_with_scaler(self, epoch: int, loss: float, val_loss: float = None):
         """Save checkpoint including scaler state and EMA weights"""
         model_metadata = build_model_metadata(self.config, self.model)
         checkpoint = {
@@ -1546,6 +1723,8 @@ class KokoroTrainer:
             'current_optimizer_step': self.current_optimizer_step,
             'optimizer_steps_completed': self.optimizer_steps_completed,
             'loss': loss,
+            'train_loss': loss,
+            'val_loss': val_loss,
             'config': self.config,
             'model_metadata': model_metadata,
         }
@@ -1572,6 +1751,13 @@ class KokoroTrainer:
         mel_loss_epoch = 0.0
         dur_loss_epoch = 0.0
         stop_loss_epoch = 0.0
+
+        # Spectral convergence tracking for training
+        train_sc_sum = 0.0
+        train_sc_count = 0
+        # Cache last batch spectrograms for end-of-epoch image logging
+        _last_train_gt_mel = None
+        _last_train_pred_mel = None
 
         # Track losses as tensors for batched accumulation (sync every N batches)
         loss_accumulation_interval = 10
@@ -2002,6 +2188,9 @@ class KokoroTrainer:
                             grad_norms_by_param.append((name, grad_norm))
                     total_grad_norm = total_grad_norm ** 0.5
 
+                    # Log total gradient norm to TensorBoard at every optimizer step
+                    self.writer.add_scalar('stats/grad_norm', total_grad_norm, self.optimizer_steps_completed)
+
                     grad_norm_ema_for_threshold = self.grad_explosion_norm_ema if self.grad_explosion_norm_ema is not None else 0.0
                     gradient_explosion_threshold, dynamic_abs_floor, ema_ready = self._compute_grad_explosion_threshold()
 
@@ -2188,6 +2377,45 @@ class KokoroTrainer:
                         # Force TensorBoard to update the file
                         self.writer.flush()
 
+                    # Log spectrogram every 200 optimizer steps
+                    if self.optimizer_steps_completed % 200 == 0:
+                        with torch.no_grad():
+                            try:
+                                gt_mel = mel_specs[0].detach().cpu()        # (T, n_mels)
+                                gt_mel_img = gt_mel.T.unsqueeze(0)          # (1, n_mels, T) for TensorBoard
+                                self.writer.add_image(
+                                    'spectrogram/train_ground_truth',
+                                    gt_mel_img,
+                                    self.optimizer_steps_completed,
+                                    dataformats='CHW'
+                                )
+                                # predicted_mel is still available here (deleted later in the batch loop)
+                                if _last_train_pred_mel is not None:
+                                    pred_mel_img = _last_train_pred_mel.T.unsqueeze(0)
+                                    self.writer.add_image(
+                                        'spectrogram/train_predicted',
+                                        pred_mel_img,
+                                        self.optimizer_steps_completed,
+                                        dataformats='CHW'
+                                    )
+                            except Exception as e:
+                                logger.debug(f"Failed to log train spectrogram: {e}")
+
+                        # Log gradient histograms every 200 steps (gradients are live here,
+                        # before the next batch's zero_grad)
+                        try:
+                            for name, param in self.model.named_parameters():
+                                if param.grad is not None:
+                                    tag_name = name.replace('.', '/')
+                                    self.writer.add_histogram(
+                                        f'gradients/{tag_name}',
+                                        param.grad.data.cpu().float(),
+                                        self.optimizer_steps_completed
+                                    )
+                            self.writer.flush()
+                        except Exception as e:
+                            logger.debug(f"Failed to log gradient histograms: {e}")
+
                     # Reset accumulation counter after stepping
                     accumulated_step = 0
 
@@ -2229,6 +2457,25 @@ class KokoroTrainer:
                 has_pitch_loss = loss_pitch is not None and loss_pitch.item() > 0
                 has_energy_loss = loss_energy is not None and loss_energy.item() > 0
 
+                # Compute spectral convergence and cache spectrograms before freeing tensors
+                try:
+                    with torch.no_grad():
+                        for b in range(mel_specs.size(0)):
+                            L = int(mel_lengths[b].item())
+                            if L <= 0:
+                                continue
+                            ref = mel_specs[b, :L, :]
+                            pred_sc = predicted_mel[b, :L, :]
+                            num = torch.norm(ref - pred_sc, p='fro')
+                            den = torch.norm(ref, p='fro')
+                            if den.item() > 0:
+                                train_sc_sum += (num / den).item()
+                                train_sc_count += 1
+                    # Cache first sample for end-of-epoch image logging
+                    _last_train_gt_mel = mel_specs[0].detach().cpu()
+                    _last_train_pred_mel = predicted_mel[0].detach().cpu()
+                except Exception:
+                    pass
 
                 # Free output tensors every batch — large, not needed after loss/backward
                 del predicted_mel, predicted_log_durations, predicted_stop_logits
@@ -2343,6 +2590,28 @@ class KokoroTrainer:
                            f"Overflows: {mp_stats['overflow_count']}, "
                            f"Success Rate: {success_rate:.1f}%, "
                            f"Current Scale: {self.scaler.get_scale():.0f}")
+
+        # Log epoch-level train spectral convergence
+        if train_sc_count > 0:
+            avg_train_sc = train_sc_sum / train_sc_count
+            self.writer.add_scalar('metrics/train_spectral_convergence', avg_train_sc, epoch)
+            logger.info(f"  Train SpectralConv (epoch {epoch+1}): {avg_train_sc:.6f}")
+
+        # Log end-of-epoch train spectrograms (ground truth + predicted)
+        try:
+            if _last_train_gt_mel is not None:
+                self.writer.add_image(
+                    'spectrogram/train_ground_truth_epoch',
+                    _last_train_gt_mel.T.unsqueeze(0), epoch, dataformats='CHW'
+                )
+            if _last_train_pred_mel is not None:
+                self.writer.add_image(
+                    'spectrogram/train_predicted_epoch',
+                    _last_train_pred_mel.T.unsqueeze(0), epoch, dataformats='CHW'
+                )
+            self.writer.flush()
+        except Exception as e:
+            logger.debug(f"Failed to log end-of-epoch train spectrograms: {e}")
 
         return (total_loss_epoch / num_batches,
                 mel_loss_epoch / num_batches,
@@ -2491,15 +2760,35 @@ class KokoroTrainer:
                         f"Avg Dur Loss: {avg_dur_loss:.4f}, "
                         f"Avg Stop Loss: {avg_stop_loss:.4f}, "
                         f"Current LR: {current_lr:.8f}")
+
+            # Log epoch-level train losses to TensorBoard
+            self.writer.add_scalar('loss/train_total_epoch', avg_total_loss, epoch)
+            self.writer.add_scalar('loss/train_mel_epoch', avg_mel_loss, epoch)
+            self.writer.add_scalar('loss/train_duration_epoch', avg_dur_loss, epoch)
+            self.writer.add_scalar('loss/train_stop_epoch', avg_stop_loss, epoch)
+            self.writer.flush()
+
+            # Log weight histograms once per epoch
+            self._log_histograms_epoch(epoch)
+
             self._log_epoch_cache_delta(epoch, "train", self.dataset, train_cache_start)
 
             # Run validation if enabled
+            current_val_loss = None
             validation_interval = getattr(self.config, 'validation_interval', 1)
             if self.val_dataloader is not None and (epoch + 1) % validation_interval == 0:
                 val_cache_start = self._snapshot_cache_stats(self.val_dataset)
                 val_total_loss, val_mel_loss, val_dur_loss, val_stop_loss = self.validate_epoch(epoch)
+                current_val_loss = val_total_loss
                 self._log_epoch_cache_delta(epoch, "val", self.val_dataset, val_cache_start)
                 self.validation_losses.append(val_total_loss)
+
+                # Log epoch-level val losses to TensorBoard
+                self.writer.add_scalar('loss/val_total_epoch', val_total_loss, epoch)
+                self.writer.add_scalar('loss/val_mel_epoch', val_mel_loss, epoch)
+                self.writer.add_scalar('loss/val_duration_epoch', val_dur_loss, epoch)
+                self.writer.add_scalar('loss/val_stop_epoch', val_stop_loss, epoch)
+                self.writer.flush()
 
                 # Check for improvement
                 min_delta = getattr(self.config, 'early_stopping_min_delta', 0.001)
@@ -2510,7 +2799,7 @@ class KokoroTrainer:
                     logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
 
                     # Save best model
-                    self.save_checkpoint_with_scaler(epoch, val_total_loss)
+                    self.save_checkpoint_with_scaler(epoch, val_total_loss, val_loss=val_total_loss)
                 else:
                     self.epochs_without_improvement += 1
                     logger.info(f"⚠ No validation improvement for {self.epochs_without_improvement} epoch(s) "
@@ -2553,7 +2842,7 @@ class KokoroTrainer:
                 should_save_periodic = (self.val_dataloader is None or
                                        self.epochs_without_improvement > 0)
                 if should_save_periodic:
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
+                    self.save_checkpoint_with_scaler(epoch, avg_total_loss, val_loss=current_val_loss)
                     logger.info(f"Periodic checkpoint saved for epoch {epoch+1}")
 
             # Strategic memory cleanup at epoch end
@@ -3132,7 +3421,7 @@ if __name__ == "__main__":
             self.amp_growth_interval = 2000  # Steps between scale growth attempts
 
             # Optimizer configurations
-            self.weight_decay = 0.01
+            self.weight_decay = 0.02
             self.adam_eps = 1e-8
             self.adam_betas = (0.9, 0.999)
 
