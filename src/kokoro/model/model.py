@@ -555,6 +555,51 @@ class KokoroModel(nn.Module):
                 return (expanded_encoder_outputs, encoder_output_padding_mask,
                         predicted_log_durations, predicted_pitch, predicted_energy)
 
+    def _prepare_training_decoder_inputs(self, mel_specs: torch.Tensor, mel_padding_mask: Optional[torch.Tensor]):
+        """Prepare decoder inputs used by training forward:
+        - shift/pad mel_specs, project, apply dropout and positional encoding
+        - return (projected_with_pe, tgt_mask, mel_padding_mask_bool)
+        """
+        batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
+        device = mel_specs.device
+
+        decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
+        # mel_specs no longer needed by caller
+        del mel_specs
+
+        decoder_input_projected = self.mel_projection_in(decoder_input_mels)
+
+        decoder_input_projected = torch.nn.functional.dropout(
+            decoder_input_projected, p=0.3, training=self.training
+        )
+
+        decoder_input_projected_with_pe = self.encoder_positional_encoding(
+            decoder_input_projected, seq_offset=0
+        )
+        del decoder_input_projected
+
+        tgt_mask = self._get_causal_mask(mel_seq_len, device)
+
+        if mel_padding_mask is not None:
+            mel_padding_mask = mel_padding_mask.to(torch.bool)
+
+        return decoder_input_projected_with_pe, tgt_mask, mel_padding_mask
+
+    def _project_mel_frame(self, decoder_input_mel: torch.Tensor, seq_offset: int):
+        """Project a single mel frame and apply positional encoding at absolute position `seq_offset`."""
+        mel_projected_t = self.mel_projection_in(decoder_input_mel)
+        mel_projected_t_with_pe = self.encoder_positional_encoding(mel_projected_t, seq_offset=seq_offset)
+        return mel_projected_t_with_pe
+
+    def _project_decoder_outputs(self, decoder_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Project decoder outputs to mel frames and stop logits.
+
+        Returns: (predicted_mel_frames, predicted_stop_logits)
+        """
+        predicted_mel_frames = self.mel_projection_out(decoder_outputs)
+        predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+        return predicted_mel_frames, predicted_stop_logits
+
     def forward_training(
         self,
         phoneme_indices: torch.Tensor,
@@ -621,36 +666,8 @@ class KokoroModel(nn.Module):
                         encoder_output_padding_mask = mask_out
 
                 # ── 4. Decoder input ────────────────────────────────────────
-                decoder_input_mels = F.pad(mel_specs[:, :-1, :], (0, 0, 1, 0), "constant", 0.0)
-                # mel_specs no longer needed after this
-                del mel_specs
-
-                decoder_input_projected = self.mel_projection_in(decoder_input_mels)
-                del decoder_input_mels
-
-                # Pre-net dropout (Tacotron 2 trick): randomly zero a fraction of the
-                # projected decoder input DURING TRAINING ONLY.  This prevents the decoder
-                # from over-relying on the previous ground-truth mel frame (teacher forcing)
-                # and forces it to attend to encoder context.  At inference the decoder feeds
-                # back its own predictions; without this dropout the train/inference mismatch
-                # causes the decoder to collapse after the first few voiced frames.
-                # Rate: 0.3 (not 0.5) — the OneCycleLR is still ascending toward its peak
-                # LR at ~epoch 30; using 0.5 while the LR is high causes the encoder to
-                # spike and loss to rise.  0.3 provides train/inference decoupling without
-                # over-perturbing gradients during the warmup phase.
-                decoder_input_projected = torch.nn.functional.dropout(
-                    decoder_input_projected, p=0.3, training=self.training
-                )
-
-                decoder_input_projected_with_pe = self.encoder_positional_encoding(
-                    decoder_input_projected, seq_offset=0
-                )
-                del decoder_input_projected
-
-                tgt_mask = self._get_causal_mask(mel_seq_len, device)
-
-                if mel_padding_mask is not None:
-                    mel_padding_mask = mel_padding_mask.to(torch.bool)
+                decoder_input_projected_with_pe, tgt_mask, mel_padding_mask = \
+                    self._prepare_training_decoder_inputs(mel_specs, mel_padding_mask)
 
                 # ── 5. Decoder ──────────────────────────────────────────────
                 decoder_outputs = self._checkpoint_decoder_forward(
@@ -665,8 +682,7 @@ class KokoroModel(nn.Module):
                 del encoder_output_padding_mask
 
                 # ── 6. Output projections ───────────────────────────────────
-                predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-                predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+                predicted_mel_frames, predicted_stop_logits = self._project_decoder_outputs(decoder_outputs)
 
                 # decoder_outputs served both projections — free now
                 del decoder_outputs
@@ -778,11 +794,7 @@ class KokoroModel(nn.Module):
                         with torch.profiler.record_function(f"inference_decode_step_{t}"):
                             try:
                                 # Project current input and cache — O(1) per step, not O(t)
-                                mel_projected_t = self.mel_projection_in(decoder_input_mel)
-                                # Apply PE at absolute position t
-                                mel_projected_t_with_pe = self.encoder_positional_encoding(
-                                    mel_projected_t, seq_offset=t
-                                )
+                                mel_projected_t_with_pe = self._project_mel_frame(decoder_input_mel, seq_offset=t)
 
                                 decoder_outputs, self_attn_kv_caches = self.decoder(
                                     tgt=mel_projected_t_with_pe,          # single frame only
@@ -798,10 +810,8 @@ class KokoroModel(nn.Module):
                                 decoder_out_t = decoder_outputs[:, -1:, :].clone()
                                 del decoder_outputs
 
-                                mel_pred_t = self.mel_projection_out(decoder_out_t)
+                                mel_pred_t, stop_token_logit_t = self._project_decoder_outputs(decoder_out_t)
                                 generated_mels.append(mel_pred_t)
-
-                                stop_token_logit_t = self.stop_token_predictor(decoder_out_t)
                                 del decoder_out_t
 
                                 stop_probability = torch.sigmoid(stop_token_logit_t).mean().item()
