@@ -466,6 +466,95 @@ class KokoroModel(nn.Module):
             self._causal_mask_cache = self._generate_square_subsequent_mask(sz, device)
         return self._causal_mask_cache
 
+    def _encode_and_expand(
+        self,
+        phoneme_indices: torch.Tensor,
+        stress_indices: Optional[torch.Tensor],
+        text_padding_mask: torch.Tensor,
+        pitch_targets: Optional[torch.Tensor] = None,
+        energy_targets: Optional[torch.Tensor] = None,
+        phoneme_durations: Optional[torch.Tensor] = None,
+        inference: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Shared helper: encode text, run variance adaptor or fallback duration+length_regulate.
+
+        Returns: (expanded_encoder_outputs, encoder_output_padding_mask,
+                  predicted_log_durations, predicted_pitch, predicted_energy)
+        """
+        with torch.profiler.record_function("encode_and_expand"):
+            # 1. Encode text
+            text_encoded = self.encode_text(
+                phoneme_indices, stress_indices=stress_indices, mask=text_padding_mask
+            )
+            # free inputs no longer needed
+            del phoneme_indices
+            if stress_indices is not None:
+                del stress_indices
+
+            # 2. Variance adaptor / duration path
+            if self.use_variance_predictor:
+                phoneme_pitch = None
+                phoneme_energy = None
+
+                if (not inference) and (pitch_targets is not None):
+                    phoneme_pitch = self._average_by_duration(
+                        pitch_targets, phoneme_durations, text_padding_mask
+                    )
+                    del pitch_targets
+
+                if (not inference) and (energy_targets is not None):
+                    phoneme_energy = self._average_by_duration(
+                        energy_targets, phoneme_durations, text_padding_mask
+                    )
+                    del energy_targets
+
+                duration_target = phoneme_durations.float() if (not inference and phoneme_durations is not None) else None
+
+                (adapted_encoder_output,
+                 predicted_log_durations,
+                 predicted_pitch,
+                 predicted_energy,
+                 frame_mask) = self.variance_adaptor(
+                    text_encoded,
+                    mask=text_padding_mask,
+                    pitch_target=phoneme_pitch,
+                    energy_target=phoneme_energy,
+                    duration_target=duration_target,
+                )
+
+                # free intermediates
+                del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations, text_padding_mask
+
+                expanded_encoder_outputs = adapted_encoder_output
+                encoder_output_padding_mask = frame_mask
+                del adapted_encoder_output, frame_mask
+
+                return (expanded_encoder_outputs, encoder_output_padding_mask,
+                        predicted_log_durations, predicted_pitch, predicted_energy)
+
+            else:
+                # Fallback duration predictor + length regulation
+                predicted_log_durations = self._predict_durations(text_encoded)
+                predicted_pitch = None
+                predicted_energy = None
+
+                if inference:
+                    durations_for_length_regulate = torch.clamp(
+                        torch.exp(predicted_log_durations), min=1.0
+                    ).long()
+                    expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                        text_encoded, durations_for_length_regulate, text_padding_mask
+                    )
+                    del text_encoded, durations_for_length_regulate
+                else:
+                    expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
+                        text_encoded, phoneme_durations.float(), text_padding_mask
+                    )
+                    del text_encoded, phoneme_durations, text_padding_mask
+
+                return (expanded_encoder_outputs, encoder_output_padding_mask,
+                        predicted_log_durations, predicted_pitch, predicted_energy)
+
     def forward_training(
         self,
         phoneme_indices: torch.Tensor,
@@ -493,67 +582,20 @@ class KokoroModel(nn.Module):
                 text_padding_mask = text_padding_mask.to(torch.bool)
 
             try:
-                # ── 1. Encode text ──────────────────────────────────────────
-                text_encoded = self.encode_text(
-                    phoneme_indices, stress_indices=stress_indices, mask=text_padding_mask
+                # Encode and expand (shared helper)
+                (expanded_encoder_outputs,
+                 encoder_output_padding_mask,
+                 predicted_log_durations,
+                 predicted_pitch,
+                 predicted_energy) = self._encode_and_expand(
+                    phoneme_indices=phoneme_indices,
+                    stress_indices=stress_indices,
+                    text_padding_mask=text_padding_mask,
+                    pitch_targets=pitch_targets,
+                    energy_targets=energy_targets,
+                    phoneme_durations=phoneme_durations,
+                    inference=False,
                 )
-                # phoneme_indices / stress_indices no longer needed
-                del phoneme_indices
-                if stress_indices is not None:
-                    del stress_indices
-
-                # ── 2. Variance adaptor ─────────────────────────────────────
-                if self.use_variance_predictor:
-                    phoneme_pitch = None
-                    phoneme_energy = None
-
-                    if pitch_targets is not None:
-                        phoneme_pitch = self._average_by_duration(
-                            pitch_targets, phoneme_durations, text_padding_mask
-                        )
-                        # pitch_targets expanded into phoneme_pitch — free original
-                        del pitch_targets
-
-                    if energy_targets is not None:
-                        phoneme_energy = self._average_by_duration(
-                            energy_targets, phoneme_durations, text_padding_mask
-                        )
-                        del energy_targets
-
-                    # Pass raw frame counts (not log1p) as duration_target.
-                    # VarianceAdaptor's LengthRegulator casts to .long() internally,
-                    # so it needs actual integer frame counts (e.g. 5), not log1p
-                    # values (e.g. 1.79) which would be truncated to 1-2 frames.
-                    # The duration *loss* target (log1p for the predictor head) is
-                    # computed separately in the trainer from predicted_log_durations.
-                    (adapted_encoder_output,
-                     predicted_log_durations,
-                     predicted_pitch,
-                     predicted_energy,
-                     frame_mask) = self.variance_adaptor(
-                        text_encoded,
-                        mask=text_padding_mask,
-                        pitch_target=phoneme_pitch,
-                        energy_target=phoneme_energy,
-                        duration_target=phoneme_durations.float()
-                    )
-
-                    # Free everything consumed by the adaptor
-                    del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations, text_padding_mask
-
-                    expanded_encoder_outputs = adapted_encoder_output
-                    encoder_output_padding_mask = frame_mask
-                    del adapted_encoder_output, frame_mask
-
-                else:
-                    predicted_log_durations = self._predict_durations(text_encoded)
-                    predicted_pitch = None
-                    predicted_energy = None
-
-                    expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                        text_encoded, phoneme_durations.float(), text_padding_mask
-                    )
-                    del text_encoded, phoneme_durations, text_padding_mask
 
                 # ── 3. Align expanded output to mel length ──────────────────
                 current_expanded_len = expanded_encoder_outputs.shape[1]
@@ -676,40 +718,20 @@ class KokoroModel(nn.Module):
                     else:
                         text_padding_mask = text_padding_mask.to(torch.bool)
 
-                    with torch.profiler.record_function("inference_encode_text"):
-                        text_encoded = self.encode_text(
-                            phoneme_indices, stress_indices=stress_indices, mask=text_padding_mask
-                        )
-
-                    with torch.profiler.record_function("inference_predict_durations"):
-                        if self.use_variance_predictor:
-                            # Use the full adapted output so pitch/energy embeddings
-                            # are applied — matching exactly what forward_training does.
-                            # VarianceAdaptor now applies exp() internally before rounding
-                            # when duration_target is None, so frame counts are correct.
-                            (adapted_encoder_output,
-                             predicted_log_durations,
-                             _pitch_pred, _energy_pred,
-                             frame_mask) = self.variance_adaptor(
-                                text_encoded,
-                                mask=text_padding_mask,
-                                pitch_target=None,
-                                energy_target=None,
-                                duration_target=None
-                            )
-                            del text_encoded
-                            expanded_encoder_outputs = adapted_encoder_output
-                            encoder_output_padding_mask = frame_mask
-                            del adapted_encoder_output, frame_mask
-                        else:
-                            predicted_log_durations = self._predict_durations(text_encoded)
-                            durations_for_length_regulate = torch.clamp(
-                                torch.exp(predicted_log_durations), min=1.0
-                            ).long()
-                            expanded_encoder_outputs, encoder_output_padding_mask = self._length_regulate(
-                                text_encoded, durations_for_length_regulate, text_padding_mask
-                            )
-                            del text_encoded, durations_for_length_regulate
+                    # Shared encode+expand helper for inference
+                    (expanded_encoder_outputs,
+                     encoder_output_padding_mask,
+                     predicted_log_durations,
+                     predicted_pitch,
+                     predicted_energy) = self._encode_and_expand(
+                        phoneme_indices=phoneme_indices,
+                        stress_indices=stress_indices,
+                        text_padding_mask=text_padding_mask,
+                        pitch_targets=None,
+                        energy_targets=None,
+                        phoneme_durations=None,
+                        inference=True,
+                    )
 
                     # Clear ALiBi distance caches before inference — during generation seq_len
                     # grows by 1 each step so every key is unique; the cache fills with 10
