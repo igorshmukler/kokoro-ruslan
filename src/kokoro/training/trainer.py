@@ -1712,7 +1712,7 @@ class KokoroTrainer:
         else:
             return (0.0, 0.0, 0.0, 0.0)
 
-    def save_checkpoint_with_scaler(self, epoch: int, loss: float):
+    def save_checkpoint_with_scaler(self, epoch: int, loss: float, val_loss: float = None):
         """Save checkpoint including scaler state and EMA weights"""
         model_metadata = build_model_metadata(self.config, self.model)
         checkpoint = {
@@ -1723,6 +1723,8 @@ class KokoroTrainer:
             'current_optimizer_step': self.current_optimizer_step,
             'optimizer_steps_completed': self.optimizer_steps_completed,
             'loss': loss,
+            'train_loss': loss,
+            'val_loss': val_loss,
             'config': self.config,
             'model_metadata': model_metadata,
         }
@@ -2772,10 +2774,12 @@ class KokoroTrainer:
             self._log_epoch_cache_delta(epoch, "train", self.dataset, train_cache_start)
 
             # Run validation if enabled
+            current_val_loss = None
             validation_interval = getattr(self.config, 'validation_interval', 1)
             if self.val_dataloader is not None and (epoch + 1) % validation_interval == 0:
                 val_cache_start = self._snapshot_cache_stats(self.val_dataset)
                 val_total_loss, val_mel_loss, val_dur_loss, val_stop_loss = self.validate_epoch(epoch)
+                current_val_loss = val_total_loss
                 self._log_epoch_cache_delta(epoch, "val", self.val_dataset, val_cache_start)
                 self.validation_losses.append(val_total_loss)
 
@@ -2795,7 +2799,7 @@ class KokoroTrainer:
                     logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
 
                     # Save best model
-                    self.save_checkpoint_with_scaler(epoch, val_total_loss)
+                    self.save_checkpoint_with_scaler(epoch, val_total_loss, val_loss=val_total_loss)
                 else:
                     self.epochs_without_improvement += 1
                     logger.info(f"⚠ No validation improvement for {self.epochs_without_improvement} epoch(s) "
@@ -2838,7 +2842,7 @@ class KokoroTrainer:
                 should_save_periodic = (self.val_dataloader is None or
                                        self.epochs_without_improvement > 0)
                 if should_save_periodic:
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss)
+                    self.save_checkpoint_with_scaler(epoch, avg_total_loss, val_loss=current_val_loss)
                     logger.info(f"Periodic checkpoint saved for epoch {epoch+1}")
 
             # Strategic memory cleanup at epoch end
