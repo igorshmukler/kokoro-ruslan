@@ -2799,7 +2799,7 @@ class KokoroTrainer:
                     logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
 
                     # Save best model
-                    self.save_checkpoint_with_scaler(epoch, val_total_loss, val_loss=val_total_loss)
+                    self.save_checkpoint_with_scaler(epoch, avg_total_loss, val_loss=val_total_loss)
                 else:
                     self.epochs_without_improvement += 1
                     logger.info(f"⚠ No validation improvement for {self.epochs_without_improvement} epoch(s) "
