@@ -11,6 +11,7 @@ import os
 from kokoro.model.positional_encoding import PositionalEncoding
 from kokoro.model.transformers import TransformerDecoder, TransformerEncoderBlock, MultiHeadAttentionImproved
 from kokoro.utils.gpu_profiler import GPUProfiler
+from kokoro.utils.lengths import length_regulate, average_by_duration
 from .generator import KokoroGenerator
 
 logger = logging.getLogger(__name__)
@@ -318,62 +319,8 @@ class KokoroModel(nn.Module):
 
 
     def _length_regulate(self, encoder_outputs, durations, text_padding_mask):
-        with torch.profiler.record_function("length_regulate"):
-            self._log_memory("length_regulation_start")
-
-            batch_size, max_text_len, hidden_dim = encoder_outputs.shape
-            device = encoder_outputs.device
-
-            durations = torch.clamp(durations, min=1.0)
-
-            # ── Pass 1: compute per-sample output lengths on CPU only ──────────
-            # No GPU tensors created here — just integer arithmetic.
-            lengths = []
-            non_padded_masks = []
-            for i in range(batch_size):
-                npm = ~text_padding_mask[i].to(torch.bool)
-                non_padded_masks.append(npm)
-                if torch.any(npm):
-                    dur_i = durations[i][npm].clamp(min=1).long()
-                    lengths.append(int(dur_i.sum().item()))
-                else:
-                    lengths.append(0)
-
-            max_expanded_len = max(max(lengths, default=0), 1)
-
-            # ── Single allocation ───────────────────────────────────────────────
-            # out  starts zeroed  (correct padding value)
-            # mask starts all-True (all padding); valid frames set to False below
-            out  = torch.zeros(batch_size, max_expanded_len, hidden_dim,
-                           device=device, dtype=encoder_outputs.dtype)
-            mask = torch.ones(batch_size, max_expanded_len, dtype=torch.bool, device=device)
-
-            # ── Pass 2: expand directly into out, one sample at a time ─────────
-            # Each `expanded` tensor is freed before the next iteration,
-            # so peak extra memory is one sample's expansion, not all B.
-            for i in range(batch_size):
-                if lengths[i] == 0:
-                    logger.warning(f"Batch {i}: All tokens are padding, leaving row zeroed")
-                    continue
-
-                filtered_enc = encoder_outputs[i][non_padded_masks[i]]
-                filtered_dur = durations[i][non_padded_masks[i]].clamp(min=1).long()
-
-                try:
-                    expanded = torch.repeat_interleave(filtered_enc, filtered_dur, dim=0)
-                    ln = expanded.shape[0]
-                    out[i, :ln]  = expanded
-                    mask[i, :ln] = False        # mark valid frames
-                    del expanded                # free before next sample
-                except Exception as e:
-                    logger.error(f"Error in repeat_interleave for batch {i}: {e}")
-                    # row stays zeroed, mask stays all-True — safely treated as padding
-
-            self._log_memory("length_regulation_end")
-
-            logger.debug(f"Length regulation completed: {encoder_outputs.shape} -> {out.shape}")
-
-            return out, mask
+        # Delegate to shared utility (keeps behavior identical)
+        return length_regulate(encoder_outputs, durations, text_padding_mask)
 
 
     def _average_by_duration(self,
@@ -392,67 +339,7 @@ class KokoroModel(nn.Module):
         Returns:
             Phoneme-level averaged values    (batch, phonemes)
         """
-        batch_size, num_phonemes = durations.shape
-        device = durations.device
-
-        durations_clamped = durations.long().clamp(min=0)
-
-        # Cumulative sum gives frame boundaries for each phoneme
-        # ends[b, p]   = last frame index (exclusive) for phoneme p in sample b
-        # starts[b, p] = first frame index for phoneme p
-        ends = durations_clamped.cumsum(dim=1)                          # (B, P)
-        starts = ends - durations_clamped                               # (B, P)
-        max_frames = values.size(1)
-
-        # Clamp to valid frame range
-        starts = starts.clamp(max=max_frames - 1)
-        ends = ends.clamp(max=max_frames)
-
-        # For each phoneme, create a range mask and use it to average
-        # Shape: (B, P, F) would be too large — use scatter_add on (B, F) instead
-
-        # frame_phoneme[b, f] = which phoneme owns frame f
-        # Build this by: for each phoneme p, fill [starts[b,p]:ends[b,p]] with p
-        phoneme_range = torch.arange(num_phonemes, device=device)  # (P,)
-
-        # (B, P) starts and ends → use scatter to fill frame_labels
-        # Trick: scatter the phoneme index at start position, then propagate
-        frame_labels_float = torch.zeros(batch_size, max_frames + 1, device=device)
-        frame_labels_float.scatter_add_(
-            1,
-            starts.clamp(max=max_frames),
-            phoneme_range.unsqueeze(0).expand(batch_size, -1).float()
-        )
-        frame_labels_float.scatter_add_(
-            1,
-            ends.clamp(max=max_frames),
-            -phoneme_range.unsqueeze(0).expand(batch_size, -1).float()
-        )
-        # cumsum gives phoneme index for each frame
-        frame_to_phoneme = frame_labels_float[:, :-1].cumsum(dim=1).long()  # (B, F)
-
-        # scatter_add values into phoneme buckets
-        phoneme_sums = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
-        phoneme_counts = torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
-
-        # Mask out frames beyond actual sequence
-        valid_frame_mask = frame_to_phoneme < num_phonemes  # (B, F)
-        safe_labels = frame_to_phoneme.clamp(max=num_phonemes - 1)
-
-        phoneme_sums.scatter_add_(1, safe_labels, values * valid_frame_mask.to(values.dtype))
-        phoneme_counts.scatter_add_(1, safe_labels, valid_frame_mask.to(values.dtype))
-
-        # Avoid division by zero for empty phonemes
-        output = phoneme_sums / phoneme_counts.clamp(min=1.0)
-
-        # Zero out padded phoneme positions
-        if mask is not None:
-            output = output.masked_fill(mask.bool(), 0.0)
-        else:
-            # Zero out phonemes with zero duration (they're padding regardless)
-            output = output.masked_fill(durations_clamped == 0, 0.0)
-
-        return output
+        return average_by_duration(values, durations, mask)
 
     @staticmethod
     def _generate_square_subsequent_mask(sz: int, device: torch.device) -> torch.Tensor:

@@ -10,6 +10,8 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 import logging
 
+from kokoro.utils.lengths import vectorized_expand_tokens, LengthRegulator
+
 logger = logging.getLogger(__name__)
 
 # Default architecture constants
@@ -17,106 +19,6 @@ DEFAULT_HIDDEN_DIM = 512
 DEFAULT_FILTER_SIZE = 256
 DEFAULT_N_BINS = 256
 DEFAULT_HOP_LENGTH = 256
-
-
-def _vectorized_expand_tokens(
-    tokens: torch.Tensor,
-    durations: torch.Tensor,
-    max_len: Optional[int] = None
-) -> torch.Tensor:
-    """
-    Vectorized token expansion. CPU round-trip retained for MPS stability.
-    Python loop over batch items eliminated via repeat_interleave + scatter.
-    """
-    device = tokens.device
-    is_3d = tokens.dim() == 3
-    B, L = tokens.shape[0], tokens.shape[1]
-
-    tokens_cpu = tokens.detach().to('cpu')
-    durations_cpu = durations.detach().to('cpu').long().clamp(min=0)
-
-    lengths = durations_cpu.sum(dim=1)                # (B,)
-    max_expanded = int(lengths.max().item())
-    if max_len is not None:
-        max_expanded = min(max_expanded, int(max_len))
-
-    if max_expanded == 0:
-        out_len = max(1, int(max_len)) if max_len is not None else 1
-        if is_3d:
-            return tokens_cpu.new_zeros(B, out_len, tokens_cpu.size(2)).to(device)
-        return tokens_cpu.new_zeros(B, out_len).to(device)
-
-    try:
-        d_flat = durations_cpu.reshape(B * L)
-
-        if is_3d:
-            D = tokens_cpu.size(2)
-            flat = tokens_cpu.reshape(B * L, D)
-            expanded_flat = torch.repeat_interleave(flat, d_flat, dim=0)  # (total, D)
-        else:
-            flat = tokens_cpu.reshape(B * L)
-            expanded_flat = torch.repeat_interleave(flat, d_flat, dim=0)  # (total,)
-
-        # Build batch index for each expanded frame — no Python loop
-        batch_ids = torch.arange(B).repeat_interleave(lengths)            # (total,)
-
-        # Build within-batch frame index by subtracting each batch item's start offset
-        batch_start_offsets = torch.zeros(B, dtype=torch.long)
-        batch_start_offsets[1:] = lengths.cumsum(0)[:-1]
-        per_frame_offset = batch_start_offsets.repeat_interleave(lengths)  # (total,)
-        frame_ids = torch.arange(expanded_flat.size(0)) - per_frame_offset # (total,)
-
-        # Mask frames that exceed max_expanded (happens when max_len clips)
-        valid = frame_ids < max_expanded
-
-        if is_3d:
-            out_cpu = tokens_cpu.new_zeros(B, max_expanded, D)
-            out_cpu[batch_ids[valid], frame_ids[valid]] = expanded_flat[valid]
-        else:
-            out_cpu = tokens_cpu.new_zeros(B, max_expanded)
-            out_cpu[batch_ids[valid], frame_ids[valid]] = expanded_flat[valid]
-
-        # Pad to exact max_len if needed
-        if max_len is not None and out_cpu.size(1) < max_len:
-            pad = max_len - out_cpu.size(1)
-            out_cpu = F.pad(out_cpu, (0, 0, 0, pad) if is_3d else (0, pad))
-
-        return out_cpu.to(device)
-
-    except Exception as e:
-        logger.warning(f"Vectorized expansion failed, using fallback: {e}")
-        expanded = []
-        for i in range(B):
-            if durations_cpu[i].sum() == 0:
-                z_shape = (1, tokens_cpu.size(2)) if is_3d else (1,)
-                expanded.append(torch.zeros(z_shape, dtype=tokens_cpu.dtype))
-            else:
-                expanded.append(torch.repeat_interleave(tokens_cpu[i], durations_cpu[i], dim=0))
-        output = torch.nn.utils.rnn.pad_sequence(expanded, batch_first=True).to(device)
-        if max_len is not None:
-            if output.size(1) < max_len:
-                output = F.pad(output, (0, 0, 0, max_len - output.size(1)) if is_3d else (0, max_len - output.size(1)))
-            else:
-                output = output[:, :max_len] if not is_3d else output[:, :max_len, :]
-        return output
-
-
-class LengthRegulator(nn.Module):
-    """
-    Expands phoneme-level hidden states to frame-level based on durations.
-    Essential for bridging the gap between text and audio length.
-    """
-    def __init__(self):
-        super().__init__()
-
-    def forward(self, x, durations, max_len=None):
-        # Vectorized expansion strategy:
-        # 1) Move the per-token tensors to CPU to avoid MPS repeat_interleave bugs
-        # 2) Flatten (B, L, D) -> (B*L, D) and repeat_interleave with flattened repeats
-        # 3) Scatter the single expanded flat tensor into a preallocated (B, max_len, D)
-        #    buffer using computed offsets — this uses one big allocation for the output
-        # Fallback: if vectorized path fails, fall back to safe per-example expansion
-        return _vectorized_expand_tokens(x, durations, max_len=max_len)
 
 
 class VariancePredictor(nn.Module):
@@ -369,7 +271,7 @@ class VarianceAdaptor(nn.Module):
                                     max_len: Optional[int] = None) -> torch.Tensor:
         # Vectorized expansion similar to LengthRegulator: flatten tokens and durations,
         # repeat_interleave once, then scatter into a preallocated (B, max_len) buffer.
-        return _vectorized_expand_tokens(targets, durations, max_len=max_len)
+        return vectorized_expand_tokens(targets, durations, max_len=max_len)
 
     # ------------------------------------------------------------------
     # Forward
