@@ -19,7 +19,6 @@ import faulthandler
 from pathlib import Path
 
 from typing import Tuple, Dict, Any, Optional
-from dataclasses import dataclass
 
 from torch.utils.tensorboard import SummaryWriter
 
