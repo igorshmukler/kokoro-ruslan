@@ -109,8 +109,18 @@ class KokoroTTS:
     def _load_model(self) -> KokoroModel:
         """Loads the trained Kokoro model with robust error handling."""
         final_model_path = self.model_dir / "kokoro_russian_final.pth"
-        checkpoint_files = sorted(list(self.model_dir.glob("checkpoint_epoch_*.pth")),
-                                  key=lambda x: int(x.stem.split('_')[-1]))
+        def _epoch_sort_key(p):
+            """Return the numeric epoch from filenames like checkpoint_epoch_18.pth.
+            Falls back to -1 for names with non-numeric suffixes (e.g. *_migrated.pth)
+            so they sort to the front and are never mistakenly chosen as 'latest'."""
+            m = re.search(r'checkpoint_epoch_(\d+)\.pth$', p.name)
+            return int(m.group(1)) if m else -1
+
+        checkpoint_files = sorted(
+            [p for p in self.model_dir.glob("checkpoint_epoch_*.pth")
+             if re.search(r'checkpoint_epoch_(\d+)\.pth$', p.name)],
+            key=_epoch_sort_key,
+        )
 
         model_path = None
         if final_model_path.exists():
@@ -243,6 +253,33 @@ class KokoroTTS:
         model = KokoroModel(
             **model_kwargs
         )
+
+        # ------------------------------------------------------------------ #
+        # Key migration: older checkpoints stored the VarianceAdaptor at    #
+        # `variance_adaptor.*` but the current model wraps it inside        #
+        # VarianceAdaptorWrapper, giving the path                           #
+        # `duration_adaptor.variance_adaptor.*`.  Remap transparently so   #
+        # both old and new checkpoints load without strict=False fallback.  #
+        # ------------------------------------------------------------------ #
+        # The VarianceAdaptor is registered under TWO paths on the current model:
+        #   • variance_adaptor.*                      (self.variance_adaptor)
+        #   • duration_adaptor.variance_adaptor.*     (self.duration_adaptor.variance_adaptor)
+        # Older checkpoints only have the un-nested variance_adaptor.* path.
+        # Copy those keys to the nested path so both slots are satisfied.
+        _old_prefix = "variance_adaptor."
+        _new_prefix = "duration_adaptor.variance_adaptor."
+        _additions = {}
+        for _k, _v in state_dict_to_load.items():
+            if _k.startswith(_old_prefix) and not _k.startswith("duration_adaptor."):
+                _nested_key = _new_prefix + _k[len(_old_prefix):]
+                if _nested_key not in state_dict_to_load:
+                    _additions[_nested_key] = _v
+        if _additions:
+            state_dict_to_load = {**state_dict_to_load, **_additions}
+            logger.info(
+                "Applied legacy key remapping: copied %d keys from 'variance_adaptor.*' "
+                "to 'duration_adaptor.variance_adaptor.*'.", len(_additions)
+            )
 
         # Strict load preferred: fail fast on real architecture/state mismatches,
         # but be tolerant of newly-added parameters (e.g. new LayerNorms) by

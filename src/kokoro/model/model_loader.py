@@ -8,7 +8,6 @@ import torch
 import pickle
 import logging
 from pathlib import Path
-from typing import Optional
 
 # Import model and training components
 from kokoro.training.config import TrainingConfig
