@@ -250,6 +250,36 @@ class KokoroTTS:
                 "Use a checkpoint and phoneme processor saved from the same metadata-enabled training run."
             )
 
+        # ------------------------------------------------------------------ #
+        # Auto-correct ff_dim from actual checkpoint weight shapes.          #
+        # The GLU-style FFN uses linear1 with out_features = ff_dim * 2;     #
+        # if the metadata value doesn't match the weights it was generated   #
+        # from a stale config value and we must use the weight-derived dim.  #
+        # ------------------------------------------------------------------ #
+        _enc_key = 'transformer_encoder_layers.0.linear1.weight'
+        if _enc_key in state_dict_to_load:
+            _actual_enc_ff = int(state_dict_to_load[_enc_key].shape[0]) // 2
+            if _actual_enc_ff != model_kwargs['encoder_ff_dim']:
+                logger.warning(
+                    "encoder_ff_dim in checkpoint metadata (%d) does not match the actual "
+                    "weight shapes (%d). The metadata was saved from a stale config value. "
+                    "Using the weight-derived value so the checkpoint loads correctly.",
+                    model_kwargs['encoder_ff_dim'], _actual_enc_ff,
+                )
+                model_kwargs['encoder_ff_dim'] = _actual_enc_ff
+
+        _dec_key = 'decoder.layers.0.linear1.weight'
+        if _dec_key in state_dict_to_load:
+            _actual_dec_ff = int(state_dict_to_load[_dec_key].shape[0]) // 2
+            if _actual_dec_ff != model_kwargs['decoder_ff_dim']:
+                logger.warning(
+                    "decoder_ff_dim in checkpoint metadata (%d) does not match the actual "
+                    "weight shapes (%d). The metadata was saved from a stale config value. "
+                    "Using the weight-derived value so the checkpoint loads correctly.",
+                    model_kwargs['decoder_ff_dim'], _actual_dec_ff,
+                )
+                model_kwargs['decoder_ff_dim'] = _actual_dec_ff
+
         model = KokoroModel(
             **model_kwargs
         )

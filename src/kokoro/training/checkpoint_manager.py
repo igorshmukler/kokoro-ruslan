@@ -26,6 +26,9 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
             'n_encoder_layers': int(getattr(config, 'n_encoder_layers', 6)),
             'n_decoder_layers': int(getattr(config, 'n_decoder_layers', 6)),
             'n_heads': int(getattr(config, 'n_heads', 8)),
+            # Derive ff_dim from the actual model weights (GLU: linear1 outputs ff_dim*2).
+            # This is the authoritative source; config values can diverge from what was
+            # actually used to build the model.
             'encoder_ff_dim': int(getattr(config, 'encoder_ff_dim', 3072)),
             'decoder_ff_dim': int(getattr(config, 'decoder_ff_dim', 3072)),
             'encoder_dropout': float(getattr(config, 'encoder_dropout', 0.1)),
@@ -52,6 +55,23 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
 
     if model is not None:
         metadata['architecture']['vocab_size'] = int(getattr(model, 'vocab_size', 0))
+
+        # Override ff_dim with values derived from the actual model weights.
+        # The GLU-style FFN projects to ff_dim*2 in linear1 and back from ff_dim in linear2,
+        # so the true ff_dim = linear1.out_features // 2.  This overrides any stale config
+        # value and is the authoritative record of what was actually trained.
+        enc_layers = getattr(model, 'transformer_encoder_layers', None)
+        if enc_layers and len(enc_layers) > 0:
+            linear1 = getattr(enc_layers[0], 'linear1', None)
+            if linear1 is not None and hasattr(linear1, 'out_features'):
+                metadata['architecture']['encoder_ff_dim'] = int(linear1.out_features // 2)
+
+        decoder = getattr(model, 'decoder', None)
+        dec_layers = getattr(decoder, 'layers', None) if decoder is not None else None
+        if dec_layers and len(dec_layers) > 0:
+            linear1 = getattr(dec_layers[0], 'linear1', None)
+            if linear1 is not None and hasattr(linear1, 'out_features'):
+                metadata['architecture']['decoder_ff_dim'] = int(linear1.out_features // 2)
 
     return metadata
 
