@@ -297,6 +297,13 @@ class KokoroTrainer:
             vocab_size,
             config.n_mels,
             config.hidden_dim,
+            n_encoder_layers=getattr(config, 'n_encoder_layers', 6),
+            n_heads=getattr(config, 'n_heads', 8),
+            encoder_ff_dim=getattr(config, 'encoder_ff_dim', 2048),
+            encoder_dropout=getattr(config, 'encoder_dropout', 0.1),
+            n_decoder_layers=getattr(config, 'n_decoder_layers', 6),
+            decoder_ff_dim=getattr(config, 'decoder_ff_dim', 2048),
+            max_decoder_seq_len=getattr(config, 'max_decoder_seq_len', 4000),
             use_variance_predictor=getattr(config, 'use_variance_predictor', True),
             variance_filter_size=getattr(config, 'variance_filter_size', 256),
             variance_kernel_size=getattr(config, 'variance_kernel_size', 3),
@@ -425,6 +432,13 @@ class KokoroTrainer:
             else:
                 onecycle_steps = total_steps
 
+            # When manual warmup is enabled, OneCycleLR must start exactly at
+            # `learning_rate` (where the warmup ends).  OneCycleLR's initial LR is
+            # max_lr / div_factor, so setting div_factor = max_lr_multiplier ensures
+            # a seamless handoff with no jump at step warmup_steps.
+            # When warmup is disabled, use the classic div_factor=25.0 (10x below base_lr).
+            _max_lr_multiplier = getattr(config, 'max_lr_multiplier', 2.0)
+            onecycle_div_factor = float(_max_lr_multiplier) if self.use_warmup else 25.0
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
                 max_lr=max_lr,
@@ -434,7 +448,7 @@ class KokoroTrainer:
                 cycle_momentum=False,
                 base_momentum=0.85,
                 max_momentum=0.95,
-                div_factor=3.0,
+                div_factor=onecycle_div_factor,
                 final_div_factor=10000.0,
                 last_epoch=-1
             )
@@ -443,6 +457,7 @@ class KokoroTrainer:
             self._onecycle_steps = onecycle_steps
             self._onecycle_max_lr = max_lr
             self._onecycle_pct_start = pct_start
+            self._onecycle_div_factor = onecycle_div_factor
             logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={onecycle_steps} "
                        f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
         else:
@@ -1451,8 +1466,9 @@ class KokoroTrainer:
                 # param_groups[0]['lr'] is the exact LR that training ended at.
                 last_lr = self.optimizer.state_dict()['param_groups'][0]['lr']
 
-                base_lr   = max_lr / 3.0          # div_factor=3.0
-                final_lr  = max_lr / 10000.0      # final_div_factor=10000.0
+                _div_factor = getattr(self, '_onecycle_div_factor', float(getattr(self.config, 'max_lr_multiplier', 2.0)) if getattr(self, 'use_warmup', False) else 25.0)
+                base_lr   = max_lr / _div_factor   # matches div_factor used at construction
+                final_lr  = max_lr / 10000.0       # final_div_factor=10000.0
                 peak_step = int(pct_start * onecycle_steps)
 
                 # Find which step on the NEW schedule matches last_lr. When
@@ -1498,7 +1514,7 @@ class KokoroTrainer:
                     cycle_momentum=False,
                     base_momentum=0.85,
                     max_momentum=0.95,
-                    div_factor=3.0,
+                    div_factor=_div_factor,
                     final_div_factor=10000.0,
                     last_epoch=-1,
                 )
@@ -3473,7 +3489,7 @@ if __name__ == "__main__":
             self.save_every = 5
             self.resume_checkpoint = 'auto'
             self.n_mels = 80
-            self.hidden_dim = 512
+            self.hidden_dim = 768
             self.duration_loss_weight = 0.1
             self.stop_token_loss_weight = 1.0
             self.max_seq_length = 2500

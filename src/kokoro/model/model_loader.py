@@ -97,10 +97,10 @@ class ModelLoader:
     def create_model(self, vocab_size: int) -> KokoroModel:
         """Create model with appropriate architecture parameters"""
         # Define model parameters that should match training configuration
-        EMBED_DIM = 512
+        EMBED_DIM = 768
         NUM_LAYERS = 6
         NUM_HEADS = 8
-        FF_DIM = 2048
+        FF_DIM = 3072
         DROPOUT = 0.1
         MAX_DECODER_SEQ_LEN = 4000  # Match checkpoint's PE size
 
