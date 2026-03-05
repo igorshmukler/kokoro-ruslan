@@ -223,10 +223,55 @@ def load_checkpoint(
         try:
             model.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
-            raise RuntimeError(
-                "Strict checkpoint model load failed due to architecture/state mismatch. "
-                f"Original error: {e}"
-            ) from e
+            # Check whether ALL missing keys belong to variance_adaptor sub-components
+            # that were added in a later architecture revision. If so, allow a partial
+            # load so that training can resume with those weights freshly initialised.
+            error_str = str(e)
+            import re as _re
+            missing_match = _re.search(r'Missing key\(s\) in state_dict:\s*(.*?)(?:\.\s*Unexpected|\Z)', error_str, _re.DOTALL)
+            unexpected_match = _re.search(r'Unexpected key\(s\) in state_dict:\s*(.*?)(?:\.\s*Missing|\Z)', error_str, _re.DOTALL)
+
+            # Collect missing keys
+            missing_keys: list = []
+            if missing_match:
+                missing_keys = [k.strip().strip('"') for k in missing_match.group(1).split(',') if k.strip()]
+
+            # Collect unexpected keys (keys in ckpt but not in model)
+            unexpected_keys: list = []
+            if unexpected_match:
+                unexpected_keys = [k.strip().strip('"') for k in unexpected_match.group(1).split(',') if k.strip()]
+
+            # Define the namespace prefixes that represent newly-added sub-modules
+            _NEW_VARIANCE_PREFIX = 'duration_adaptor.variance_adaptor.'
+
+            all_missing_are_new_variance = missing_keys and all(
+                k.startswith(_NEW_VARIANCE_PREFIX) for k in missing_keys
+            )
+            no_unexpected = not unexpected_keys
+
+            if all_missing_are_new_variance and no_unexpected:
+                logger.warning(
+                    "Checkpoint is missing variance_adaptor sub-module weights "
+                    f"({len(missing_keys)} keys). This is an expected architecture "
+                    "migration (old checkpoint predates the restructured VarianceAdaptor). "
+                    "Loading shared weights and initialising missing keys from scratch."
+                )
+                # Load the compatible weights; missing keys keep their randomly-initialised values
+                incompatible = model.load_state_dict(model_state_dict, strict=False)
+                if incompatible.unexpected_keys:
+                    raise RuntimeError(
+                        "Partial checkpoint load produced unexpected keys, aborting. "
+                        f"Unexpected: {incompatible.unexpected_keys}"
+                    )
+                logger.info(
+                    f"Partial load succeeded. {len(incompatible.missing_keys)} variance_adaptor "
+                    "keys will train from random initialisation."
+                )
+            else:
+                raise RuntimeError(
+                    "Strict checkpoint model load failed due to architecture/state mismatch. "
+                    f"Original error: {e}"
+                ) from e
 
         if 'optimizer_state_dict' not in checkpoint_dict or 'scheduler_state_dict' not in checkpoint_dict:
             raise RuntimeError(

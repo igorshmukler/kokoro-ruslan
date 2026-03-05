@@ -62,9 +62,22 @@ class TrainingConfig:
 
     # Loss weights
     duration_loss_weight: float = 0.1
-    stop_token_loss_weight: float = 1.0
+    # Stop token BCE dominated early training (~21% of loss by epoch 6, ~15% at epoch 18).
+    # Halving from 1.0 → 0.5 reduces total loss by ~0.08-0.10 once stop is learned,
+    # freeing capacity for mel reconstruction to improve.
+    stop_token_loss_weight: float = 0.5
     pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
+
+    # SpecAugment (Park et al. 2019) — applied to teacher-forced mel decoder input only.
+    # The unmasked original mel is still used as the loss target, so gradients for
+    # unmasked frames are unaffected.  Masking forces the decoder to rely on encoder
+    # context rather than memorising the previous mel frame.
+    use_spec_augment: bool = True
+    spec_augment_time_mask_max: int = 30   # Max consecutive frames masked per mask
+    spec_augment_freq_mask_max: int = 10   # Max consecutive mel bins masked per mask
+    spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
+    spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Stop token class-imbalance correction.
     # BCE on stop tokens is extremely skewed: only 1 positive frame per sequence
     # among ~T negatives (T ≈ average mel length).  Without pos_weight the model

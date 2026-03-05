@@ -19,7 +19,6 @@ import faulthandler
 from pathlib import Path
 
 from typing import Tuple, Dict, Any, Optional
-from dataclasses import dataclass
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -1090,6 +1089,33 @@ class KokoroTrainer:
             if self.use_warmup:
                 self.current_optimizer_step += 1
 
+    @staticmethod
+    def _apply_spec_augment(
+        mel_specs: torch.Tensor,
+        time_mask_max: int = 30,
+        freq_mask_max: int = 10,
+        num_time_masks: int = 2,
+        num_freq_masks: int = 2,
+    ) -> torch.Tensor:
+        """Apply SpecAugment (Park et al. 2019): random time & frequency masking.
+
+        mel_specs: (B, T, mel_dim) — teacher-forced decoder input.
+        Returns a masked clone; the original tensor is NOT modified.
+        Only the teacher-forced input is masked; the loss target remains the
+        unmasked ground-truth mel, so gradients on unmasked frames are exact.
+        """
+        B, T, mel_dim = mel_specs.shape
+        masked = mel_specs.clone()
+        for _ in range(num_time_masks):
+            t = torch.randint(0, max(1, min(time_mask_max, T // 4)), (1,)).item()
+            t0 = torch.randint(0, max(1, T - t), (1,)).item()
+            masked[:, t0:t0 + t, :] = 0.0
+        for _ in range(num_freq_masks):
+            f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
+            f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
+            masked[:, :, f0:f0 + f] = 0.0
+        return masked
+
     def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
                          mel_specs, phoneme_durations, stop_token_targets,
                          mel_lengths, phoneme_lengths,
@@ -1339,7 +1365,32 @@ class KokoroTrainer:
                 if checkpoint is None:
                     checkpoint = torch.load(checkpoint_path, map_location=self.device)
                 if 'ema_model_state_dict' in checkpoint:
-                    self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+                    try:
+                        self.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+                    except RuntimeError as _ema_err:
+                        # Architecture migration: if the only missing keys are the
+                        # newly-restructured variance_adaptor sub-modules, do a
+                        # partial load and fill the missing keys from the current
+                        # model (which already has them freshly initialised).
+                        _NEW_VP = 'duration_adaptor.variance_adaptor.'
+                        _incompat = self.ema_model.load_state_dict(
+                            checkpoint['ema_model_state_dict'], strict=False
+                        )
+                        if _incompat.unexpected_keys or not all(
+                            k.startswith(_NEW_VP) for k in _incompat.missing_keys
+                        ):
+                            raise
+                        # Copy freshly-initialised weights from current model into EMA
+                        _current_sd = self.model.state_dict()
+                        _ema_sd = self.ema_model.state_dict()
+                        for k in _incompat.missing_keys:
+                            if k in _current_sd:
+                                _ema_sd[k] = _current_sd[k].clone()
+                        self.ema_model.load_state_dict(_ema_sd)
+                        logger.warning(
+                            f"EMA partial load: {len(_incompat.missing_keys)} variance_adaptor "
+                            "keys initialised from current model (architecture migration)."
+                        )
                     if 'ema_updates' in checkpoint:
                         self.ema_updates = checkpoint['ema_updates']
                     logger.info(f"Loaded EMA model state from checkpoint (updates: {self.ema_updates})")
@@ -1712,7 +1763,10 @@ class KokoroTrainer:
         else:
             return (0.0, 0.0, 0.0, 0.0)
 
-    def save_checkpoint_with_scaler(self, epoch: int, loss: float, val_loss: float = None):
+    def save_checkpoint_with_scaler(
+        self, epoch: int, loss: float, val_loss: float = None,
+        val_mel_loss: float = None, val_stop_loss: float = None, val_dur_loss: float = None,
+    ):
         """Save checkpoint including scaler state and EMA weights"""
         model_metadata = build_model_metadata(self.config, self.model)
         checkpoint = {
@@ -1725,6 +1779,9 @@ class KokoroTrainer:
             'loss': loss,
             'train_loss': loss,
             'val_loss': val_loss,
+            'val_mel_loss': val_mel_loss,
+            'val_stop_loss': val_stop_loss,
+            'val_dur_loss': val_dur_loss,
             'config': self.config,
             'model_metadata': model_metadata,
         }
@@ -1843,6 +1900,17 @@ class KokoroTrainer:
                         stress_indices = batch.get('stress_indices', None)
                         if stress_indices is not None:
                             stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
+                        # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
+                        if getattr(self.config, 'use_spec_augment', False):
+                            mel_for_model = KokoroTrainer._apply_spec_augment(
+                                mel_specs,
+                                time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 30),
+                                freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
+                                num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
+                                num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),
+                            )
+                        else:
+                            mel_for_model = mel_specs
                 else:
                     # No profiler overhead
                     non_blocking = self.device.type == 'cuda'
@@ -1869,6 +1937,17 @@ class KokoroTrainer:
                     stress_indices = batch.get('stress_indices', None)
                     if stress_indices is not None:
                         stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
+                    # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
+                    if getattr(self.config, 'use_spec_augment', False):
+                        mel_for_model = KokoroTrainer._apply_spec_augment(
+                            mel_specs,
+                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 30),
+                            freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
+                            num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
+                            num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),
+                        )
+                    else:
+                        mel_for_model = mel_specs
 
                     # Validate tensor dimensions to prevent MPS overflow
                     max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
@@ -1961,24 +2040,24 @@ class KokoroTrainer:
                         if self.use_mixed_precision:
                             with self.get_autocast_context():
                                 predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                    self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                    self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
                                              pitch_targets=pitches, energy_targets=energies,
                                              stress_indices=stress_indices)
                         else:
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
                                          pitch_targets=pitches, energy_targets=energies,
                                          stress_indices=stress_indices)
                 else:
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                                self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
                                          pitch_targets=pitches, energy_targets=energies,
                                          stress_indices=stress_indices)
                     else:
                         predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
+                            self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
                                      pitch_targets=pitches, energy_targets=energies,
                                      stress_indices=stress_indices)
 
@@ -2775,6 +2854,7 @@ class KokoroTrainer:
 
             # Run validation if enabled
             current_val_loss = None
+            val_mel_loss = val_dur_loss = val_stop_loss = None
             validation_interval = getattr(self.config, 'validation_interval', 1)
             if self.val_dataloader is not None and (epoch + 1) % validation_interval == 0:
                 val_cache_start = self._snapshot_cache_stats(self.val_dataset)
@@ -2799,7 +2879,10 @@ class KokoroTrainer:
                     logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
 
                     # Save best model
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss, val_loss=val_total_loss)
+                    self.save_checkpoint_with_scaler(
+                        epoch, avg_total_loss, val_loss=val_total_loss,
+                        val_mel_loss=val_mel_loss, val_stop_loss=val_stop_loss, val_dur_loss=val_dur_loss,
+                    )
                 else:
                     self.epochs_without_improvement += 1
                     logger.info(f"⚠ No validation improvement for {self.epochs_without_improvement} epoch(s) "
@@ -2842,7 +2925,10 @@ class KokoroTrainer:
                 should_save_periodic = (self.val_dataloader is None or
                                        self.epochs_without_improvement > 0)
                 if should_save_periodic:
-                    self.save_checkpoint_with_scaler(epoch, avg_total_loss, val_loss=current_val_loss)
+                    self.save_checkpoint_with_scaler(
+                        epoch, avg_total_loss, val_loss=current_val_loss,
+                        val_mel_loss=val_mel_loss, val_stop_loss=val_stop_loss, val_dur_loss=val_dur_loss,
+                    )
                     logger.info(f"Periodic checkpoint saved for epoch {epoch+1}")
 
             # Strategic memory cleanup at epoch end
