@@ -3473,7 +3473,7 @@ if __name__ == "__main__":
             self.save_every = 5
             self.resume_checkpoint = 'auto'
             self.n_mels = 80
-            self.hidden_dim = 512
+            self.hidden_dim = 768
             self.duration_loss_weight = 0.1
             self.stop_token_loss_weight = 1.0
             self.max_seq_length = 2500

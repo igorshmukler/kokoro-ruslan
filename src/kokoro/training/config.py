@@ -46,12 +46,12 @@ class TrainingConfig:
 
     # Model parameters
     n_mels: int = 80
-    hidden_dim: int = 512
+    hidden_dim: int = 768
     n_encoder_layers: int = 6
     n_decoder_layers: int = 6
     n_heads: int = 8
-    encoder_ff_dim: int = 2048
-    decoder_ff_dim: int = 2048
+    encoder_ff_dim: int = 3072
+    decoder_ff_dim: int = 3072
     encoder_dropout: float = 0.1
     max_decoder_seq_len: int = 4000
 
