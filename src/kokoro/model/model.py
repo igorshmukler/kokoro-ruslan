@@ -128,10 +128,13 @@ class KokoroModel(nn.Module):
             )
             # Use a simple adaptor which calls the predictor and length_regulate
             # Note: pass model's prediction function to preserve any checkpointing
-            # Pass the bound instance method `_length_regulate` so tests that
-            # mock `self._length_regulate` will observe calls made by the
-            # adaptor (keeps behavior identical but test-friendly).
-            self.duration_adaptor = SimpleDurationAdaptor(self._predict_durations, self._length_regulate)
+            # Pass a callable wrapper that resolves `self._length_regulate` at
+            # call time so tests which patch `model._length_regulate` will be
+            # observed by the adaptor.
+            self.duration_adaptor = SimpleDurationAdaptor(
+                self._predict_durations,
+                lambda encoder_outputs, durations, mask: self._length_regulate(encoder_outputs, durations, mask)
+            )
             logger.info("Variance predictor disabled, using basic duration predictor via adaptor")
 
         # Mel feature projection to match hidden dimension for decoder input
