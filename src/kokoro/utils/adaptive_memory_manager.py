@@ -493,3 +493,68 @@ class AdaptiveMemoryManager:
             })
 
         return stats
+
+    def print_report(self) -> None:
+        """Print a comprehensive human-readable memory management report."""
+        report = self.get_memory_report()
+
+        print("\n" + "="*60)
+        print("ADAPTIVE MEMORY MANAGEMENT REPORT")
+        print("="*60)
+
+        print(f"\nDevice: {report['device_type'].upper()}")
+        print(f"Total Batches Processed: {report['total_batches']}")
+        print(f"Total Cleanups Performed: {report['cleanup_count']}")
+        print(f"Cleanup Frequency: {report['cleanup_frequency']:.4f} cleanups/batch")
+
+        print(f"\nPerformance Impact:")
+        print(f"  Total Cleanup Time: {report['total_cleanup_time_ms']:.1f}ms")
+        print(f"  Average Cleanup Time: {report['avg_cleanup_time_ms']:.1f}ms")
+        print(f"  Cleanup Overhead: {report['cleanup_overhead_percent']:.2f}%")
+
+        print(f"\nMemory Status:")
+        print(f"  Current Pressure Level: {report['current_pressure'].upper()}")
+        print(f"  Current Usage: {report.get('current_memory_usage_percent', 0):.1f}%")
+        print(f"  Average Usage: {report.get('avg_memory_usage_percent', 0):.1f}%")
+        print(f"  Peak Usage: {report.get('max_memory_usage_percent', 0):.1f}%")
+        print(f"  Memory Trend: {report['memory_trend']:+.2f}% (positive = increasing)")
+        print(f"  Consecutive High Pressure Batches: {report['consecutive_high_pressure']}")
+
+        print(f"\nRecommendations:")
+        recommendations = []
+
+        # Performance recommendations
+        if report['cleanup_overhead_percent'] > 5.0:
+            recommendations.append("• High cleanup overhead detected - consider optimizing cleanup frequency")
+
+        if report['cleanup_frequency'] > 0.1:
+            recommendations.append("• Very frequent cleanups - consider increasing batch size or reducing model size")
+
+        # Memory recommendations
+        if report.get('avg_memory_usage_percent', 0) > 85:
+            recommendations.append("• High average memory usage - consider reducing batch size")
+            if report['device_type'] == 'mps':
+                recommendations.append("• For MPS: Unified memory architecture may benefit from smaller batches")
+
+        if report['memory_trend'] > 5.0:
+            recommendations.append("• Memory usage increasing - potential memory leak or insufficient cleanup")
+
+        if report['consecutive_high_pressure'] > 50:
+            recommendations.append("• Sustained high memory pressure - consider model architecture optimization")
+
+        # Device-specific recommendations
+        if report['device_type'] == 'mps':
+            recommendations.append("• MPS detected: Monitor for memory fragmentation in unified memory")
+            if report.get('avg_memory_usage_percent', 0) > 70:
+                recommendations.append("• Consider using smaller batch sizes for MPS vs equivalent CUDA setup")
+        elif report['device_type'] == 'cuda':
+            if report['cleanup_frequency'] < 0.01:
+                recommendations.append("• CUDA: Low cleanup frequency may indicate room for batch size increase")
+
+        if not recommendations:
+            recommendations.append("• Memory management appears optimal for current configuration")
+
+        for rec in recommendations:
+            print(rec)
+
+        print("="*60)

@@ -2,6 +2,84 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.26 (2026-03-06)
+
+- Refactored trainer
+
+### Bug fixes (decoder regularization)
+
+- **Decoder input dropout now honors constructor config** (`model.py`): `_prepare_training_decoder_inputs` previously applied `torch.nn.functional.dropout(..., p=0.3, ...)` with a hardcoded probability, ignoring `KokoroModel(decoder_input_dropout=...)`. This made architectural tuning ineffective and could over-regularize teacher-forced decoding. Fixed by using `self.decoder_input_dropout` at the dropout call site.
+
+### Unit tests added
+
+- `tests/unit/test_decoder_helpers.py` — added `test_prepare_training_decoder_inputs_uses_configured_decoder_input_dropout`, which monkeypatches `torch.nn.functional.dropout` and asserts that `_prepare_training_decoder_inputs` passes the configured `decoder_input_dropout` value (and `training=True`).
+
+## 0.0.25 (2026-03-05)
+
+### Model architecture update
+
+- Increased default model capacity for new training runs:
+  - `hidden_dim`: `512 -> 768`
+  - `encoder_ff_dim`: `2048 -> 3072`
+  - `decoder_ff_dim`: `2048 -> 3072`
+- Updated both training defaults (`training/config.py`) and model construction defaults (`model_loader.py`) so train/infer paths stay aligned.
+- Trainer model instantiation now forwards architecture fields (`n_encoder_layers`, `n_heads`, `encoder_ff_dim`, `encoder_dropout`, `n_decoder_layers`, `decoder_ff_dim`, `max_decoder_seq_len`) from `TrainingConfig` instead of relying on constructor defaults.
+
+### Bug fixes
+
+- **OneCycle warmup handoff continuity** (`trainer.py`): when manual warmup is enabled, OneCycleLR now uses `div_factor=max_lr_multiplier` so LR starts exactly at `learning_rate` after warmup, avoiding a warmup→scheduler LR jump.
+- **Resume-time scheduler consistency** (`trainer.py`): OneCycle reconstruction now uses the same effective `div_factor` that was used at creation.
+- **Stale metadata FF-dim mismatch guard** (`inference.py`): if checkpoint metadata `encoder_ff_dim` / `decoder_ff_dim` disagree with actual `linear1.weight` shapes, inference auto-corrects to weight-derived values and logs a warning, preventing shape-load failures from stale config metadata.
+
+### Unit tests added
+
+- `tests/unit/test_onecycle_warmup_continuity.py` — validates smooth LR continuity across linear warmup into OneCycle phase.
+
+## 0.0.24 (2026-03-05)
+
+### Refactor (model/inference structure)
+
+- **Autoregressive inference extracted** (`model/generator.py`): introduced `KokoroGenerator` to encapsulate generation loop, stop criteria, cache precompute/updates, and inference-time housekeeping.
+- **Encode/expand path unified** (`model.py`): added `_encode_and_expand` helper used by both training and inference to reduce divergence between code paths.
+- **Training decoder input prep unified** (`model.py`): added `_prepare_training_decoder_inputs` helper for shift/pad, projection, dropout, positional encoding, and mask handling.
+- **Duration adaptor interface unified** (`model.py`): both variance-enabled and fallback duration paths now flow through a common adaptor interface (`VarianceAdaptorWrapper` / `SimpleDurationAdaptor`) to keep behavior consistent.
+
+### Bug fixes and compatibility
+
+- **Legacy variance-adaptor checkpoint compatibility** (`trainer.py`): EMA checkpoint loading now handles older key layouts by performing a partial non-strict load and mapping compatible parameters into the current structure.
+- **Stop-token loss rebalanced** (`training/config.py`): default `stop_token_loss_weight` reduced from `1.0` to `0.5`.
+
+### Unit tests added
+
+- `tests/unit/test_encode_and_expand.py`
+- `tests/unit/test_generator.py`
+- `tests/unit/test_model_refactors.py`
+- `tests/unit/test_model_log_memory_refactor.py`
+- `tests/unit/test_spec_augment.py`
+- `tests/unit/test_decoder_helpers.py` (expanded for decoder helper coverage)
+
+## 0.0.23 (2026-03-03)
+
+### Training stability and observability
+
+- **OneCycle tuning** (`training/config.py`): reduced aggressiveness (`max_lr_multiplier: 3.0 -> 2.0`, `pct_start: 0.4 -> 0.3`) for more stable early training.
+- **Localized gradient clipping expanded** (`trainer.py`): added dedicated FFN clipping controls (`ffn_spike_clip_norm`, `encoder_ffn_spike_clip_norm`) and extended pre-clip logic to target known spike-prone `linear1/linear2` weights.
+- **TensorBoard resume cleanup** (`trainer.py`): writer is reopened with `purge_step` on resume to hide stale events beyond resume step.
+- **Scheduler resume reconstruction** (`trainer.py`): OneCycleLR is rebuilt from current config after checkpoint resume to avoid stale schedule boundaries from old optimizer metadata.
+- **Histogram logging** (`trainer.py`): added epoch-level parameter histogram logging for better training diagnostics.
+- **Checkpoint metrics** (`trainer.py`): `val_loss` is now included in checkpoint payload.
+
+### Model behavior updates
+
+- **Decoder pre-net dropout introduced** (`model.py`): training path applies dropout to projected decoder inputs (`p=0.3`) to reduce teacher-forcing over-reliance.
+- **Inference collapse guard** (`model.py`): added energy-based early-stop fallback when recent generated frames indicate prolonged near-silence collapse.
+
+### Unit tests added
+
+- `tests/unit/test_trainer_adaptive_stabilization.py`
+- `tests/unit/test_trainer_checkpoint_step_counters.py`
+- `tests/unit/test_trainer_loss_stability.py`
+
 ## 0.0.22 (2026-02-27)
 
 ### New feature — stress parallel embedding

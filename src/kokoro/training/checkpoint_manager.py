@@ -3,12 +3,15 @@
 Checkpoint management utilities
 """
 
+import math
 import os
 import torch
 import pickle
 from pathlib import Path
 from typing import Optional, Tuple, Dict, Any
 import logging
+
+from torch.utils.tensorboard import SummaryWriter
 
 from kokoro.training.config import TrainingConfig
 from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
@@ -333,6 +336,202 @@ def load_checkpoint(
         except Exception as e2:
             logger.error(f"Error loading checkpoint even with weights_only=False: {e2}")
             raise e2
+
+
+def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=None) -> None:
+    """Resume all training state from a checkpoint into *trainer*.
+
+    Handles model weights, optimizer, scheduler, scaler (AMP), EMA, step
+    counters, TensorBoard writer purge, and OneCycleLR reconstruction.
+    Mutates *trainer* in-place; no return value.
+
+    Args:
+        trainer: A ``KokoroTrainer`` instance (typed as ``Any`` to avoid a
+            circular import — only attribute access is required).
+        _load_checkpoint_fn: Override for ``load_checkpoint``; used by tests
+            to inject a monkeypatched version without altering this module.
+        _SummaryWriter: Override for ``SummaryWriter``; same rationale.
+    """
+    _lc = _load_checkpoint_fn if _load_checkpoint_fn is not None else load_checkpoint
+    _SW = _SummaryWriter if _SummaryWriter is not None else SummaryWriter
+
+    config = trainer.config
+
+    if not config.resume_checkpoint:
+        logger.info("No resume checkpoint specified, starting from scratch.")
+        return
+
+    checkpoint_path = None
+    if config.resume_checkpoint.lower() == 'auto':
+        checkpoint_path = find_latest_checkpoint(config.output_dir)
+        if not checkpoint_path:
+            logger.info("No checkpoint found for auto-resume, starting from scratch.")
+            return
+    else:
+        checkpoint_path = config.resume_checkpoint
+        if not os.path.exists(checkpoint_path):
+            logger.error(f"Checkpoint not found: {checkpoint_path}")
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+
+    logger.info(f"Resuming from checkpoint: {checkpoint_path}")
+    trainer.start_epoch, trainer.best_loss, phoneme_processor = _lc(
+        checkpoint_path, trainer.model, trainer.optimizer, trainer.scheduler, config.output_dir
+    )
+
+    checkpoint = None
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+    except Exception as e:
+        logger.warning(f"Could not load raw checkpoint metadata: {e}")
+
+    # Load scaler state if available
+    if trainer.use_mixed_precision and trainer.scaler:
+        try:
+            if checkpoint is None:
+                checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+            if 'scaler' in checkpoint:
+                trainer.scaler.load_state_dict(checkpoint['scaler'])
+                logger.info(f"Loaded {trainer.device_type.upper()} scaler state from checkpoint")
+            else:
+                logger.info(f"No scaler state found in checkpoint, using default for {trainer.device_type}")
+        except Exception as e:
+            logger.warning(f"Could not load scaler state: {e}")
+
+    # Load EMA model state if available
+    if trainer.use_ema and trainer.ema_model is not None:
+        try:
+            if checkpoint is None:
+                checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+            if 'ema_model_state_dict' in checkpoint:
+                try:
+                    trainer.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+                except RuntimeError as _ema_err:
+                    # Architecture migration: if the only missing keys are the
+                    # newly-restructured variance_adaptor sub-modules, do a
+                    # partial load and fill the missing keys from the current
+                    # model (which already has them freshly initialised).
+                    _NEW_VP = 'duration_adaptor.variance_adaptor.'
+                    _incompat = trainer.ema_model.load_state_dict(
+                        checkpoint['ema_model_state_dict'], strict=False
+                    )
+                    if _incompat.unexpected_keys or not all(
+                        k.startswith(_NEW_VP) for k in _incompat.missing_keys
+                    ):
+                        raise
+                    # Copy freshly-initialised weights from current model into EMA
+                    _current_sd = trainer.model.state_dict()
+                    _ema_sd = trainer.ema_model.state_dict()
+                    for k in _incompat.missing_keys:
+                        if k in _current_sd:
+                            _ema_sd[k] = _current_sd[k].clone()
+                    trainer.ema_model.load_state_dict(_ema_sd)
+                    logger.warning(
+                        f"EMA partial load: {len(_incompat.missing_keys)} variance_adaptor "
+                        "keys initialised from current model (architecture migration)."
+                    )
+                if 'ema_updates' in checkpoint:
+                    trainer.ema_updates = checkpoint['ema_updates']
+                logger.info(f"Loaded EMA model state from checkpoint (updates: {trainer.ema_updates})")
+            else:
+                logger.info("No EMA state found in checkpoint, initializing EMA from current model")
+                trainer.ema_model.load_state_dict(trainer.model.state_dict())
+        except Exception as e:
+            logger.warning(f"Could not load EMA state: {e}")
+
+    if checkpoint is not None:
+        if 'current_optimizer_step' in checkpoint:
+            trainer.current_optimizer_step = int(checkpoint['current_optimizer_step'])
+            logger.info(f"Restored current_optimizer_step={trainer.current_optimizer_step}")
+        else:
+            logger.info("No current_optimizer_step found in checkpoint, using default counter state")
+
+        if 'optimizer_steps_completed' in checkpoint:
+            trainer.optimizer_steps_completed = int(checkpoint['optimizer_steps_completed'])
+            logger.info(f"Restored optimizer_steps_completed={trainer.optimizer_steps_completed}")
+        else:
+            logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
+
+    trainer.dataset.phoneme_processor = phoneme_processor
+
+    logger.info(f"Resumed from epoch {trainer.start_epoch}, best loss {trainer.best_loss:.4f}")
+
+    # Purge stale TensorBoard events from epochs after the resume point.
+    purge_step = trainer.current_optimizer_step + 1
+    trainer.writer.close()
+    trainer.writer = _SW(log_dir=trainer.log_dir, purge_step=purge_step)
+    logger.info(
+        f"TensorBoard writer reopened with purge_step={purge_step} "
+        f"(hiding stale events from optimizer_step >= {purge_step})"
+    )
+
+    # Reconstruct the OneCycleLR from the CURRENT config to avoid stale phase
+    # definitions loaded via load_state_dict() from a checkpoint that may have
+    # been saved with different max_lr / pct_start values.
+    if trainer.scheduler_per_batch and isinstance(trainer.scheduler, torch.optim.lr_scheduler.OneCycleLR):
+        onecycle_steps = getattr(trainer, '_onecycle_steps', None)
+        max_lr = getattr(trainer, '_onecycle_max_lr', None)
+        pct_start = getattr(trainer, '_onecycle_pct_start', 0.3)
+        if onecycle_steps is not None and max_lr is not None:
+            last_lr = trainer.optimizer.state_dict()['param_groups'][0]['lr']
+
+            _div_factor = getattr(trainer, '_onecycle_div_factor',
+                float(getattr(config, 'max_lr_multiplier', 2.0))
+                if getattr(trainer, 'use_warmup', False) else 25.0)
+            base_lr  = max_lr / _div_factor
+            final_lr = max_lr / 10000.0
+            peak_step = int(pct_start * onecycle_steps)
+
+            if last_lr >= max_lr:
+                target_step = peak_step
+                resume_lr   = max_lr
+                logger.info(
+                    f"Resume LR ({last_lr:.2e}) >= new max_lr ({max_lr:.2e}); "
+                    f"positioning OneCycleLR at peak (step {peak_step})."
+                )
+            elif last_lr >= base_lr:
+                ratio = (last_lr - base_lr) / (max_lr - base_lr)
+                t = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * ratio))) / math.pi
+                target_step = max(0, min(peak_step, int(round(t * peak_step))))
+                resume_lr   = last_lr
+            elif last_lr >= final_lr:
+                decay_steps = onecycle_steps - peak_step
+                ratio = (last_lr - final_lr) / (max_lr - final_lr)
+                t = math.acos(max(-1.0, min(1.0, 2.0 * ratio - 1.0))) / math.pi
+                target_step = max(peak_step, min(onecycle_steps - 1, peak_step + int(round(t * decay_steps))))
+                resume_lr   = last_lr
+            else:
+                target_step = onecycle_steps - 1
+                resume_lr   = final_lr
+
+            saved_lr = [g['lr'] for g in trainer.optimizer.param_groups]
+            trainer.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+                trainer.optimizer,
+                max_lr=max_lr,
+                total_steps=onecycle_steps,
+                pct_start=pct_start,
+                anneal_strategy='cos',
+                cycle_momentum=False,
+                base_momentum=0.85,
+                max_momentum=0.95,
+                div_factor=_div_factor,
+                final_div_factor=10000.0,
+                last_epoch=-1,
+            )
+            trainer.scheduler.last_epoch = target_step
+            resume_lr = min(resume_lr, max_lr)
+            for g in trainer.optimizer.param_groups:
+                g['lr'] = resume_lr
+            trainer.scheduler._last_lr = [resume_lr for _ in trainer.optimizer.param_groups]
+
+            logger.info(
+                f"OneCycleLR reconstructed from current config after resume: "
+                f"max_lr={max_lr:.2e}, total_steps={onecycle_steps}, pct_start={pct_start}, "
+                f"last_lr={last_lr:.2e} → positioned at step {target_step}/{onecycle_steps}, "
+                f"resume_lr={resume_lr:.2e}"
+            )
+            del saved_lr
+        else:
+            logger.warning("Could not reconstruct OneCycleLR after resume: missing _onecycle_steps or _onecycle_max_lr")
 
 
 def find_latest_checkpoint(output_dir: str) -> Optional[str]:
