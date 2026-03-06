@@ -1,10 +1,8 @@
 """
-Tests covering the fix: VarianceAdaptor.forward uses exp() on duration_pred
-before rounding when duration_target is None (inference mode).
+Tests covering duration decoding in VarianceAdaptor inference mode.
 
-Bug: old code did `torch.round(duration_pred)` directly on log1p-domain values
-     (e.g. log1p(5) ≈ 1.79 → rounds to 2 frames, not the correct 6).
-Fix: new code does `torch.round(torch.exp(duration_pred))` → exp(1.79) ≈ 6.
+Duration predictor outputs are trained in log1p-domain, so inference must decode
+with expm1 before rounding: round(expm1(log1p(d))) == d.
 """
 import math
 import torch
@@ -38,18 +36,18 @@ def _adaptor_with_fixed_predictor(log_val: float) -> VarianceAdaptor:
 
 
 # ---------------------------------------------------------------------------
-# 1. Frame count aligns with exp() of the log-domain prediction
+# 1. Frame count aligns with expm1() of the log-domain prediction
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("n_frames,n_phonemes", [
     (5, 4),
     (7, 3),
-    (1, 6),   # edge: exp(log1p(1)) ≈ round(2.0) = 2 frames each
+    (1, 6),
     (10, 2),
 ])
-def test_inference_frame_count_matches_exp_of_log_prediction(n_frames, n_phonemes):
+def test_inference_frame_count_matches_expm1_of_log_prediction(n_frames, n_phonemes):
     """
     With a fixed predictor outputting log1p(n_frames), the expanded sequence
-    should have n_phonemes * round(exp(log1p(n_frames))) frames.
+    should have n_phonemes * round(expm1(log1p(n_frames))) frames.
     """
     log_val = math.log1p(n_frames)
     adaptor = _adaptor_with_fixed_predictor(log_val)
@@ -62,7 +60,7 @@ def test_inference_frame_count_matches_exp_of_log_prediction(n_frames, n_phoneme
         pitch_target=None, energy_target=None, duration_target=None
     )
 
-    expected_frames_per_phoneme = round(math.exp(log_val))
+    expected_frames_per_phoneme = round(math.expm1(log_val))
     expected_total = n_phonemes * expected_frames_per_phoneme
     assert adapted.shape[1] == expected_total, (
         f"Expected {expected_total} frames ({n_phonemes} phonemes × "
@@ -71,12 +69,12 @@ def test_inference_frame_count_matches_exp_of_log_prediction(n_frames, n_phoneme
 
 
 # ---------------------------------------------------------------------------
-# 2. Inference gives more frames than naïve rounding of log-domain prediction
+# 2. Inference decode is exact inverse of log1p encoding
 # ---------------------------------------------------------------------------
-def test_inference_exp_gives_more_frames_than_raw_round():
+def test_inference_expm1_roundtrip_matches_duration():
     """
-    Regression: without exp(), log1p(5) ≈ 1.79 rounds to 2 frames.
-    With exp(), it correctly produces ~6 frames.
+    Regression: decoding log1p(5) in inference must return exactly 5 frames,
+    not 2 (raw-round of log value) or 6 (exp decode).
     """
     log_val = math.log1p(5)   # ≈ 1.7918
     adaptor = _adaptor_with_fixed_predictor(log_val)
@@ -85,7 +83,7 @@ def test_inference_exp_gives_more_frames_than_raw_round():
     n_phonemes = 4
     encoder_output = torch.randn(1, n_phonemes, hidden)
 
-    # Inference path — should use exp()
+    # Inference path — should use expm1()
     adapted_infer, _, _, _, _ = adaptor(
         encoder_output, duration_target=None,
         pitch_target=None, energy_target=None
@@ -98,17 +96,22 @@ def test_inference_exp_gives_more_frames_than_raw_round():
         pitch_target=None, energy_target=None
     )
 
+    expected = n_phonemes * 5
+    assert adapted_infer.shape[1] == expected, (
+        "Inference with expm1() must invert log1p exactly "
+        f"(expected {expected}, got {adapted_infer.shape[1]})"
+    )
     assert adapted_infer.shape[1] > adapted_wrong.shape[1], (
-        "Inference with exp() should yield more frames than raw-round of log1p value "
+        "Inference with expm1() should yield more frames than raw-round of log1p value "
         f"(got {adapted_infer.shape[1]} vs {adapted_wrong.shape[1]})"
     )
 
 
 # ---------------------------------------------------------------------------
-# 3. Negative prediction clamped to 0 (not negative frames)
+# 3. Negative prediction clamped to 0 (then padded to minimum frames)
 # ---------------------------------------------------------------------------
 def test_inference_negative_prediction_clamped_to_zero_frames():
-    """exp of a large negative number → near 0 after clamp(min=0)."""
+    """expm1 of a large negative number -> < 0, then clamp(min=0)."""
     adaptor = _adaptor_with_fixed_predictor(-100.0)  # exp(-100) ≈ 0 → clamp → 0
 
     hidden = adaptor.hidden_dim
@@ -119,17 +122,17 @@ def test_inference_negative_prediction_clamped_to_zero_frames():
         encoder_output, duration_target=None,
         pitch_target=None, energy_target=None
     )
-    # Should not crash; all durations = 0 so adapted has minimal frames
-    # (VarianceAdaptor pads to min_frames=3 to avoid kernel size errors)
+    # Should not crash; all durations = 0 so adapted is padded to min_frames=3.
     assert adapted.shape[0] == 1
+    assert adapted.shape[1] == 3
     assert adapted.shape[2] == hidden
 
 
 # ---------------------------------------------------------------------------
-# 4. exp(0) = 1 → each phoneme gets at least one frame
+# 4. expm1(0) = 0, then min_frames pad applies
 # ---------------------------------------------------------------------------
 def test_inference_zero_log_prediction_gives_one_frame_per_phoneme():
-    """log_pred=0 → exp(0)=1.0 → round(1.)=1 → 1 frame per phoneme."""
+    """log_pred=0 → expm1(0)=0.0 → round(0.)=0, then adaptor pads to 3 frames."""
     adaptor = _adaptor_with_fixed_predictor(0.0)
 
     hidden = adaptor.hidden_dim
@@ -141,8 +144,8 @@ def test_inference_zero_log_prediction_gives_one_frame_per_phoneme():
         pitch_target=None, energy_target=None
     )
 
-    assert adapted.shape[1] == n_phonemes, (
-        "exp(0)=1 frame per phoneme → total should equal n_phonemes"
+    assert adapted.shape[1] == 3, (
+        "expm1(0)=0 frame per phoneme, then min_frames padding should produce 3 frames"
     )
 
 
@@ -188,7 +191,7 @@ def test_inference_output_is_finite_and_correct_shape():
         pitch_target=None, energy_target=None
     )
 
-    expected_frames_per_phoneme = round(math.exp(log_val))  # round(5) = 5
+    expected_frames_per_phoneme = round(math.expm1(log_val))  # round(4) = 4
     expected_frames = n_phonemes * expected_frames_per_phoneme
 
     assert adapted.shape == (batch, expected_frames, hidden)
