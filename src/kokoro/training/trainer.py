@@ -1613,11 +1613,36 @@ class KokoroTrainer:
                     else:
                         mel_for_model = mel_specs
 
-                # Validate tensor dimensions to prevent MPS overflow
-                max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
-                if max_dim > 2000:
-                    logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
-                    continue
+                # Adaptive long-sequence handling: cap/truncate oversized batches
+                # instead of skipping them entirely so training still benefits from
+                # difficult long-form samples.
+                max_dim_cap = int(getattr(self.config, 'max_sequence_dim_cap', 2000))
+                transferred, mel_for_model, truncation_info = KokoroTrainer._cap_batch_sequence_dimensions(
+                    transferred=transferred,
+                    mel_for_model=mel_for_model,
+                    max_mel_len=max_dim_cap,
+                    max_phoneme_len=max_dim_cap,
+                )
+                if truncation_info['truncated']:
+                    logger.warning(
+                        "⚠️ BATCH %d - Capped long sequence dimensions "
+                        "(mel: %d→%d, phoneme: %d→%d) to keep training stable",
+                        batch_idx,
+                        truncation_info['orig_mel_len'],
+                        truncation_info['new_mel_len'],
+                        truncation_info['orig_phoneme_len'],
+                        truncation_info['new_phoneme_len'],
+                    )
+
+                mel_specs = transferred.mel_specs
+                phoneme_indices = transferred.phoneme_indices
+                phoneme_durations = transferred.phoneme_durations
+                stop_token_targets = transferred.stop_token_targets
+                mel_lengths = transferred.mel_lengths
+                phoneme_lengths = transferred.phoneme_lengths
+                pitches = transferred.pitches
+                energies = transferred.energies
+                stress_indices = transferred.stress_indices
 
                 # Log variance predictor ranges periodically only in verbose mode
                 if getattr(self.config, 'verbose', False) and batch_idx % 50 == 0 and pitches is not None and energies is not None:
@@ -2765,6 +2790,55 @@ class KokoroTrainer:
         remaining_including_current = max(1, int(num_batches) - int(batch_idx))
         already_accumulated = max(0, int(accumulated_step))
         return max(1, min(total_target, already_accumulated + remaining_including_current))
+
+    @staticmethod
+    def _cap_batch_sequence_dimensions(
+        *,
+        transferred: BatchOnDevice,
+        mel_for_model: torch.Tensor,
+        max_mel_len: int,
+        max_phoneme_len: int,
+    ) -> Tuple[BatchOnDevice, torch.Tensor, Dict[str, int | bool]]:
+        """Cap oversized mel/phoneme dimensions in a batch and keep training.
+
+        Returns updated ``(transferred, mel_for_model, info)`` where ``info``
+        records original/new lengths and whether truncation occurred.
+        """
+        info: Dict[str, int | bool] = {
+            'truncated': False,
+            'orig_mel_len': int(transferred.mel_specs.size(1)),
+            'new_mel_len': int(transferred.mel_specs.size(1)),
+            'orig_phoneme_len': int(transferred.phoneme_indices.size(1)),
+            'new_phoneme_len': int(transferred.phoneme_indices.size(1)),
+        }
+
+        mel_cap = max(1, int(max_mel_len))
+        phoneme_cap = max(1, int(max_phoneme_len))
+
+        if transferred.mel_specs.size(1) > mel_cap:
+            info['truncated'] = True
+            info['new_mel_len'] = mel_cap
+
+            transferred.mel_specs = transferred.mel_specs[:, :mel_cap, :]
+            mel_for_model = mel_for_model[:, :mel_cap, :]
+            transferred.stop_token_targets = transferred.stop_token_targets[:, :mel_cap]
+            transferred.mel_lengths = transferred.mel_lengths.clamp(max=mel_cap)
+            if transferred.pitches is not None:
+                transferred.pitches = transferred.pitches[:, :mel_cap]
+            if transferred.energies is not None:
+                transferred.energies = transferred.energies[:, :mel_cap]
+
+        if transferred.phoneme_indices.size(1) > phoneme_cap:
+            info['truncated'] = True
+            info['new_phoneme_len'] = phoneme_cap
+
+            transferred.phoneme_indices = transferred.phoneme_indices[:, :phoneme_cap]
+            transferred.phoneme_durations = transferred.phoneme_durations[:, :phoneme_cap]
+            transferred.phoneme_lengths = transferred.phoneme_lengths.clamp(max=phoneme_cap)
+            if transferred.stress_indices is not None:
+                transferred.stress_indices = transferred.stress_indices[:, :phoneme_cap]
+
+        return transferred, mel_for_model, info
 
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """
