@@ -1,4 +1,5 @@
 import torch
+import pytest
 
 from kokoro.model.model import KokoroModel
 
@@ -36,3 +37,34 @@ def test_project_mel_frame_and_project_decoder_outputs():
     pred_mel, stop_logits = model._project_decoder_outputs(dec_out)
     assert pred_mel.shape == (batch, 3, model.mel_dim)
     assert stop_logits.shape == (batch, 3)
+
+
+def test_prepare_training_decoder_inputs_uses_configured_decoder_input_dropout(monkeypatch):
+    configured_dropout = 0.17
+    model = KokoroModel(
+        vocab_size=30,
+        hidden_dim=64,
+        n_encoder_layers=1,
+        encoder_dropout=0.0,
+        decoder_input_dropout=configured_dropout,
+        use_variance_predictor=False,
+    )
+    model.train()
+
+    observed = {}
+
+    def fake_dropout(input_tensor, p=0.5, training=False, inplace=False):
+        observed["p"] = p
+        observed["training"] = training
+        return input_tensor
+
+    monkeypatch.setattr(torch.nn.functional, "dropout", fake_dropout)
+
+    batch = 2
+    mel_len = 6
+    mel_specs = torch.randn(batch, mel_len, model.mel_dim)
+
+    model._prepare_training_decoder_inputs(mel_specs, mel_padding_mask=None)
+
+    assert observed["p"] == pytest.approx(configured_dropout)
+    assert observed["training"] is True

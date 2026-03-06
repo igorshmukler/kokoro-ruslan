@@ -458,7 +458,7 @@ class KokoroModel(nn.Module):
         decoder_input_projected = self.mel_projection_in(decoder_input_mels)
 
         decoder_input_projected = torch.nn.functional.dropout(
-            decoder_input_projected, p=0.3, training=self.training
+            decoder_input_projected, p=self.decoder_input_dropout, training=self.training
         )
 
         decoder_input_projected_with_pe = self.encoder_positional_encoding(
