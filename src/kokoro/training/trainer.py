@@ -1046,7 +1046,8 @@ class KokoroTrainer:
                                           durations: torch.Tensor,
                                           phoneme_lengths: torch.Tensor) -> torch.Tensor:
         """
-        Average frame-level values (pitch/energy) to phoneme-level using durations
+        Average frame-level values (pitch/energy) to phoneme-level using durations.
+        Fully vectorized via torch.repeat_interleave and scatter_add_ — no Python loops.
 
         Args:
             values: Frame-level values (batch, mel_frames)
@@ -1056,27 +1057,57 @@ class KokoroTrainer:
         Returns:
             Phoneme-level averaged values (batch, phonemes)
         """
-        batch_size = durations.shape[0]
-        num_phonemes = durations.shape[1]
+        batch_size, num_phonemes = durations.shape
+        num_frames = values.shape[1]
         device = durations.device
 
-        # Create output tensor
-        phoneme_values = torch.zeros(batch_size, num_phonemes, device=device)
+        # Zero out durations for padding positions (beyond each item's phoneme_lengths)
+        ph_range = torch.arange(num_phonemes, device=device).unsqueeze(0)   # (1, num_phonemes)
+        valid_ph_mask = ph_range < phoneme_lengths.unsqueeze(1)              # (batch, num_phonemes)
+        durations_masked = durations.long() * valid_ph_mask.long()           # (batch, num_phonemes)
 
-        for b in range(batch_size):
-            curr_durations = durations[b]  # (phonemes,)
-            curr_values = values[b]  # (frames,)
-            actual_phoneme_len = int(phoneme_lengths[b].item())
+        # Total frames covered across the whole batch
+        total_dur_per_b = durations_masked.sum(dim=1)                        # (batch,)
+        total_dur = int(total_dur_per_b.sum().item())
 
-            frame_idx = 0
+        if total_dur == 0:
+            return torch.zeros(batch_size, num_phonemes, device=device, dtype=values.dtype)
 
-            for p in range(actual_phoneme_len):
-                dur = int(curr_durations[p].item())
-                if dur > 0 and frame_idx < len(curr_values):
-                    # Average the values for this phoneme's frames
-                    end_idx = min(frame_idx + dur, len(curr_values))
-                    phoneme_values[b, p] = curr_values[frame_idx:end_idx].mean()
-                    frame_idx = end_idx
+        # Build flat per-frame phoneme and batch indices with repeat_interleave
+        # flat_dur[b * num_phonemes + p] = durations_masked[b, p]
+        flat_dur = durations_masked.reshape(-1)                              # (batch * num_phonemes,)
+
+        ph_idx_flat = torch.arange(num_phonemes, device=device).repeat(batch_size)          # (batch * num_phonemes,)
+        b_idx_flat  = torch.arange(batch_size,   device=device).repeat_interleave(num_phonemes)
+
+        # Each (b, p) entry is repeated dur[b, p] times → gives per-frame assignments
+        ph_per_frame = torch.repeat_interleave(ph_idx_flat, flat_dur)        # (total_dur,)
+        b_per_frame  = torch.repeat_interleave(b_idx_flat,  flat_dur)        # (total_dur,)
+
+        # Convert global position in the flat frame sequence to a local frame index
+        # within each batch item so we can index into `values`
+        cum_offsets = torch.cat([
+            torch.zeros(1, dtype=torch.long, device=device),
+            total_dur_per_b.cumsum(0)[:-1]
+        ])                                                                    # (batch,)
+        global_idx      = torch.arange(total_dur, dtype=torch.long, device=device)
+        local_frame_idx = global_idx - torch.repeat_interleave(cum_offsets, total_dur_per_b)
+        local_frame_idx = local_frame_idx.clamp(0, num_frames - 1)
+
+        # Gather the value for each (batch, local_frame) pair
+        frame_values = values[b_per_frame, local_frame_idx]                  # (total_dur,)
+
+        # Scatter-sum into a flat (batch * num_phonemes,) buffer, then reshape
+        global_ph_idx = b_per_frame * num_phonemes + ph_per_frame            # (total_dur,)
+        phoneme_sum = torch.zeros(batch_size * num_phonemes, device=device, dtype=values.dtype)
+        phoneme_sum.scatter_add_(0, global_ph_idx, frame_values)
+        phoneme_sum = phoneme_sum.reshape(batch_size, num_phonemes)
+
+        # Divide by duration count (clamp to 1 avoids divide-by-zero for zero-dur phonemes)
+        phoneme_values = phoneme_sum / durations_masked.float().clamp(min=1)
+
+        # Ensure padding positions are exactly zero
+        phoneme_values = phoneme_values * valid_ph_mask.float()
 
         return phoneme_values
 
