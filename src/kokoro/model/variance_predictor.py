@@ -322,10 +322,10 @@ class VarianceAdaptor(nn.Module):
         if duration_target is not None:
             durations_to_use = duration_target
         else:
-            # Inference: duration predictor outputs log-domain values;
-            # apply exp() to recover the frame count.
-            # e.g. log1p(5) ≈ 1.7918 → exp(1.7918) ≈ 6.0 → 6 frames
-            durations_to_use = torch.clamp(torch.round(torch.exp(duration_pred)), min=0)
+            # Inference: duration predictor outputs log1p-domain values;
+            # apply expm1() to recover the frame count (inverse of log1p).
+            # e.g. log1p(5) ≈ 1.7918 → expm1(1.7918) = 5.0 → 5 frames
+            durations_to_use = torch.clamp(torch.round(torch.expm1(duration_pred)), min=0)
 
         durations_to_use = durations_to_use.to(device)
 
