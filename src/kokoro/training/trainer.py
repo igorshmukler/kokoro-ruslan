@@ -1419,7 +1419,13 @@ class KokoroTrainer:
                     logger.error(f"Error in validation batch {batch_idx}: {e}")
                     continue
 
-        self.model.train()  # Set back to training mode
+        # Restore both the validated model and the regular model to train mode.
+        # When EMA is active, model_to_validate is the EMA model (a separate object
+        # from self.model); restoring only self.model would leave the EMA model in
+        # eval mode for the rest of the epoch.
+        model_to_validate.train()
+        if model_to_validate is not self.model:
+            self.model.train()
 
         # Compute averages
         if num_batches > 0:
