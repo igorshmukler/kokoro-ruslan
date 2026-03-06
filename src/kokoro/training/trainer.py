@@ -1700,9 +1700,18 @@ class KokoroTrainer:
                     self.interbatch_profiler.start_forward_pass()
 
                 with self._profiler_record("Training_Step", is_profiling_epoch):
+                    # Use exact accumulation divisor so tail micro-batches at epoch end
+                    # are not under-scaled when fewer than gradient_accumulation_steps remain.
+                    accumulation_divisor = KokoroTrainer._effective_accumulation_divisor(
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                        accumulated_step=accumulated_step,
+                        batch_idx=batch_idx,
+                        num_batches=num_batches,
+                    )
+
                     step_result = self._execute_training_step(
                         transferred, mel_for_model,
-                        loss_scale=(1.0 / gradient_accumulation_steps) * adaptive_loss_scale,
+                        loss_scale=(1.0 / accumulation_divisor) * adaptive_loss_scale,
                     )
 
                 if enable_interbatch_profiling or is_profiling_epoch:
@@ -1876,13 +1885,19 @@ class KokoroTrainer:
 
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
-                    self._optimizer_step_with_clipping(
+                    step_successful = self._optimizer_step_with_clipping(
                         clip_norm=adaptive_clip_norm,
                         step_scheduler=True,
                         update_ema=True,
                     )
 
-                    self.optimizer_steps_completed += 1
+                    if step_successful:
+                        self.optimizer_steps_completed += 1
+                    else:
+                        logger.warning(
+                            "Optimizer step skipped (AMP overflow/non-finite grads); "
+                            "scheduler and EMA were not advanced for this step"
+                        )
 
                     # Log every 10 steps
                     if self.optimizer_steps_completed % 10 == 0:
@@ -2710,13 +2725,13 @@ class KokoroTrainer:
         *,
         step_scheduler: bool,
         update_ema: bool,
-    ) -> None:
+    ) -> bool:
         runtime_policy = getattr(self, 'runtime_step_policy', None)
         if runtime_policy is None:
             runtime_policy = RuntimeStepPolicy(logger=logger)
             self.runtime_step_policy = runtime_policy
 
-        runtime_policy.optimizer_step_with_clipping(
+        return runtime_policy.optimizer_step_with_clipping(
             model=self.model,
             optimizer=self.optimizer,
             use_mixed_precision=self.use_mixed_precision,
@@ -2730,6 +2745,26 @@ class KokoroTrainer:
             update_ema=update_ema,
             update_ema_fn=self._update_ema,
         )
+
+    @staticmethod
+    def _effective_accumulation_divisor(
+        *,
+        gradient_accumulation_steps: int,
+        accumulated_step: int,
+        batch_idx: int,
+        num_batches: int,
+    ) -> int:
+        """Return the correct loss divisor for gradient accumulation.
+
+        For normal full accumulation windows this equals
+        ``gradient_accumulation_steps``. For the final partial window at the end
+        of an epoch, this returns the exact number of micro-batches that will
+        contribute to the upcoming optimizer step.
+        """
+        total_target = max(1, int(gradient_accumulation_steps))
+        remaining_including_current = max(1, int(num_batches) - int(batch_idx))
+        already_accumulated = max(0, int(accumulated_step))
+        return max(1, min(total_target, already_accumulated + remaining_including_current))
 
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """

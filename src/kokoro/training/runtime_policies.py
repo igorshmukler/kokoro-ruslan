@@ -26,7 +26,9 @@ class RuntimeStepPolicy:
         step_scheduler_fn: Callable[[], None],
         update_ema: bool,
         update_ema_fn: Callable[[], None],
-    ) -> None:
+    ) -> bool:
+        step_successful = False
+
         if use_mixed_precision:
             if device_type == 'cuda':
                 scaler.unscale_(optimizer)
@@ -36,6 +38,9 @@ class RuntimeStepPolicy:
                 scaler.step(optimizer)
                 scaler.update()
                 new_scale = scaler.get_scale()
+
+                # CUDA GradScaler skips optimizer update on overflow and lowers scale.
+                step_successful = not (new_scale < old_scale)
 
                 if new_scale != old_scale:
                     mixed_precision_stats['scale_updates'] += 1
@@ -67,12 +72,15 @@ class RuntimeStepPolicy:
         else:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
             optimizer.step()
+            step_successful = True
 
-        if step_scheduler and scheduler_per_batch:
+        if step_successful and step_scheduler and scheduler_per_batch:
             step_scheduler_fn()
 
-        if update_ema:
+        if step_successful and update_ema:
             update_ema_fn()
+
+        return step_successful
 
 
 class MemoryOOMPolicy:
