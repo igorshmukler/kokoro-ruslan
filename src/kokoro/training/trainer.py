@@ -945,6 +945,15 @@ class KokoroTrainer:
             result[key] = val.to(self.device, non_blocking=non_blocking) if val is not None else None
         return result
 
+    def _profiler_record(self, name: str, active: bool):
+        """Return a torch.profiler.record_function context when *active*, else a no-op.
+
+        This lets callers write a single ``with self._profiler_record(name, flag):``
+        block instead of duplicating the enclosed code inside an if/else.
+        """
+        from contextlib import nullcontext
+        return torch.profiler.record_function(name) if active else nullcontext()
+
     def _has_nonfinite_gradients(self) -> bool:
         """Check whether any model gradient contains NaN/Inf values."""
         for param in self.model.parameters():
@@ -1889,32 +1898,7 @@ class KokoroTrainer:
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_data_loading()
 
-                # Only add profiler overhead when actually profiling
-                if is_profiling_epoch:
-                    with torch.profiler.record_function("Data_Loading"):
-                        transferred = self._transfer_batch_to_device(batch)
-                        mel_specs = transferred['mel_specs']
-                        phoneme_indices = transferred['phoneme_indices']
-                        phoneme_durations = transferred['phoneme_durations']
-                        stop_token_targets = transferred['stop_token_targets']
-                        mel_lengths = transferred['mel_lengths']
-                        phoneme_lengths = transferred['phoneme_lengths']
-                        pitches = transferred['pitches']
-                        energies = transferred['energies']
-                        stress_indices = transferred['stress_indices']
-                        # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
-                        if getattr(self.config, 'use_spec_augment', False):
-                            mel_for_model = KokoroTrainer._apply_spec_augment(
-                                mel_specs,
-                                time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 30),
-                                freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
-                                num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
-                                num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),
-                            )
-                        else:
-                            mel_for_model = mel_specs
-                else:
-                    # No profiler overhead
+                with self._profiler_record("Data_Loading", is_profiling_epoch):
                     transferred = self._transfer_batch_to_device(batch)
                     mel_specs = transferred['mel_specs']
                     phoneme_indices = transferred['phoneme_indices']
@@ -1937,22 +1921,22 @@ class KokoroTrainer:
                     else:
                         mel_for_model = mel_specs
 
-                    # Validate tensor dimensions to prevent MPS overflow
-                    max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
-                    if max_dim > 2000:
-                        logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
-                        continue
+                # Validate tensor dimensions to prevent MPS overflow
+                max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
+                if max_dim > 2000:
+                    logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
+                    continue
 
-                    # Log variance predictor ranges periodically only in verbose mode
-                    if getattr(self.config, 'verbose', False) and batch_idx % 50 == 0 and pitches is not None and energies is not None:
-                        pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
-                        energy_min, energy_max = energies.min().item(), energies.max().item()
-                        if pitch_max > 1.5 or energy_max > 1.5:
-                            logger.error(f"⚠️ BATCH {batch_idx} - UNNORMALIZED VARIANCE INPUTS!")
-                            logger.error(f"   Pitch: [{pitch_min:.3f}, {pitch_max:.3f}]")
-                            logger.error(f"   Energy: [{energy_min:.3f}, {energy_max:.3f}]")
-                        else:
-                            logger.info(f"Batch {batch_idx} variance ranges OK - Pitch: [{pitch_min:.3f}, {pitch_max:.3f}], Energy: [{energy_min:.3f}, {energy_max:.3f}]")
+                # Log variance predictor ranges periodically only in verbose mode
+                if getattr(self.config, 'verbose', False) and batch_idx % 50 == 0 and pitches is not None and energies is not None:
+                    pitch_min, pitch_max = pitches.min().item(), pitches.max().item()
+                    energy_min, energy_max = energies.min().item(), energies.max().item()
+                    if pitch_max > 1.5 or energy_max > 1.5:
+                        logger.error(f"⚠️ BATCH {batch_idx} - UNNORMALIZED VARIANCE INPUTS!")
+                        logger.error(f"   Pitch: [{pitch_min:.3f}, {pitch_max:.3f}]")
+                        logger.error(f"   Energy: [{energy_min:.3f}, {energy_max:.3f}]")
+                    else:
+                        logger.info(f"Batch {batch_idx} variance ranges OK - Pitch: [{pitch_min:.3f}, {pitch_max:.3f}], Energy: [{energy_min:.3f}, {energy_max:.3f}]")
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_data_loading()
@@ -2023,20 +2007,7 @@ class KokoroTrainer:
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_forward_pass()
 
-                if is_profiling_epoch:
-                    with torch.profiler.record_function("Model_Forward"):
-                        if self.use_mixed_precision:
-                            with self.get_autocast_context():
-                                predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                    self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
-                                             pitch_targets=pitches, energy_targets=energies,
-                                             stress_indices=stress_indices)
-                        else:
-                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
-                                         pitch_targets=pitches, energy_targets=energies,
-                                         stress_indices=stress_indices)
-                else:
+                with self._profiler_record("Model_Forward", is_profiling_epoch):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
@@ -2111,24 +2082,7 @@ class KokoroTrainer:
                     )
 
                 # Loss calculation with mixed precision
-                if is_profiling_epoch:
-                    with torch.profiler.record_function("Loss_Calculation"):
-                        if self.use_mixed_precision:
-                            with self.get_autocast_context():
-                                total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
-                                    predicted_mel, predicted_log_durations, predicted_stop_logits,
-                                    mel_specs, phoneme_durations, stop_token_targets,
-                                    mel_lengths, phoneme_lengths,
-                                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                                )
-                        else:
-                            total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
-                                predicted_mel, predicted_log_durations, predicted_stop_logits,
-                                mel_specs, phoneme_durations, stop_token_targets,
-                                mel_lengths, phoneme_lengths,
-                                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                            )
-                else:
+                with self._profiler_record("Loss_Calculation", is_profiling_epoch):
                     if self.use_mixed_precision:
                         with self.get_autocast_context():
                             total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
@@ -2192,17 +2146,7 @@ class KokoroTrainer:
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_backward_pass()
 
-                if is_profiling_epoch:
-                    with torch.profiler.record_function("Backward_Pass"):
-                        if self.use_mixed_precision:
-                            if self.device_type == 'cuda':
-                                self.scaler.scale(scaled_total_loss).backward()
-                            else:  # MPS
-                                scaled_loss = self.scaler.scale(scaled_total_loss)
-                                scaled_loss.backward()
-                        else:
-                            scaled_total_loss.backward()
-                else:
+                with self._profiler_record("Backward_Pass", is_profiling_epoch):
                     if self.use_mixed_precision:
                         if self.device_type == 'cuda':
                             self.scaler.scale(scaled_total_loss).backward()
