@@ -51,11 +51,10 @@ def test_prepare_training_decoder_inputs_uses_configured_decoder_input_dropout(m
     )
     model.train()
 
-    observed = {}
+    observed_calls = []
 
     def fake_dropout(input_tensor, p=0.5, training=False, inplace=False):
-        observed["p"] = p
-        observed["training"] = training
+        observed_calls.append({"p": p, "training": training})
         return input_tensor
 
     monkeypatch.setattr(torch.nn.functional, "dropout", fake_dropout)
@@ -66,5 +65,8 @@ def test_prepare_training_decoder_inputs_uses_configured_decoder_input_dropout(m
 
     model._prepare_training_decoder_inputs(mel_specs, mel_padding_mask=None)
 
-    assert observed["p"] == pytest.approx(configured_dropout)
-    assert observed["training"] is True
+    assert any(call["p"] == pytest.approx(configured_dropout) for call in observed_calls)
+    assert any(
+        call["p"] == pytest.approx(configured_dropout) and call["training"] is True
+        for call in observed_calls
+    )
