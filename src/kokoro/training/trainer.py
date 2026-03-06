@@ -34,6 +34,7 @@ from kokoro.training.checkpoint_manager import (
 )
 from kokoro.utils.interbatch_profiler import InterbatchProfiler
 from kokoro.training.mps_grad_scaler import MPSGradScaler
+from kokoro.training.losses import calculate_training_losses
 
 from kokoro.utils.adaptive_memory_manager import AdaptiveMemoryManager
 from kokoro.utils.ema import recommended_ema_decay
@@ -1182,179 +1183,31 @@ class KokoroTrainer:
                          mel_lengths, phoneme_lengths,
                          predicted_pitch=None, predicted_energy=None,
                          pitch_targets=None, energy_targets=None):
-        """Calculate losses with optimized masking"""
-        max_mel_len = mel_specs.size(1)
-        max_phoneme_len = phoneme_durations.size(1)
-
-        # Create base masks efficiently (2D only, no feature dimension expansion yet)
-        # Use direct comparison without intermediate .expand() to save memory
-        mel_mask_2d = torch.arange(max_mel_len, device=self.device).unsqueeze(0) < mel_lengths.unsqueeze(1)
-        phoneme_mask_2d = torch.arange(max_phoneme_len, device=self.device).unsqueeze(0) < phoneme_lengths.unsqueeze(1)
-
-        # Pre-compute mask normalization factors (reused across losses)
-
-        # Mel Spectrogram Loss
-        loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
-        mel_mask_3d = mel_mask_2d.unsqueeze(-1).expand_as(loss_mel_unreduced)
-        mel_valid = mel_mask_3d & torch.isfinite(loss_mel_unreduced)
-        if mel_valid.any():
-            loss_mel = loss_mel_unreduced[mel_valid].mean()
-        else:
-            loss_mel = torch.tensor(0.0, device=self.device)
-
-        # Duration Loss - convert to float once
-        target_log_durations = torch.log(phoneme_durations.float() + 1.0)
-
-        # Debugging: log predicted vs target duration stats (mean/std/min/max)
-        if getattr(self.config, 'verbose', False):
-            try:
-                pred = predicted_log_durations.detach()
-                targ = target_log_durations.detach()
-                pred_valid_mask = torch.isfinite(pred)
-                targ_valid_mask = torch.isfinite(targ)
-
-                if pred_valid_mask.any():
-                    p = pred[pred_valid_mask]
-                    p_mean = float(p.mean().item())
-                    p_std = float(p.std().item())
-                    p_min = float(p.min().item())
-                    p_max = float(p.max().item())
-                else:
-                    p_mean = p_std = p_min = p_max = float('nan')
-
-                if targ_valid_mask.any():
-                    t = targ[targ_valid_mask]
-                    t_mean = float(t.mean().item())
-                    t_std = float(t.std().item())
-                    t_min = float(t.min().item())
-                    t_max = float(t.max().item())
-                else:
-                    t_mean = t_std = t_min = t_max = float('nan')
-
-                logger.info(
-                    f"Duration pred: mean={p_mean:.4f} std={p_std:.4f} min={p_min:.4f} max={p_max:.4f} | "
-                    f"target: mean={t_mean:.4f} std={t_std:.4f} min={t_min:.4f} max={t_max:.4f}"
-                )
-            except Exception as _e:
-                logger.debug(f"Failed to log duration stats: {_e}")
-
-        loss_duration_unreduced = self.criterion_duration(predicted_log_durations, target_log_durations)
-
-        # Only calculate loss on phonemes that actually exist in the mask
-        # AND (optionally) have a duration > 0 if you find silences are still noisy
-        duration_valid = phoneme_mask_2d & (phoneme_durations > 0)
-
-        # Debugging: report how many phoneme positions exist and how many are used for duration loss
-        if getattr(self.config, 'verbose', False):
-            try:
-                phoneme_mask_count = int(phoneme_mask_2d.sum().item())
-                duration_valid_count = int(duration_valid.sum().item())
-                logger.info(f"Phoneme mask total positions={phoneme_mask_count}, duration_valid positions={duration_valid_count}")
-            except Exception:
-                logger.debug("Could not compute phoneme/duration mask counts for logging")
-        if duration_valid.any():
-            loss_duration = loss_duration_unreduced[duration_valid].mean()
-        else:
-            # Log that duration loss has no valid positions for this batch
-            logger.warning("Duration loss: no valid phoneme positions found for this batch; using 0.0 as loss")
-            loss_duration = torch.tensor(0.0, device=self.device)
-
-        # Stop Token Loss - reuse mel_mask_2d directly (no need to slice from 3D)
-        loss_stop_token_unreduced = self.criterion_stop_token(predicted_stop_logits, stop_token_targets)
-        stop_valid = mel_mask_2d & torch.isfinite(loss_stop_token_unreduced)
-        if stop_valid.any():
-            loss_stop_token = loss_stop_token_unreduced[stop_valid].mean()
-        else:
-            loss_stop_token = torch.tensor(0.0, device=self.device)
-
-        # Pitch Loss (if variance predictor enabled) - ensure predictions are phoneme-level
-        loss_pitch = torch.tensor(0.0, device=self.device)
-        if predicted_pitch is not None and pitch_targets is not None and self.criterion_pitch is not None:
-            # If model returned frame-level pitch predictions, average to phoneme-level
-            if predicted_pitch.dim() == 2 and predicted_pitch.size(1) != phoneme_durations.size(1):
-                pred_pitch_ph = self._average_pitch_energy_by_duration(
-                    predicted_pitch, phoneme_durations, phoneme_lengths
-                )
-            else:
-                pred_pitch_ph = predicted_pitch
-
-            loss_pitch_unreduced = self.criterion_pitch(pred_pitch_ph, pitch_targets)
-            pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
-            if pitch_valid.any():
-                loss_pitch = loss_pitch_unreduced[pitch_valid].mean()
-
-        # Energy Loss (if variance predictor enabled) - ensure predictions are phoneme-level
-        loss_energy = torch.tensor(0.0, device=self.device)
-        if predicted_energy is not None and energy_targets is not None and self.criterion_energy is not None:
-            # If model returned frame-level energy predictions, average to phoneme-level
-            if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
-                pred_energy_ph = self._average_pitch_energy_by_duration(
-                    predicted_energy, phoneme_durations, phoneme_lengths
-                )
-            else:
-                pred_energy_ph = predicted_energy
-
-            loss_energy_unreduced = self.criterion_energy(pred_energy_ph, energy_targets)
-            energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
-            if energy_valid.any():
-                loss_energy = loss_energy_unreduced[energy_valid].mean()
-
-        # Monitor and auto-recover from variance predictor divergence
-        variance_diverged = False
-        if loss_pitch > 10.0 or loss_energy > 10.0:
-            logger.warning(f"⚠️  Variance predictor divergence detected - pitch: {loss_pitch:.2f}, energy: {loss_energy:.2f}")
-
-            # Log prediction vs target statistics for debugging
-            if predicted_pitch is not None and pitch_targets is not None:
-                pred_min, pred_max = predicted_pitch.min().item(), predicted_pitch.max().item()
-                targ_min, targ_max = pitch_targets.min().item(), pitch_targets.max().item()
-                logger.warning(f"   Pitch predictions: [{pred_min:.3f}, {pred_max:.3f}]")
-                logger.warning(f"   Pitch targets: [{targ_min:.3f}, {targ_max:.3f}]")
-
-            if predicted_energy is not None and energy_targets is not None:
-                pred_min, pred_max = predicted_energy.min().item(), predicted_energy.max().item()
-                targ_min, targ_max = energy_targets.min().item(), energy_targets.max().item()
-                logger.warning(f"   Energy predictions: [{pred_min:.3f}, {pred_max:.3f}]")
-                logger.warning(f"   Energy targets: [{targ_min:.3f}, {targ_max:.3f}]")
-
-            logger.warning(f"   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
-
-            # Reset variance predictor weights to initial state.
-            # The predictors live under model.variance_adaptor, not at model top-level.
-            va = getattr(self.model, 'variance_adaptor', None)
-            if va is not None:
-                if hasattr(va, 'pitch_predictor') and va.pitch_predictor is not None:
-                    va.pitch_predictor._init_weights()
-                if hasattr(va, 'energy_predictor') and va.energy_predictor is not None:
-                    va.energy_predictor._init_weights()
-
-            # Zero out these losses for this batch to prevent gradient explosion
-            loss_pitch = torch.tensor(0.0, device=self.device)
-            loss_energy = torch.tensor(0.0, device=self.device)
-            variance_diverged = True
-
-        # Clamp individual losses to prevent numerical explosion (critical for MPS stability)
-        loss_mel = torch.clamp(loss_mel, max=100.0)
-        loss_duration = torch.clamp(loss_duration, max=100.0)
-        loss_stop_token = torch.clamp(loss_stop_token, max=100.0)
-        if not variance_diverged:
-            loss_pitch = torch.clamp(loss_pitch, max=10.0)
-            loss_energy = torch.clamp(loss_energy, max=10.0)
-
-        # Combine all losses (pitch/energy normalized to [0,1], safe to use)
-        total_loss = (loss_mel +
-                     loss_duration * self.config.duration_loss_weight +
-                     loss_stop_token * self.config.stop_token_loss_weight +
-                     loss_pitch * getattr(self.config, 'pitch_loss_weight', 0.1) +
-                     loss_energy * getattr(self.config, 'energy_loss_weight', 0.1))
-
-        # Final NaN/Inf check (caller decides whether to skip the batch)
-        if not torch.isfinite(total_loss):
-            logger.warning(f"Non-finite total_loss detected! "
-                          f"mel={loss_mel:.2f}, dur={loss_duration:.2f}, stop={loss_stop_token:.2f}, "
-                          f"pitch={loss_pitch:.2f}, energy={loss_energy:.2f}")
-
-        return total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy
+        """Calculate losses with optimized masking."""
+        return calculate_training_losses(
+            device=self.device,
+            config=self.config,
+            model=getattr(self, 'model', None),
+            criterion_mel=self.criterion_mel,
+            criterion_duration=self.criterion_duration,
+            criterion_stop_token=self.criterion_stop_token,
+            criterion_pitch=self.criterion_pitch,
+            criterion_energy=self.criterion_energy,
+            average_by_duration=self._average_pitch_energy_by_duration,
+            logger=logger,
+            predicted_mel=predicted_mel,
+            predicted_log_durations=predicted_log_durations,
+            predicted_stop_logits=predicted_stop_logits,
+            mel_specs=mel_specs,
+            phoneme_durations=phoneme_durations,
+            stop_token_targets=stop_token_targets,
+            mel_lengths=mel_lengths,
+            phoneme_lengths=phoneme_lengths,
+            predicted_pitch=predicted_pitch,
+            predicted_energy=predicted_energy,
+            pitch_targets=pitch_targets,
+            energy_targets=energy_targets,
+        )
 
     @staticmethod
     def _apply_warmup_guard(warmup_steps: int, total_steps: int) -> Tuple[int, int]:
@@ -2013,72 +1866,11 @@ class KokoroTrainer:
 
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            # CUDA path with built-in GradScaler
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
-
-                            old_scale = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Step scheduler with warmup immediately after optimizer step
-                            if self.scheduler_per_batch:
-                                self._step_scheduler_with_warmup()
-
-                            # Update EMA model weights
-                            self._update_ema()
-
-                            # Update mixed precision stats
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                                    self.mixed_precision_stats['overflow_count'] += 1
-                                else:
-                                    self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['successful_steps'] += 1
-
-                        else:  # MPS path with custom scaler
-                            # For MPS, clip gradients before unscaling
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
-
-                            old_scale = self.scaler.get_scale()
-                            step_successful = self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-
-                            # Step scheduler with warmup immediately after optimizer step
-                            if self.scheduler_per_batch:
-                                self._step_scheduler_with_warmup()
-
-                            # Update EMA model weights
-                            self._update_ema()
-
-                            # Update mixed precision stats
-                            if step_successful:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['skipped_steps'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
-
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=adaptive_clip_norm)
-                        self.optimizer.step()
-
-                        # Step scheduler with warmup immediately after optimizer step
-                        if self.scheduler_per_batch:
-                            self._step_scheduler_with_warmup()
-
-                        # Update EMA model weights
-                        self._update_ema()
+                    self._optimizer_step_with_clipping(
+                        clip_norm=adaptive_clip_norm,
+                        step_scheduler=True,
+                        update_ema=True,
+                    )
 
                     self.optimizer_steps_completed += 1
 
@@ -2902,6 +2694,60 @@ class KokoroTrainer:
             predicted_energy=predicted_energy,
         )
 
+    def _optimizer_step_with_clipping(
+        self,
+        clip_norm: float,
+        *,
+        step_scheduler: bool,
+        update_ema: bool,
+    ) -> None:
+        if self.use_mixed_precision:
+            if self.device_type == 'cuda':
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
+
+                old_scale = self.scaler.get_scale()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                new_scale = self.scaler.get_scale()
+
+                if new_scale != old_scale:
+                    self.mixed_precision_stats['scale_updates'] += 1
+                    if new_scale < old_scale:
+                        self.mixed_precision_stats['scale_decreases'] += 1
+                        self.mixed_precision_stats['overflow_count'] += 1
+                    else:
+                        self.mixed_precision_stats['successful_steps'] += 1
+                else:
+                    self.mixed_precision_stats['successful_steps'] += 1
+            else:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
+
+                old_scale = self.scaler.get_scale()
+                step_successful = self.scaler.step(self.optimizer)
+                self.scaler.update()
+                new_scale = self.scaler.get_scale()
+
+                if step_successful:
+                    self.mixed_precision_stats['successful_steps'] += 1
+                else:
+                    self.mixed_precision_stats['skipped_steps'] += 1
+                    self.mixed_precision_stats['overflow_count'] += 1
+
+                if new_scale != old_scale:
+                    self.mixed_precision_stats['scale_updates'] += 1
+                    if new_scale < old_scale:
+                        self.mixed_precision_stats['scale_decreases'] += 1
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
+            self.optimizer.step()
+
+        if step_scheduler and self.scheduler_per_batch:
+            self._step_scheduler_with_warmup()
+
+        if update_ema:
+            self._update_ema()
+
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """
         Run a single training batch
@@ -2921,11 +2767,11 @@ class KokoroTrainer:
         step_result = self._execute_training_step(transferred, transferred.mel_specs)
 
         if step_result is not None:
-            if self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
+            self._optimizer_step_with_clipping(
+                clip_norm=0.5,
+                step_scheduler=False,
+                update_ema=False,
+            )
 
         if measure_time:
             return time.time() - start_time
@@ -3024,14 +2870,6 @@ class KokoroTrainer:
                 with torch.profiler.record_function("Data_Loading"):
                     transferred = self._transfer_batch_to_device(batch)
                     mel_specs = transferred.mel_specs
-                    phoneme_indices = transferred.phoneme_indices
-                    phoneme_durations = transferred.phoneme_durations
-                    stop_token_targets = transferred.stop_token_targets
-                    mel_lengths = transferred.mel_lengths
-                    phoneme_lengths = transferred.phoneme_lengths
-                    pitches = transferred.pitches
-                    energies = transferred.energies
-                    stress_indices = transferred.stress_indices
                 self.interbatch_profiler.end_data_loading()
                 self.log_memory_stats("data_loading")
 
@@ -3039,95 +2877,32 @@ class KokoroTrainer:
                     self.optimizer.zero_grad()
 
                 self.interbatch_profiler.start_forward_pass()
-                with torch.profiler.record_function("Model_Forward"):
-                    if self.use_mixed_precision:
-                        with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                           pitch_targets=pitches, energy_targets=energies,
-                                           stress_indices=stress_indices)
-                    else:
-                        predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                            self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                       pitch_targets=pitches, energy_targets=energies,
-                                       stress_indices=stress_indices)
-                self.interbatch_profiler.end_forward_pass()
-                self.log_memory_stats("forward_pass")
-
-                phoneme_pitches = None
-                phoneme_energies = None
-                if pitches is not None and predicted_pitch is not None:
-                    phoneme_pitches = self._average_pitch_energy_by_duration(
-                        pitches, phoneme_durations, phoneme_lengths
-                    )
-                if energies is not None and predicted_energy is not None:
-                    phoneme_energies = self._average_pitch_energy_by_duration(
-                        energies, phoneme_durations, phoneme_lengths
-                    )
-
-                with torch.profiler.record_function("Loss_Calculation"):
-                    if self.use_mixed_precision:
-                        with self.get_autocast_context():
-                            total_loss, _, _, _, _, _ = self._calculate_losses(
-                                predicted_mel, predicted_log_durations, predicted_stop_logits,
-                                mel_specs, phoneme_durations, stop_token_targets,
-                                mel_lengths, phoneme_lengths,
-                                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                            )
-                    else:
-                        total_loss, _, _, _, _, _ = self._calculate_losses(
-                            predicted_mel, predicted_log_durations, predicted_stop_logits,
-                            mel_specs, phoneme_durations, stop_token_targets,
-                            mel_lengths, phoneme_lengths,
-                            predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                        )
-                self.log_memory_stats("loss_calculation")
-
                 self.interbatch_profiler.start_backward_pass()
-                with torch.profiler.record_function("Backward_Pass"):
-                    if self.use_mixed_precision:
-                        self.scaler.scale(total_loss).backward()
-                    else:
-                        total_loss.backward()
+                with torch.profiler.record_function("Training_Step"):
+                    step_result = self._execute_training_step(
+                        transferred,
+                        mel_specs,
+                        loss_scale=1.0,
+                    )
+                self.interbatch_profiler.end_forward_pass()
                 self.interbatch_profiler.end_backward_pass()
-                self.log_memory_stats("backward_pass")
+
+                if step_result is None:
+                    if self.enable_adaptive_memory:
+                        self.memory_manager.emergency_cleanup()
+                    else:
+                        self.clear_device_cache()
+                    self.interbatch_profiler.end_batch(mel_specs.size(0))
+                    continue
+
+                self.log_memory_stats("training_step")
 
                 with torch.profiler.record_function("Optimizer_Step"):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            self.scaler.unscale_(self.optimizer)
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-                            old_scale = self.scaler.get_scale()
-                            self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                                    self.mixed_precision_stats['overflow_count'] += 1
-                                else:
-                                    self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                        else:  # MPS
-                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-                            old_scale = self.scaler.get_scale()
-                            step_successful = self.scaler.step(self.optimizer)
-                            self.scaler.update()
-                            new_scale = self.scaler.get_scale()
-                            if step_successful:
-                                self.mixed_precision_stats['successful_steps'] += 1
-                            else:
-                                self.mixed_precision_stats['skipped_steps'] += 1
-                                self.mixed_precision_stats['overflow_count'] += 1
-                            if new_scale != old_scale:
-                                self.mixed_precision_stats['scale_updates'] += 1
-                                if new_scale < old_scale:
-                                    self.mixed_precision_stats['scale_decreases'] += 1
-                    else:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
-                        self.optimizer.step()
+                    self._optimizer_step_with_clipping(
+                        clip_norm=0.5,
+                        step_scheduler=False,
+                        update_ema=False,
+                    )
                 self.log_memory_stats("optimizer_step")
 
                 self.interbatch_profiler.end_batch(mel_specs.size(0))
