@@ -338,7 +338,7 @@ def load_checkpoint(
             raise e2
 
 
-def resume_from_checkpoint(trainer) -> None:
+def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=None) -> None:
     """Resume all training state from a checkpoint into *trainer*.
 
     Handles model weights, optimizer, scheduler, scaler (AMP), EMA, step
@@ -348,7 +348,13 @@ def resume_from_checkpoint(trainer) -> None:
     Args:
         trainer: A ``KokoroTrainer`` instance (typed as ``Any`` to avoid a
             circular import — only attribute access is required).
+        _load_checkpoint_fn: Override for ``load_checkpoint``; used by tests
+            to inject a monkeypatched version without altering this module.
+        _SummaryWriter: Override for ``SummaryWriter``; same rationale.
     """
+    _lc = _load_checkpoint_fn if _load_checkpoint_fn is not None else load_checkpoint
+    _SW = _SummaryWriter if _SummaryWriter is not None else SummaryWriter
+
     config = trainer.config
 
     if not config.resume_checkpoint:
@@ -368,7 +374,7 @@ def resume_from_checkpoint(trainer) -> None:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
     logger.info(f"Resuming from checkpoint: {checkpoint_path}")
-    trainer.start_epoch, trainer.best_loss, phoneme_processor = load_checkpoint(
+    trainer.start_epoch, trainer.best_loss, phoneme_processor = _lc(
         checkpoint_path, trainer.model, trainer.optimizer, trainer.scheduler, config.output_dir
     )
 
@@ -452,7 +458,7 @@ def resume_from_checkpoint(trainer) -> None:
     # Purge stale TensorBoard events from epochs after the resume point.
     purge_step = trainer.current_optimizer_step + 1
     trainer.writer.close()
-    trainer.writer = SummaryWriter(log_dir=trainer.log_dir, purge_step=purge_step)
+    trainer.writer = _SW(log_dir=trainer.log_dir, purge_step=purge_step)
     logger.info(
         f"TensorBoard writer reopened with purge_step={purge_step} "
         f"(hiding stale events from optimizer_step >= {purge_step})"

@@ -1390,8 +1390,17 @@ class KokoroTrainer:
         return warmup_steps, onecycle_steps
 
     def setup_checkpoint_resumption(self):
-        """Delegate checkpoint resumption to checkpoint_manager.resume_from_checkpoint."""
-        resume_from_checkpoint(self)
+        """Delegate checkpoint resumption to checkpoint_manager.resume_from_checkpoint.
+
+        Passes the trainer-module-scoped ``load_checkpoint`` and
+        ``SummaryWriter`` so that test monkeypatches on those names propagate
+        correctly into the implementation.
+        """
+        resume_from_checkpoint(
+            self,
+            _load_checkpoint_fn=load_checkpoint,
+            _SummaryWriter=SummaryWriter,
+        )
 
     def _log_histograms_epoch(self, epoch: int) -> None:
         """Log weight histograms for all named model parameters to TensorBoard (once per epoch)."""
