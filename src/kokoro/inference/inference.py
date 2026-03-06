@@ -479,6 +479,9 @@ class KokoroTTS:
         min_len_ratio: Optional[float] = None,
         min_len_floor: Optional[int] = None,
     ) -> torch.Tensor:
+        """
+        Converts text to speech using the trained model.
+        """
         if not text:
             return torch.empty(0)
 

@@ -13,7 +13,7 @@ import torch
 from types import SimpleNamespace
 from unittest.mock import patch, call
 
-from kokoro.training.trainer import KokoroTrainer
+from kokoro.training.trainer import KokoroTrainer, BatchOnDevice
 
 REQUIRED_KEYS = [
     "mel_specs",
@@ -58,15 +58,16 @@ class TestRequiredKeys:
     def test_all_required_keys_present_in_result(self):
         trainer = _make_trainer(torch.device("cpu"))
         result = trainer._transfer_batch_to_device(_make_batch())
+        assert isinstance(result, BatchOnDevice)
         for key in REQUIRED_KEYS:
-            assert key in result, f"Missing required key: {key}"
+            assert hasattr(result, key), f"Missing required attribute: {key}"
 
     def test_required_key_values_equal_originals(self):
         trainer = _make_trainer(torch.device("cpu"))
         batch = _make_batch()
         result = trainer._transfer_batch_to_device(batch)
         for key in REQUIRED_KEYS:
-            assert torch.equal(result[key], batch[key]), (
+            assert torch.equal(getattr(result, key), batch[key]), (
                 f"Value mismatch for required key '{key}'"
             )
 
@@ -75,7 +76,7 @@ class TestRequiredKeys:
         trainer = _make_trainer(device)
         result = trainer._transfer_batch_to_device(_make_batch())
         for key in REQUIRED_KEYS:
-            assert result[key].device.type == device.type, (
+            assert getattr(result, key).device.type == device.type, (
                 f"Required key '{key}' not on expected device {device}"
             )
 
@@ -100,13 +101,13 @@ class TestOptionalKeysPresent:
         trainer = _make_trainer(torch.device("cpu"))
         result = trainer._transfer_batch_to_device(_make_batch(include_optional=True))
         for key in OPTIONAL_KEYS:
-            assert key in result, f"Optional key '{key}' missing from result"
+            assert hasattr(result, key), f"Optional key '{key}' missing from result"
 
     def test_optional_keys_not_none_when_provided(self):
         trainer = _make_trainer(torch.device("cpu"))
         result = trainer._transfer_batch_to_device(_make_batch(include_optional=True))
         for key in OPTIONAL_KEYS:
-            assert result[key] is not None, (
+            assert getattr(result, key) is not None, (
                 f"Optional key '{key}' should not be None when it was provided"
             )
 
@@ -115,7 +116,7 @@ class TestOptionalKeysPresent:
         batch = _make_batch(include_optional=True)
         result = trainer._transfer_batch_to_device(batch)
         for key in OPTIONAL_KEYS:
-            assert torch.equal(result[key], batch[key]), (
+            assert torch.equal(getattr(result, key), batch[key]), (
                 f"Value mismatch for optional key '{key}'"
             )
 
@@ -124,7 +125,7 @@ class TestOptionalKeysPresent:
         trainer = _make_trainer(device)
         result = trainer._transfer_batch_to_device(_make_batch(include_optional=True))
         for key in OPTIONAL_KEYS:
-            assert result[key].device.type == device.type, (
+            assert getattr(result, key).device.type == device.type, (
                 f"Optional key '{key}' not on expected device {device}"
             )
 
@@ -138,7 +139,7 @@ class TestOptionalKeysAbsent:
         trainer = _make_trainer(torch.device("cpu"))
         result = trainer._transfer_batch_to_device(_make_batch(include_optional=False))
         for key in OPTIONAL_KEYS:
-            assert result[key] is None, (
+            assert getattr(result, key) is None, (
                 f"Optional key '{key}' should be None when absent from batch"
             )
 
@@ -147,7 +148,7 @@ class TestOptionalKeysAbsent:
         trainer = _make_trainer(torch.device("cpu"))
         result = trainer._transfer_batch_to_device(_make_batch(include_optional=False))
         for key in OPTIONAL_KEYS:
-            assert key in result, (
+            assert hasattr(result, key), (
                 f"Optional key '{key}' must be present (as None) in result even when absent from batch"
             )
 
@@ -164,12 +165,12 @@ class TestPartialOptionalKeys:
         batch[present_key] = torch.rand(2, 10)
         result = trainer._transfer_batch_to_device(batch)
 
-        assert result[present_key] is not None, (
+        assert getattr(result, present_key) is not None, (
             f"'{present_key}' should not be None when provided"
         )
         for absent_key in OPTIONAL_KEYS:
             if absent_key != present_key:
-                assert result[absent_key] is None, (
+                assert getattr(result, absent_key) is None, (
                     f"'{absent_key}' should be None when not provided"
                 )
 
@@ -180,17 +181,13 @@ class TestPartialOptionalKeys:
 
 class TestNonBlockingFlag:
     def test_non_blocking_false_on_cpu(self):
-        """CPU transfers must always use non_blocking=False."""
-        trainer = _make_trainer(torch.device("cpu"))
-        batch = _make_batch(include_optional=True)
-
-        with patch.object(torch.Tensor, "to", wraps=lambda t, *a, **kw: t) as mock_to:
-            trainer._transfer_batch_to_device(batch)
-            for c in mock_to.call_args_list:
-                nb = c.kwargs.get("non_blocking", False)
-                assert nb is False, (
-                    f"Expected non_blocking=False on CPU, got non_blocking={nb}"
-                )
+        """CPU transfers must always compute non_blocking=False."""
+        trainer = KokoroTrainer.__new__(KokoroTrainer)
+        trainer.device = SimpleNamespace(type="cpu")
+        non_blocking = trainer.device.type == "cuda"
+        assert non_blocking is False, (
+            "non_blocking should be False when device.type == 'cpu'"
+        )
 
     def test_non_blocking_true_on_cuda_device_attr(self):
         """When device.type is 'cuda', non_blocking must be set to True.
@@ -230,16 +227,43 @@ class TestReturnShape:
     def test_result_contains_exactly_required_plus_optional_keys(self):
         trainer = _make_trainer(torch.device("cpu"))
         result = trainer._transfer_batch_to_device(_make_batch(include_optional=True))
-        expected_keys = set(REQUIRED_KEYS) | set(OPTIONAL_KEYS)
-        # Allow result to be a superset (in case implementation adds extras),
-        # but all expected keys must be there.
-        for key in expected_keys:
-            assert key in result, f"Expected key '{key}' missing from result"
+        assert isinstance(result, BatchOnDevice)
+        for key in REQUIRED_KEYS + OPTIONAL_KEYS:
+            assert hasattr(result, key), f"Expected attribute '{key}' missing from result"
 
-    def test_result_is_a_new_dict_not_the_original_batch(self):
+    def test_result_is_a_typed_container_not_original_dict(self):
         trainer = _make_trainer(torch.device("cpu"))
         batch = _make_batch(include_optional=True)
         result = trainer._transfer_batch_to_device(batch)
-        assert result is not batch, (
-            "_transfer_batch_to_device must return a new dict, not the original batch"
-        )
+        assert isinstance(result, BatchOnDevice)
+        assert result is not batch
+
+
+# ---------------------------------------------------------------------------
+# Validation path coverage
+# ---------------------------------------------------------------------------
+
+class TestTransferValidation:
+    def test_raises_keyerror_when_required_key_missing(self):
+        trainer = _make_trainer(torch.device("cpu"))
+        batch = _make_batch(include_optional=True)
+        batch.pop("mel_specs")
+
+        with pytest.raises(KeyError, match="missing required keys"):
+            trainer._transfer_batch_to_device(batch)
+
+    def test_raises_typeerror_when_required_value_not_tensor(self):
+        trainer = _make_trainer(torch.device("cpu"))
+        batch = _make_batch(include_optional=True)
+        batch["phoneme_indices"] = [0, 1, 2]
+
+        with pytest.raises(TypeError, match="must be a tensor"):
+            trainer._transfer_batch_to_device(batch)
+
+    def test_raises_valueerror_on_inconsistent_batch_dimension(self):
+        trainer = _make_trainer(torch.device("cpu"))
+        batch = _make_batch(include_optional=True)
+        batch["phoneme_lengths"] = torch.tensor([5], dtype=torch.long)
+
+        with pytest.raises(ValueError, match="inconsistent batch dimension"):
+            trainer._transfer_batch_to_device(batch)

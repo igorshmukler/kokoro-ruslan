@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from types import SimpleNamespace
 
-from kokoro.training.trainer import KokoroTrainer
+from kokoro.training.trainer import KokoroTrainer, EpochMetrics
 
 
 class _CountingModel(nn.Module):
@@ -142,7 +142,9 @@ def test_train_epoch_processes_high_risk_batch_with_adaptive_stabilization(monke
     # Prevent tests from calling torch.mps.empty_cache (some torch builds raise when MPS not available)
     monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
 
-    avg_total_loss, _, _, _ = trainer.train_epoch(0)
+    metrics = trainer.train_epoch(0)
+    assert isinstance(metrics, EpochMetrics)
+    avg_total_loss, _, _, _ = metrics
 
     risk_ratio = max(1785 / 1400, 240 / 150)
     expected_clip = max(0.05, 0.5 / (risk_ratio ** 0.5))
@@ -170,7 +172,9 @@ def test_train_epoch_keeps_default_clip_for_normal_batch(monkeypatch):
     # Prevent tests from calling torch.mps.empty_cache
     monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
 
-    avg_total_loss, _, _, _ = trainer.train_epoch(0)
+    metrics = trainer.train_epoch(0)
+    assert isinstance(metrics, EpochMetrics)
+    avg_total_loss, _, _, _ = metrics
 
     assert trainer.model.forward_calls == 1
     assert avg_total_loss > 0.0
@@ -194,7 +198,9 @@ def test_train_epoch_uses_emergency_clip_norm_on_gradient_explosion(monkeypatch)
     # Prevent tests from calling torch.mps.empty_cache
     monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
 
-    avg_total_loss, _, _, _ = trainer.train_epoch(0)
+    metrics = trainer.train_epoch(0)
+    assert isinstance(metrics, EpochMetrics)
+    avg_total_loss, _, _, _ = metrics
 
     assert trainer.model.forward_calls == 1
     assert avg_total_loss > 0.0

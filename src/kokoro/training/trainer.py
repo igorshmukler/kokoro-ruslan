@@ -6,6 +6,7 @@ Extended to support mixed precision training on both CUDA and MPS devices with i
 
 import os
 import time
+from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -44,6 +45,52 @@ import math
 torch.serialization.add_safe_globals([TrainingConfig])
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BatchOnDevice:
+    """Device-ready batch tensors for train/val/profiling paths."""
+    mel_specs: torch.Tensor
+    phoneme_indices: torch.Tensor
+    phoneme_durations: torch.Tensor
+    stop_token_targets: torch.Tensor
+    mel_lengths: torch.Tensor
+    phoneme_lengths: torch.Tensor
+    pitches: Optional[torch.Tensor] = None
+    energies: Optional[torch.Tensor] = None
+    stress_indices: Optional[torch.Tensor] = None
+
+
+@dataclass
+class StepResult:
+    """Outputs and losses from one forward/backward execution step."""
+    total_loss: torch.Tensor
+    loss_mel: torch.Tensor
+    loss_duration: torch.Tensor
+    loss_stop_token: torch.Tensor
+    loss_pitch: Optional[torch.Tensor]
+    loss_energy: Optional[torch.Tensor]
+    predicted_mel: torch.Tensor
+    predicted_log_durations: torch.Tensor
+    predicted_pitch: Optional[torch.Tensor]
+    predicted_energy: Optional[torch.Tensor]
+
+
+@dataclass
+class EpochMetrics:
+    """Averaged epoch-level losses returned by train/validation loops."""
+    total_loss: float
+    mel_loss: float
+    dur_loss: float
+    stop_loss: float
+    pitch_loss: float = 0.0
+    energy_loss: float = 0.0
+
+    def as_tuple(self) -> Tuple[float, float, float, float]:
+        return (self.total_loss, self.mel_loss, self.dur_loss, self.stop_loss)
+
+    def __iter__(self):
+        return iter(self.as_tuple())
 
 
 class KokoroTrainer:
@@ -806,22 +853,74 @@ class KokoroTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
-    def _transfer_batch_to_device(self, batch: Dict) -> Dict[str, Any]:
-        """Transfer a batch of tensors to the training device.
+    def _validate_transferred_batch(self, transferred: BatchOnDevice) -> None:
+        """Validate required batch structure after device transfer."""
+        base_batch_size = transferred.mel_specs.size(0)
+        required_tensors = {
+            'phoneme_indices': transferred.phoneme_indices,
+            'phoneme_durations': transferred.phoneme_durations,
+            'stop_token_targets': transferred.stop_token_targets,
+            'mel_lengths': transferred.mel_lengths,
+            'phoneme_lengths': transferred.phoneme_lengths,
+        }
 
-        Moves all required and optional tensors to self.device using non-blocking
-        transfers for CUDA.  Always returns all optional keys (pitches, energies,
-        stress_indices) – missing keys are returned as None.
-        """
+        for name, tensor in required_tensors.items():
+            if not torch.is_tensor(tensor):
+                raise TypeError(f"Batch field '{name}' is not a tensor")
+            if tensor.size(0) != base_batch_size:
+                raise ValueError(
+                    f"Batch field '{name}' has inconsistent batch dimension "
+                    f"{tensor.size(0)} != {base_batch_size}"
+                )
+
+        optional_tensors = {
+            'pitches': transferred.pitches,
+            'energies': transferred.energies,
+            'stress_indices': transferred.stress_indices,
+        }
+        for name, tensor in optional_tensors.items():
+            if tensor is not None and tensor.size(0) != base_batch_size:
+                raise ValueError(
+                    f"Optional batch field '{name}' has inconsistent batch dimension "
+                    f"{tensor.size(0)} != {base_batch_size}"
+                )
+
+    def _transfer_batch_to_device(self, batch: Dict[str, Any]) -> BatchOnDevice:
+        """Transfer and validate a batch in one centralized path."""
+        required_keys = (
+            'mel_specs', 'phoneme_indices', 'phoneme_durations',
+            'stop_token_targets', 'mel_lengths', 'phoneme_lengths'
+        )
+        missing_keys = [key for key in required_keys if key not in batch]
+        if missing_keys:
+            raise KeyError(f"Batch is missing required keys: {missing_keys}")
+
         non_blocking = self.device.type == 'cuda'
-        tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
-                       'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
-        result: Dict[str, Any] = {k: batch[k].to(self.device, non_blocking=non_blocking)
-                                   for k in tensor_keys}
-        for key in ('pitches', 'energies', 'stress_indices'):
-            val = batch.get(key, None)
-            result[key] = val.to(self.device, non_blocking=non_blocking) if val is not None else None
-        return result
+
+        def _to_device(key: str, required: bool = True) -> Optional[torch.Tensor]:
+            value = batch.get(key)
+            if value is None:
+                if required:
+                    raise ValueError(f"Batch field '{key}' is None")
+                return None
+            if not torch.is_tensor(value):
+                raise TypeError(f"Batch field '{key}' must be a tensor, got {type(value).__name__}")
+            return value.to(self.device, non_blocking=non_blocking)
+
+        transferred = BatchOnDevice(
+            mel_specs=_to_device('mel_specs'),
+            phoneme_indices=_to_device('phoneme_indices'),
+            phoneme_durations=_to_device('phoneme_durations'),
+            stop_token_targets=_to_device('stop_token_targets'),
+            mel_lengths=_to_device('mel_lengths'),
+            phoneme_lengths=_to_device('phoneme_lengths'),
+            pitches=_to_device('pitches', required=False),
+            energies=_to_device('energies', required=False),
+            stress_indices=_to_device('stress_indices', required=False),
+        )
+
+        self._validate_transferred_batch(transferred)
+        return transferred
 
     def _profiler_record(self, name: str, active: bool):
         """Return a torch.profiler.record_function context when *active*, else a no-op.
@@ -1300,14 +1399,14 @@ class KokoroTrainer:
         except Exception as e:
             logger.debug(f"Failed to log weight histograms: {e}")
 
-    def validate_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
+    def validate_epoch(self, epoch: int) -> EpochMetrics:
         """
         Run validation loop to monitor overfitting.
         Uses EMA model if available for better validation metrics.
         Returns: (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
         """
         if self.val_dataloader is None:
-            return 0.0, 0.0, 0.0, 0.0
+            return EpochMetrics(0.0, 0.0, 0.0, 0.0)
 
         # Use EMA model for validation if available, otherwise use regular model
         model_to_validate = self.ema_model if (self.use_ema and self.ema_model is not None) else self.model
@@ -1339,15 +1438,15 @@ class KokoroTrainer:
                 try:
                     # Data loading - batch transfer for efficiency
                     transferred = self._transfer_batch_to_device(batch)
-                    mel_specs = transferred['mel_specs']
-                    phoneme_indices = transferred['phoneme_indices']
-                    phoneme_durations = transferred['phoneme_durations']
-                    stop_token_targets = transferred['stop_token_targets']
-                    mel_lengths = transferred['mel_lengths']
-                    phoneme_lengths = transferred['phoneme_lengths']
-                    pitches = transferred['pitches']
-                    energies = transferred['energies']
-                    stress_indices = transferred['stress_indices']
+                    mel_specs = transferred.mel_specs
+                    phoneme_indices = transferred.phoneme_indices
+                    phoneme_durations = transferred.phoneme_durations
+                    stop_token_targets = transferred.stop_token_targets
+                    mel_lengths = transferred.mel_lengths
+                    phoneme_lengths = transferred.phoneme_lengths
+                    pitches = transferred.pitches
+                    energies = transferred.energies
+                    stress_indices = transferred.stress_indices
 
                     # Forward pass (without mixed precision for validation consistency)
                     predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
@@ -1509,9 +1608,16 @@ class KokoroTrainer:
 
             self.writer.flush()
 
-            return (avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss)
+            return EpochMetrics(
+                total_loss=avg_total_loss,
+                mel_loss=avg_mel_loss,
+                dur_loss=avg_dur_loss,
+                stop_loss=avg_stop_loss,
+                pitch_loss=avg_pitch_loss,
+                energy_loss=avg_energy_loss,
+            )
         else:
-            return (0.0, 0.0, 0.0, 0.0)
+            return EpochMetrics(0.0, 0.0, 0.0, 0.0)
 
     def save_checkpoint_with_scaler(
         self, epoch: int, loss: float, val_loss: float = None,
@@ -1549,7 +1655,7 @@ class KokoroTrainer:
         torch.save(checkpoint, checkpoint_path)
         logger.info(f"Checkpoint saved to {checkpoint_path}")
 
-    def train_epoch(self, epoch: int) -> Tuple[float, float, float, float]:
+    def train_epoch(self, epoch: int) -> EpochMetrics:
         """Train for one epoch with enhanced profiling, mixed precision, and adaptive memory management"""
         self.model.train()
 
@@ -1623,15 +1729,15 @@ class KokoroTrainer:
 
                 with self._profiler_record("Data_Loading", is_profiling_epoch):
                     transferred = self._transfer_batch_to_device(batch)
-                    mel_specs = transferred['mel_specs']
-                    phoneme_indices = transferred['phoneme_indices']
-                    phoneme_durations = transferred['phoneme_durations']
-                    stop_token_targets = transferred['stop_token_targets']
-                    mel_lengths = transferred['mel_lengths']
-                    phoneme_lengths = transferred['phoneme_lengths']
-                    pitches = transferred['pitches']
-                    energies = transferred['energies']
-                    stress_indices = transferred['stress_indices']
+                    mel_specs = transferred.mel_specs
+                    phoneme_indices = transferred.phoneme_indices
+                    phoneme_durations = transferred.phoneme_durations
+                    stop_token_targets = transferred.stop_token_targets
+                    mel_lengths = transferred.mel_lengths
+                    phoneme_lengths = transferred.phoneme_lengths
+                    pitches = transferred.pitches
+                    energies = transferred.energies
+                    stress_indices = transferred.stress_indices
                     # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
                     if getattr(self.config, 'use_spec_augment', False):
                         mel_for_model = KokoroTrainer._apply_spec_augment(
@@ -1756,16 +1862,16 @@ class KokoroTrainer:
                         self.interbatch_profiler.end_batch(mel_specs.size(0))
                     continue
 
-                total_loss              = step_result['total_loss']
-                loss_mel                = step_result['loss_mel']
-                loss_duration           = step_result['loss_duration']
-                loss_stop_token         = step_result['loss_stop_token']
-                loss_pitch              = step_result['loss_pitch']
-                loss_energy             = step_result['loss_energy']
-                predicted_mel           = step_result['predicted_mel']
-                predicted_log_durations = step_result['predicted_log_durations']
-                predicted_pitch         = step_result['predicted_pitch']
-                predicted_energy        = step_result['predicted_energy']
+                total_loss              = step_result.total_loss
+                loss_mel                = step_result.loss_mel
+                loss_duration           = step_result.loss_duration
+                loss_stop_token         = step_result.loss_stop_token
+                loss_pitch              = step_result.loss_pitch
+                loss_energy             = step_result.loss_energy
+                predicted_mel           = step_result.predicted_mel
+                predicted_log_durations = step_result.predicted_log_durations
+                predicted_pitch         = step_result.predicted_pitch
+                predicted_energy        = step_result.predicted_energy
 
                 # Advance gradient accumulation cycle after successful backward
                 accumulated_step += 1
@@ -2229,10 +2335,12 @@ class KokoroTrainer:
         except Exception as e:
             logger.debug(f"Failed to log end-of-epoch train spectrograms: {e}")
 
-        return (total_loss_epoch / num_batches,
-                mel_loss_epoch / num_batches,
-                dur_loss_epoch / num_batches,
-                stop_loss_epoch / num_batches)
+        return EpochMetrics(
+            total_loss=(total_loss_epoch / num_batches),
+            mel_loss=(mel_loss_epoch / num_batches),
+            dur_loss=(dur_loss_epoch / num_batches),
+            stop_loss=(stop_loss_epoch / num_batches),
+        )
 
     def _snapshot_cache_stats(self, dataset) -> Optional[Dict[str, float]]:
         """Safely snapshot dataset feature-cache stats for epoch delta reporting."""
@@ -2363,7 +2471,11 @@ class KokoroTrainer:
                 epoch_cleanup_time_start = self.memory_manager.total_cleanup_time
                 epoch_memory_history_start = len(self.memory_manager.memory_history)
 
-            avg_total_loss, avg_mel_loss, avg_dur_loss, avg_stop_loss = self.train_epoch(epoch)
+            train_metrics = self.train_epoch(epoch)
+            avg_total_loss = train_metrics.total_loss
+            avg_mel_loss = train_metrics.mel_loss
+            avg_dur_loss = train_metrics.dur_loss
+            avg_stop_loss = train_metrics.stop_loss
 
             # Step scheduler per epoch only if NOT using OneCycleLR (which steps per batch)
             if not self.scheduler_per_batch:
@@ -2395,7 +2507,11 @@ class KokoroTrainer:
             validation_interval = getattr(self.config, 'validation_interval', 1)
             if self.val_dataloader is not None and (epoch + 1) % validation_interval == 0:
                 val_cache_start = self._snapshot_cache_stats(self.val_dataset)
-                val_total_loss, val_mel_loss, val_dur_loss, val_stop_loss = self.validate_epoch(epoch)
+                val_metrics = self.validate_epoch(epoch)
+                val_total_loss = val_metrics.total_loss
+                val_mel_loss = val_metrics.mel_loss
+                val_dur_loss = val_metrics.dur_loss
+                val_stop_loss = val_metrics.stop_loss
                 current_val_loss = val_total_loss
                 self._log_epoch_cache_delta(epoch, "val", self.val_dataset, val_cache_start)
                 self.validation_losses.append(val_total_loss)
@@ -2645,10 +2761,10 @@ class KokoroTrainer:
 
     def _execute_training_step(
         self,
-        transferred: Dict,
+        transferred: BatchOnDevice,
         mel_for_model: torch.Tensor,
         loss_scale: float = 1.0,
-    ) -> Optional[Dict]:
+    ) -> Optional[StepResult]:
         """Core forward + pitch/energy averaging + loss + backward step.
 
         Handles finite-output and finite-loss guards internally, logging errors
@@ -2675,15 +2791,15 @@ class KokoroTrainer:
             ``predicted_pitch``, ``predicted_energy``; or ``None`` if any
             output or loss is non-finite (caller should skip the batch).
         """
-        mel_specs          = transferred['mel_specs']
-        phoneme_indices    = transferred['phoneme_indices']
-        phoneme_durations  = transferred['phoneme_durations']
-        stop_token_targets = transferred['stop_token_targets']
-        mel_lengths        = transferred['mel_lengths']
-        phoneme_lengths    = transferred['phoneme_lengths']
-        pitches            = transferred['pitches']
-        energies           = transferred['energies']
-        stress_indices     = transferred['stress_indices']
+        mel_specs          = transferred.mel_specs
+        phoneme_indices    = transferred.phoneme_indices
+        phoneme_durations  = transferred.phoneme_durations
+        stop_token_targets = transferred.stop_token_targets
+        mel_lengths        = transferred.mel_lengths
+        phoneme_lengths    = transferred.phoneme_lengths
+        pitches            = transferred.pitches
+        energies           = transferred.energies
+        stress_indices     = transferred.stress_indices
 
         # --- Forward pass -------------------------------------------------
         with self.get_autocast_context():
@@ -2773,18 +2889,18 @@ class KokoroTrainer:
         else:
             (total_loss * loss_scale).backward()
 
-        return {
-            'total_loss':              total_loss,
-            'loss_mel':                loss_mel,
-            'loss_duration':           loss_duration,
-            'loss_stop_token':         loss_stop_token,
-            'loss_pitch':              loss_pitch,
-            'loss_energy':             loss_energy,
-            'predicted_mel':           predicted_mel,
-            'predicted_log_durations': predicted_log_durations,
-            'predicted_pitch':         predicted_pitch,
-            'predicted_energy':        predicted_energy,
-        }
+        return StepResult(
+            total_loss=total_loss,
+            loss_mel=loss_mel,
+            loss_duration=loss_duration,
+            loss_stop_token=loss_stop_token,
+            loss_pitch=loss_pitch,
+            loss_energy=loss_energy,
+            predicted_mel=predicted_mel,
+            predicted_log_durations=predicted_log_durations,
+            predicted_pitch=predicted_pitch,
+            predicted_energy=predicted_energy,
+        )
 
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """
@@ -2802,7 +2918,7 @@ class KokoroTrainer:
         transferred = self._transfer_batch_to_device(batch)
         self.optimizer.zero_grad()
 
-        step_result = self._execute_training_step(transferred, transferred['mel_specs'])
+        step_result = self._execute_training_step(transferred, transferred.mel_specs)
 
         if step_result is not None:
             if self.scaler is not None:
@@ -2907,15 +3023,15 @@ class KokoroTrainer:
                 self.interbatch_profiler.start_data_loading()
                 with torch.profiler.record_function("Data_Loading"):
                     transferred = self._transfer_batch_to_device(batch)
-                    mel_specs = transferred['mel_specs']
-                    phoneme_indices = transferred['phoneme_indices']
-                    phoneme_durations = transferred['phoneme_durations']
-                    stop_token_targets = transferred['stop_token_targets']
-                    mel_lengths = transferred['mel_lengths']
-                    phoneme_lengths = transferred['phoneme_lengths']
-                    pitches = transferred['pitches']
-                    energies = transferred['energies']
-                    stress_indices = transferred['stress_indices']
+                    mel_specs = transferred.mel_specs
+                    phoneme_indices = transferred.phoneme_indices
+                    phoneme_durations = transferred.phoneme_durations
+                    stop_token_targets = transferred.stop_token_targets
+                    mel_lengths = transferred.mel_lengths
+                    phoneme_lengths = transferred.phoneme_lengths
+                    pitches = transferred.pitches
+                    energies = transferred.energies
+                    stress_indices = transferred.stress_indices
                 self.interbatch_profiler.end_data_loading()
                 self.log_memory_stats("data_loading")
 
