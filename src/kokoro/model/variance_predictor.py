@@ -322,10 +322,12 @@ class VarianceAdaptor(nn.Module):
         if duration_target is not None:
             durations_to_use = duration_target
         else:
-            # Inference: duration predictor is trained on log1p targets, so we must
-            # apply exp() before rounding to recover actual frame counts.
-            # e.g. log1p(7) ≈ 2.08 → exp(2.08) ≈ 8.0 → 8 frames
-            durations_to_use = torch.clamp(torch.round(torch.exp(duration_pred)), min=0)
+            # Inference: duration predictor is trained on log1p targets
+            # (target = log(d + 1)), so the correct inverse is expm1:
+            #   expm1(logp1(d)) = exp(log(d+1)) - 1 = d
+            # e.g. log1p(7) ≈ 2.079 → expm1(2.079) = 7.0 → 7 frames
+            # Using exp() instead (the previous bug) would yield 8 frames (+1 bias).
+            durations_to_use = torch.clamp(torch.round(torch.expm1(duration_pred)), min=0)
 
         durations_to_use = durations_to_use.to(device)
 
