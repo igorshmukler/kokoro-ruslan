@@ -35,6 +35,7 @@ from kokoro.training.checkpoint_manager import (
 from kokoro.utils.interbatch_profiler import InterbatchProfiler
 from kokoro.training.mps_grad_scaler import MPSGradScaler
 from kokoro.training.losses import calculate_training_losses
+from kokoro.training.runtime_policies import RuntimeStepPolicy, MemoryOOMPolicy
 
 from kokoro.utils.adaptive_memory_manager import AdaptiveMemoryManager
 from kokoro.utils.ema import recommended_ema_decay
@@ -154,6 +155,8 @@ class KokoroTrainer:
         self._setup_model()
         self._setup_optimizer()
         self._setup_scheduler()
+        self.runtime_step_policy = RuntimeStepPolicy(logger=logger)
+        self.memory_oom_policy = MemoryOOMPolicy(logger=logger)
 
         # Training state
         self.start_epoch = 0
@@ -585,37 +588,38 @@ class KokoroTrainer:
 
     def adaptive_memory_cleanup(self, batch_idx: int, force: bool = False) -> Dict[str, Any]:
         """Perform adaptive memory cleanup"""
-        if self.enable_adaptive_memory:
-            return self.memory_manager.adaptive_cleanup(batch_idx, force)
-        else:
-            # Fallback to original cleanup behavior
-            if batch_idx % 200 == 0 and batch_idx > 0:
-                self.clear_device_cache()
-            return {'cleaned': False, 'pressure_level': 'disabled'}
+        memory_policy = getattr(self, 'memory_oom_policy', None)
+        if memory_policy is None:
+            memory_policy = MemoryOOMPolicy(logger=logger)
+            self.memory_oom_policy = memory_policy
+
+        return memory_policy.adaptive_cleanup(
+            enable_adaptive_memory=self.enable_adaptive_memory,
+            memory_manager=self.memory_manager,
+            batch_idx=batch_idx,
+            force=force,
+            clear_device_cache_fn=self.clear_device_cache,
+        )
 
     def handle_oom_with_adaptive_cleanup(self, batch_idx: int, error: Exception) -> bool:
         """
         Handle OOM error with adaptive cleanup
         Returns True if training should continue, False if unrecoverable
         """
-        logger.error(f"OOM error at batch {batch_idx} on {self.device_type}: {error}")
+        memory_policy = getattr(self, 'memory_oom_policy', None)
+        if memory_policy is None:
+            memory_policy = MemoryOOMPolicy(logger=logger)
+            self.memory_oom_policy = memory_policy
 
-        if self.enable_adaptive_memory:
-            # Emergency cleanup
-            cleanup_result = self.memory_manager.emergency_cleanup()
-
-            # Log results
-            if cleanup_result['success']:
-                logger.info(f"Emergency cleanup freed {cleanup_result['memory_freed_mb']:.1f}MB")
-                return True  # Try to continue
-            else:
-                logger.error("Emergency cleanup failed to free significant memory")
-                return False  # Unrecoverable
-        else:
-            # Fallback emergency cleanup
-            self.clear_device_cache()
-            gc.collect()
-            return True
+        return memory_policy.handle_oom(
+            enable_adaptive_memory=self.enable_adaptive_memory,
+            memory_manager=self.memory_manager,
+            batch_idx=batch_idx,
+            error=error,
+            device_type=self.device_type,
+            clear_device_cache_fn=self.clear_device_cache,
+            gc_collect_fn=gc.collect,
+        )
 
     def reset_profiling_stats(self):
         """Reset profiling statistics"""
@@ -2701,52 +2705,25 @@ class KokoroTrainer:
         step_scheduler: bool,
         update_ema: bool,
     ) -> None:
-        if self.use_mixed_precision:
-            if self.device_type == 'cuda':
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
+        runtime_policy = getattr(self, 'runtime_step_policy', None)
+        if runtime_policy is None:
+            runtime_policy = RuntimeStepPolicy(logger=logger)
+            self.runtime_step_policy = runtime_policy
 
-                old_scale = self.scaler.get_scale()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-                new_scale = self.scaler.get_scale()
-
-                if new_scale != old_scale:
-                    self.mixed_precision_stats['scale_updates'] += 1
-                    if new_scale < old_scale:
-                        self.mixed_precision_stats['scale_decreases'] += 1
-                        self.mixed_precision_stats['overflow_count'] += 1
-                    else:
-                        self.mixed_precision_stats['successful_steps'] += 1
-                else:
-                    self.mixed_precision_stats['successful_steps'] += 1
-            else:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
-
-                old_scale = self.scaler.get_scale()
-                step_successful = self.scaler.step(self.optimizer)
-                self.scaler.update()
-                new_scale = self.scaler.get_scale()
-
-                if step_successful:
-                    self.mixed_precision_stats['successful_steps'] += 1
-                else:
-                    self.mixed_precision_stats['skipped_steps'] += 1
-                    self.mixed_precision_stats['overflow_count'] += 1
-
-                if new_scale != old_scale:
-                    self.mixed_precision_stats['scale_updates'] += 1
-                    if new_scale < old_scale:
-                        self.mixed_precision_stats['scale_decreases'] += 1
-        else:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=clip_norm)
-            self.optimizer.step()
-
-        if step_scheduler and self.scheduler_per_batch:
-            self._step_scheduler_with_warmup()
-
-        if update_ema:
-            self._update_ema()
+        runtime_policy.optimizer_step_with_clipping(
+            model=self.model,
+            optimizer=self.optimizer,
+            use_mixed_precision=self.use_mixed_precision,
+            device_type=self.device_type,
+            scaler=self.scaler,
+            mixed_precision_stats=self.mixed_precision_stats,
+            clip_norm=clip_norm,
+            step_scheduler=step_scheduler,
+            scheduler_per_batch=self.scheduler_per_batch,
+            step_scheduler_fn=self._step_scheduler_with_warmup,
+            update_ema=update_ema,
+            update_ema_fn=self._update_ema,
+        )
 
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """

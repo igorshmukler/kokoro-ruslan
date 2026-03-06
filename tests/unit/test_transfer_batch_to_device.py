@@ -11,7 +11,7 @@ The helper must:
 import pytest
 import torch
 from types import SimpleNamespace
-from unittest.mock import patch, call
+from unittest.mock import patch
 
 from kokoro.training.trainer import KokoroTrainer, BatchOnDevice
 
