@@ -928,6 +928,23 @@ class KokoroTrainer:
         elif self.device.type == DeviceType.MPS.value:
             torch.mps.empty_cache()
 
+    def _transfer_batch_to_device(self, batch: Dict) -> Dict[str, Any]:
+        """Transfer a batch of tensors to the training device.
+
+        Moves all required and optional tensors to self.device using non-blocking
+        transfers for CUDA.  Always returns all optional keys (pitches, energies,
+        stress_indices) – missing keys are returned as None.
+        """
+        non_blocking = self.device.type == 'cuda'
+        tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
+                       'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
+        result: Dict[str, Any] = {k: batch[k].to(self.device, non_blocking=non_blocking)
+                                   for k in tensor_keys}
+        for key in ('pitches', 'energies', 'stress_indices'):
+            val = batch.get(key, None)
+            result[key] = val.to(self.device, non_blocking=non_blocking) if val is not None else None
+        return result
+
     def _has_nonfinite_gradients(self) -> bool:
         """Check whether any model gradient contains NaN/Inf values."""
         for param in self.model.parameters():
@@ -1589,31 +1606,16 @@ class KokoroTrainer:
             for batch_idx, batch in enumerate(progress_bar):
                 try:
                     # Data loading - batch transfer for efficiency
-                    non_blocking = self.device.type == 'cuda'
-
-                    # Batch transfer all required tensors at once
-                    tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
-                                   'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
-                    transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
-                                   for k in tensor_keys}
-
+                    transferred = self._transfer_batch_to_device(batch)
                     mel_specs = transferred['mel_specs']
                     phoneme_indices = transferred['phoneme_indices']
                     phoneme_durations = transferred['phoneme_durations']
                     stop_token_targets = transferred['stop_token_targets']
                     mel_lengths = transferred['mel_lengths']
                     phoneme_lengths = transferred['phoneme_lengths']
-
-                    # Optional tensors (pitch and energy)
-                    pitches = batch.get('pitches', None)
-                    energies = batch.get('energies', None)
-                    if pitches is not None:
-                        pitches = pitches.to(self.device, non_blocking=non_blocking)
-                    if energies is not None:
-                        energies = energies.to(self.device, non_blocking=non_blocking)
-                    stress_indices = batch.get('stress_indices', None)
-                    if stress_indices is not None:
-                        stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
+                    pitches = transferred['pitches']
+                    energies = transferred['energies']
+                    stress_indices = transferred['stress_indices']
 
                     # Forward pass (without mixed precision for validation consistency)
                     predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
@@ -1890,32 +1892,16 @@ class KokoroTrainer:
                 # Only add profiler overhead when actually profiling
                 if is_profiling_epoch:
                     with torch.profiler.record_function("Data_Loading"):
-                        # Use non_blocking only for CUDA
-                        non_blocking = self.device.type == 'cuda'
-
-                        # Batch transfer all required tensors at once for better performance
-                        tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
-                                       'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
-                        transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
-                                       for k in tensor_keys}
-
+                        transferred = self._transfer_batch_to_device(batch)
                         mel_specs = transferred['mel_specs']
                         phoneme_indices = transferred['phoneme_indices']
                         phoneme_durations = transferred['phoneme_durations']
                         stop_token_targets = transferred['stop_token_targets']
                         mel_lengths = transferred['mel_lengths']
                         phoneme_lengths = transferred['phoneme_lengths']
-
-                        # Optional tensors (pitch and energy)
-                        pitches = batch.get('pitches', None)
-                        energies = batch.get('energies', None)
-                        if pitches is not None:
-                            pitches = pitches.to(self.device, non_blocking=non_blocking)
-                        if energies is not None:
-                            energies = energies.to(self.device, non_blocking=non_blocking)
-                        stress_indices = batch.get('stress_indices', None)
-                        if stress_indices is not None:
-                            stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
+                        pitches = transferred['pitches']
+                        energies = transferred['energies']
+                        stress_indices = transferred['stress_indices']
                         # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
                         if getattr(self.config, 'use_spec_augment', False):
                             mel_for_model = KokoroTrainer._apply_spec_augment(
@@ -1929,30 +1915,16 @@ class KokoroTrainer:
                             mel_for_model = mel_specs
                 else:
                     # No profiler overhead
-                    non_blocking = self.device.type == 'cuda'
-
-                    tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
-                                   'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
-                    transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
-                                   for k in tensor_keys}
-
+                    transferred = self._transfer_batch_to_device(batch)
                     mel_specs = transferred['mel_specs']
                     phoneme_indices = transferred['phoneme_indices']
                     phoneme_durations = transferred['phoneme_durations']
                     stop_token_targets = transferred['stop_token_targets']
                     mel_lengths = transferred['mel_lengths']
                     phoneme_lengths = transferred['phoneme_lengths']
-
-                    # Optional tensors (pitch and energy) - get them first
-                    pitches = batch.get('pitches', None)
-                    energies = batch.get('energies', None)
-                    if pitches is not None:
-                        pitches = pitches.to(self.device, non_blocking=non_blocking)
-                    if energies is not None:
-                        energies = energies.to(self.device, non_blocking=non_blocking)
-                    stress_indices = batch.get('stress_indices', None)
-                    if stress_indices is not None:
-                        stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
+                    pitches = transferred['pitches']
+                    energies = transferred['energies']
+                    stress_indices = transferred['stress_indices']
                     # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
                     if getattr(self.config, 'use_spec_augment', False):
                         mel_for_model = KokoroTrainer._apply_spec_augment(
@@ -3136,31 +3108,16 @@ class KokoroTrainer:
         start_time = time.time() if measure_time else None
 
         # Data loading - batch transfer for efficiency
-        non_blocking = self.device.type == 'cuda'
-
-        # Batch transfer all required tensors at once
-        tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
-                       'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
-        transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
-                       for k in tensor_keys}
-
+        transferred = self._transfer_batch_to_device(batch)
         mel_specs = transferred['mel_specs']
         phoneme_indices = transferred['phoneme_indices']
         phoneme_durations = transferred['phoneme_durations']
         stop_token_targets = transferred['stop_token_targets']
         mel_lengths = transferred['mel_lengths']
         phoneme_lengths = transferred['phoneme_lengths']
-
-        # Optional tensors (pitch and energy)
-        pitches = batch.get('pitches', None)
-        energies = batch.get('energies', None)
-        if pitches is not None:
-            pitches = pitches.to(self.device, non_blocking=non_blocking)
-        if energies is not None:
-            energies = energies.to(self.device, non_blocking=non_blocking)
-        stress_indices = batch.get('stress_indices', None)
-        if stress_indices is not None:
-            stress_indices = stress_indices.to(self.device, non_blocking=non_blocking)
+        pitches = transferred['pitches']
+        energies = transferred['energies']
+        stress_indices = transferred['stress_indices']
 
         self.optimizer.zero_grad()
 
@@ -3320,26 +3277,18 @@ class KokoroTrainer:
                 cleanup_result = self.adaptive_memory_cleanup(batch_idx)
                 self.profile_step()
 
-                non_blocking = self.device.type == 'cuda'
                 self.interbatch_profiler.start_data_loading()
                 with torch.profiler.record_function("Data_Loading"):
-                    tensor_keys = ['mel_specs', 'phoneme_indices', 'phoneme_durations',
-                                   'stop_token_targets', 'mel_lengths', 'phoneme_lengths']
-                    transferred = {k: batch[k].to(self.device, non_blocking=non_blocking)
-                                   for k in tensor_keys}
+                    transferred = self._transfer_batch_to_device(batch)
                     mel_specs = transferred['mel_specs']
                     phoneme_indices = transferred['phoneme_indices']
                     phoneme_durations = transferred['phoneme_durations']
                     stop_token_targets = transferred['stop_token_targets']
                     mel_lengths = transferred['mel_lengths']
                     phoneme_lengths = transferred['phoneme_lengths']
-
-                    pitches = batch.get('pitches', None)
-                    energies = batch.get('energies', None)
-                    if pitches is not None:
-                        pitches = pitches.to(self.device, non_blocking=non_blocking)
-                    if energies is not None:
-                        energies = energies.to(self.device, non_blocking=non_blocking)
+                    pitches = transferred['pitches']
+                    energies = transferred['energies']
+                    stress_indices = transferred['stress_indices']
                 self.interbatch_profiler.end_data_loading()
                 self.log_memory_stats("data_loading")
 
