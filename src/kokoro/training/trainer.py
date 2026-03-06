@@ -2008,13 +2008,7 @@ class KokoroTrainer:
                     self.interbatch_profiler.start_forward_pass()
 
                 with self._profiler_record("Model_Forward", is_profiling_epoch):
-                    if self.use_mixed_precision:
-                        with self.get_autocast_context():
-                            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                                self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
-                                         pitch_targets=pitches, energy_targets=energies,
-                                         stress_indices=stress_indices)
-                    else:
+                    with self.get_autocast_context():
                         predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                             self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
                                      pitch_targets=pitches, energy_targets=energies,
@@ -2083,15 +2077,7 @@ class KokoroTrainer:
 
                 # Loss calculation with mixed precision
                 with self._profiler_record("Loss_Calculation", is_profiling_epoch):
-                    if self.use_mixed_precision:
-                        with self.get_autocast_context():
-                            total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
-                                predicted_mel, predicted_log_durations, predicted_stop_logits,
-                                mel_specs, phoneme_durations, stop_token_targets,
-                                mel_lengths, phoneme_lengths,
-                                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                            )
-                    else:
+                    with self.get_autocast_context():
                         total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
                             predicted_mel, predicted_log_durations, predicted_stop_logits,
                             mel_specs, phoneme_durations, stop_token_targets,
@@ -2147,12 +2133,8 @@ class KokoroTrainer:
                     self.interbatch_profiler.start_backward_pass()
 
                 with self._profiler_record("Backward_Pass", is_profiling_epoch):
-                    if self.use_mixed_precision:
-                        if self.device_type == 'cuda':
-                            self.scaler.scale(scaled_total_loss).backward()
-                        else:  # MPS
-                            scaled_loss = self.scaler.scale(scaled_total_loss)
-                            scaled_loss.backward()
+                    if self.scaler is not None:
+                        self.scaler.scale(scaled_total_loss).backward()
                     else:
                         scaled_total_loss.backward()
 
