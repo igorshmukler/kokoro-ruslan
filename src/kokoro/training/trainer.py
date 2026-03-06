@@ -19,7 +19,7 @@ import copy
 import faulthandler
 from pathlib import Path
 
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, Union
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -2798,13 +2798,13 @@ class KokoroTrainer:
         mel_for_model: torch.Tensor,
         max_mel_len: int,
         max_phoneme_len: int,
-    ) -> Tuple[BatchOnDevice, torch.Tensor, Dict[str, int | bool]]:
+    ) -> Tuple[BatchOnDevice, torch.Tensor, Dict[str, Union[int, bool]]]:
         """Cap oversized mel/phoneme dimensions in a batch and keep training.
 
         Returns updated ``(transferred, mel_for_model, info)`` where ``info``
         records original/new lengths and whether truncation occurred.
         """
-        info: Dict[str, int | bool] = {
+        info: Dict[str, Union[int, bool]] = {
             'truncated': False,
             'orig_mel_len': int(transferred.mel_specs.size(1)),
             'new_mel_len': int(transferred.mel_specs.size(1)),
