@@ -540,6 +540,34 @@ class RuslanDataset(Dataset):
         except Exception as e:
             logger.warning(f"Failed to save cached features for {audio_file}: {e}")
 
+    @staticmethod
+    def _build_fallback_durations(num_phonemes: int, num_mel_frames: int) -> torch.Tensor:
+        """Build estimated phoneme durations with exact frame-sum consistency.
+
+        Ensures:
+        - shape == (num_phonemes,)
+        - durations are integer and non-negative
+        - durations.sum() == num_mel_frames (always)
+
+        For short utterances where ``num_mel_frames < num_phonemes``, this will
+        assign zero duration to some tail phonemes rather than over-allocating
+        frames. The loss path already masks out zero-duration tokens.
+        """
+        num_phonemes = max(0, int(num_phonemes))
+        num_mel_frames = max(0, int(num_mel_frames))
+
+        if num_phonemes == 0:
+            return torch.zeros((0,), dtype=torch.long)
+
+        base = num_mel_frames // num_phonemes
+        remainder = num_mel_frames % num_phonemes
+
+        durations = torch.full((num_phonemes,), int(base), dtype=torch.long)
+        if remainder > 0:
+            durations[:remainder] += 1
+
+        return durations
+
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
         audio_file = sample['audio_file']
@@ -692,18 +720,10 @@ class RuslanDataset(Dataset):
 
         else:
             # Fall back to estimated durations
-            if num_phonemes == 0:
-                phoneme_durations = torch.zeros_like(phoneme_indices_tensor, dtype=torch.long)
-            else:
-                avg_duration = num_mel_frames / num_phonemes
-                phoneme_durations = torch.full((num_phonemes,), int(avg_duration), dtype=torch.long)
-
-                remainder = num_mel_frames - torch.sum(phoneme_durations).item()
-                # Distribute remainder frames to early phonemes
-                for i in range(remainder):
-                    if i < num_phonemes: # Ensure we don't go out of bounds
-                        phoneme_durations[i] += 1
-                phoneme_durations = torch.clamp(phoneme_durations, min=1)
+            phoneme_durations = RuslanDataset._build_fallback_durations(
+                num_phonemes=num_phonemes,
+                num_mel_frames=num_mel_frames,
+            )
 
         # --- Generate Stop Token Targets ---
         stop_token_targets = torch.zeros(mel_spec.shape[1], dtype=torch.float32)

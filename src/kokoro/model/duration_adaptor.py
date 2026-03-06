@@ -72,15 +72,22 @@ class SimpleDurationAdaptor(BaseDurationAdaptor):
                 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         # predicted_log_durations: (batch, phonemes)
         predicted_log_durations = self.duration_predictor_fn(text_encoded)
-        if predicted_log_durations.dim() > 1 and predicted_log_durations.size(-1) == 1:
+        # Only collapse an explicit trailing feature-channel of size 1 produced by
+        # predictors that output (B, T, 1) — do NOT squeeze (B, 1) which is the
+        # legitimate T=1 (single-phoneme) case.
+        if predicted_log_durations.dim() == 3 and predicted_log_durations.size(-1) == 1:
             predicted_log_durations = predicted_log_durations.squeeze(-1)
 
         # Determine durations to use for length regulation
         if duration_target is not None:
             durations_for_length = duration_target.long()
         else:
-            # inference path: convert predicted log durations to integer durations
-            durations_for_length = torch.clamp(torch.exp(predicted_log_durations), min=1.0).long()
+            # Inference: the duration predictor is trained against log1p targets
+            # (losses.py: target = log(d + 1)), so the correct inverse is expm1:
+            #   expm1(log1p(d)) = d
+            # Using exp() (the previous bug) would yield (d + 1), biasing every
+            # phoneme duration upward by one frame.
+            durations_for_length = torch.clamp(torch.expm1(predicted_log_durations), min=1.0).round().long()
 
         # Expand encoder outputs to frame level
         expanded_encoder_outputs, frame_mask = self.length_regulate_fn(text_encoded, durations_for_length, mask)

@@ -10,6 +10,8 @@ class _CountingModel(nn.Module):
         super().__init__()
         self.w = nn.Parameter(torch.tensor(0.0))
         self.forward_calls = 0
+        self.last_mel_len = None
+        self.last_phoneme_len = None
 
     def forward(
         self,
@@ -25,6 +27,8 @@ class _CountingModel(nn.Module):
         batch_size = mel_specs.size(0)
         mel_len = mel_specs.size(1)
         phoneme_len = phoneme_indices.size(1)
+        self.last_mel_len = mel_len
+        self.last_phoneme_len = phoneme_len
         predicted_mel = mel_specs + self.w
         predicted_log_durations = torch.zeros(batch_size, phoneme_len, device=mel_specs.device) + self.w
         predicted_stop_logits = torch.zeros(batch_size, mel_len, device=mel_specs.device) + self.w
@@ -205,3 +209,29 @@ def test_train_epoch_uses_emergency_clip_norm_on_gradient_explosion(monkeypatch)
     assert trainer.model.forward_calls == 1
     assert avg_total_loss > 0.0
     assert captured["max_norm"] == 0.05
+
+
+def test_train_epoch_caps_oversized_batch_instead_of_skipping(monkeypatch):
+    trainer = _build_trainer_for_stabilization_test()
+    oversized_batch = _make_batch(mel_len=2105, max_duration=60)
+    trainer.dataloader = [oversized_batch]
+
+    captured = {}
+    original_clip = torch.nn.utils.clip_grad_norm_
+
+    def _capture_clip(parameters, max_norm, *args, **kwargs):
+        captured["max_norm"] = float(max_norm)
+        return original_clip(parameters, max_norm, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.utils, "clip_grad_norm_", _capture_clip)
+    monkeypatch.setattr(getattr(torch, 'mps', object()), "empty_cache", lambda: None, raising=False)
+
+    metrics = trainer.train_epoch(0)
+    assert isinstance(metrics, EpochMetrics)
+
+    assert trainer.model.forward_calls == 1
+    assert trainer.model.last_mel_len == 2000
+    assert trainer.model.last_phoneme_len == 4
+    risk_ratio = max(2000 / 1400, 60 / 150)
+    expected_clip = max(0.05, 0.5 / (risk_ratio ** 0.5))
+    assert abs(captured["max_norm"] - expected_clip) < 1e-6

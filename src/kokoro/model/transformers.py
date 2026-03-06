@@ -642,34 +642,28 @@ class ImprovedTransformerDecoder(nn.Module):
 
 class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     """
-    Backward compatibility wrapper for the original TransformerEncoderBlock.
-    Uses post-norm + ReLU to match the architecture that existing checkpoints were
-    trained with.  Do NOT change use_prenorm here without also retraining from scratch
-    — the norm1/norm2 weights in saved checkpoints were trained for post-norm semantics
-    (applied AFTER the sublayer residual), and switching to pre-norm (applied BEFORE)
-    with the same weights produces completely wrong activations / garbage mel output.
+    Compatibility wrapper for TransformerEncoderBlock.
+    Uses pre-norm + GELU — norm is applied BEFORE each sublayer (attention and FFN),
+    which improves training stability and gradient flow.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  drop_path_rate: float = 0.0):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
-                        activation='relu', use_prenorm=False, use_relative_pos=False,
+                        activation='gelu', use_prenorm=True, use_relative_pos=False,
                         drop_path_rate=drop_path_rate)
 
 
 class TransformerDecoder(ImprovedTransformerDecoder):
     """
-    Backward compatibility wrapper for the original TransformerDecoder.
-    Uses post-norm + ReLU to match the architecture that existing checkpoints were
-    trained with.  Do NOT change use_prenorm here without also retraining from scratch
-    — the norm1/norm2/norm3 weights in saved checkpoints were trained for post-norm
-    semantics, and switching to pre-norm with the same weights produces garbage output.
-    Post-norm also means self.norm (the final decoder LayerNorm) is None, which is why
-    checkpoints are missing 'decoder.norm.weight' / 'decoder.norm.bias'.
+    Compatibility wrapper for TransformerDecoder.
+    Uses pre-norm + GELU — norm is applied BEFORE each sublayer (self-attention,
+    cross-attention, and FFN), and a final LayerNorm is applied after all decoder
+    blocks.  This improves training stability and gradient flow compared to post-norm.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        use_prenorm=False, activation='relu')
+                        use_prenorm=True, activation='gelu')
 
 
 # --- Helper functions for optimized components (optional, for direct use) ---

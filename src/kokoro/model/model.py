@@ -611,8 +611,9 @@ class KokoroModel(nn.Module):
             batch_size = phoneme_indices.size(0)
             device = phoneme_indices.device
 
-            self.eval()
-
+            # Mode management is the caller's responsibility; do not call self.eval() here.
+            # forward_inference() may be invoked directly (e.g. from a validation loop that
+            # already set eval mode) or from forward() whose caller owns the mode lifecycle.
             self._log_memory("inference_start")
 
             with torch.no_grad():
@@ -707,9 +708,15 @@ class KokoroModel(nn.Module):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Main forward pass that dispatches to training or inference mode.
+
+        Mode management (train/eval) is intentionally NOT performed here.
+        The caller — trainer, validation loop, or inference script — is
+        responsible for setting the correct mode before calling forward().
+        Switching mode inside forward() would silently override .eval() set
+        by validate_epoch(), contaminating val metrics with dropout noise and
+        making early-stopping decisions unreliable.
         """
         if mel_specs is not None:
-            self.train()
             if phoneme_durations is None or stop_token_targets is None:
                 raise ValueError("phoneme_durations and stop_token_targets must be provided for training mode.")
             return self.forward_training(
@@ -719,7 +726,6 @@ class KokoroModel(nn.Module):
                 stress_indices=stress_indices,
             )
         else:
-            self.eval()
             return self.forward_inference(
                 phoneme_indices, max_len=self.max_decoder_seq_len,
                 text_padding_mask=text_padding_mask,

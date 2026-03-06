@@ -83,7 +83,7 @@ def test_runtime_step_policy_non_mixed_precision_preserves_scheduler_and_ema_cad
     scheduler_calls = {"count": 0}
     ema_calls = {"count": 0}
 
-    policy.optimizer_step_with_clipping(
+    step_successful = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=False,
@@ -98,6 +98,7 @@ def test_runtime_step_policy_non_mixed_precision_preserves_scheduler_and_ema_cad
         update_ema_fn=lambda: ema_calls.__setitem__("count", ema_calls["count"] + 1),
     )
 
+    assert step_successful is True
     assert scheduler_calls["count"] == 1
     assert ema_calls["count"] == 1
 
@@ -109,7 +110,7 @@ def test_runtime_step_policy_scheduler_not_stepped_when_disabled():
 
     scheduler_calls = {"count": 0}
 
-    policy.optimizer_step_with_clipping(
+    step_successful = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=False,
@@ -124,6 +125,7 @@ def test_runtime_step_policy_scheduler_not_stepped_when_disabled():
         update_ema_fn=lambda: None,
     )
 
+    assert step_successful is True
     assert scheduler_calls["count"] == 0
 
 
@@ -134,7 +136,7 @@ def test_runtime_step_policy_cuda_updates_mixed_precision_stats_on_scale_drop():
     scaler = _FakeCudaScaler(scales=[1024.0, 512.0])
     stats = _mp_stats()
 
-    policy.optimizer_step_with_clipping(
+    step_successful = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=True,
@@ -149,6 +151,7 @@ def test_runtime_step_policy_cuda_updates_mixed_precision_stats_on_scale_drop():
         update_ema_fn=lambda: None,
     )
 
+    assert step_successful is False
     assert scaler.unscaled is True
     assert stats["scale_updates"] == 1
     assert stats["scale_decreases"] == 1
@@ -162,7 +165,7 @@ def test_runtime_step_policy_mps_failed_step_updates_skip_counters():
     scaler = _FakeMpsScaler(scales=[1024.0, 512.0], step_successful=False)
     stats = _mp_stats()
 
-    policy.optimizer_step_with_clipping(
+    step_successful = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=True,
@@ -177,10 +180,40 @@ def test_runtime_step_policy_mps_failed_step_updates_skip_counters():
         update_ema_fn=lambda: None,
     )
 
+    assert step_successful is False
     assert stats["skipped_steps"] == 1
     assert stats["overflow_count"] == 1
     assert stats["scale_updates"] == 1
     assert stats["scale_decreases"] == 1
+
+
+def test_runtime_step_policy_skipped_step_does_not_advance_scheduler_or_ema():
+    policy = RuntimeStepPolicy(logger=SimpleNamespace(info=lambda *a, **k: None))
+    model = _SingleParamModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    scaler = _FakeMpsScaler(scales=[1024.0, 512.0], step_successful=False)
+
+    scheduler_calls = {"count": 0}
+    ema_calls = {"count": 0}
+
+    step_successful = policy.optimizer_step_with_clipping(
+        model=model,
+        optimizer=optimizer,
+        use_mixed_precision=True,
+        device_type="mps",
+        scaler=scaler,
+        mixed_precision_stats=_mp_stats(),
+        clip_norm=0.5,
+        step_scheduler=True,
+        scheduler_per_batch=True,
+        step_scheduler_fn=lambda: scheduler_calls.__setitem__("count", scheduler_calls["count"] + 1),
+        update_ema=True,
+        update_ema_fn=lambda: ema_calls.__setitem__("count", ema_calls["count"] + 1),
+    )
+
+    assert step_successful is False
+    assert scheduler_calls["count"] == 0
+    assert ema_calls["count"] == 0
 
 
 def test_memory_policy_adaptive_cleanup_path_uses_manager():

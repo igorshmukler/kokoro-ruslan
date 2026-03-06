@@ -50,3 +50,55 @@ def test_forward_inference_receives_post_expected_threshold(monkeypatch):
     assert hasattr(tts2.model, 'last_forward_kwargs')
     assert 'post_expected_stop_threshold' in tts2.model.last_forward_kwargs
     assert abs(float(tts2.model.last_forward_kwargs['post_expected_stop_threshold']) - 0.75) < 1e-6
+
+
+def test_adaptive_trailing_trim_preserves_weak_tail_frames(monkeypatch):
+    """Weak trailing phones near the silence floor should not be aggressively trimmed."""
+    import kokoro.inference.inference as inference_mod
+
+    class DummyProcessor:
+        def __init__(self):
+            self.phoneme_to_id = {'a': 1, '<sil>': 2, '<unk>': 0}
+
+        def process_text(self, text):
+            return [(text, ['a'], None)]
+
+    class DummyModel:
+        def __init__(self):
+            self.mel_dim = 80
+
+        def forward_inference(self, **kwargs):
+            # Shape: (1, T=100, 80)
+            # - Strong voiced region: frames 20..70 at -6.0
+            # - Weak trailing region: frames 84..88 at -9.6 (near silence floor)
+            # - Elsewhere: silence floor at -11.5
+            mel = torch.full((1, 100, 80), -11.5)
+            mel[:, 20:71, :] = -6.0
+            mel[:, 84:89, :] = -9.6
+            return mel
+
+    class CapturingVocoderManager:
+        def __init__(self, *args, **kwargs):
+            self.last_mel = None
+
+        def mel_to_audio(self, mel):
+            self.last_mel = mel
+            return torch.zeros(100)
+
+    monkeypatch.setattr(inference_mod.KokoroTTS, '_load_phoneme_processor', lambda self: DummyProcessor())
+    monkeypatch.setattr(inference_mod.KokoroTTS, '_load_model', lambda self: DummyModel())
+    monkeypatch.setattr(inference_mod, 'VocoderManager', CapturingVocoderManager)
+
+    tts = inference_mod.KokoroTTS(model_dir='my_model', device='cpu')
+    tts.text_to_speech('hello', output_path=None)
+
+    # Vocoder input is (80, T) after transpose+squeeze in text_to_speech.
+    assert tts.vocoder_manager.last_mel is not None
+    assert tts.vocoder_manager.last_mel.dim() == 2
+
+    kept_frames = int(tts.vocoder_manager.last_mel.shape[-1])
+
+    # Weak tail ends at frame 88. We expect adaptive trim to keep past this.
+    assert kept_frames >= 89, (
+        f"Adaptive trailing trim cut weak tail frames unexpectedly: kept {kept_frames} frames"
+    )

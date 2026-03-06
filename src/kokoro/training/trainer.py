@@ -19,7 +19,7 @@ import copy
 import faulthandler
 from pathlib import Path
 
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, Union
 
 from torch.utils.tensorboard import SummaryWriter
 
@@ -1419,7 +1419,13 @@ class KokoroTrainer:
                     logger.error(f"Error in validation batch {batch_idx}: {e}")
                     continue
 
-        self.model.train()  # Set back to training mode
+        # Restore both the validated model and the regular model to train mode.
+        # When EMA is active, model_to_validate is the EMA model (a separate object
+        # from self.model); restoring only self.model would leave the EMA model in
+        # eval mode for the rest of the epoch.
+        model_to_validate.train()
+        if model_to_validate is not self.model:
+            self.model.train()
 
         # Compute averages
         if num_batches > 0:
@@ -1607,11 +1613,36 @@ class KokoroTrainer:
                     else:
                         mel_for_model = mel_specs
 
-                # Validate tensor dimensions to prevent MPS overflow
-                max_dim = max(mel_specs.shape[1], phoneme_indices.shape[1])
-                if max_dim > 2000:
-                    logger.warning(f"⚠️ Skipping batch {batch_idx}: excessive dimensions (max_dim={max_dim})")
-                    continue
+                # Adaptive long-sequence handling: cap/truncate oversized batches
+                # instead of skipping them entirely so training still benefits from
+                # difficult long-form samples.
+                max_dim_cap = int(getattr(self.config, 'max_sequence_dim_cap', 2000))
+                transferred, mel_for_model, truncation_info = KokoroTrainer._cap_batch_sequence_dimensions(
+                    transferred=transferred,
+                    mel_for_model=mel_for_model,
+                    max_mel_len=max_dim_cap,
+                    max_phoneme_len=max_dim_cap,
+                )
+                if truncation_info['truncated']:
+                    logger.warning(
+                        "⚠️ BATCH %d - Capped long sequence dimensions "
+                        "(mel: %d→%d, phoneme: %d→%d) to keep training stable",
+                        batch_idx,
+                        truncation_info['orig_mel_len'],
+                        truncation_info['new_mel_len'],
+                        truncation_info['orig_phoneme_len'],
+                        truncation_info['new_phoneme_len'],
+                    )
+
+                mel_specs = transferred.mel_specs
+                phoneme_indices = transferred.phoneme_indices
+                phoneme_durations = transferred.phoneme_durations
+                stop_token_targets = transferred.stop_token_targets
+                mel_lengths = transferred.mel_lengths
+                phoneme_lengths = transferred.phoneme_lengths
+                pitches = transferred.pitches
+                energies = transferred.energies
+                stress_indices = transferred.stress_indices
 
                 # Log variance predictor ranges periodically only in verbose mode
                 if getattr(self.config, 'verbose', False) and batch_idx % 50 == 0 and pitches is not None and energies is not None:
@@ -1694,9 +1725,18 @@ class KokoroTrainer:
                     self.interbatch_profiler.start_forward_pass()
 
                 with self._profiler_record("Training_Step", is_profiling_epoch):
+                    # Use exact accumulation divisor so tail micro-batches at epoch end
+                    # are not under-scaled when fewer than gradient_accumulation_steps remain.
+                    accumulation_divisor = KokoroTrainer._effective_accumulation_divisor(
+                        gradient_accumulation_steps=gradient_accumulation_steps,
+                        accumulated_step=accumulated_step,
+                        batch_idx=batch_idx,
+                        num_batches=num_batches,
+                    )
+
                     step_result = self._execute_training_step(
                         transferred, mel_for_model,
-                        loss_scale=(1.0 / gradient_accumulation_steps) * adaptive_loss_scale,
+                        loss_scale=(1.0 / accumulation_divisor) * adaptive_loss_scale,
                     )
 
                 if enable_interbatch_profiling or is_profiling_epoch:
@@ -1870,13 +1910,19 @@ class KokoroTrainer:
 
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
-                    self._optimizer_step_with_clipping(
+                    step_successful = self._optimizer_step_with_clipping(
                         clip_norm=adaptive_clip_norm,
                         step_scheduler=True,
                         update_ema=True,
                     )
 
-                    self.optimizer_steps_completed += 1
+                    if step_successful:
+                        self.optimizer_steps_completed += 1
+                    else:
+                        logger.warning(
+                            "Optimizer step skipped (AMP overflow/non-finite grads); "
+                            "scheduler and EMA were not advanced for this step"
+                        )
 
                     # Log every 10 steps
                     if self.optimizer_steps_completed % 10 == 0:
@@ -2704,13 +2750,13 @@ class KokoroTrainer:
         *,
         step_scheduler: bool,
         update_ema: bool,
-    ) -> None:
+    ) -> bool:
         runtime_policy = getattr(self, 'runtime_step_policy', None)
         if runtime_policy is None:
             runtime_policy = RuntimeStepPolicy(logger=logger)
             self.runtime_step_policy = runtime_policy
 
-        runtime_policy.optimizer_step_with_clipping(
+        return runtime_policy.optimizer_step_with_clipping(
             model=self.model,
             optimizer=self.optimizer,
             use_mixed_precision=self.use_mixed_precision,
@@ -2724,6 +2770,75 @@ class KokoroTrainer:
             update_ema=update_ema,
             update_ema_fn=self._update_ema,
         )
+
+    @staticmethod
+    def _effective_accumulation_divisor(
+        *,
+        gradient_accumulation_steps: int,
+        accumulated_step: int,
+        batch_idx: int,
+        num_batches: int,
+    ) -> int:
+        """Return the correct loss divisor for gradient accumulation.
+
+        For normal full accumulation windows this equals
+        ``gradient_accumulation_steps``. For the final partial window at the end
+        of an epoch, this returns the exact number of micro-batches that will
+        contribute to the upcoming optimizer step.
+        """
+        total_target = max(1, int(gradient_accumulation_steps))
+        remaining_including_current = max(1, int(num_batches) - int(batch_idx))
+        already_accumulated = max(0, int(accumulated_step))
+        return max(1, min(total_target, already_accumulated + remaining_including_current))
+
+    @staticmethod
+    def _cap_batch_sequence_dimensions(
+        *,
+        transferred: BatchOnDevice,
+        mel_for_model: torch.Tensor,
+        max_mel_len: int,
+        max_phoneme_len: int,
+    ) -> Tuple[BatchOnDevice, torch.Tensor, Dict[str, Union[int, bool]]]:
+        """Cap oversized mel/phoneme dimensions in a batch and keep training.
+
+        Returns updated ``(transferred, mel_for_model, info)`` where ``info``
+        records original/new lengths and whether truncation occurred.
+        """
+        info: Dict[str, Union[int, bool]] = {
+            'truncated': False,
+            'orig_mel_len': int(transferred.mel_specs.size(1)),
+            'new_mel_len': int(transferred.mel_specs.size(1)),
+            'orig_phoneme_len': int(transferred.phoneme_indices.size(1)),
+            'new_phoneme_len': int(transferred.phoneme_indices.size(1)),
+        }
+
+        mel_cap = max(1, int(max_mel_len))
+        phoneme_cap = max(1, int(max_phoneme_len))
+
+        if transferred.mel_specs.size(1) > mel_cap:
+            info['truncated'] = True
+            info['new_mel_len'] = mel_cap
+
+            transferred.mel_specs = transferred.mel_specs[:, :mel_cap, :]
+            mel_for_model = mel_for_model[:, :mel_cap, :]
+            transferred.stop_token_targets = transferred.stop_token_targets[:, :mel_cap]
+            transferred.mel_lengths = transferred.mel_lengths.clamp(max=mel_cap)
+            if transferred.pitches is not None:
+                transferred.pitches = transferred.pitches[:, :mel_cap]
+            if transferred.energies is not None:
+                transferred.energies = transferred.energies[:, :mel_cap]
+
+        if transferred.phoneme_indices.size(1) > phoneme_cap:
+            info['truncated'] = True
+            info['new_phoneme_len'] = phoneme_cap
+
+            transferred.phoneme_indices = transferred.phoneme_indices[:, :phoneme_cap]
+            transferred.phoneme_durations = transferred.phoneme_durations[:, :phoneme_cap]
+            transferred.phoneme_lengths = transferred.phoneme_lengths.clamp(max=phoneme_cap)
+            if transferred.stress_indices is not None:
+                transferred.stress_indices = transferred.stress_indices[:, :phoneme_cap]
+
+        return transferred, mel_for_model, info
 
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """
