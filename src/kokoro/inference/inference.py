@@ -571,31 +571,38 @@ class KokoroTTS:
                 # Based on torch.log(1e-9), the floor is -20.7, but typical speech is -11.5 to 0.
                 mel_spec = torch.clamp(mel_spec, min=-11.5, max=2.0)
 
-                # 2b. Trim trailing (and leading) silence frames before vocoding.
-                # Frames where all 80 mel bins are near the silence floor (-11.5) carry no
-                # speech content and only add silence to the output audio.  We keep a frame
-                # if its per-frame mean is above a conservative threshold (-9.5 works well
-                # for natural-log scaled mels; voiced speech averages around -4 to -6).
+                # 2b. Conservative trailing-silence trim before vocoding.
+                # Use an adaptive threshold per sample, but keep a fixed floor to avoid
+                # over-trimming weak consonants/fricatives near utterance ends.
                 # Shape at this point: (1, T, 80) — batch dim still present.
-                silence_threshold = -9.5
                 frame_means = mel_spec[0].mean(dim=-1)  # (T,)
-                voiced_mask = frame_means > silence_threshold
-                voiced_indices = voiced_mask.nonzero(as_tuple=False).squeeze(-1)
-                if voiced_indices.numel() > 0:
-                    first_voiced = int(voiced_indices[0].item())
-                    last_voiced = int(voiced_indices[-1].item())
-                    # Keep a small silence margin (10 frames ≈ 116 ms at hop=256/sr=22050)
-                    margin = 10
-                    t_start = max(0, first_voiced - margin)
-                    t_end = min(mel_spec.shape[1], last_voiced + margin + 1)
-                    trimmed = mel_spec[:, t_start:t_end, :]
-                    logger.info(
-                        f"Silence trim: {mel_spec.shape[1]} → {trimmed.shape[1]} frames "
-                        f"(kept [{t_start}:{t_end}], threshold={silence_threshold})"
-                    )
-                    mel_spec = trimmed
-                else:
-                    logger.warning("All mel frames are below silence threshold — output may be silent.")
+                if frame_means.numel() > 0:
+                    # Robust adaptive threshold (quiet-tail aware) with conservative floor.
+                    q10 = float(torch.quantile(frame_means, 0.10).item())
+                    q20 = float(torch.quantile(frame_means, 0.20).item())
+                    adaptive_threshold = max(-9.8, min(-9.2, 0.5 * (q10 + q20)))
+
+                    voiced_indices = (frame_means > adaptive_threshold).nonzero(as_tuple=False).squeeze(-1)
+                    if voiced_indices.numel() > 0:
+                        last_voiced = int(voiced_indices[-1].item())
+
+                        # Trailing-only trim avoids clipping quiet onsets and preserves
+                        # natural lead-in breath/noise where present.
+                        trailing_margin = 24  # ~278 ms at hop=256/sr=22050
+                        min_keep_frames = 60
+
+                        proposed_end = min(mel_spec.shape[1], last_voiced + trailing_margin + 1)
+                        t_end = max(min_keep_frames, proposed_end)
+                        t_end = min(t_end, mel_spec.shape[1])
+
+                        trimmed = mel_spec[:, :t_end, :]
+                        logger.info(
+                            f"Trailing silence trim: {mel_spec.shape[1]} → {trimmed.shape[1]} frames "
+                            f"(end={t_end}, last_voiced={last_voiced}, threshold={adaptive_threshold:.3f})"
+                        )
+                        mel_spec = trimmed
+                    else:
+                        logger.warning("No voiced frames detected above adaptive threshold; skipping trim.")
 
                 # 3. Transposition Fix
                 if mel_spec.shape[-1] == self.n_mels:

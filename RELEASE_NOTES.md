@@ -2,6 +2,13 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.27 (2026-03-06)
+
+- Moved encoder/decoder to pre-norm GELU
+- Fixed bugs in forward training, duration predictor
+- Only advance scheduler/EMA on successful optimizer steps
+- Adopt oversized sequences rather than skip
+
 ## 0.0.26 (2026-03-06)
 
 - Refactored trainer
