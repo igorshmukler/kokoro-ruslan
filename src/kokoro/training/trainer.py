@@ -2371,7 +2371,7 @@ class KokoroTrainer:
                     pass
 
                 # Free output tensors every batch — large, not needed after loss/backward
-                del predicted_mel, predicted_log_durations, predicted_stop_logits
+                del predicted_mel, predicted_log_durations
                 if predicted_pitch is not None:
                     del predicted_pitch
                     predicted_pitch = None
