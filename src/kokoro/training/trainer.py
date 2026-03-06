@@ -99,12 +99,10 @@ class KokoroTrainer:
         self.config = config
         self.device = torch.device(config.device)
 
-        # Create the log directory
+        # Create the tensorboard log directory
         log_dir = os.path.join(config.output_dir, 'logs')
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir  # stored for writer re-creation on resume
-
-        # Initialize the writer
         self.writer = SummaryWriter(log_dir=log_dir)
         logger.info(f"Tensorboard log directory created at: {log_dir}")
 
@@ -149,7 +147,44 @@ class KokoroTrainer:
         # Initialize adaptive memory manager
         self.memory_manager = AdaptiveMemoryManager(self.device, config)
 
-        # Initialize mixed precision training components
+        self._setup_mixed_precision()
+        self._setup_datasets_and_dataloaders()
+        self._setup_model()
+        self._setup_optimizer()
+        self._setup_scheduler()
+
+        # Training state
+        self.start_epoch = 0
+        self.best_loss = float('inf')
+        self.best_val_loss = float('inf')
+        self.epochs_without_improvement = 0
+        self.validation_losses = []
+
+        self._setup_ema()
+
+        # Profiler setup
+        self.profiler = None
+        self.profiling_stats = {}
+        self.memory_snapshots = []
+        self.log_dir = os.path.join(config.output_dir, "profiler_logs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.interbatch_profiler = InterbatchProfiler(config)
+
+        # Adaptive memory management
+        self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
+        self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
+
+        self._setup_grad_explosion_tracker()
+
+        self.optimizer_steps_completed = 0
+
+    # ------------------------------------------------------------------
+    # Private setup helpers (called exclusively from __init__)
+    # ------------------------------------------------------------------
+
+    def _setup_mixed_precision(self):
+        """Initialize mixed precision training components (scaler, device_type)."""
+        config = self.config
         self.use_mixed_precision = getattr(config, 'use_mixed_precision', True)
         self.mixed_precision_dtype = getattr(config, 'mixed_precision_dtype', torch.float16)
 
@@ -163,7 +198,6 @@ class KokoroTrainer:
                 )
                 self.device_type = 'cuda'
                 logger.info("Mixed precision training enabled with CUDA GradScaler")
-
             elif self.device.type == DeviceType.MPS.value:
                 if check_mps_mixed_precision_support():
                     self.scaler = MPSGradScaler(
@@ -189,6 +223,20 @@ class KokoroTrainer:
             self.device_type = self.device.type
             logger.info("Mixed precision training disabled by configuration")
 
+        self.mixed_precision_stats = {
+            'scale_updates': 0,
+            'scale_decreases': 0,
+            'overflow_count': 0,
+            'successful_steps': 0,
+            'skipped_steps': 0
+        }
+        # Flag so the MPS mixed-precision deprecation warning is emitted only once
+        self._mps_amp_warned = False
+
+    def _setup_datasets_and_dataloaders(self):
+        """Build train/validation datasets and their corresponding DataLoaders."""
+        config = self.config
+
         # Precompute features if requested
         if getattr(config, 'precompute_features', False):
             logger.info("Pre-computing features for all samples...")
@@ -201,22 +249,17 @@ class KokoroTrainer:
         # Initialize datasets with train/validation split
         full_dataset = RuslanDataset(config.data_dir, config)
 
-        # Create train/validation split
         val_split = getattr(config, 'validation_split', 0.1)
         if val_split > 0:
+            import random
             dataset_size = len(full_dataset.samples)
             indices = list(range(dataset_size))
-
-            import random
             random.seed(42)
             random.shuffle(indices)
-
             split_idx = int(dataset_size * (1 - val_split))
             train_indices = indices[:split_idx]
             val_indices = indices[split_idx:]
-
             logger.info(f"Dataset split: {len(train_indices)} training, {len(val_indices)} validation samples")
-
             self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices)
             self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices)
         else:
@@ -225,7 +268,6 @@ class KokoroTrainer:
             self.val_dataset = None
 
         use_dynamic = getattr(config, 'use_dynamic_batching', True)
-
         if use_dynamic:
             logger.info("Using dynamic frame-based batching")
             self.batch_sampler = DynamicFrameBatchSampler(
@@ -246,22 +288,15 @@ class KokoroTrainer:
             )
 
         num_workers = max(0, int(getattr(config, 'num_workers', 0)))
-        prefetch_factor = 2 if num_workers > 0 else None
-        persistent_workers = num_workers > 0
+        # Store shared DataLoader kwargs so _build_dataloader can access them
+        self._num_workers = num_workers
+        self._prefetch_factor = 2 if num_workers > 0 else None
+        self._persistent_workers = num_workers > 0
+        self._pin_memory = config.pin_memory and self.device.type == DeviceType.CUDA.value
 
-        self.dataloader = DataLoader(
-            self.dataset,
-            batch_sampler=self.batch_sampler,
-            collate_fn=collate_fn,
-            num_workers=num_workers,
-            pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-            prefetch_factor=prefetch_factor,
-            persistent_workers=persistent_workers
-        )
+        self.dataloader = self._build_dataloader(self.dataset, self.batch_sampler)
 
-        # Initialize validation dataloader if validation set exists
         if self.val_dataset is not None:
-            # Use dynamic batching for validation too
             if use_dynamic:
                 val_batch_sampler = DynamicFrameBatchSampler(
                     dataset=self.val_dataset,
@@ -278,20 +313,13 @@ class KokoroTrainer:
                     drop_last=False,
                     shuffle=False
                 )
-
-            self.val_dataloader = DataLoader(
-                self.val_dataset,
-                batch_sampler=val_batch_sampler,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=config.pin_memory and self.device.type == DeviceType.CUDA.value,
-                prefetch_factor=prefetch_factor,
-                persistent_workers=persistent_workers
-            )
+            self.val_dataloader = self._build_dataloader(self.val_dataset, val_batch_sampler)
         else:
             self.val_dataloader = None
 
-        # Initialize model
+    def _setup_model(self):
+        """Instantiate KokoroModel, move to device, optionally compile, and create loss criteria."""
+        config = self.config
         vocab_size = self.dataset.phoneme_processor.get_vocab_size()
         self.model = KokoroModel(
             vocab_size,
@@ -342,7 +370,31 @@ class KokoroTrainer:
         model_info = self.model.get_model_info()
         logger.info(f"Model initialized with {model_info['total_parameters']:,} parameters ({model_info['model_size_mb']:.1f} MB)")
 
-        # Initialize optimizer
+        # Loss criteria
+        self.criterion_mel = nn.L1Loss(reduction='none')
+        self.criterion_duration = nn.MSELoss(reduction='none')
+        # pos_weight corrects the severe class imbalance in stop token targets:
+        # only the final frame of each sequence is positive (1.0); all others
+        # are negative (0.0).  Without this the model learns to always predict 0
+        # and achieves near-zero BCE loss while never detecting end-of-utterance.
+        _stop_pos_w = torch.tensor(
+            [getattr(config, 'stop_token_pos_weight', 150.0)],
+            device=self.device
+        )
+        self.criterion_stop_token = nn.BCEWithLogitsLoss(
+            reduction='none', pos_weight=_stop_pos_w
+        )
+        if getattr(config, 'use_variance_predictor', True):
+            self.criterion_pitch = nn.MSELoss(reduction='none')
+            self.criterion_energy = nn.MSELoss(reduction='none')
+            logger.info("Variance predictor losses initialized (pitch/energy)")
+        else:
+            self.criterion_pitch = None
+            self.criterion_energy = None
+
+    def _setup_optimizer(self):
+        """Create AdamW optimizer with fused/non-fused selection logic."""
+        config = self.config
         default_use_fused = self.device_type == 'cuda' and torch.__version__ >= '2.0'
         forced_use_fused = getattr(config, 'use_fused_adamw', None)
 
@@ -384,29 +436,9 @@ class KokoroTrainer:
             else:
                 raise
 
-        self.criterion_mel = nn.L1Loss(reduction='none')
-        self.criterion_duration = nn.MSELoss(reduction='none')
-        # pos_weight corrects the severe class imbalance in stop token targets:
-        # only the final frame of each sequence is positive (1.0); all others
-        # are negative (0.0).  Without this the model learns to always predict 0
-        # and achieves near-zero BCE loss while never detecting end-of-utterance.
-        _stop_pos_w = torch.tensor(
-            [getattr(config, 'stop_token_pos_weight', 150.0)],
-            device=self.device
-        )
-        self.criterion_stop_token = nn.BCEWithLogitsLoss(
-            reduction='none', pos_weight=_stop_pos_w
-        )
-
-        if getattr(config, 'use_variance_predictor', True):
-            self.criterion_pitch = nn.MSELoss(reduction='none')
-            self.criterion_energy = nn.MSELoss(reduction='none')
-            logger.info("Variance predictor losses initialized (pitch/energy)")
-        else:
-            self.criterion_pitch = None
-            self.criterion_energy = None
-
-        # Learning rate scheduler with warmup
+    def _setup_scheduler(self):
+        """Configure OneCycleLR (with optional linear warmup) or CosineAnnealingWarmRestarts."""
+        config = self.config
         use_onecycle = getattr(config, 'use_onecycle_lr', True)
         if use_onecycle:
             steps_per_epoch = len(self.dataloader)
@@ -472,14 +504,9 @@ class KokoroTrainer:
             self.scheduler_per_batch = False
             logger.info("CosineAnnealingWarmRestarts scheduler initialized (legacy mode)")
 
-        # Training state
-        self.start_epoch = 0
-        self.best_loss = float('inf')
-        self.best_val_loss = float('inf')
-        self.epochs_without_improvement = 0
-        self.validation_losses = []
-
-        # EMA (Exponential Moving Average) of model weights
+    def _setup_ema(self):
+        """Initialize Exponential Moving Average (EMA) of model weights."""
+        config = self.config
         self.use_ema = getattr(config, 'use_ema', True)
         cfg_ema = getattr(config, 'ema_decay', None)
         self.ema_update_every = getattr(config, 'ema_update_every', 1)
@@ -489,7 +516,6 @@ class KokoroTrainer:
                 n_train = len(self.dataset)
             except Exception:
                 n_train = 0
-
             effective_batch = int(getattr(config, 'batch_size', 1) * getattr(config, 'gradient_accumulation_steps', 1))
             k = float(getattr(config, 'ema_half_life_epochs', 1.0))
             self.ema_decay = recommended_ema_decay(n_train=n_train, batch_size=effective_batch, k=k)
@@ -514,29 +540,9 @@ class KokoroTrainer:
             self.ema_model = None
             logger.info("EMA disabled")
 
-        # Mixed precision training stats
-        self.mixed_precision_stats = {
-            'scale_updates': 0,
-            'scale_decreases': 0,
-            'overflow_count': 0,
-            'successful_steps': 0,
-            'skipped_steps': 0
-        }
-
-        # Profiler setup
-        self.profiler = None
-        self.profiling_stats = {}
-        self.memory_snapshots = []
-        self.log_dir = os.path.join(config.output_dir, "profiler_logs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(self.log_dir, exist_ok=True)
-
-        self.interbatch_profiler = InterbatchProfiler(config)
-
-        # Adaptive memory management
-        self.enable_adaptive_memory = getattr(config, 'enable_adaptive_memory', True)
-        self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
-
-        # Gradient explosion tracking
+    def _setup_grad_explosion_tracker(self):
+        """Initialize gradient explosion detection and localized spike clipping state."""
+        config = self.config
         self.grad_explosion_norm_ema = None
         self.grad_explosion_ema_alpha = getattr(config, 'grad_explosion_ema_alpha', 0.95)
         self.grad_explosion_abs_floor = getattr(config, 'grad_explosion_abs_floor', 1000.0)
@@ -552,8 +558,6 @@ class KokoroTrainer:
         self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
         self.ffn_spike_clip_norm = getattr(config, 'ffn_spike_clip_norm', 15.0)
 
-        self.optimizer_steps_completed = 0
-
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
         from contextlib import nullcontext
@@ -568,14 +572,11 @@ class KokoroTrainer:
             # "Destination NDArray and Accumulator NDArray cannot have different datatype"
             # This affects ALiBi, attention, and all linear layers with long sequences
             # Solution: Always use fp32 on MPS (slower but stable)
-
-            # Disable mixed precision to avoid repeated warnings
             self.use_mixed_precision = False
-
-            if not self.use_mixed_precision:
+            if not self._mps_amp_warned:
                 logger.warning("Mixed precision disabled on MPS due to backend bugs with fp16")
                 logger.warning("Training will use fp32 on MPS (slower but stable)")
-
+                self._mps_amp_warned = True
             return nullcontext()
         else:
             return nullcontext()
@@ -759,33 +760,35 @@ class KokoroTrainer:
             self.profiler = None
             logger.info("PyTorch profiler stopped")
 
+    def _query_device_memory_mb(self) -> Tuple[float, float, float, float]:
+        """Return (current, peak, reserved, total) memory in MB for the active device.
+
+        For CUDA all four values come from the CUDA memory API.  For MPS only
+        ``current_allocated_memory`` is available, so the remaining three fields
+        are approximated from that value.  Returns zeros on CPU or when the
+        device memory API is unavailable.
+        """
+        if self.device.type == DeviceType.CUDA.value:
+            current  = torch.cuda.memory_allocated() / 1024**2
+            peak     = torch.cuda.max_memory_allocated() / 1024**2
+            reserved = torch.cuda.memory_reserved() / 1024**2
+            total    = torch.cuda.get_device_properties(self.device).total_memory / 1024**2
+            return current, peak, reserved, total
+        elif self.device.type == DeviceType.MPS.value:
+            try:
+                current = torch.mps.current_allocated_memory() / 1024**2
+                # MPS doesn't track peak/reserved separately; total is approximate
+                return current, current, current, 8192.0
+            except Exception:
+                return 0.0, 0.0, 0.0, 0.0
+        return 0.0, 0.0, 0.0, 0.0
+
     def profile_step(self):
-        """Step the profiler and log memory stats"""
+        """Step the profiler and append a memory snapshot."""
         if self.profiler:
             self.profiler.step()
 
-        # Log memory statistics based on device type
-        current_memory = 0
-        peak_memory = 0
-        reserved_memory = 0
-        total_memory = 0
-
-        if self.device.type == DeviceType.CUDA.value:
-            current_memory = torch.cuda.memory_allocated() / 1024**2  # MB
-            peak_memory = torch.cuda.max_memory_allocated() / 1024**2  # MB
-            reserved_memory = torch.cuda.memory_reserved() / 1024**2  # MB
-            total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**2  # MB
-        elif self.device.type == DeviceType.MPS.value:
-            # MPS doesn't have detailed memory stats, use approximations
-            try:
-                current_memory = torch.mps.current_allocated_memory() / 1024**2  # MB
-                peak_memory = current_memory  # MPS doesn't track peak separately
-                reserved_memory = current_memory
-                # Estimate total memory (this is approximate for Apple Silicon)
-                total_memory = 8192  # Default estimate, could be made configurable
-            except:
-                # Fallback if MPS memory functions aren't available
-                current_memory = peak_memory = reserved_memory = total_memory = 0
+        current_memory, peak_memory, reserved_memory, total_memory = self._query_device_memory_mb()
 
         self.memory_snapshots.append({
             'timestamp': time.time(),
@@ -797,19 +800,8 @@ class KokoroTrainer:
         })
 
     def log_memory_stats(self, stage_name: str):
-        """Log memory statistics for a specific stage"""
-        current_memory = 0
-        peak_memory = 0
-
-        if self.device.type == DeviceType.CUDA.value:
-            current_memory = torch.cuda.memory_allocated() / 1024**2
-            peak_memory = torch.cuda.max_memory_allocated() / 1024**2
-        elif self.device.type == DeviceType.MPS.value:
-            try:
-                current_memory = torch.mps.current_allocated_memory() / 1024**2
-                peak_memory = current_memory
-            except:
-                current_memory = peak_memory = 0
+        """Log memory statistics for a specific stage."""
+        current_memory, peak_memory, _, _ = self._query_device_memory_mb()
 
         if stage_name not in self.profiling_stats.get('stage_stats', {}):
             self.profiling_stats.setdefault('stage_stats', {})[stage_name] = {
@@ -1041,6 +1033,18 @@ class KokoroTrainer:
 
         return clipped
 
+    def _build_dataloader(self, dataset, batch_sampler) -> DataLoader:
+        """Construct a DataLoader with the shared worker/memory kwargs set during __init__."""
+        return DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
+            num_workers=self._num_workers,
+            pin_memory=self._pin_memory,
+            prefetch_factor=self._prefetch_factor,
+            persistent_workers=self._persistent_workers,
+        )
+
     def _average_pitch_energy_by_duration(self,
                                           values: torch.Tensor,
                                           durations: torch.Tensor,
@@ -1194,10 +1198,8 @@ class KokoroTrainer:
                          predicted_pitch=None, predicted_energy=None,
                          pitch_targets=None, energy_targets=None):
         """Calculate losses with optimized masking"""
-        # batch_size = mel_specs.size(0)
         max_mel_len = mel_specs.size(1)
         max_phoneme_len = phoneme_durations.size(1)
-        # n_mels = mel_specs.size(2)
 
         # Create base masks efficiently (2D only, no feature dimension expansion yet)
         # Use direct comparison without intermediate .expand() to save memory
@@ -1205,8 +1207,6 @@ class KokoroTrainer:
         phoneme_mask_2d = torch.arange(max_phoneme_len, device=self.device).unsqueeze(0) < phoneme_lengths.unsqueeze(1)
 
         # Pre-compute mask normalization factors (reused across losses)
-        # mel_mask_count = mel_mask_2d.sum().clamp(min=1)
-        # phoneme_mask_count = phoneme_mask_2d.sum().clamp(min=1)
 
         # Mel Spectrogram Loss
         loss_mel_unreduced = self.criterion_mel(predicted_mel, mel_specs)
@@ -1218,7 +1218,6 @@ class KokoroTrainer:
             loss_mel = torch.tensor(0.0, device=self.device)
 
         # Duration Loss - convert to float once
-        # phoneme_mask_float = phoneme_mask_2d.float()
         target_log_durations = torch.log(phoneme_durations.float() + 1.0)
 
         # Debugging: log predicted vs target duration stats (mean/std/min/max)
@@ -3236,11 +3235,13 @@ class KokoroTrainer:
                         with self.get_autocast_context():
                             predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                                 self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                           pitch_targets=pitches, energy_targets=energies)
+                                           pitch_targets=pitches, energy_targets=energies,
+                                           stress_indices=stress_indices)
                     else:
                         predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                             self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                                       pitch_targets=pitches, energy_targets=energies)
+                                       pitch_targets=pitches, energy_targets=energies,
+                                       stress_indices=stress_indices)
                 self.interbatch_profiler.end_forward_pass()
                 self.log_memory_stats("forward_pass")
 
