@@ -2007,49 +2007,22 @@ class KokoroTrainer:
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_forward_pass()
 
-                with self._profiler_record("Model_Forward", is_profiling_epoch):
-                    with self.get_autocast_context():
-                        predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                            self.model(phoneme_indices, mel_for_model, phoneme_durations, stop_token_targets,
-                                     pitch_targets=pitches, energy_targets=energies,
-                                     stress_indices=stress_indices)
+                with self._profiler_record("Training_Step", is_profiling_epoch):
+                    step_result = self._execute_training_step(
+                        transferred, mel_for_model,
+                        loss_scale=(1.0 / gradient_accumulation_steps) * adaptive_loss_scale,
+                    )
 
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.end_forward_pass()
+                    self.interbatch_profiler.start_backward_pass()
+                    self.interbatch_profiler.end_backward_pass()
 
                 if is_profiling_epoch:
-                    self.log_memory_stats("forward_pass")
+                    self.log_memory_stats("training_step")
 
-                outputs_are_finite = torch.isfinite(predicted_mel).all() and \
-                    torch.isfinite(predicted_log_durations).all() and \
-                    torch.isfinite(predicted_stop_logits).all() and \
-                    (predicted_pitch is None or torch.isfinite(predicted_pitch).all()) and \
-                    (predicted_energy is None or torch.isfinite(predicted_energy).all())
-
-                if not outputs_are_finite:
-                    logger.error(f"\n{'='*80}")
-                    logger.error(f"❌ BATCH {batch_idx} - NON-FINITE MODEL OUTPUTS DETECTED")
-                    logger.error(f"{'='*80}")
-                    logger.error(
-                        f"Output Finiteness: "
-                        f"mel={torch.isfinite(predicted_mel).all().item()}, "
-                        f"dur={torch.isfinite(predicted_log_durations).all().item()}, "
-                        f"stop={torch.isfinite(predicted_stop_logits).all().item()}, "
-                        f"pitch={True if predicted_pitch is None else torch.isfinite(predicted_pitch).all().item()}, "
-                        f"energy={True if predicted_energy is None else torch.isfinite(predicted_energy).all().item()}"
-                    )
-
-                    # Detailed output statistics
-                    if not torch.isfinite(predicted_mel).all():
-                        logger.error(f"predicted_mel: {torch.isnan(predicted_mel).sum()} NaNs, {torch.isinf(predicted_mel).sum()} Infs")
-                    if not torch.isfinite(predicted_log_durations).all():
-                        logger.error(f"predicted_log_durations: {torch.isnan(predicted_log_durations).sum()} NaNs, {torch.isinf(predicted_log_durations).sum()} Infs")
-                    if predicted_pitch is not None and not torch.isfinite(predicted_pitch).all():
-                        logger.error(f"predicted_pitch: {torch.isnan(predicted_pitch).sum()} NaNs, {torch.isinf(predicted_pitch).sum()} Infs")
-                    if predicted_energy is not None and not torch.isfinite(predicted_energy).all():
-                        logger.error(f"predicted_energy: {torch.isnan(predicted_energy).sum()} NaNs, {torch.isinf(predicted_energy).sum()} Infs")
-                    logger.error(f"{'='*80}\n")
-
+                if step_result is None:
+                    # Non-finite outputs or losses — reset accumulation and skip
                     self.optimizer.zero_grad(set_to_none=True)
                     accumulated_step = 0
                     if self.enable_adaptive_memory:
@@ -2060,92 +2033,19 @@ class KokoroTrainer:
                         self.interbatch_profiler.end_batch(mel_specs.size(0))
                     continue
 
-
-                # Convert mel-frame level pitch/energy to phoneme level for loss calculation
-                phoneme_pitches = None
-                phoneme_energies = None
-                if pitches is not None and predicted_pitch is not None:
-                    # Average pitch from mel-frame level to phoneme level using durations
-                    phoneme_pitches = self._average_pitch_energy_by_duration(
-                        pitches, phoneme_durations, phoneme_lengths
-                    )
-                if energies is not None and predicted_energy is not None:
-                    # Average energy from mel-frame level to phoneme level using durations
-                    phoneme_energies = self._average_pitch_energy_by_duration(
-                        energies, phoneme_durations, phoneme_lengths
-                    )
-
-                # Loss calculation with mixed precision
-                with self._profiler_record("Loss_Calculation", is_profiling_epoch):
-                    with self.get_autocast_context():
-                        total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
-                            predicted_mel, predicted_log_durations, predicted_stop_logits,
-                            mel_specs, phoneme_durations, stop_token_targets,
-                            mel_lengths, phoneme_lengths,
-                            predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                        )
-
-                if is_profiling_epoch:
-                    self.log_memory_stats("loss_calculation")
-
-
-                finite_losses = (
-                    torch.isfinite(total_loss) and
-                    torch.isfinite(loss_mel) and
-                    torch.isfinite(loss_duration) and
-                    torch.isfinite(loss_stop_token) and
-                    (loss_pitch is None or torch.isfinite(loss_pitch)) and
-                    (loss_energy is None or torch.isfinite(loss_energy))
-                )
-
-                if not finite_losses:
-                    logger.error(f"\n{'='*80}")
-                    logger.error(f"❌ BATCH {batch_idx} - NON-FINITE LOSS DETECTED")
-                    logger.error(f"{'='*80}")
-                    logger.error(
-                        f"Loss finiteness: "
-                        f"total={torch.isfinite(total_loss).item()}, "
-                        f"mel={torch.isfinite(loss_mel).item()}, "
-                        f"dur={torch.isfinite(loss_duration).item()}, "
-                        f"stop={torch.isfinite(loss_stop_token).item()}, "
-                        f"pitch={True if loss_pitch is None else torch.isfinite(loss_pitch).item()}, "
-                        f"energy={True if loss_energy is None else torch.isfinite(loss_energy).item()}"
-                    )
-                    logger.error(f"Loss values: total={total_loss}, mel={loss_mel}, dur={loss_duration}, "
-                                f"stop={loss_stop_token}, pitch={loss_pitch}, energy={loss_energy}")
-                    logger.error(f"{'='*80}\n")
-                    self.optimizer.zero_grad(set_to_none=True)
-                    accumulated_step = 0
-                    if self.enable_adaptive_memory:
-                        self.memory_manager.emergency_cleanup()
-                    else:
-                        self.clear_device_cache()
-                    continue
-
-
-                # Scale loss by gradient accumulation steps for proper gradient averaging
-                # Also apply adaptive scaling for high-risk batches
-                scaled_total_loss = (total_loss / gradient_accumulation_steps) * adaptive_loss_scale
-
-                # Backward pass with mixed precision and interbatch profiling
-
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.start_backward_pass()
-
-                with self._profiler_record("Backward_Pass", is_profiling_epoch):
-                    if self.scaler is not None:
-                        self.scaler.scale(scaled_total_loss).backward()
-                    else:
-                        scaled_total_loss.backward()
+                total_loss              = step_result['total_loss']
+                loss_mel                = step_result['loss_mel']
+                loss_duration           = step_result['loss_duration']
+                loss_stop_token         = step_result['loss_stop_token']
+                loss_pitch              = step_result['loss_pitch']
+                loss_energy             = step_result['loss_energy']
+                predicted_mel           = step_result['predicted_mel']
+                predicted_log_durations = step_result['predicted_log_durations']
+                predicted_pitch         = step_result['predicted_pitch']
+                predicted_energy        = step_result['predicted_energy']
 
                 # Advance gradient accumulation cycle after successful backward
                 accumulated_step += 1
-
-                if enable_interbatch_profiling or is_profiling_epoch:
-                    self.interbatch_profiler.end_backward_pass()
-
-                if is_profiling_epoch:
-                    self.log_memory_stats("backward_pass")
 
                 # MPS cache clearing - only when needed based on memory pressure
                 if self.device_type == DeviceType.MPS.value:
@@ -3020,6 +2920,149 @@ class KokoroTrainer:
 
         return total_time
 
+    def _execute_training_step(
+        self,
+        transferred: Dict,
+        mel_for_model: torch.Tensor,
+        loss_scale: float = 1.0,
+    ) -> Optional[Dict]:
+        """Core forward + pitch/energy averaging + loss + backward step.
+
+        Handles finite-output and finite-loss guards internally, logging errors
+        and returning ``None`` when a batch must be skipped.  Does **not**
+        perform ``zero_grad()``, ``optimizer.step()``, gradient-accumulation
+        bookkeeping, or profiling annotations — those remain with the caller so
+        that ``train_epoch`` can wrap them with its extra instrumentation while
+        ``_run_single_batch`` uses the simpler path.
+
+        Args:
+            transferred:   Pre-transferred batch tensors (output of
+                           ``_transfer_batch_to_device``).
+            mel_for_model: Mel spectrogram fed to the model; may differ from
+                           ``transferred['mel_specs']`` when SpecAugment is
+                           active.
+            loss_scale:    Scalar applied to ``total_loss`` before
+                           ``.backward()`` — combine ``1/grad_accum_steps``
+                           and ``adaptive_loss_scale`` in the caller.
+
+        Returns:
+            A dict with keys ``total_loss``, ``loss_mel``, ``loss_duration``,
+            ``loss_stop_token``, ``loss_pitch``, ``loss_energy``,
+            ``predicted_mel``, ``predicted_log_durations``,
+            ``predicted_pitch``, ``predicted_energy``; or ``None`` if any
+            output or loss is non-finite (caller should skip the batch).
+        """
+        mel_specs          = transferred['mel_specs']
+        phoneme_indices    = transferred['phoneme_indices']
+        phoneme_durations  = transferred['phoneme_durations']
+        stop_token_targets = transferred['stop_token_targets']
+        mel_lengths        = transferred['mel_lengths']
+        phoneme_lengths    = transferred['phoneme_lengths']
+        pitches            = transferred['pitches']
+        energies           = transferred['energies']
+        stress_indices     = transferred['stress_indices']
+
+        # --- Forward pass -------------------------------------------------
+        with self.get_autocast_context():
+            predicted_mel, predicted_log_durations, predicted_stop_logits, \
+                predicted_pitch, predicted_energy = self.model(
+                    phoneme_indices, mel_for_model, phoneme_durations,
+                    stop_token_targets, pitch_targets=pitches,
+                    energy_targets=energies, stress_indices=stress_indices,
+                )
+
+        # --- Finite-output guard ------------------------------------------
+        if not (
+            torch.isfinite(predicted_mel).all()
+            and torch.isfinite(predicted_log_durations).all()
+            and torch.isfinite(predicted_stop_logits).all()
+            and (predicted_pitch is None or torch.isfinite(predicted_pitch).all())
+            and (predicted_energy is None or torch.isfinite(predicted_energy).all())
+        ):
+            logger.error(
+                f"Non-finite model outputs — skipping batch "
+                f"(mel={torch.isfinite(predicted_mel).all().item()}, "
+                f"dur={torch.isfinite(predicted_log_durations).all().item()}, "
+                f"stop={torch.isfinite(predicted_stop_logits).all().item()}, "
+                f"pitch={True if predicted_pitch is None else torch.isfinite(predicted_pitch).all().item()}, "
+                f"energy={True if predicted_energy is None else torch.isfinite(predicted_energy).all().item()})"
+            )
+            if not torch.isfinite(predicted_mel).all():
+                logger.error(f"predicted_mel: {torch.isnan(predicted_mel).sum()} NaNs, {torch.isinf(predicted_mel).sum()} Infs")
+            if not torch.isfinite(predicted_log_durations).all():
+                logger.error(f"predicted_log_durations: {torch.isnan(predicted_log_durations).sum()} NaNs, {torch.isinf(predicted_log_durations).sum()} Infs")
+            if predicted_pitch is not None and not torch.isfinite(predicted_pitch).all():
+                logger.error(f"predicted_pitch: {torch.isnan(predicted_pitch).sum()} NaNs, {torch.isinf(predicted_pitch).sum()} Infs")
+            if predicted_energy is not None and not torch.isfinite(predicted_energy).all():
+                logger.error(f"predicted_energy: {torch.isnan(predicted_energy).sum()} NaNs, {torch.isinf(predicted_energy).sum()} Infs")
+            return None
+
+        # --- Pitch/energy mel-frame → phoneme-level averaging ------------
+        phoneme_pitches  = None
+        phoneme_energies = None
+        if pitches is not None and predicted_pitch is not None:
+            phoneme_pitches = self._average_pitch_energy_by_duration(
+                pitches, phoneme_durations, phoneme_lengths
+            )
+        if energies is not None and predicted_energy is not None:
+            phoneme_energies = self._average_pitch_energy_by_duration(
+                energies, phoneme_durations, phoneme_lengths
+            )
+
+        # --- Loss calculation ---------------------------------------------
+        with self.get_autocast_context():
+            total_loss, loss_mel, loss_duration, loss_stop_token, \
+                loss_pitch, loss_energy = self._calculate_losses(
+                    predicted_mel, predicted_log_durations, predicted_stop_logits,
+                    mel_specs, phoneme_durations, stop_token_targets,
+                    mel_lengths, phoneme_lengths,
+                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies,
+                )
+
+        # --- Finite-loss guard -------------------------------------------
+        if not (
+            torch.isfinite(total_loss)
+            and torch.isfinite(loss_mel)
+            and torch.isfinite(loss_duration)
+            and torch.isfinite(loss_stop_token)
+            and (loss_pitch is None or torch.isfinite(loss_pitch))
+            and (loss_energy is None or torch.isfinite(loss_energy))
+        ):
+            logger.error(
+                f"Non-finite loss — skipping batch "
+                f"(total={torch.isfinite(total_loss).item()}, "
+                f"mel={torch.isfinite(loss_mel).item()}, "
+                f"dur={torch.isfinite(loss_duration).item()}, "
+                f"stop={torch.isfinite(loss_stop_token).item()}, "
+                f"pitch={True if loss_pitch is None else torch.isfinite(loss_pitch).item()}, "
+                f"energy={True if loss_energy is None else torch.isfinite(loss_energy).item()})"
+            )
+            logger.error(
+                f"Loss values: total={total_loss}, mel={loss_mel}, "
+                f"dur={loss_duration}, stop={loss_stop_token}, "
+                f"pitch={loss_pitch}, energy={loss_energy}"
+            )
+            return None
+
+        # --- Backward pass -----------------------------------------------
+        if self.scaler is not None:
+            self.scaler.scale(total_loss * loss_scale).backward()
+        else:
+            (total_loss * loss_scale).backward()
+
+        return {
+            'total_loss':              total_loss,
+            'loss_mel':                loss_mel,
+            'loss_duration':           loss_duration,
+            'loss_stop_token':         loss_stop_token,
+            'loss_pitch':              loss_pitch,
+            'loss_energy':             loss_energy,
+            'predicted_mel':           predicted_mel,
+            'predicted_log_durations': predicted_log_durations,
+            'predicted_pitch':         predicted_pitch,
+            'predicted_energy':        predicted_energy,
+        }
+
     def _run_single_batch(self, batch: Dict, measure_time: bool = False) -> Optional[float]:
         """
         Run a single training batch
@@ -3033,82 +3076,17 @@ class KokoroTrainer:
         """
         start_time = time.time() if measure_time else None
 
-        # Data loading - batch transfer for efficiency
         transferred = self._transfer_batch_to_device(batch)
-        mel_specs = transferred['mel_specs']
-        phoneme_indices = transferred['phoneme_indices']
-        phoneme_durations = transferred['phoneme_durations']
-        stop_token_targets = transferred['stop_token_targets']
-        mel_lengths = transferred['mel_lengths']
-        phoneme_lengths = transferred['phoneme_lengths']
-        pitches = transferred['pitches']
-        energies = transferred['energies']
-        stress_indices = transferred['stress_indices']
-
         self.optimizer.zero_grad()
 
-        # Forward pass with optional AMP
-        if self.use_mixed_precision:
-            with self.get_autocast_context():
-                predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                    self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                             pitch_targets=pitches, energy_targets=energies,
-                             stress_indices=stress_indices)
+        step_result = self._execute_training_step(transferred, transferred['mel_specs'])
 
-                # Convert pitch/energy to phoneme level
-                phoneme_pitches = None
-                phoneme_energies = None
-                if pitches is not None and predicted_pitch is not None:
-                    phoneme_pitches = self._average_pitch_energy_by_duration(
-                        pitches, phoneme_durations, phoneme_lengths
-                    )
-                if energies is not None and predicted_energy is not None:
-                    phoneme_energies = self._average_pitch_energy_by_duration(
-                        energies, phoneme_durations, phoneme_lengths
-                    )
-
-                # Loss calculation
-                total_loss, _, _, _, _, _ = self._calculate_losses(
-                    predicted_mel, predicted_log_durations, predicted_stop_logits,
-                    mel_specs, phoneme_durations, stop_token_targets,
-                    mel_lengths, phoneme_lengths,
-                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-                )
-
-            # Backward pass with scaler
-            self.scaler.scale(total_loss).backward()
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            # No AMP
-            predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
-                self.model(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
-                         pitch_targets=pitches, energy_targets=energies,
-                         stress_indices=stress_indices)
-
-            # Convert pitch/energy to phoneme level
-            phoneme_pitches = None
-            phoneme_energies = None
-            if pitches is not None and predicted_pitch is not None:
-                phoneme_pitches = self._average_pitch_energy_by_duration(
-                    pitches, phoneme_durations, phoneme_lengths
-                )
-            if energies is not None and predicted_energy is not None:
-                phoneme_energies = self._average_pitch_energy_by_duration(
-                    energies, phoneme_durations, phoneme_lengths
-                )
-
-            # Loss calculation
-            total_loss, _, _, _, _, _ = self._calculate_losses(
-                predicted_mel, predicted_log_durations, predicted_stop_logits,
-                mel_specs, phoneme_durations, stop_token_targets,
-                mel_lengths, phoneme_lengths,
-                predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
-            )
-
-            # Regular backward pass
-            total_loss.backward()
-            self.optimizer.step()
+        if step_result is not None:
+            if self.scaler is not None:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
 
         if measure_time:
             return time.time() - start_time
