@@ -182,7 +182,7 @@ def test_train_epoch_keeps_default_clip_for_normal_batch(monkeypatch):
 
     assert trainer.model.forward_calls == 1
     assert avg_total_loss > 0.0
-    assert captured["max_norm"] == 0.5
+    assert captured["max_norm"] == 1.0  # Raised from 0.5: encoder needs more headroom
 
 
 def test_train_epoch_uses_emergency_clip_norm_on_gradient_explosion(monkeypatch):
@@ -208,7 +208,7 @@ def test_train_epoch_uses_emergency_clip_norm_on_gradient_explosion(monkeypatch)
 
     assert trainer.model.forward_calls == 1
     assert avg_total_loss > 0.0
-    assert captured["max_norm"] == 0.05
+    assert captured["max_norm"] == 0.3  # Floor raised from 0.05
 
 
 def test_train_epoch_caps_oversized_batch_instead_of_skipping(monkeypatch):

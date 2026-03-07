@@ -398,7 +398,14 @@ class KokoroTrainer:
             self.criterion_energy = None
 
     def _setup_optimizer(self):
-        """Create AdamW optimizer with fused/non-fused selection logic."""
+        """Create AdamW optimizer with per-group LR for encoder vs decoder.
+
+        The encoder (embedding + positional encoding + encoder transformer layers)
+        historically receives near-zero gradients due to the long backprop path
+        through the decoder.  Assigning it a separate param group with a higher
+        base LR (encoder_lr_multiplier × learning_rate) gives it proportionally
+        more gradient signal without destabilising the decoder.
+        """
         config = self.config
         default_use_fused = self.device_type == 'cuda' and torch.__version__ >= '2.0'
         forced_use_fused = getattr(config, 'use_fused_adamw', None)
@@ -418,16 +425,53 @@ class KokoroTrainer:
         )
         logger.info(f"AdamW fused setting: effective={use_fused} (source={fused_source}, device={self.device_type})")
 
-        optimizer_kwargs = {
-            'lr': config.learning_rate,
-            'weight_decay': getattr(config, 'weight_decay', 0.01),
-            'eps': getattr(config, 'adam_eps', 1e-8),
-            'betas': getattr(config, 'adam_betas', (0.9, 0.999)),
-            'fused': use_fused,
-        }
+        base_lr = config.learning_rate
+        weight_decay = getattr(config, 'weight_decay', 0.01)
+        adam_eps = getattr(config, 'adam_eps', 1e-8)
+        adam_betas = getattr(config, 'adam_betas', (0.9, 0.999))
+        encoder_lr_mult = float(getattr(config, 'encoder_lr_multiplier', 3.0))
+        self._encoder_lr_multiplier = encoder_lr_mult
+
+        # Partition parameters into encoder group (higher LR) and decoder/rest group.
+        encoder_prefixes = (
+            'text_embedding.',
+            'stress_embedding.',
+            'encoder_positional_encoding.',
+            'positional_encoding.',   # legacy attribute name
+            'transformer_encoder_layers.',
+        )
+        encoder_param_ids: set = set()
+        encoder_params = []
+        decoder_params = []
+        for name, param in self.model.named_parameters():
+            if any(name.startswith(prefix) for prefix in encoder_prefixes):
+                if id(param) not in encoder_param_ids:
+                    encoder_param_ids.add(id(param))
+                    encoder_params.append(param)
+            else:
+                decoder_params.append(param)
+
+        encoder_lr = base_lr * encoder_lr_mult
+        param_groups = [
+            {'params': encoder_params, 'lr': encoder_lr,
+             'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
+            {'params': decoder_params, 'lr': base_lr,
+             'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
+        ]
+        if not encoder_params:
+            # Fallback: single group (no identifiable encoder params)
+            param_groups = [{'params': list(self.model.parameters()), 'lr': base_lr,
+                             'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas}]
+            self._encoder_lr_multiplier = 1.0
+            logger.warning("No encoder params identified for separate LR group — using single param group")
+        else:
+            logger.info(
+                f"Optimizer param groups: encoder={len(encoder_params)} params (lr={encoder_lr:.2e}), "
+                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e})"
+            )
 
         try:
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
+            self.optimizer = torch.optim.AdamW(param_groups, fused=use_fused)
             if use_fused:
                 logger.info(f"Using fused AdamW optimizer on {self.device_type.upper()}")
             else:
@@ -435,8 +479,7 @@ class KokoroTrainer:
         except (TypeError, ValueError, RuntimeError) as e:
             if use_fused:
                 logger.warning(f"Fused AdamW not available on {self.device_type}: {e}. Falling back to standard AdamW.")
-                optimizer_kwargs['fused'] = False
-                self.optimizer = torch.optim.AdamW(self.model.parameters(), **optimizer_kwargs)
+                self.optimizer = torch.optim.AdamW(param_groups, fused=False)
                 logger.info("Using standard AdamW optimizer (fallback)")
             else:
                 raise
@@ -474,11 +517,20 @@ class KokoroTrainer:
             # max_lr / div_factor, so setting div_factor = max_lr_multiplier ensures
             # a seamless handoff with no jump at step warmup_steps.
             # When warmup is disabled, use the classic div_factor=25.0 (10x below base_lr).
-            _max_lr_multiplier = getattr(config, 'max_lr_multiplier', 2.0)
+            _max_lr_multiplier = getattr(config, 'max_lr_multiplier', 5.0)
             onecycle_div_factor = float(_max_lr_multiplier) if self.use_warmup else 25.0
+
+            # Build per-group max_lr: encoder group gets encoder_lr_multiplier x decoder max_lr
+            _enc_mult = getattr(self, '_encoder_lr_multiplier', 1.0)
+            n_pg = len(self.optimizer.param_groups)
+            if n_pg > 1:
+                max_lr_arg = [max_lr * _enc_mult] + [max_lr] * (n_pg - 1)
+            else:
+                max_lr_arg = max_lr
+
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,
-                max_lr=max_lr,
+                max_lr=max_lr_arg,
                 total_steps=onecycle_steps,
                 pct_start=pct_start,
                 anneal_strategy='cos',
@@ -490,13 +542,18 @@ class KokoroTrainer:
                 last_epoch=-1
             )
             self.scheduler_per_batch = True
-            # Store parameters needed to reconstruct the scheduler after checkpoint resume
+            # Store parameters needed to reconstruct the scheduler after checkpoint resume.
+            # _onecycle_max_lr is always the DECODER (base) max_lr; encoder uses
+            # _onecycle_max_lr * _encoder_lr_multiplier.
             self._onecycle_steps = onecycle_steps
-            self._onecycle_max_lr = max_lr
+            self._onecycle_max_lr = max_lr          # decoder reference max_lr
             self._onecycle_pct_start = pct_start
             self._onecycle_div_factor = onecycle_div_factor
-            logger.info(f"OneCycleLR scheduler initialized: max_lr={max_lr:.2e}, total_steps={onecycle_steps} "
-                       f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})")
+            logger.info(
+                f"OneCycleLR scheduler initialized: decoder max_lr={max_lr:.2e}, "
+                f"encoder max_lr={max_lr * _enc_mult:.2e}, total_steps={onecycle_steps} "
+                f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})"
+            )
         else:
             self.use_warmup = False
             self.current_optimizer_step = 0
@@ -1138,15 +1195,22 @@ class KokoroTrainer:
         Step the learning rate scheduler with optional linear warmup.
         During warmup, manually set LR to increase linearly.
         After warmup, use the configured scheduler (e.g., OneCycleLR).
+
+        Encoder param group (group 0 when multiple groups exist) receives
+        _encoder_lr_multiplier × the base warmup LR so it warms up to the
+        same higher base LR that OneCycleLR will continue from.
         """
         if self.use_warmup and self.current_optimizer_step < self.warmup_steps:
             # Linear warmup phase
             warmup_progress = self.current_optimizer_step / self.warmup_steps
-            current_lr = self.warmup_start_lr + (self.warmup_target_lr - self.warmup_start_lr) * warmup_progress
+            base_lr = self.warmup_start_lr + (self.warmup_target_lr - self.warmup_start_lr) * warmup_progress
 
-            # Set LR for all parameter groups
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = current_lr
+            encoder_lr_mult = getattr(self, '_encoder_lr_multiplier', 1.0)
+            n_pg = len(self.optimizer.param_groups)
+            for i, param_group in enumerate(self.optimizer.param_groups):
+                # Encoder is group 0 when there are multiple groups
+                mult = encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0
+                param_group['lr'] = base_lr * mult
 
             self.current_optimizer_step += 1
         else:
@@ -1601,8 +1665,11 @@ class KokoroTrainer:
                     pitches = transferred.pitches
                     energies = transferred.energies
                     stress_indices = transferred.stress_indices
-                    # SpecAugment: mask teacher-forced mel input; loss target stays unmasked
-                    if getattr(self.config, 'use_spec_augment', False):
+                    # SpecAugment: mask teacher-forced mel input; loss target stays unmasked.
+                    # Epoch gate: disabled for early epochs so the model can first learn basic
+                    # encoder-decoder alignment before augmentation adds noise.
+                    _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 5)
+                    if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
                         mel_for_model = KokoroTrainer._apply_spec_augment(
                             mel_specs,
                             time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 30),
@@ -1662,22 +1729,27 @@ class KokoroTrainer:
                     self.log_memory_stats("data_loading")
 
 
-                # Adaptive stabilization for sequence/duration outliers (no hard skipping)
-                max_mel_length = 1400  # Earlier guard for long batches
-                max_duration_value = 150  # Earlier guard for extreme durations
+                # Adaptive stabilization for sequence/duration outliers (no hard skipping).
+                # IMPORTANT: soft_mel_length is now aligned with the hard cap (1400) so that
+                # *normal* Russian TTS sequences (700-1300 frames) no longer trigger aggressive
+                # gradient clipping that was starving the encoder of training signal.
+                max_mel_length = 1400  # Hard cap for sequence dimensions
+                max_duration_value = 150  # Hard cap for extreme durations
                 adaptive_loss_scale = 1.0
-                adaptive_clip_norm = 0.5
+                adaptive_clip_norm = 1.0  # Raised from 0.5: encoder needs more headroom
 
                 mel_length = mel_specs.shape[1]
                 max_duration_in_batch = phoneme_durations.max().item()
 
-                # Soft stabilization starts earlier to reduce projection-layer gradient spikes
-                soft_mel_length = 900
+                # Soft stabilization: only fires for sequences ABOVE the hard cap threshold.
+                # Setting soft_mel_length == max_mel_length means sequences in the normal
+                # training range (< 1400 frames) are never penalised by soft clipping.
+                soft_mel_length = 1400  # Raised from 900: stop penalising normal sequences
                 soft_duration_value = 80
                 soft_risk_ratio = max(mel_length / soft_mel_length, max_duration_in_batch / soft_duration_value)
                 if soft_risk_ratio > 1.0:
                     adaptive_loss_scale = min(adaptive_loss_scale, max(0.5, 1.0 / (soft_risk_ratio ** 0.65)))
-                    adaptive_clip_norm = min(adaptive_clip_norm, max(0.1, 0.4 / (soft_risk_ratio ** 0.35)))
+                    adaptive_clip_norm = min(adaptive_clip_norm, max(0.3, 0.8 / (soft_risk_ratio ** 0.35)))
 
                 mel_risk_ratio = mel_length / max_mel_length
                 duration_risk_ratio = max_duration_in_batch / max_duration_value
@@ -1837,7 +1909,7 @@ class KokoroTrainer:
                         for param_name, param_norm in top10:
                             log_fn(f"  {param_name}: {param_norm:.2f}")
 
-                        adaptive_clip_norm = min(adaptive_clip_norm, 0.05)
+                        adaptive_clip_norm = min(adaptive_clip_norm, 0.3)  # Floor raised from 0.05
                         log_fn(f"Emergency clip norm set to {adaptive_clip_norm:.3f}")
                         log_fn(f"{'='*80}\n")
                     else:

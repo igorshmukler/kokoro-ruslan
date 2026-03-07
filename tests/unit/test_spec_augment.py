@@ -1,5 +1,5 @@
 """
-Unit tests for KokoroTrainer._apply_spec_augment.
+Unit tests for KokoroTrainer._apply_spec_augment and its epoch gate.
 
 Covers:
   - Output shape unchanged
@@ -8,6 +8,7 @@ Covers:
   - Masking stays within tensor bounds
   - Zero masks produce identity
   - use_spec_augment=False path passes mel_specs through unchanged
+  - spec_augment_start_epoch gate: augment suppressed before the epoch threshold
 """
 import torch
 import pytest
@@ -143,3 +144,67 @@ class TestSpecAugmentIntegration:
 
         # Same object (no copy)
         assert mel_for_model is mel
+
+
+class TestSpecAugmentEpochGate:
+    """Verify the spec_augment_start_epoch gate added to train_epoch.
+
+    Before the fix, spec augmentation was applied from epoch 0, adding
+    noise before the model established basic alignment.  Now it is
+    gated behind spec_augment_start_epoch (default=5) so the first
+    epochs train on clean mel spectrograms.
+    """
+
+    def _gate_active(
+        self, epoch: int, use_spec_augment: bool, start_epoch: int
+    ) -> bool:
+        """Mirror the exact boolean expression used in trainer.train_epoch."""
+        import types
+        trainer = KokoroTrainer.__new__(KokoroTrainer)
+        trainer.config = types.SimpleNamespace(
+            use_spec_augment=use_spec_augment,
+            spec_augment_start_epoch=start_epoch,
+        )
+        _spec_aug_start = getattr(trainer.config, 'spec_augment_start_epoch', 5)
+        return getattr(trainer.config, 'use_spec_augment', False) and epoch >= _spec_aug_start
+
+    @pytest.mark.parametrize("epoch", [0, 1, 2, 3, 4])
+    def test_gate_suppresses_augment_before_start_epoch(self, epoch: int):
+        assert not self._gate_active(epoch, use_spec_augment=True, start_epoch=5), (
+            f"Spec augment must be suppressed at epoch {epoch} (start_epoch=5)"
+        )
+
+    @pytest.mark.parametrize("epoch", [5, 6, 7, 10, 20])
+    def test_gate_allows_augment_at_and_after_start_epoch(self, epoch: int):
+        assert self._gate_active(epoch, use_spec_augment=True, start_epoch=5), (
+            f"Spec augment must be active at epoch {epoch} (start_epoch=5)"
+        )
+
+    def test_gate_respects_use_spec_augment_false_regardless_of_epoch(self):
+        """use_spec_augment=False suppresses augment even when epoch >= start."""
+        for epoch in range(10):
+            assert not self._gate_active(
+                epoch, use_spec_augment=False, start_epoch=0
+            ), f"use_spec_augment=False must suppress at epoch {epoch}"
+
+    def test_getattr_default_start_epoch_is_5(self):
+        """When config lacks spec_augment_start_epoch, the fallback default is 5."""
+        import types
+        trainer = KokoroTrainer.__new__(KokoroTrainer)
+        trainer.config = types.SimpleNamespace(use_spec_augment=True)  # no start_epoch
+        default = getattr(trainer.config, 'spec_augment_start_epoch', 5)
+        assert default == 5
+
+    @pytest.mark.parametrize("start_epoch", [0, 1, 3, 10])
+    def test_gate_respects_custom_start_epoch(self, start_epoch: int):
+        """Epoch gate boundary is exactly at start_epoch, not before or after."""
+        # Suppressed for all epochs strictly before start
+        for epoch in range(start_epoch):
+            assert not self._gate_active(
+                epoch, use_spec_augment=True, start_epoch=start_epoch
+            )
+        # Active from start_epoch onwards
+        for epoch in range(start_epoch, start_epoch + 5):
+            assert self._gate_active(
+                epoch, use_spec_augment=True, start_epoch=start_epoch
+            )

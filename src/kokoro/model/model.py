@@ -33,7 +33,7 @@ class KokoroModel(nn.Module):
 
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
-                 encoder_dropout: float = 0.1, decoder_input_dropout: float = 0.3, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
+                 encoder_dropout: float = 0.1, decoder_input_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
                  max_decoder_seq_len: int = 4000, enable_profiling: bool = False,
                  gradient_checkpointing: bool = True, checkpoint_segments: int = 2,
                  use_variance_predictor: bool = True, variance_filter_size: int = 256,
