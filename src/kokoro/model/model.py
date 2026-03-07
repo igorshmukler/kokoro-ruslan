@@ -33,7 +33,7 @@ class KokoroModel(nn.Module):
 
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
-                 encoder_dropout: float = 0.1, decoder_input_dropout: float = 0.3, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
+                 encoder_dropout: float = 0.1, decoder_input_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
                  max_decoder_seq_len: int = 4000, enable_profiling: bool = False,
                  gradient_checkpointing: bool = True, checkpoint_segments: int = 2,
                  use_variance_predictor: bool = True, variance_filter_size: int = 256,
@@ -81,7 +81,7 @@ class KokoroModel(nn.Module):
         if use_stress_embedding:
             self.stress_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
 
-        self.encoder_positional_encoding = PositionalEncoding(
+        self.positional_encoding = PositionalEncoding(
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
         )
 
@@ -306,7 +306,7 @@ class KokoroModel(nn.Module):
             text_emb = self.text_embedding(phoneme_indices) * (self.hidden_dim ** 0.5)
             if self.use_stress_embedding and stress_indices is not None:
                 text_emb = text_emb + self.stress_embedding(stress_indices)
-            text_emb = self.encoder_positional_encoding(text_emb, seq_offset=0)
+            text_emb = self.positional_encoding(text_emb, seq_offset=0)
 
             self._log_memory("text_embedding_end")
 
@@ -461,7 +461,7 @@ class KokoroModel(nn.Module):
             decoder_input_projected, p=self.decoder_input_dropout, training=self.training
         )
 
-        decoder_input_projected_with_pe = self.encoder_positional_encoding(
+        decoder_input_projected_with_pe = self.positional_encoding(
             decoder_input_projected, seq_offset=0
         )
         del decoder_input_projected
@@ -476,7 +476,7 @@ class KokoroModel(nn.Module):
     def _project_mel_frame(self, decoder_input_mel: torch.Tensor, seq_offset: int):
         """Project a single mel frame and apply positional encoding at absolute position `seq_offset`."""
         mel_projected_t = self.mel_projection_in(decoder_input_mel)
-        mel_projected_t_with_pe = self.encoder_positional_encoding(mel_projected_t, seq_offset=seq_offset)
+        mel_projected_t_with_pe = self.positional_encoding(mel_projected_t, seq_offset=seq_offset)
         return mel_projected_t_with_pe
 
     def _project_decoder_outputs(self, decoder_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

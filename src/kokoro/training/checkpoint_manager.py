@@ -472,10 +472,17 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
         max_lr = getattr(trainer, '_onecycle_max_lr', None)
         pct_start = getattr(trainer, '_onecycle_pct_start', 0.3)
         if onecycle_steps is not None and max_lr is not None:
-            last_lr = trainer.optimizer.state_dict()['param_groups'][0]['lr']
+            # _onecycle_max_lr is always the DECODER (base) max_lr.
+            # The encoder group (group 0 when multiple groups exist) uses max_lr * encoder_mult.
+            # Use the last param group (decoder) as the reference for computing the schedule
+            # position, since its LR range is [base_lr, max_lr] without the encoder scaling.
+            n_pg = len(trainer.optimizer.param_groups)
+            ref_group_idx = n_pg - 1  # last group = decoder params
+            encoder_lr_mult = getattr(trainer, '_encoder_lr_multiplier', 1.0)
+            last_lr = trainer.optimizer.state_dict()['param_groups'][ref_group_idx]['lr']
 
             _div_factor = getattr(trainer, '_onecycle_div_factor',
-                float(getattr(config, 'max_lr_multiplier', 2.0))
+                float(getattr(config, 'max_lr_multiplier', 5.0))
                 if getattr(trainer, 'use_warmup', False) else 25.0)
             base_lr  = max_lr / _div_factor
             final_lr = max_lr / 10000.0
@@ -503,10 +510,16 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 target_step = onecycle_steps - 1
                 resume_lr   = final_lr
 
+            # Build per-group max_lr: encoder group (group 0 when n_pg > 1) gets encoder_lr_mult × max_lr
+            if n_pg > 1:
+                max_lr_arg = [max_lr * encoder_lr_mult] + [max_lr] * (n_pg - 1)
+            else:
+                max_lr_arg = max_lr
+
             saved_lr = [g['lr'] for g in trainer.optimizer.param_groups]
             trainer.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 trainer.optimizer,
-                max_lr=max_lr,
+                max_lr=max_lr_arg,
                 total_steps=onecycle_steps,
                 pct_start=pct_start,
                 anneal_strategy='cos',
@@ -519,13 +532,19 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             )
             trainer.scheduler.last_epoch = target_step
             resume_lr = min(resume_lr, max_lr)
-            for g in trainer.optimizer.param_groups:
-                g['lr'] = resume_lr
-            trainer.scheduler._last_lr = [resume_lr for _ in trainer.optimizer.param_groups]
+            for i, g in enumerate(trainer.optimizer.param_groups):
+                # Encoder group (group 0 in multi-group setup) keeps its higher LR
+                mult = encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0
+                g['lr'] = resume_lr * mult
+            trainer.scheduler._last_lr = [
+                resume_lr * (encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0)
+                for i in range(n_pg)
+            ]
 
             logger.info(
                 f"OneCycleLR reconstructed from current config after resume: "
-                f"max_lr={max_lr:.2e}, total_steps={onecycle_steps}, pct_start={pct_start}, "
+                f"decoder max_lr={max_lr:.2e}, encoder max_lr={max_lr * encoder_lr_mult:.2e}, "
+                f"total_steps={onecycle_steps}, pct_start={pct_start}, "
                 f"last_lr={last_lr:.2e} → positioned at step {target_step}/{onecycle_steps}, "
                 f"resume_lr={resume_lr:.2e}"
             )

@@ -25,8 +25,13 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 2.0  # Max LR = learning_rate * this value
+    max_lr_multiplier: float = 5.0  # Max LR = learning_rate * this value (raised from 2.0: plateau fix)
     pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
+    # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
+    # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
+    # that the severely under-trained encoder layers get proportionally more gradient
+    # signal relative to the already-learning decoder.
+    encoder_lr_multiplier: float = 3.0
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -61,7 +66,7 @@ class TrainingConfig:
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
     # Loss weights
-    duration_loss_weight: float = 0.1
+    duration_loss_weight: float = 0.35  # Raised from 0.1: stronger signal through frozen encoder path
     # Stop token BCE dominated early training (~21% of loss by epoch 6, ~15% at epoch 18).
     # Halving from 1.0 → 0.5 reduces total loss by ~0.08-0.10 once stop is learned,
     # freeing capacity for mel reconstruction to improve.
@@ -78,6 +83,13 @@ class TrainingConfig:
     spec_augment_freq_mask_max: int = 10   # Max consecutive mel bins masked per mask
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
+    # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
+    # With pct_start=0.3 and 50 epochs the LR peaks at ~epoch 15; starting spec
+    # augment before the peak compounds the ramp-phase instability and causes
+    # val_loss regression (observed: ep4→ep6 val 1.87→2.04 with start=5).
+    # Start at epoch 18: 3 epochs after the LR peak, once the schedule is
+    # descending and the model has stabilised.
+    spec_augment_start_epoch: int = 18
     # Stop token class-imbalance correction.
     # BCE on stop tokens is extremely skewed: only 1 positive frame per sequence
     # among ~T negatives (T ≈ average mel length).  Without pos_weight the model
@@ -132,10 +144,11 @@ class TrainingConfig:
     attention_spike_clip_norm: float = 20.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
     ffn_spike_clip_norm: float = 15.0
-    # Tighter clip for encoder FFN layers — encoder linear1 is the primary spike source
-    # identified via checkpoint regression analysis (delta 11-12 per 2 epochs without this).
-    # Decoder FFN needs more freedom to learn mel generation; encoder needs less.
-    encoder_ffn_spike_clip_norm: float = 10.0
+    # Encoder FFN per-layer pre-clip. Previously 10.0 which was so tight it zeroed the
+    # already-microscopic encoder gradients (~1e-7), starving the encoder of all signal.
+    # Raised to 100.0: real instabilities are still caught by the global clip_grad_norm;
+    # this pre-clip now only fires on genuine spikes, not on normal encoder gradients.
+    encoder_ffn_spike_clip_norm: float = 100.0
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100

@@ -2,6 +2,43 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.28 (2026-03-07)
+
+- **Encoder/decoder parameter group split** (`trainer.py`): optimizer now uses two separate AdamW parameter groups. Encoder parameters (`text_embedding`, `stress_embedding`, positional encodings, `transformer_encoder_layers`) are trained at `encoder_lr_multiplier × base_lr` (default 3×); decoder and variance adaptor parameters use `base_lr`. Per-group `max_lr` values are set accordingly in the OneCycleLR schedule and manual warmup ramp. Previously both groups shared the same LR, starving the encoder of gradient signal.
+- **Adaptive clip base and explosion floor raised** (`trainer.py`): base gradient clip norm increased from `0.5` to `1.0`; the hard floor applied after an explosion event raised from `0.05` to `0.3`. The `soft_mel_length` threshold was also raised from `900` to `1400` frames to stop penalising normally-sized Russian sequences.
+- **`encoder_ffn_spike_clip_norm` loosened** (`config.py`): default raised from `10.0` to `100.0`. The old value was zeroing microscopically small but valid encoder FFN gradients at every step.
+- **`duration_loss_weight` raised** (`config.py`): default raised from `0.1` to `0.35`, giving the encoder stronger alignment signal through the duration predictor path.
+- **`decoder_input_dropout` reduced** (`model.py`): default in `KokoroModel.__init__` changed from `0.3` to `0.1`. The high value was over-regularising teacher-forced decoding during early training.
+- **`max_lr_multiplier` raised** (`config.py`): default raised from `2.0` to `5.0`, widening the OneCycleLR peak to give the model more room to descend in the first epochs.
+- **Checkpoint resume multi-group support** (`checkpoint_manager.py`): `resume_from_checkpoint` now reconstructs the OneCycleLR with per-group `max_lr` values (`[max_lr * encoder_lr_mult, max_lr]`) so LR schedules are correctly restored after resume.
+
+### Spec augment gate delayed
+
+- **`spec_augment_start_epoch` raised from 5 to 18** (`config.py`, `trainer.py`): empirical observation showed val_loss regressing from 1.87 → 2.04 across epochs 5–6 when spec augment activated at epoch 5 while the OneCycleLR was still ramping (peak at ~epoch 15 with `pct_start=0.3`, 50 epochs). Starting augmentation 3 epochs after the LR peak eliminates ramp-phase double-destabilisation. The fallback default in the trainer is updated to match.
+
+### Transformer module refactor (`transformers.py`)
+
+- **`GLUFeedForward` extracted as shared module**: the GLU feed-forward block (linear1 → split gate/linear → activation(gate) × linear → linear2) is now a standalone `nn.Module` used by both encoder and decoder layers. Previously each block inlined duplicate `linear1`/`linear2`/`dropout_ff`/`_init_weights` logic.
+- **`_build_activation` factory**: activation selection for FFN blocks moved to a single `_build_activation(name)` factory function instead of being duplicated across encoder and decoder block constructors. Raises `ValueError` for unrecognised names.
+- **`use_prenorm` removed**: `ImprovedTransformerEncoderBlock` and decoder equivalents no longer accept a `use_prenorm` parameter — pre-norm is now always applied (matching the 0.0.27 change that made pre-norm GELU the fixed architecture). The parameter was dead code.
+- **`dropout_ff` deduplicated**: internal feed-forward dropout is now owned by `GLUFeedForward`; the redundant `self.dropout_ff` attribute on the block classes is removed.
+
+### New config fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `encoder_lr_multiplier` | `3.0` | LR multiplier for the encoder parameter group relative to `learning_rate` |
+| `spec_augment_start_epoch` | `18` | Epoch at which SpecAugment is first applied |
+| `max_lr_multiplier` | `5.0` | OneCycleLR peak multiplier (was `2.0`) |
+
+### Unit tests added / updated
+
+- `tests/unit/test_optimizer_param_groups.py` — **new**, 19 tests: verifies two-group structure, encoder LR multiplier, decoder base LR, fallback to single group when no encoder params are found, per-group `max_lr` in scheduler.
+- `tests/unit/test_spec_augment.py` — added `TestSpecAugmentEpochGate` class (15 tests): gate suppresses augment before `spec_augment_start_epoch`, gate opens exactly at the threshold epoch, `use_spec_augment=False` always suppresses regardless of epoch.
+- `tests/unit/test_config_pitch_extraction_defaults.py` — updated `test_training_config_convergence_fix_defaults` to assert new defaults (`spec_augment_start_epoch=18`, `max_lr_multiplier=5.0`, `duration_loss_weight=0.35`, `encoder_lr_multiplier=3.0`, `encoder_ffn_spike_clip_norm=100.0`).
+- `tests/unit/test_trainer_adaptive_stabilization.py` — updated two clip-norm threshold assertions to match new values (`0.5→1.0`, `0.05→0.3`).
+- `tests/unit/test_transformers.py` — expanded coverage for `GLUFeedForward` and `_build_activation`, removed tests for the deleted `use_prenorm` parameter.
+
 ## 0.0.27 (2026-03-06)
 
 - Moved encoder/decoder to pre-norm GELU
