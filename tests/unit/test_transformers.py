@@ -691,7 +691,7 @@ def test_decoder_deterministic_eval():
 
 
 # ===========================================================================
-# _build_activation (refactor item 1)
+# _build_activation
 # ===========================================================================
 
 class TestBuildActivation:
@@ -731,7 +731,7 @@ class TestBuildActivation:
 
 
 # ===========================================================================
-# GLUFeedForward (refactor item 2)
+# GLUFeedForward
 # ===========================================================================
 
 class TestGLUFeedForward:
