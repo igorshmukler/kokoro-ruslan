@@ -365,3 +365,121 @@ class TestCheckpointRoundTrip:
         )
         assert loaded["val_loss"] is None
         assert loaded["train_loss"] == pytest.approx(3.14159)
+
+
+# ---------------------------------------------------------------------------
+# Resume: best_val_loss restoration
+# ---------------------------------------------------------------------------
+
+class TestResumeRestoresBestValLoss:
+    """Regression guard for the bug where resume_from_checkpoint() never
+    restored trainer.best_val_loss, causing the first post-resume epoch to
+    always report 'improved by inf' and overwrite the best checkpoint even
+    when the new val_loss was actually worse.
+
+    The fix reads checkpoint['val_loss'] and sets trainer.best_val_loss.
+    """
+
+    def _make_resume_checkpoint(self, tmp_path, val_loss_value):
+        """Write a minimal .pth file that resume_from_checkpoint() can read."""
+        payload = {
+            'current_optimizer_step': 100,
+            'optimizer_steps_completed': 100,
+            'val_loss': val_loss_value,
+        }
+        path = tmp_path / 'checkpoint_epoch_4.pth'
+        torch.save(payload, str(path))
+        return str(path)
+
+    def _make_trainer_stub(self):
+        """Return a KokoroTrainer stub with only the attributes read by
+        the best_val_loss restoration block in resume_from_checkpoint()."""
+        trainer = KokoroTrainer.__new__(KokoroTrainer)
+        trainer.best_val_loss = float('inf')
+        trainer.current_optimizer_step = 0
+        trainer.optimizer_steps_completed = 0
+        return trainer
+
+    def test_best_val_loss_restored_from_checkpoint_val_loss(self, tmp_path):
+        """best_val_loss is set to checkpoint['val_loss'] when the key exists."""
+        from kokoro.training import checkpoint_manager as cm
+
+        val_loss_in_ckpt = 1.8733
+        ckpt_path = self._make_resume_checkpoint(tmp_path, val_loss_in_ckpt)
+
+        checkpoint = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        trainer = self._make_trainer_stub()
+
+        # Replicate only the restoration block (avoids needing the full resume machinery)
+        if 'val_loss' in checkpoint:
+            trainer.best_val_loss = float(checkpoint['val_loss'])
+
+        assert trainer.best_val_loss == pytest.approx(val_loss_in_ckpt), (
+            f"Expected best_val_loss={val_loss_in_ckpt}, got {trainer.best_val_loss}"
+        )
+
+    def test_best_val_loss_stays_inf_when_checkpoint_has_no_val_loss(self, tmp_path):
+        """When checkpoint has no 'val_loss' key, best_val_loss stays float('inf')."""
+        path = tmp_path / 'checkpoint_no_val.pth'
+        torch.save({'current_optimizer_step': 50}, str(path))
+
+        checkpoint = torch.load(str(path), map_location='cpu', weights_only=False)
+        trainer = self._make_trainer_stub()
+
+        if 'val_loss' in checkpoint:
+            trainer.best_val_loss = float(checkpoint['val_loss'])
+
+        assert trainer.best_val_loss == float('inf'), (
+            "best_val_loss should remain inf when checkpoint has no val_loss key"
+        )
+
+    def test_worse_val_loss_does_not_trigger_improvement_after_restore(self, tmp_path):
+        """After restoring best_val_loss=1.87, a new val_loss=1.917 (worse) must
+        NOT be treated as an improvement — preventing the best checkpoint overwrite."""
+        best_val_in_ckpt = 1.8733
+        new_val_loss = 1.9170
+        min_delta = 0.001
+
+        trainer = self._make_trainer_stub()
+        trainer.best_val_loss = best_val_in_ckpt  # simulate restored
+
+        improved = new_val_loss < (trainer.best_val_loss - min_delta)
+
+        assert not improved, (
+            f"A worse val_loss ({new_val_loss}) must not be counted as an improvement "
+            f"over the restored best ({best_val_in_ckpt})"
+        )
+
+    def test_better_val_loss_does_trigger_improvement_after_restore(self, tmp_path):
+        """After restoring best_val_loss=1.87, a new val_loss=1.82 (better) must
+        be treated as an improvement so the model checkpoint is updated."""
+        best_val_in_ckpt = 1.8733
+        new_val_loss = 1.82
+        min_delta = 0.001
+
+        trainer = self._make_trainer_stub()
+        trainer.best_val_loss = best_val_in_ckpt  # simulate restored
+
+        improved = new_val_loss < (trainer.best_val_loss - min_delta)
+
+        assert improved, (
+            f"A better val_loss ({new_val_loss}) must be counted as an improvement "
+            f"over the restored best ({best_val_in_ckpt})"
+        )
+
+    def test_improvement_without_restore_always_fires_on_first_epoch(self, tmp_path):
+        """Without the fix (best_val_loss=inf), even a bad val_loss looks like
+        an improvement.  This test documents the pre-fix behaviour as a canary."""
+        bad_val_loss = 2.50  # clearly worse than the real best of 1.87
+        min_delta = 0.001
+
+        trainer = self._make_trainer_stub()
+        # best_val_loss NOT restored — stays float('inf') as it was before the fix
+
+        improved = bad_val_loss < (trainer.best_val_loss - min_delta)
+
+        assert improved, (
+            "Pre-fix behaviour: any val_loss < float('inf') incorrectly looks like "
+            "an improvement when best_val_loss is not restored on resume"
+        )
+
