@@ -171,8 +171,8 @@ class KokoroTrainer:
         self.profiler = None
         self.profiling_stats = {}
         self.memory_snapshots = []
-        self.log_dir = os.path.join(config.output_dir, "profiler_logs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
-        os.makedirs(self.log_dir, exist_ok=True)
+        self.profiler_log_dir = os.path.join(config.output_dir, "profiler_logs", datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+        os.makedirs(self.profiler_log_dir, exist_ok=True)
         self.interbatch_profiler = InterbatchProfiler(config)
 
         # Adaptive memory management
@@ -715,7 +715,7 @@ class KokoroTrainer:
     def start_torch_profiler(self, output_dir: str = None):
         """Start PyTorch profiler with comprehensive settings"""
         if output_dir is None:
-            output_dir = self.log_dir
+            output_dir = self.profiler_log_dir
 
         os.makedirs(output_dir, exist_ok=True)
 
@@ -2355,7 +2355,7 @@ class KokoroTrainer:
 
         enable_profiling = getattr(self.config, 'enable_profiling', False)
         if enable_profiling:
-            logger.info(f"Profiler logs will be saved to: {self.log_dir}")
+            logger.info(f"Profiler logs will be saved to: {self.profiler_log_dir}")
 
         # Log interbatch profiling settings
         enable_interbatch_profiling = getattr(self.config, 'enable_interbatch_profiling', False)
