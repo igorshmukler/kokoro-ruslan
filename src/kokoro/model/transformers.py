@@ -38,6 +38,65 @@ def drop_path(x: torch.Tensor, drop_prob: float = 0.0, training: bool = False) -
     output = x.div(keep_prob) * random_tensor
     return output
 
+def _build_activation(name: str) -> nn.Module:
+    """Factory that returns the requested activation module.
+
+    Supported values: ``'gelu'`` (default), ``'swish'`` / ``'silu'``, ``'relu'``.
+    Raises :class:`ValueError` for unknown names so callers get a clear message
+    rather than silently falling back to an unexpected default.
+    """
+    name = name.lower()
+    if name == 'gelu':
+        return nn.GELU()
+    elif name in ('swish', 'silu'):  # SiLU == Swish
+        return nn.SiLU()
+    elif name == 'relu':
+        return nn.ReLU()
+    else:
+        raise ValueError(
+            f"Unsupported activation '{name}'. "
+            "Choose from: 'gelu', 'swish'/'silu', 'relu'."
+        )
+
+
+class GLUFeedForward(nn.Module):
+    """Gated Linear Unit (GLU) feed-forward block shared by encoder and decoder.
+
+    Architecture::
+
+        x → linear1 (d_model → dim_feedforward * 2)
+          → split(gate, linear)
+          → activation(gate) * linear
+          → dropout
+          → linear2 (dim_feedforward → d_model)
+
+    Weight matrices are initialised with Xavier uniform; biases are zeroed.
+    """
+
+    def __init__(self, d_model: int, dim_feedforward: int, dropout: float,
+                 activation: str = 'gelu'):
+        super().__init__()
+        # Expand to 2× so we can split into gate and linear paths
+        self.linear1 = nn.Linear(d_model, dim_feedforward * 2)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.activation = _build_activation(activation)
+        self.dropout = nn.Dropout(dropout)
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        nn.init.xavier_uniform_(self.linear1.weight)
+        if self.linear1.bias is not None:
+            nn.init.zeros_(self.linear1.bias)
+        nn.init.xavier_uniform_(self.linear2.weight)
+        if self.linear2.bias is not None:
+            nn.init.zeros_(self.linear2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.linear1(x)
+        gate, linear = x.chunk(2, dim=-1)
+        return self.linear2(self.dropout(self.activation(gate) * linear))
+
+
 class MultiHeadAttentionImproved(nn.Module):
     """Improved multi-head attention with better initialization and optional relative positioning"""
 
@@ -322,10 +381,9 @@ class ImprovedTransformerEncoderBlock(nn.Module):
     """Enhanced Transformer encoder block with better normalization and activations"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 activation: str = 'gelu', use_prenorm: bool = True,
-                 use_relative_pos: bool = False, drop_path_rate: float = 0.0):
+                 activation: str = 'gelu', use_relative_pos: bool = False,
+                 drop_path_rate: float = 0.0):
         super().__init__()
-        self.use_prenorm = use_prenorm
         self.drop_path_rate = drop_path_rate
 
         # Self-attention module
@@ -333,20 +391,8 @@ class ImprovedTransformerEncoderBlock(nn.Module):
             d_model, nhead, dropout, use_relative_pos
         )
 
-        # Activation function for feed-forward network
-        if activation == 'gelu':
-            self.activation = nn.GELU()
-        elif activation == 'swish': # SiLU is Swish
-            self.activation = nn.SiLU()
-        elif activation == 'relu':
-            self.activation = nn.ReLU()
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
-
         # GLU-style feedforward (Gated Linear Unit)
-        # Input to linear1 is d_model, output is dim_feedforward * 2 (for gate and linear paths)
-        self.linear1 = nn.Linear(d_model, dim_feedforward * 2)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation)
 
         # Normalization layers (LayerNorm)
         self.norm1 = nn.LayerNorm(d_model)
@@ -355,29 +401,6 @@ class ImprovedTransformerEncoderBlock(nn.Module):
         # Dropout layers
         self.dropout1 = nn.Dropout(dropout) # After self-attention residual
         self.dropout2 = nn.Dropout(dropout) # After feed-forward residual
-        self.dropout_ff = nn.Dropout(dropout) # Inside feed-forward
-
-        # Initialize weights for linear layers
-        self._init_weights()
-
-    def _init_weights(self):
-        # Initialize only weight here, bias is usually initialized to zeros by default
-        nn.init.xavier_uniform_(self.linear1.weight)
-        if self.linear1.bias is not None:
-            nn.init.zeros_(self.linear1.bias)
-        nn.init.xavier_uniform_(self.linear2.weight)
-        if self.linear2.bias is not None:
-            nn.init.zeros_(self.linear2.bias)
-
-    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
-        """GLU-style feed-forward block"""
-        x = self.linear1(x)
-        # Split into two parts: one for gating, one for linear transformation
-        gate, linear = x.chunk(2, dim=-1)
-        # Apply activation to gate and multiply with linear path
-        gated_output = self.activation(gate) * linear
-        # Apply dropout and final linear transformation
-        return self.linear2(self.dropout_ff(gated_output))
 
     def forward(self, src: torch.Tensor, src_mask: Optional[torch.Tensor] = None, # Self-attention mask (e.g., causal)
                 src_key_padding_mask: Optional[torch.Tensor] = None # Padding mask for src (True for padded)
@@ -387,42 +410,18 @@ class ImprovedTransformerEncoderBlock(nn.Module):
         if src_key_padding_mask is not None:
             src_key_padding_mask = src_key_padding_mask.to(torch.bool)
 
-        if self.use_prenorm:
-            # Pre-normalization (e.g., Transformer-XL, GPT-2)
-            # Self-attention sub-layer
-            src_norm = self.norm1(src) # Apply LayerNorm BEFORE attention
-            # MultiHeadAttentionImproved returns (output, attn_weights)
-            attn_output, _, _ = self.self_attn(src_norm, src_norm, src_norm,
-                                            attn_mask=src_mask,
-                                            key_padding_mask=src_key_padding_mask)
+        # Pre-norm: LayerNorm is applied BEFORE each sub-layer (attention and FFN),
+        # improving training stability and gradient flow.
+        src_norm = self.norm1(src)
+        attn_output, _, _ = self.self_attn(src_norm, src_norm, src_norm,
+                                           attn_mask=src_mask,
+                                           key_padding_mask=src_key_padding_mask)
+        attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
+        src = src + self.dropout1(attn_output)
 
-            # Apply stochastic depth to attention output
-            attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
-            src = src + self.dropout1(attn_output) # Residual connection + Dropout
-
-            # Feed-forward sub-layer
-            src_norm = self.norm2(src) # Apply LayerNorm BEFORE FFN
-            ff_output = self._ff_block(src_norm)
-
-            # Apply stochastic depth to FFN output
-            ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
-            src = src + self.dropout2(ff_output) # Residual connection + Dropout
-
-        else:
-            # Post-normalization (Original Transformer)
-            # Self-attention sub-layer
-            attn_output, _, _ = self.self_attn(src, src, src,
-                                            attn_mask=src_mask,
-                                            key_padding_mask=src_key_padding_mask)
-            # Apply stochastic depth to attention output
-            attn_output = drop_path(attn_output, self.drop_path_rate, self.training)
-            src = self.norm1(src + self.dropout1(attn_output)) # Residual + Dropout + LayerNorm
-
-            # Feed-forward sub-layer
-            ff_output = self._ff_block(src)
-            # Apply stochastic depth to FFN output
-            ff_output = drop_path(ff_output, self.drop_path_rate, self.training)
-            src = self.norm2(src + self.dropout2(ff_output)) # Residual + Dropout + LayerNorm
+        src_norm = self.norm2(src)
+        ff_output = drop_path(self.ff(src_norm), self.drop_path_rate, self.training)
+        src = src + self.dropout2(ff_output)
 
         return src
 
@@ -431,9 +430,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
     """Enhanced Transformer decoder block with improved architecture"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 activation: str = 'gelu', use_prenorm: bool = True):
+                 activation: str = 'gelu'):
         super().__init__()
-        self.use_prenorm = use_prenorm
 
         # Decoder self-attention: usually causal, can use relative positional encoding
         self.self_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=True)
@@ -441,19 +439,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         # Cross-attention (encoder-decoder attention): no relative pos, queries from decoder, keys/values from encoder
         self.cross_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=False)
 
-        # Activation function for feed-forward network
-        if activation == 'gelu':
-            self.activation = nn.GELU()
-        elif activation == 'swish':
-            self.activation = nn.SiLU()
-        elif activation == 'relu':
-            self.activation = nn.ReLU()
-        else:
-            raise ValueError(f"Unsupported activation: {activation}")
-
         # GLU-style feedforward
-        self.linear1 = nn.Linear(d_model, dim_feedforward * 2)
-        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation)
 
         # Normalization layers
         self.norm1 = nn.LayerNorm(d_model) # For self-attention
@@ -464,17 +451,6 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         self.dropout1 = nn.Dropout(dropout) # After self-attention residual
         self.dropout2 = nn.Dropout(dropout) # After cross-attention residual
         self.dropout3 = nn.Dropout(dropout) # After feed-forward residual
-        self.dropout_ff = nn.Dropout(dropout) # Inside feed-forward
-
-        self._init_weights()
-
-    def _init_weights(self):
-        nn.init.xavier_uniform_(self.linear1.weight)
-        if self.linear1.bias is not None:
-            nn.init.zeros_(self.linear1.bias)
-        nn.init.xavier_uniform_(self.linear2.weight)
-        if self.linear2.bias is not None:
-            nn.init.zeros_(self.linear2.bias)
 
     def precompute_cross_attention_kv(self, memory: torch.Tensor) -> None:
         """Cache K and V projections for fixed encoder output during inference."""
@@ -489,13 +465,6 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         """Release cached K, V after inference completes."""
         self._cached_cross_K = None
         self._cached_cross_V = None
-
-    def _ff_block(self, x: torch.Tensor) -> torch.Tensor:
-        """GLU-style feed-forward block"""
-        x = self.linear1(x)
-        gate, linear = x.chunk(2, dim=-1)
-        gated_output = self.activation(gate) * linear
-        return self.linear2(self.dropout_ff(gated_output))
 
     def forward(self, tgt: torch.Tensor, memory: torch.Tensor, # memory is encoder output
                 tgt_mask: Optional[torch.Tensor] = None, # Causal mask for decoder self-attention
@@ -516,47 +485,26 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         cached_k = getattr(self, '_cached_cross_K', None)
         cached_v = getattr(self, '_cached_cross_V', None)
 
-        if self.use_prenorm:
-            # Pre-normalization
-            # Self-attention sub-layer
-            tgt_norm = self.norm1(tgt)
-            attn_output, _, updated_cache = self.self_attn(tgt_norm, tgt_norm, tgt_norm,
-                                            attn_mask=tgt_mask,
-                                            key_padding_mask=tgt_key_padding_mask,
-                                            kv_cache=self_attn_kv_cache
-                                            )
-            tgt = tgt + self.dropout1(attn_output)
+        # Pre-norm: LayerNorm is applied BEFORE each sub-layer.
+        # Self-attention
+        tgt_norm = self.norm1(tgt)
+        attn_output, _, updated_cache = self.self_attn(tgt_norm, tgt_norm, tgt_norm,
+                                                       attn_mask=tgt_mask,
+                                                       key_padding_mask=tgt_key_padding_mask,
+                                                       kv_cache=self_attn_kv_cache)
+        tgt = tgt + self.dropout1(attn_output)
 
-            # Cross-attention sub-layer
-            tgt_norm = self.norm2(tgt)
-            # Query is from decoder (tgt_norm), Key/Value from encoder (memory)
-            cross_attn_output, _, _ = self.cross_attn(tgt_norm, memory, memory,
-                                                   attn_mask=memory_mask, # Usually None
-                                                   key_padding_mask=memory_key_padding_mask,
-                                                   precomputed_k=cached_k,
-                                                   precomputed_v=cached_v)
+        # Cross-attention
+        tgt_norm = self.norm2(tgt)
+        cross_attn_output, _, _ = self.cross_attn(tgt_norm, memory, memory,
+                                                  attn_mask=memory_mask,  # Usually None
+                                                  key_padding_mask=memory_key_padding_mask,
+                                                  precomputed_k=cached_k,
+                                                  precomputed_v=cached_v)
+        tgt = tgt + self.dropout2(cross_attn_output)
 
-            tgt = tgt + self.dropout2(cross_attn_output)
-            tgt = tgt + self.dropout3(self._ff_block(self.norm3(tgt)))
-
-        else:
-            # Post-normalization
-            # Self-attention sub-layer
-            attn_output, _, updated_cache = self.self_attn(tgt, tgt, tgt,
-                                            attn_mask=tgt_mask,
-                                            key_padding_mask=tgt_key_padding_mask,
-                                            kv_cache=self_attn_kv_cache)
-            tgt = self.norm1(tgt + self.dropout1(attn_output))
-
-            # Cross-attention sub-layer
-            cross_attn_output, _, _ = self.cross_attn(tgt, memory, memory,
-                                                   attn_mask=memory_mask, # Usually None
-                                                   key_padding_mask=memory_key_padding_mask,
-                                                   precomputed_k=cached_k,
-                                                   precomputed_v=cached_v)
-
-            tgt = self.norm2(tgt + self.dropout2(cross_attn_output))
-            tgt = self.norm3(tgt + self.dropout3(self._ff_block(tgt)))
+        # Feed-forward
+        tgt = tgt + self.dropout3(self.ff(self.norm3(tgt)))
 
         return tgt, updated_cache
 
@@ -565,23 +513,18 @@ class ImprovedTransformerDecoder(nn.Module):
     """Enhanced Transformer decoder with better layer organization"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
-                 dropout: float, num_layers: int, use_prenorm: bool = True,
-                 activation: str = 'gelu'):
+                 dropout: float, num_layers: int, activation: str = 'gelu'):
         super().__init__()
         self.num_layers = num_layers
-        self.use_prenorm = use_prenorm
 
         self.layers = nn.ModuleList([
             ImprovedTransformerDecoderBlock(
-                d_model, nhead, dim_feedforward, dropout, activation, use_prenorm
+                d_model, nhead, dim_feedforward, dropout, activation
             ) for _ in range(num_layers)
         ])
 
-        # Final layer norm for pre-norm architecture (applied after all blocks)
-        if use_prenorm:
-            self.norm = nn.LayerNorm(d_model)
-        else:
-            self.norm = None # No final norm for post-norm architecture
+        # Final LayerNorm applied after all blocks (pre-norm architecture)
+        self.norm = nn.LayerNorm(d_model)
 
     def precompute_cross_attention_kv(self, memory: torch.Tensor) -> None:
         for layer in self.layers:
@@ -629,9 +572,7 @@ class ImprovedTransformerDecoder(nn.Module):
                 if updated_caches is not None:
                     updated_caches.append(new_cache)
 
-        # Apply final normalization if pre-norm architecture is used
-        if self.norm is not None:
-            output = self.norm(output)
+        output = self.norm(output)
 
         return output, updated_caches
 
@@ -649,7 +590,7 @@ class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  drop_path_rate: float = 0.0):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
-                        activation='gelu', use_prenorm=True, use_relative_pos=False,
+                        activation='gelu', use_relative_pos=False,
                         drop_path_rate=drop_path_rate)
 
 
@@ -663,7 +604,7 @@ class TransformerDecoder(ImprovedTransformerDecoder):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        use_prenorm=True, activation='gelu')
+                        activation='gelu')
 
 
 # --- Helper functions for optimized components (optional, for direct use) ---
@@ -671,24 +612,21 @@ class TransformerDecoder(ImprovedTransformerDecoder):
 
 def create_optimized_encoder_layers(d_model: int, nhead: int, dim_feedforward: int,
                                    dropout: float, num_layers: int,
-                                   use_prenorm: bool = True,
                                    activation: str = 'gelu',
                                    use_relative_pos: bool = False) -> nn.ModuleList:
     """Create a list of optimized encoder layers."""
     return nn.ModuleList([
         ImprovedTransformerEncoderBlock(
             d_model, nhead, dim_feedforward, dropout,
-            activation, use_prenorm, use_relative_pos
+            activation, use_relative_pos
         ) for _ in range(num_layers)
     ])
 
 
 def create_optimized_decoder(d_model: int, nhead: int, dim_feedforward: int,
                            dropout: float, num_layers: int,
-                           use_prenorm: bool = True,
                            activation: str = 'gelu') -> ImprovedTransformerDecoder:
     """Create an optimized transformer decoder."""
     return ImprovedTransformerDecoder(
-        d_model, nhead, dim_feedforward, dropout, num_layers,
-        use_prenorm, activation
+        d_model, nhead, dim_feedforward, dropout, num_layers, activation
     )
