@@ -83,9 +83,13 @@ class TrainingConfig:
     spec_augment_freq_mask_max: int = 10   # Max consecutive mel bins masked per mask
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
-    # Epoch gate: SpecAugment is too noisy before basic alignment is established.
-    # Keep disabled for the first N epochs while encoder/decoder learn basic mappings.
-    spec_augment_start_epoch: int = 5
+    # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
+    # With pct_start=0.3 and 50 epochs the LR peaks at ~epoch 15; starting spec
+    # augment before the peak compounds the ramp-phase instability and causes
+    # val_loss regression (observed: ep4→ep6 val 1.87→2.04 with start=5).
+    # Start at epoch 18: 3 epochs after the LR peak, once the schedule is
+    # descending and the model has stabilised.
+    spec_augment_start_epoch: int = 18
     # Stop token class-imbalance correction.
     # BCE on stop tokens is extremely skewed: only 1 positive frame per sequence
     # among ~T negatives (T ≈ average mel length).  Without pos_weight the model

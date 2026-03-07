@@ -187,13 +187,13 @@ class TestSpecAugmentEpochGate:
                 epoch, use_spec_augment=False, start_epoch=0
             ), f"use_spec_augment=False must suppress at epoch {epoch}"
 
-    def test_getattr_default_start_epoch_is_5(self):
-        """When config lacks spec_augment_start_epoch, the fallback default is 5."""
+    def test_getattr_default_start_epoch_is_18(self):
+        """When config lacks spec_augment_start_epoch, the fallback default is 18."""
         import types
         trainer = KokoroTrainer.__new__(KokoroTrainer)
         trainer.config = types.SimpleNamespace(use_spec_augment=True)  # no start_epoch
-        default = getattr(trainer.config, 'spec_augment_start_epoch', 5)
-        assert default == 5
+        default = getattr(trainer.config, 'spec_augment_start_epoch', 18)
+        assert default == 18
 
     @pytest.mark.parametrize("start_epoch", [0, 1, 3, 10])
     def test_gate_respects_custom_start_epoch(self, start_epoch: int):

@@ -1666,9 +1666,9 @@ class KokoroTrainer:
                     energies = transferred.energies
                     stress_indices = transferred.stress_indices
                     # SpecAugment: mask teacher-forced mel input; loss target stays unmasked.
-                    # Epoch gate: disabled for early epochs so the model can first learn basic
-                    # encoder-decoder alignment before augmentation adds noise.
-                    _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 5)
+                    # Epoch gate: disabled until after the OneCycleLR peak so spec augment
+                    # does not compound ramp-phase instability.  Default matches config.py.
+                    _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 18)
                     if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
                         mel_for_model = KokoroTrainer._apply_spec_augment(
                             mel_specs,
