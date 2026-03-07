@@ -606,27 +606,3 @@ class TransformerDecoder(ImprovedTransformerDecoder):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
                         activation='gelu')
 
-
-# --- Helper functions for optimized components (optional, for direct use) ---
-# These can be used if you want to explicitly create the improved versions.
-
-def create_optimized_encoder_layers(d_model: int, nhead: int, dim_feedforward: int,
-                                   dropout: float, num_layers: int,
-                                   activation: str = 'gelu',
-                                   use_relative_pos: bool = False) -> nn.ModuleList:
-    """Create a list of optimized encoder layers."""
-    return nn.ModuleList([
-        ImprovedTransformerEncoderBlock(
-            d_model, nhead, dim_feedforward, dropout,
-            activation, use_relative_pos
-        ) for _ in range(num_layers)
-    ])
-
-
-def create_optimized_decoder(d_model: int, nhead: int, dim_feedforward: int,
-                           dropout: float, num_layers: int,
-                           activation: str = 'gelu') -> ImprovedTransformerDecoder:
-    """Create an optimized transformer decoder."""
-    return ImprovedTransformerDecoder(
-        d_model, nhead, dim_feedforward, dropout, num_layers, activation
-    )

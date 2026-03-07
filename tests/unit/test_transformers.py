@@ -661,26 +661,6 @@ def test_unsupported_activation_raises():
 
 
 # ===========================================================================
-# Helper factory functions
-# ===========================================================================
-
-def test_create_optimized_encoder_layers():
-    layers = transformers.create_optimized_encoder_layers(
-        d_model=16, nhead=4, dim_feedforward=32, dropout=0.0, num_layers=3
-    )
-    assert len(layers) == 3
-    assert all(isinstance(l, transformers.ImprovedTransformerEncoderBlock) for l in layers)
-
-
-def test_create_optimized_decoder():
-    dec = transformers.create_optimized_decoder(
-        d_model=16, nhead=4, dim_feedforward=32, dropout=0.0, num_layers=2
-    )
-    assert isinstance(dec, transformers.ImprovedTransformerDecoder)
-    assert len(dec.layers) == 2
-
-
-# ===========================================================================
 # Determinism
 # ===========================================================================
 
