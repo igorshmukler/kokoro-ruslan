@@ -449,33 +449,46 @@ class KokoroTrainer:
         encoder_lr_mult = float(getattr(config, 'encoder_lr_multiplier', 3.0))
         self._encoder_lr_multiplier = encoder_lr_mult
 
-        # Partition parameters into encoder group (higher LR) and decoder/rest group.
-        encoder_prefixes = (
+        # Partition parameters into three groups:
+        #   1. embedding_params  — text/stress embeddings, weight_decay=0 (L2 pushes
+        #      embedding rows toward zero, counteracting learned representations)
+        #   2. encoder_params    — positional encoding + transformer encoder layers,
+        #      higher LR multiplier, normal weight decay
+        #   3. decoder_params    — decoder and all other parameters, base LR
+        embedding_prefixes = (
             'text_embedding.',
             'stress_embedding.',
+        )
+        encoder_prefixes = (
             'encoder_positional_encoding.',
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
         )
-        encoder_param_ids: set = set()
+        seen_ids: set = set()
+        embedding_params = []
         encoder_params = []
         decoder_params = []
         for name, param in self.model.named_parameters():
-            if any(name.startswith(prefix) for prefix in encoder_prefixes):
-                if id(param) not in encoder_param_ids:
-                    encoder_param_ids.add(id(param))
-                    encoder_params.append(param)
+            if id(param) in seen_ids:
+                continue
+            seen_ids.add(id(param))
+            if any(name.startswith(prefix) for prefix in embedding_prefixes):
+                embedding_params.append(param)
+            elif any(name.startswith(prefix) for prefix in encoder_prefixes):
+                encoder_params.append(param)
             else:
                 decoder_params.append(param)
 
         encoder_lr = base_lr * encoder_lr_mult
         param_groups = [
+            {'params': embedding_params, 'lr': encoder_lr,
+             'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas},
             {'params': encoder_params, 'lr': encoder_lr,
              'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
             {'params': decoder_params, 'lr': base_lr,
              'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
         ]
-        if not encoder_params:
+        if not embedding_params and not encoder_params:
             # Fallback: single group (no identifiable encoder params)
             param_groups = [{'params': list(self.model.parameters()), 'lr': base_lr,
                              'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas}]
@@ -483,8 +496,10 @@ class KokoroTrainer:
             logger.warning("No encoder params identified for separate LR group — using single param group")
         else:
             logger.info(
-                f"Optimizer param groups: encoder={len(encoder_params)} params (lr={encoder_lr:.2e}), "
-                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e})"
+                f"Optimizer param groups: embeddings={len(embedding_params)} params "
+                f"(lr={encoder_lr:.2e}, wd=0.0), "
+                f"encoder={len(encoder_params)} params (lr={encoder_lr:.2e}, wd={weight_decay}), "
+                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e}, wd={weight_decay})"
             )
 
         try:
