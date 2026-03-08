@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -130,6 +131,10 @@ class KokoroModel(nn.Module):
                 nn.Dropout(encoder_dropout),
                 nn.Linear(hidden_dim // 2, 1)
             )
+            # Initialise final-layer bias to log1p(5) ≈ 1.79 so initial
+            # predictions are ~5 frames/phoneme, preventing zero-length
+            # expansions and degenerate batches early in training.
+            nn.init.constant_(self.duration_predictor[-1].bias, math.log1p(5))
             # Use a simple adaptor which calls the predictor and length_regulate
             # Note: pass model's prediction function to preserve any checkpointing
             # Pass a callable wrapper that resolves `self._length_regulate` at
