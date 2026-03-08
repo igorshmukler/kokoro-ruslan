@@ -109,6 +109,23 @@ class KokoroTrainer:
         self.writer = SummaryWriter(log_dir=log_dir)
         logger.info(f"Tensorboard log directory created at: {log_dir}")
 
+        # Custom layout: group train and val scalars onto the same chart so
+        # convergence comparisons are visible without switching between panels.
+        self.writer.add_custom_scalars({
+            "Epoch Losses": {
+                "Total Loss (train vs val)":     ["Multiline", ["loss/train_total_epoch",    "loss/val_total_epoch"]],
+                "Mel Loss (train vs val)":        ["Multiline", ["loss/train_mel_epoch",      "loss/val_mel_epoch"]],
+                "Stop Loss (train vs val)":       ["Multiline", ["loss/train_stop_epoch",     "loss/val_stop_epoch"]],
+                "Duration Loss (train vs val)":   ["Multiline", ["loss/train_duration_epoch", "loss/val_duration_epoch"]],
+            },
+            "Spectral Metrics": {
+                "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
+            },
+            "Learning Rate": {
+                "LR (encoder vs decoder)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder"]],
+            },
+        })
+
         # Attempt to load checkpoint metadata early so pitch/energy bounds are
         # available before the dataset is constructed.
         try:

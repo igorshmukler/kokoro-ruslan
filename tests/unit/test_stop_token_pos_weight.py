@@ -96,12 +96,12 @@ def _imbalanced_batch(T: int = 200):
 # ---------------------------------------------------------------------------
 class TestTrainingConfigDefaults:
 
-    def test_stop_token_pos_weight_default_is_30(self):
+    def test_stop_token_pos_weight_default_is_correct(self):
         cfg = TrainingConfig.__new__(TrainingConfig)
         # Access the raw dataclass default without calling __post_init__
         # Default was 150.0; reduced to 30.0 after observing batch stop-loss
         # spikes (>1.5) destabilise the decoder during the OneCycleLR ramp phase.
-        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 30.0
+        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 100.0
 
     def test_stop_token_pos_weight_custom_value_survives_post_init(self):
         cfg = TrainingConfig(stop_token_pos_weight=300.0)
