@@ -4,6 +4,7 @@ Variance Predictor Module for Pitch and Energy Prediction
 Based on FastSpeech 2 architecture
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -30,8 +31,10 @@ class VariancePredictor(nn.Module):
                  filter_size: int = DEFAULT_FILTER_SIZE,
                  kernel_size: int = 3,
                  dropout: float = 0.1,
-                 num_layers: int = 2):
+                 num_layers: int = 2,
+                 output_bias: float = 0.0):
         super().__init__()
+        self._output_bias = output_bias
 
         self.conv_layers = nn.ModuleList()
         self.norms = nn.ModuleList()
@@ -62,7 +65,7 @@ class VariancePredictor(nn.Module):
         for conv in self.conv_layers:
             nn.init.xavier_uniform_(conv.weight)
         nn.init.xavier_uniform_(self.linear.weight)
-        nn.init.zeros_(self.linear.bias)
+        nn.init.constant_(self.linear.bias, self._output_bias)
 
     def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
@@ -157,9 +160,13 @@ class VarianceAdaptor(nn.Module):
         self.energy_min = energy_min
         self.energy_max = energy_max
 
-        # Duration predictor operates at token (phoneme) level
+        # Duration predictor operates at token (phoneme) level.
+        # Bias is initialised to log1p(5) ≈ 1.79 so initial predictions are
+        # ~5 frames/phoneme rather than near-zero, preventing degenerate
+        # length-regulated sequences in the first training steps.
         self.duration_predictor = VariancePredictor(
-            hidden_dim, filter_size, kernel_size, dropout, num_layers=2
+            hidden_dim, filter_size, kernel_size, dropout, num_layers=2,
+            output_bias=math.log1p(5)
         )
 
         # Pitch and energy predictors operate at frame level (post-expansion)

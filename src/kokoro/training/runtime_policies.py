@@ -1,6 +1,6 @@
 import gc
 import logging
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Tuple
 
 import torch
 
@@ -26,13 +26,15 @@ class RuntimeStepPolicy:
         step_scheduler_fn: Callable[[], None],
         update_ema: bool,
         update_ema_fn: Callable[[], None],
-    ) -> bool:
+    ) -> Tuple[bool, float]:
         step_successful = False
+        post_clip_norm = 0.0
 
         if use_mixed_precision:
             if device_type == 'cuda':
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                pre_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                post_clip_norm = min(float(pre_clip), clip_norm)
 
                 old_scale = scaler.get_scale()
                 scaler.step(optimizer)
@@ -52,7 +54,8 @@ class RuntimeStepPolicy:
                 else:
                     mixed_precision_stats['successful_steps'] += 1
             else:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                pre_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+                post_clip_norm = min(float(pre_clip), clip_norm)
 
                 old_scale = scaler.get_scale()
                 step_successful = scaler.step(optimizer)
@@ -70,7 +73,8 @@ class RuntimeStepPolicy:
                     if new_scale < old_scale:
                         mixed_precision_stats['scale_decreases'] += 1
         else:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+            pre_clip = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_norm)
+            post_clip_norm = min(float(pre_clip), clip_norm)
             optimizer.step()
             step_successful = True
 
@@ -80,7 +84,7 @@ class RuntimeStepPolicy:
         if step_successful and update_ema:
             update_ema_fn()
 
-        return step_successful
+        return step_successful, post_clip_norm
 
 
 class MemoryOOMPolicy:

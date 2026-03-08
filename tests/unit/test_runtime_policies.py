@@ -83,7 +83,7 @@ def test_runtime_step_policy_non_mixed_precision_preserves_scheduler_and_ema_cad
     scheduler_calls = {"count": 0}
     ema_calls = {"count": 0}
 
-    step_successful = policy.optimizer_step_with_clipping(
+    step_successful, _ = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=False,
@@ -110,7 +110,7 @@ def test_runtime_step_policy_scheduler_not_stepped_when_disabled():
 
     scheduler_calls = {"count": 0}
 
-    step_successful = policy.optimizer_step_with_clipping(
+    step_successful, _ = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=False,
@@ -136,7 +136,7 @@ def test_runtime_step_policy_cuda_updates_mixed_precision_stats_on_scale_drop():
     scaler = _FakeCudaScaler(scales=[1024.0, 512.0])
     stats = _mp_stats()
 
-    step_successful = policy.optimizer_step_with_clipping(
+    step_successful, _ = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=True,
@@ -165,7 +165,7 @@ def test_runtime_step_policy_mps_failed_step_updates_skip_counters():
     scaler = _FakeMpsScaler(scales=[1024.0, 512.0], step_successful=False)
     stats = _mp_stats()
 
-    step_successful = policy.optimizer_step_with_clipping(
+    step_successful, _ = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=True,
@@ -196,7 +196,7 @@ def test_runtime_step_policy_skipped_step_does_not_advance_scheduler_or_ema():
     scheduler_calls = {"count": 0}
     ema_calls = {"count": 0}
 
-    step_successful = policy.optimizer_step_with_clipping(
+    step_successful, _ = policy.optimizer_step_with_clipping(
         model=model,
         optimizer=optimizer,
         use_mixed_precision=True,

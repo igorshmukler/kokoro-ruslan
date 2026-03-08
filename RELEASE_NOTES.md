@@ -2,6 +2,12 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.29 (2026-03-08)
+
+- Switched to Xavier init instead of Kaiming
+- Implemented RoPE - relative displacement between positions, for MPS
+- Misc bug-fixes and configuration adjustments
+
 ## 0.0.28 (2026-03-07)
 
 - **Encoder/decoder parameter group split** (`trainer.py`): optimizer now uses two separate AdamW parameter groups. Encoder parameters (`text_embedding`, `stress_embedding`, positional encodings, `transformer_encoder_layers`) are trained at `encoder_lr_multiplier × base_lr` (default 3×); decoder and variance adaptor parameters use `base_lr`. Per-group `max_lr` values are set accordingly in the OneCycleLR schedule and manual warmup ramp. Previously both groups shared the same LR, starving the encoder of gradient signal.

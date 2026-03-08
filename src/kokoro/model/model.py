@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -72,6 +73,10 @@ class KokoroModel(nn.Module):
 
         # Text encoder: Embedding + Positional Encoding + Stack of Transformer Blocks
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
+        # Compensate for the √hidden_dim embedding scale applied in forward().
+        # Default Uniform(−1,1) init → post-scale magnitude ≈ ±27.7 for hidden_dim=768,
+        # which causes large initial gradients.  N(0, 1/√hidden_dim) keeps post-scale std≈1.
+        nn.init.normal_(self.text_embedding.weight, mean=0.0, std=1.0 / (hidden_dim ** 0.5))
 
         # Stress embedding: 3 entries {0=unstressed, 1=primary_stress, 2=secondary_stress}.
         # Added to (not concatenated with) the phoneme embedding at the encoder input so
@@ -126,6 +131,10 @@ class KokoroModel(nn.Module):
                 nn.Dropout(encoder_dropout),
                 nn.Linear(hidden_dim // 2, 1)
             )
+            # Initialise final-layer bias to log1p(5) ≈ 1.79 so initial
+            # predictions are ~5 frames/phoneme, preventing zero-length
+            # expansions and degenerate batches early in training.
+            nn.init.constant_(self.duration_predictor[-1].bias, math.log1p(5))
             # Use a simple adaptor which calls the predictor and length_regulate
             # Note: pass model's prediction function to preserve any checkpointing
             # Pass a callable wrapper that resolves `self._length_regulate` at
@@ -139,6 +148,8 @@ class KokoroModel(nn.Module):
 
         # Mel feature projection to match hidden dimension for decoder input
         self.mel_projection_in = nn.Linear(mel_dim, hidden_dim)
+        nn.init.xavier_uniform_(self.mel_projection_in.weight)
+        nn.init.zeros_(self.mel_projection_in.bias)
 
         self.decoder = TransformerDecoder(
             d_model=hidden_dim,
@@ -149,10 +160,16 @@ class KokoroModel(nn.Module):
         )
 
         # Output projection for Mel Spectrogram
+        # Xavier init: no activation follows; default Kaiming over-scales outputs
         self.mel_projection_out = nn.Linear(hidden_dim, mel_dim)
+        nn.init.xavier_uniform_(self.mel_projection_out.weight)
+        nn.init.zeros_(self.mel_projection_out.bias)
 
         # End-of-Speech (Stop Token) Predictor
+        # Xavier init: output feeds sigmoid; Kaiming is wrong for this activation
         self.stop_token_predictor = nn.Linear(hidden_dim, 1)
+        nn.init.xavier_uniform_(self.stop_token_predictor.weight)
+        nn.init.zeros_(self.stop_token_predictor.bias)
 
         # General dropout
         self.dropout = nn.Dropout(encoder_dropout)

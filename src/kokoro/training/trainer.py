@@ -109,6 +109,23 @@ class KokoroTrainer:
         self.writer = SummaryWriter(log_dir=log_dir)
         logger.info(f"Tensorboard log directory created at: {log_dir}")
 
+        # Custom layout: group train and val scalars onto the same chart so
+        # convergence comparisons are visible without switching between panels.
+        self.writer.add_custom_scalars({
+            "Epoch Losses": {
+                "Total Loss (train vs val)":     ["Multiline", ["loss/train_total_epoch",    "loss/val_total_epoch"]],
+                "Mel Loss (train vs val)":        ["Multiline", ["loss/train_mel_epoch",      "loss/val_mel_epoch"]],
+                "Stop Loss (train vs val)":       ["Multiline", ["loss/train_stop_epoch",     "loss/val_stop_epoch"]],
+                "Duration Loss (train vs val)":   ["Multiline", ["loss/train_duration_epoch", "loss/val_duration_epoch"]],
+            },
+            "Spectral Metrics": {
+                "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
+            },
+            "Learning Rate": {
+                "LR (encoder vs decoder)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder"]],
+            },
+        })
+
         # Attempt to load checkpoint metadata early so pitch/energy bounds are
         # available before the dataset is constructed.
         try:
@@ -377,7 +394,14 @@ class KokoroTrainer:
 
         # Loss criteria
         self.criterion_mel = nn.L1Loss(reduction='none')
-        self.criterion_duration = nn.MSELoss(reduction='none')
+        # Huber loss (SmoothL1) for duration: transitions to L1 for large errors,
+        # giving a constant-magnitude gradient that does NOT shrink as predictions
+        # improve — unlike MSE whose gradient is 2*(pred-target) → 0 near convergence.
+        # delta=1.0 matches a 1 log-frame error boundary, appropriate for log-duration targets.
+        _duration_huber_delta = float(getattr(config, 'duration_huber_delta', 1.0))
+        self.criterion_duration = nn.HuberLoss(reduction='none', delta=_duration_huber_delta)
+        logger.info(f"Duration loss: HuberLoss(delta={_duration_huber_delta}) "
+                    f"(replaces MSE to prevent gradient shrinkage near convergence)")
         # pos_weight corrects the severe class imbalance in stop token targets:
         # only the final frame of each sequence is positive (1.0); all others
         # are negative (0.0).  Without this the model learns to always predict 0
@@ -390,9 +414,17 @@ class KokoroTrainer:
             reduction='none', pos_weight=_stop_pos_w
         )
         if getattr(config, 'use_variance_predictor', True):
-            self.criterion_pitch = nn.MSELoss(reduction='none')
-            self.criterion_energy = nn.MSELoss(reduction='none')
-            logger.info("Variance predictor losses initialized (pitch/energy)")
+            # Huber loss for pitch/energy for the same reason: prevents gradient
+            # vanishing as predictions converge; delta is tunable via config.
+            _pitch_huber_delta  = float(getattr(config, 'pitch_huber_delta',  10.0))
+            _energy_huber_delta = float(getattr(config, 'energy_huber_delta', 0.5))
+            self.criterion_pitch  = nn.HuberLoss(reduction='none', delta=_pitch_huber_delta)
+            self.criterion_energy = nn.HuberLoss(reduction='none', delta=_energy_huber_delta)
+            logger.info(
+                f"Variance predictor losses initialized: "
+                f"HuberLoss pitch(delta={_pitch_huber_delta}), "
+                f"HuberLoss energy(delta={_energy_huber_delta})"
+            )
         else:
             self.criterion_pitch = None
             self.criterion_energy = None
@@ -432,7 +464,13 @@ class KokoroTrainer:
         encoder_lr_mult = float(getattr(config, 'encoder_lr_multiplier', 3.0))
         self._encoder_lr_multiplier = encoder_lr_mult
 
-        # Partition parameters into encoder group (higher LR) and decoder/rest group.
+        # Partition parameters into two groups:
+        #   1. encoder_params — text/stress embeddings + positional encoding +
+        #      transformer encoder layers, higher LR multiplier, weight_decay=0
+        #      (L2 on embedding rows counteracts learned representations; encoder
+        #      transformer layers benefit from reduced regularisation given the
+        #      elevated LR)
+        #   2. decoder_params — decoder and all other parameters, base LR
         encoder_prefixes = (
             'text_embedding.',
             'stress_embedding.',
@@ -440,21 +478,22 @@ class KokoroTrainer:
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
         )
-        encoder_param_ids: set = set()
+        seen_ids: set = set()
         encoder_params = []
         decoder_params = []
         for name, param in self.model.named_parameters():
+            if id(param) in seen_ids:
+                continue
+            seen_ids.add(id(param))
             if any(name.startswith(prefix) for prefix in encoder_prefixes):
-                if id(param) not in encoder_param_ids:
-                    encoder_param_ids.add(id(param))
-                    encoder_params.append(param)
+                encoder_params.append(param)
             else:
                 decoder_params.append(param)
 
         encoder_lr = base_lr * encoder_lr_mult
         param_groups = [
             {'params': encoder_params, 'lr': encoder_lr,
-             'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
+             'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas},
             {'params': decoder_params, 'lr': base_lr,
              'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
         ]
@@ -466,8 +505,9 @@ class KokoroTrainer:
             logger.warning("No encoder params identified for separate LR group — using single param group")
         else:
             logger.info(
-                f"Optimizer param groups: encoder={len(encoder_params)} params (lr={encoder_lr:.2e}), "
-                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e})"
+                f"Optimizer param groups: encoder={len(encoder_params)} params "
+                f"(lr={encoder_lr:.2e}, wd=0.0), "
+                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e}, wd={weight_decay})"
             )
 
         try:
@@ -1765,7 +1805,9 @@ class KokoroTrainer:
                 max_mel_length = 1400  # Hard cap for sequence dimensions
                 max_duration_value = 150  # Hard cap for extreme durations
                 adaptive_loss_scale = 1.0
-                adaptive_clip_norm = 1.0  # Raised from 0.5: encoder needs more headroom
+                adaptive_clip_norm = 5.0  # Raised from 1.0: 1.0 cancelled encoder 3× LR benefit;
+                # with encoder_lr_multiplier=3.0, clipping at 1.0 applied the same absolute
+                # norm cap to both encoder and decoder, neutralising the multiplier entirely.
 
                 mel_length = mel_specs.shape[1]
                 max_duration_in_batch = phoneme_durations.max().item()
@@ -1774,7 +1816,7 @@ class KokoroTrainer:
                 # Setting soft_mel_length == max_mel_length means sequences in the normal
                 # training range (< 1400 frames) are never penalised by soft clipping.
                 soft_mel_length = 1400  # Raised from 900: stop penalising normal sequences
-                soft_duration_value = 80
+                soft_duration_value = 150
                 soft_risk_ratio = max(mel_length / soft_mel_length, max_duration_in_batch / soft_duration_value)
                 if soft_risk_ratio > 1.0:
                     adaptive_loss_scale = min(adaptive_loss_scale, max(0.5, 1.0 / (soft_risk_ratio ** 0.65)))
@@ -2011,11 +2053,13 @@ class KokoroTrainer:
 
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
-                    step_successful = self._optimizer_step_with_clipping(
+                    step_successful, clipped_norm = self._optimizer_step_with_clipping(
                         clip_norm=adaptive_clip_norm,
                         step_scheduler=True,
                         update_ema=True,
                     )
+                    # Log post-global-clip norm at the same step as stats/grad_norm
+                    self.writer.add_scalar('stats/grad_norm_clipped', clipped_norm, self.optimizer_steps_completed)
 
                     if step_successful:
                         self.optimizer_steps_completed += 1
@@ -2255,10 +2299,12 @@ class KokoroTrainer:
                            f"Success Rate: {success_rate:.1f}%, "
                            f"Current Scale: {self.scaler.get_scale():.0f}")
 
-        # Log epoch-level train spectral convergence
+        # Log epoch-level train spectral convergence.
+        # Use optimizer_steps_completed (same axis as val_spectral_convergence)
+        # so the Custom Scalar "Multiline" chart aligns both series correctly.
         if train_sc_count > 0:
             avg_train_sc = train_sc_sum / train_sc_count
-            self.writer.add_scalar('metrics/train_spectral_convergence', avg_train_sc, epoch)
+            self.writer.add_scalar('metrics/train_spectral_convergence', avg_train_sc, self.optimizer_steps_completed)
             logger.info(f"  Train SpectralConv (epoch {epoch+1}): {avg_train_sc:.6f}")
 
         # Log end-of-epoch train spectrograms (ground truth + predicted)
@@ -2436,11 +2482,15 @@ class KokoroTrainer:
                         f"Avg Stop Loss: {avg_stop_loss:.4f}, "
                         f"{_lr_str}")
 
-            # Log epoch-level train losses to TensorBoard
-            self.writer.add_scalar('loss/train_total_epoch', avg_total_loss, epoch)
-            self.writer.add_scalar('loss/train_mel_epoch', avg_mel_loss, epoch)
-            self.writer.add_scalar('loss/train_duration_epoch', avg_dur_loss, epoch)
-            self.writer.add_scalar('loss/train_stop_epoch', avg_stop_loss, epoch)
+            # Log epoch-level train losses to TensorBoard.
+            # Use optimizer_steps_completed (not epoch index) so these points
+            # land on the same x-axis as all per-step training scalars and
+            # can be visually compared with validation epoch scalars.
+            _epoch_step = self.optimizer_steps_completed
+            self.writer.add_scalar('loss/train_total_epoch', avg_total_loss, _epoch_step)
+            self.writer.add_scalar('loss/train_mel_epoch', avg_mel_loss, _epoch_step)
+            self.writer.add_scalar('loss/train_duration_epoch', avg_dur_loss, _epoch_step)
+            self.writer.add_scalar('loss/train_stop_epoch', avg_stop_loss, _epoch_step)
             self.writer.flush()
 
             # Log weight histograms once per epoch
@@ -2463,11 +2513,13 @@ class KokoroTrainer:
                 self._log_epoch_cache_delta(epoch, "val", self.val_dataset, val_cache_start)
                 self.validation_losses.append(val_total_loss)
 
-                # Log epoch-level val losses to TensorBoard
-                self.writer.add_scalar('loss/val_total_epoch', val_total_loss, epoch)
-                self.writer.add_scalar('loss/val_mel_epoch', val_mel_loss, epoch)
-                self.writer.add_scalar('loss/val_duration_epoch', val_dur_loss, epoch)
-                self.writer.add_scalar('loss/val_stop_epoch', val_stop_loss, epoch)
+                # Log epoch-level val losses to TensorBoard.
+                # Use optimizer_steps_completed so val points align with the
+                # per-step training scalars on the same x-axis.
+                self.writer.add_scalar('loss/val_total_epoch', val_total_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_mel_epoch', val_mel_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_duration_epoch', val_dur_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_stop_epoch', val_stop_loss, self.optimizer_steps_completed)
                 self.writer.flush()
 
                 # Check for improvement
@@ -2855,7 +2907,7 @@ class KokoroTrainer:
         *,
         step_scheduler: bool,
         update_ema: bool,
-    ) -> bool:
+    ) -> Tuple[bool, float]:
         runtime_policy = getattr(self, 'runtime_step_policy', None)
         if runtime_policy is None:
             runtime_policy = RuntimeStepPolicy(logger=logger)

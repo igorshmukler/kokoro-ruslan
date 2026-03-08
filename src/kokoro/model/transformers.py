@@ -5,6 +5,7 @@ from torch.utils.checkpoint import checkpoint
 from typing import Optional, Tuple
 import math
 import logging
+from kokoro.model.positional_encoding import RotaryPositionalEncoding
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,8 @@ class MultiHeadAttentionImproved(nn.Module):
     """Improved multi-head attention with better initialization and optional relative positioning"""
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1,
-                 use_relative_pos: bool = False, max_relative_distance: int = 32):
+                 use_relative_pos: bool = False, max_relative_distance: int = 32,
+                 rel_pos_type: str = 'alibi'):
         super().__init__()
         assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
 
@@ -109,6 +111,7 @@ class MultiHeadAttentionImproved(nn.Module):
         self.num_heads = num_heads
         self.d_k = d_model // num_heads # Dimension of each head's key/query/value
         self.use_relative_pos = use_relative_pos
+        self.rel_pos_type = rel_pos_type
 
         # Linear projections for Query, Key, Value
         self.w_q = nn.Linear(d_model, d_model, bias=False)
@@ -118,13 +121,22 @@ class MultiHeadAttentionImproved(nn.Module):
         # Output linear projection
         self.w_o = nn.Linear(d_model, d_model)
 
-        # ALiBi: Attention with Linear Biases (replaces Shaw et al. relative pos)
-        # Each head gets a learned slope for distance-based bias
         if use_relative_pos:
-            # Initialize slopes following ALiBi paper: geometric sequence
-            # For 8 heads: [1/2^1, 1/2^2, ..., 1/2^8] = [0.5, 0.25, 0.125, ...]
-            slopes = torch.tensor([2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)])
-            self.register_buffer('alibi_slopes', slopes)
+            if rel_pos_type == 'rope':
+                # RoPE: Rotary Position Embedding — MPS-compatible.
+                # Applied directly to Q and K in their native dtype; no separate
+                # bias tensor is added to the attention logits, so it never
+                # triggers MPS mixed-dtype arithmetic bugs.
+                self.rope = RotaryPositionalEncoding(head_dim=self.d_k)
+            else:
+                # ALiBi: Attention with Linear Biases (default, Shaw et al. style).
+                # Each head gets a fixed slope for distance-based bias.
+                # NOTE: disabled on MPS at runtime (see forward) due to fp16
+                # dtype bugs in MPS matrix multiplication.
+                # Initialize slopes following ALiBi paper: geometric sequence
+                # For 8 heads: [1/2^1, 1/2^2, ..., 1/2^8] = [0.5, 0.25, 0.125, ...]
+                slopes = torch.tensor([2 ** (-8 * (i + 1) / num_heads) for i in range(num_heads)])
+                self.register_buffer('alibi_slopes', slopes)
 
         self.dropout_attn = nn.Dropout(dropout)
         self.scale = math.sqrt(self.d_k)
@@ -221,13 +233,23 @@ class MultiHeadAttentionImproved(nn.Module):
 
         seq_len_k = K.size(2)
 
-        # 2. Prepare attention bias (ALiBi + masks) for Flash Attention
+        # 2a. Apply RoPE to Q and K (MPS-compatible relative positional encoding)
+        # RoPE operates on Q/K in their native dtype — no dtype mixing, no MPS bugs.
+        if self.use_relative_pos and self.rel_pos_type == 'rope':
+            Q, K = self.rope(Q, K)
+
+        # 2b. Prepare attention bias (ALiBi + masks) for Flash Attention
         attn_bias = None
 
-        # Add ALiBi positional bias
+        # Add ALiBi positional bias when configured
         # CRITICAL: Disable ALiBi entirely on MPS due to fp16 dtype bugs in matrix multiplication
-        # MPS backend has issues with mixed dtype operations that cause crashes
-        use_alibi = self.use_relative_pos and query.device.type != 'mps'
+        # MPS backend has issues with mixed dtype operations that cause crashes.
+        # Use rel_pos_type='rope' for full MPS-compatible relative positional encoding.
+        use_alibi = (
+            self.use_relative_pos
+            and self.rel_pos_type == 'alibi'
+            and query.device.type != 'mps'
+        )
 
         if use_alibi:
             # Get ALiBi bias: (num_heads, seq_len_q, seq_len_k)
@@ -382,13 +404,13 @@ class ImprovedTransformerEncoderBlock(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', use_relative_pos: bool = False,
-                 drop_path_rate: float = 0.0):
+                 drop_path_rate: float = 0.0, rel_pos_type: str = 'alibi'):
         super().__init__()
         self.drop_path_rate = drop_path_rate
 
         # Self-attention module
         self.self_attn = MultiHeadAttentionImproved(
-            d_model, nhead, dropout, use_relative_pos
+            d_model, nhead, dropout, use_relative_pos, rel_pos_type=rel_pos_type
         )
 
         # GLU-style feedforward (Gated Linear Unit)
@@ -430,11 +452,14 @@ class ImprovedTransformerDecoderBlock(nn.Module):
     """Enhanced Transformer decoder block with improved architecture"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 activation: str = 'gelu'):
+                 activation: str = 'gelu', rel_pos_type: str = 'alibi'):
         super().__init__()
 
-        # Decoder self-attention: usually causal, can use relative positional encoding
-        self.self_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=True)
+        # Decoder self-attention: uses relative positional encoding.
+        # Pass rel_pos_type so callers can choose 'rope' (MPS-safe) or 'alibi'.
+        self.self_attn = MultiHeadAttentionImproved(
+            d_model, nhead, dropout, use_relative_pos=True, rel_pos_type=rel_pos_type
+        )
 
         # Cross-attention (encoder-decoder attention): no relative pos, queries from decoder, keys/values from encoder
         self.cross_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=False)
@@ -513,13 +538,15 @@ class ImprovedTransformerDecoder(nn.Module):
     """Enhanced Transformer decoder with better layer organization"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
-                 dropout: float, num_layers: int, activation: str = 'gelu'):
+                 dropout: float, num_layers: int, activation: str = 'gelu',
+                 rel_pos_type: str = 'alibi'):
         super().__init__()
         self.num_layers = num_layers
 
         self.layers = nn.ModuleList([
             ImprovedTransformerDecoderBlock(
-                d_model, nhead, dim_feedforward, dropout, activation
+                d_model, nhead, dim_feedforward, dropout, activation,
+                rel_pos_type=rel_pos_type
             ) for _ in range(num_layers)
         ])
 

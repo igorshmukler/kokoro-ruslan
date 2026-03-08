@@ -66,11 +66,13 @@ class TrainingConfig:
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
     # Loss weights
-    duration_loss_weight: float = 0.35  # Raised from 0.1: stronger signal through frozen encoder path
-    # Stop token BCE dominated early training (~21% of loss by epoch 6, ~15% at epoch 18).
-    # Halving from 1.0 → 0.5 reduces total loss by ~0.08-0.10 once stop is learned,
-    # freeing capacity for mel reconstruction to improve.
-    stop_token_loss_weight: float = 0.5
+    duration_loss_weight: float = 0.35
+    # Stop token BCE contribution to total loss.
+    # Calibration: effective stop contribution = stop_token_loss_weight × pos_weight.
+    # With pos_weight=100 the weight must be scaled down proportionally from the
+    # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
+    #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
+    stop_token_loss_weight: float = 0.075
     pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
@@ -91,13 +93,19 @@ class TrainingConfig:
     # descending and the model has stabilised.
     spec_augment_start_epoch: int = 18
     # Stop token class-imbalance correction.
-    # BCE on stop tokens is extremely skewed: only 1 positive frame per sequence
-    # among ~T negatives (T ≈ average mel length).  Without pos_weight the model
-    # learns to always output 0 and achieves near-zero BCE loss without ever
-    # detecting end-of-utterance.  Set to approximately the average sequence
-    # length in frames (negative:positive ratio).  For this corpus ~150 is
-    # reasonable; increase toward 300 if the stop token still doesn't fire.
-    stop_token_pos_weight: float = 150.0
+    # BCE on stop tokens is skewed ~200:1 (negative frames : positive stop frame
+    # per average-length Russian utterance).  pos_weight=150 gave true class-balance
+    # during warmup but produced batch stop-loss spikes (>1.5 vs ~0.5 average)
+    # once the OneCycleLR ramp raised the LR past 1.2e-4.  With pos_weight=150 the
+    # gradient for a single missed stop token is 150× a non-stop frame; at higher
+    # LRs this overwhelms the mel gradient and corrupts the decoder representation
+    # (observed: stop spikes → grad_norm spikes to 18, stop val rising from
+    # 0.41 at epoch 3 to 0.64 at epoch 6 while mel simultaneously regressed).
+    # Data-driven calculation (500-sample RUSLAN cache): mean mel length = 137.8 frames
+    # → actual neg/pos imbalance = 136.8:1.  Previous value of 30 corrected only 22%.
+    # 100 ≈ 73% correction — enough signal to learn stop reliably without over-correcting
+    # (full correction at 137 causes premature stops during inference).
+    stop_token_pos_weight: float = 100.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
@@ -202,6 +210,10 @@ class TrainingConfig:
     use_mixed_precision: bool = False
 
     # Optimizer behavior
+    # AdamW regularization and numerical stability
+    weight_decay: float = 0.01   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
+    adam_eps: float = 1e-8       # AdamW epsilon for numerical stability
+    adam_betas: tuple = (0.9, 0.999)  # AdamW beta coefficients (momentum, RMS)
     # None = auto (enabled on CUDA, disabled otherwise)
     use_fused_adamw: Optional[bool] = None
     # Try fused AdamW on MPS by default (may fall back)
