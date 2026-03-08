@@ -25,8 +25,8 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 5.0  # Max LR = learning_rate * this value (raised from 2.0: plateau fix)
-    pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
+    max_lr_multiplier: float = 3.0  # Max LR = learning_rate * this value (raised from 2.0: plateau fix)
+    pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the severely under-trained encoder layers get proportionally more gradient
