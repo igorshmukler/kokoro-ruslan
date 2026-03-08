@@ -394,7 +394,14 @@ class KokoroTrainer:
 
         # Loss criteria
         self.criterion_mel = nn.L1Loss(reduction='none')
-        self.criterion_duration = nn.MSELoss(reduction='none')
+        # Huber loss (SmoothL1) for duration: transitions to L1 for large errors,
+        # giving a constant-magnitude gradient that does NOT shrink as predictions
+        # improve — unlike MSE whose gradient is 2*(pred-target) → 0 near convergence.
+        # delta=1.0 matches a 1 log-frame error boundary, appropriate for log-duration targets.
+        _duration_huber_delta = float(getattr(config, 'duration_huber_delta', 1.0))
+        self.criterion_duration = nn.HuberLoss(reduction='none', delta=_duration_huber_delta)
+        logger.info(f"Duration loss: HuberLoss(delta={_duration_huber_delta}) "
+                    f"(replaces MSE to prevent gradient shrinkage near convergence)")
         # pos_weight corrects the severe class imbalance in stop token targets:
         # only the final frame of each sequence is positive (1.0); all others
         # are negative (0.0).  Without this the model learns to always predict 0
@@ -407,9 +414,17 @@ class KokoroTrainer:
             reduction='none', pos_weight=_stop_pos_w
         )
         if getattr(config, 'use_variance_predictor', True):
-            self.criterion_pitch = nn.MSELoss(reduction='none')
-            self.criterion_energy = nn.MSELoss(reduction='none')
-            logger.info("Variance predictor losses initialized (pitch/energy)")
+            # Huber loss for pitch/energy for the same reason: prevents gradient
+            # vanishing as predictions converge; delta is tunable via config.
+            _pitch_huber_delta  = float(getattr(config, 'pitch_huber_delta',  10.0))
+            _energy_huber_delta = float(getattr(config, 'energy_huber_delta', 0.5))
+            self.criterion_pitch  = nn.HuberLoss(reduction='none', delta=_pitch_huber_delta)
+            self.criterion_energy = nn.HuberLoss(reduction='none', delta=_energy_huber_delta)
+            logger.info(
+                f"Variance predictor losses initialized: "
+                f"HuberLoss pitch(delta={_pitch_huber_delta}), "
+                f"HuberLoss energy(delta={_energy_huber_delta})"
+            )
         else:
             self.criterion_pitch = None
             self.criterion_energy = None
@@ -1801,7 +1816,7 @@ class KokoroTrainer:
                 # Setting soft_mel_length == max_mel_length means sequences in the normal
                 # training range (< 1400 frames) are never penalised by soft clipping.
                 soft_mel_length = 1400  # Raised from 900: stop penalising normal sequences
-                soft_duration_value = 80
+                soft_duration_value = 150
                 soft_risk_ratio = max(mel_length / soft_mel_length, max_duration_in_batch / soft_duration_value)
                 if soft_risk_ratio > 1.0:
                     adaptive_loss_scale = min(adaptive_loss_scale, max(0.5, 1.0 / (soft_risk_ratio ** 0.65)))
@@ -2038,11 +2053,13 @@ class KokoroTrainer:
 
                 # Optimizer step with mixed precision - only when accumulation is complete
                 if should_step:
-                    step_successful = self._optimizer_step_with_clipping(
+                    step_successful, clipped_norm = self._optimizer_step_with_clipping(
                         clip_norm=adaptive_clip_norm,
                         step_scheduler=True,
                         update_ema=True,
                     )
+                    # Log post-global-clip norm at the same step as stats/grad_norm
+                    self.writer.add_scalar('stats/grad_norm_clipped', clipped_norm, self.optimizer_steps_completed)
 
                     if step_successful:
                         self.optimizer_steps_completed += 1
@@ -2890,7 +2907,7 @@ class KokoroTrainer:
         *,
         step_scheduler: bool,
         update_ema: bool,
-    ) -> bool:
+    ) -> Tuple[bool, float]:
         runtime_policy = getattr(self, 'runtime_step_policy', None)
         if runtime_policy is None:
             runtime_policy = RuntimeStepPolicy(logger=logger)
