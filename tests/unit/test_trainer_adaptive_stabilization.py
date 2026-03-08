@@ -182,7 +182,7 @@ def test_train_epoch_keeps_default_clip_for_normal_batch(monkeypatch):
 
     assert trainer.model.forward_calls == 1
     assert avg_total_loss > 0.0
-    assert captured["max_norm"] == 1.0  # Raised from 0.5: encoder needs more headroom
+    assert captured["max_norm"] == 5.0  # Raised from 0.5: encoder needs more headroom
 
 
 def test_train_epoch_uses_emergency_clip_norm_on_gradient_explosion(monkeypatch):
