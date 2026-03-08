@@ -18,11 +18,16 @@ def test_causal_mask_cache_size_and_device_separation():
     m3 = model._get_causal_mask(20, dev_cpu)
     assert not torch.equal(m1, m3)
 
-    # if MPS is available, mask for a different device must be different/cache separate
+    # if MPS is available, the cache must store separate entries for each device;
+    # use identity comparison rather than torch.equal, which raises RuntimeError
+    # when tensors live on different devices.
     if torch.backends.mps.is_available():
         dev_mps = torch.device('mps')
         mm = model._get_causal_mask(16, dev_mps)
-        assert not torch.equal(m1, mm)
+        assert mm is not m1, "Cache must separate entries by device"
+        # Consecutive look-ups on the same device should still return the same object
+        mm2 = model._get_causal_mask(16, dev_mps)
+        assert mm2 is mm
     else:
         pytest.skip("MPS not available; device separation test skipped")
 
