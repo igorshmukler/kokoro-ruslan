@@ -67,10 +67,13 @@ class TrainingConfig:
 
     # Loss weights
     duration_loss_weight: float = 0.35  # Raised from 0.1: stronger signal through frozen encoder path
-    # Stop token BCE dominated early training (~21% of loss by epoch 6, ~15% at epoch 18).
-    # Halving from 1.0 → 0.5 reduces total loss by ~0.08-0.10 once stop is learned,
-    # freeing capacity for mel reconstruction to improve.
-    stop_token_loss_weight: float = 0.5
+    # Stop token BCE contribution to total loss.
+    # Reduced from 0.5: empirically the stop token BCE gradients (amplified by
+    # pos_weight) destabilise the decoder during the OneCycleLR ascending phase,
+    # causing val_stop to spike from 0.41 → 0.64 across epochs 3→6 while mel
+    # simultaneously regressed.  Reducing the weight limits the stop gradient's
+    # influence on the shared decoder representation during the ramp.
+    stop_token_loss_weight: float = 0.25
     pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
@@ -91,13 +94,17 @@ class TrainingConfig:
     # descending and the model has stabilised.
     spec_augment_start_epoch: int = 18
     # Stop token class-imbalance correction.
-    # BCE on stop tokens is extremely skewed: only 1 positive frame per sequence
-    # among ~T negatives (T ≈ average mel length).  Without pos_weight the model
-    # learns to always output 0 and achieves near-zero BCE loss without ever
-    # detecting end-of-utterance.  Set to approximately the average sequence
-    # length in frames (negative:positive ratio).  For this corpus ~150 is
-    # reasonable; increase toward 300 if the stop token still doesn't fire.
-    stop_token_pos_weight: float = 150.0
+    # BCE on stop tokens is skewed ~200:1 (negative frames : positive stop frame
+    # per average-length Russian utterance).  pos_weight=150 gave true class-balance
+    # during warmup but produced batch stop-loss spikes (>1.5 vs ~0.5 average)
+    # once the OneCycleLR ramp raised the LR past 1.2e-4.  With pos_weight=150 the
+    # gradient for a single missed stop token is 150× a non-stop frame; at higher
+    # LRs this overwhelms the mel gradient and corrupts the decoder representation
+    # (observed: stop spikes → grad_norm spikes to 18, stop val rising from
+    # 0.41 at epoch 3 to 0.64 at epoch 6 while mel simultaneously regressed).
+    # Reducing to 30 maintains sufficient class-balance signal while cutting the
+    # per-missed-stop gradient by 5×.  Raise toward 75 if stop tokens stop firing.
+    stop_token_pos_weight: float = 30.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
