@@ -2282,10 +2282,12 @@ class KokoroTrainer:
                            f"Success Rate: {success_rate:.1f}%, "
                            f"Current Scale: {self.scaler.get_scale():.0f}")
 
-        # Log epoch-level train spectral convergence
+        # Log epoch-level train spectral convergence.
+        # Use optimizer_steps_completed (same axis as val_spectral_convergence)
+        # so the Custom Scalar "Multiline" chart aligns both series correctly.
         if train_sc_count > 0:
             avg_train_sc = train_sc_sum / train_sc_count
-            self.writer.add_scalar('metrics/train_spectral_convergence', avg_train_sc, epoch)
+            self.writer.add_scalar('metrics/train_spectral_convergence', avg_train_sc, self.optimizer_steps_completed)
             logger.info(f"  Train SpectralConv (epoch {epoch+1}): {avg_train_sc:.6f}")
 
         # Log end-of-epoch train spectrograms (ground truth + predicted)
