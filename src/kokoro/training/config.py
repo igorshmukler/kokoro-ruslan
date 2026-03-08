@@ -102,9 +102,11 @@ class TrainingConfig:
     # LRs this overwhelms the mel gradient and corrupts the decoder representation
     # (observed: stop spikes → grad_norm spikes to 18, stop val rising from
     # 0.41 at epoch 3 to 0.64 at epoch 6 while mel simultaneously regressed).
-    # Reducing to 30 maintains sufficient class-balance signal while cutting the
-    # per-missed-stop gradient by 5×.  Raise toward 75 if stop tokens stop firing.
-    stop_token_pos_weight: float = 30.0
+    # Data-driven calculation (500-sample RUSLAN cache): mean mel length = 137.8 frames
+    # → actual neg/pos imbalance = 136.8:1.  Previous value of 30 corrected only 22%.
+    # 100 ≈ 73% correction — enough signal to learn stop reliably without over-correcting
+    # (full correction at 137 causes premature stops during inference).
+    stop_token_pos_weight: float = 100.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
