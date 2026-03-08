@@ -73,7 +73,7 @@ class TrainingConfig:
     # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
     #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
     stop_token_loss_weight: float = 0.075
-    pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
+    pitch_loss_weight: float = 0.5  # Normalized to [0,1], safe to use
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
     # SpecAugment (Park et al. 2019) — applied to teacher-forced mel decoder input only.

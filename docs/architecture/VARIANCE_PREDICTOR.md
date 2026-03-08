@@ -71,7 +71,7 @@ energy_min: float = 0.0
 energy_max: float = 1.0
 
 # Loss weights
-pitch_loss_weight: float = 0.1
+pitch_loss_weight: float = 0.5
 energy_loss_weight: float = 0.1
 ```
 
