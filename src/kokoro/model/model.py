@@ -83,7 +83,7 @@ class KokoroModel(nn.Module):
         # stress conditioning signal without changing the hidden dimension.
         self.use_stress_embedding = use_stress_embedding
         if use_stress_embedding:
-            self.stress_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
+            self.stress_embedding = nn.Embedding(3, hidden_dim)
 
         self.positional_encoding = PositionalEncoding(
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
@@ -143,6 +143,8 @@ class KokoroModel(nn.Module):
 
         # Mel feature projection to match hidden dimension for decoder input
         self.mel_projection_in = nn.Linear(mel_dim, hidden_dim)
+        nn.init.xavier_uniform_(self.mel_projection_in.weight)
+        nn.init.zeros_(self.mel_projection_in.bias)
 
         self.decoder = TransformerDecoder(
             d_model=hidden_dim,
@@ -153,10 +155,16 @@ class KokoroModel(nn.Module):
         )
 
         # Output projection for Mel Spectrogram
+        # Xavier init: no activation follows; default Kaiming over-scales outputs
         self.mel_projection_out = nn.Linear(hidden_dim, mel_dim)
+        nn.init.xavier_uniform_(self.mel_projection_out.weight)
+        nn.init.zeros_(self.mel_projection_out.bias)
 
         # End-of-Speech (Stop Token) Predictor
+        # Xavier init: output feeds sigmoid; Kaiming is wrong for this activation
         self.stop_token_predictor = nn.Linear(hidden_dim, 1)
+        nn.init.xavier_uniform_(self.stop_token_predictor.weight)
+        nn.init.zeros_(self.stop_token_predictor.bias)
 
         # General dropout
         self.dropout = nn.Dropout(encoder_dropout)
