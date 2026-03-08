@@ -2436,11 +2436,15 @@ class KokoroTrainer:
                         f"Avg Stop Loss: {avg_stop_loss:.4f}, "
                         f"{_lr_str}")
 
-            # Log epoch-level train losses to TensorBoard
-            self.writer.add_scalar('loss/train_total_epoch', avg_total_loss, epoch)
-            self.writer.add_scalar('loss/train_mel_epoch', avg_mel_loss, epoch)
-            self.writer.add_scalar('loss/train_duration_epoch', avg_dur_loss, epoch)
-            self.writer.add_scalar('loss/train_stop_epoch', avg_stop_loss, epoch)
+            # Log epoch-level train losses to TensorBoard.
+            # Use optimizer_steps_completed (not epoch index) so these points
+            # land on the same x-axis as all per-step training scalars and
+            # can be visually compared with validation epoch scalars.
+            _epoch_step = self.optimizer_steps_completed
+            self.writer.add_scalar('loss/train_total_epoch', avg_total_loss, _epoch_step)
+            self.writer.add_scalar('loss/train_mel_epoch', avg_mel_loss, _epoch_step)
+            self.writer.add_scalar('loss/train_duration_epoch', avg_dur_loss, _epoch_step)
+            self.writer.add_scalar('loss/train_stop_epoch', avg_stop_loss, _epoch_step)
             self.writer.flush()
 
             # Log weight histograms once per epoch
@@ -2463,11 +2467,13 @@ class KokoroTrainer:
                 self._log_epoch_cache_delta(epoch, "val", self.val_dataset, val_cache_start)
                 self.validation_losses.append(val_total_loss)
 
-                # Log epoch-level val losses to TensorBoard
-                self.writer.add_scalar('loss/val_total_epoch', val_total_loss, epoch)
-                self.writer.add_scalar('loss/val_mel_epoch', val_mel_loss, epoch)
-                self.writer.add_scalar('loss/val_duration_epoch', val_dur_loss, epoch)
-                self.writer.add_scalar('loss/val_stop_epoch', val_stop_loss, epoch)
+                # Log epoch-level val losses to TensorBoard.
+                # Use optimizer_steps_completed so val points align with the
+                # per-step training scalars on the same x-axis.
+                self.writer.add_scalar('loss/val_total_epoch', val_total_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_mel_epoch', val_mel_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_duration_epoch', val_dur_loss, self.optimizer_steps_completed)
+                self.writer.add_scalar('loss/val_stop_epoch', val_stop_loss, self.optimizer_steps_completed)
                 self.writer.flush()
 
                 # Check for improvement
