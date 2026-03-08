@@ -114,10 +114,14 @@ def calculate_training_losses(
             # intra-phoneme variation to a single gradient value and allowed the
             # predictor to converge to a constant per phoneme (zero variance).
             max_frame_len = mel_mask_2d.size(1)
+            # The model may expand to more frames than the target batch was padded
+            # to (e.g. predicted 258 frames vs target 148).  Truncate to the
+            # shorter of the two so shapes agree for element-wise MSE.
+            pred_pitch_aligned = predicted_pitch[:, :max_frame_len]
             pitch_targets_frame = vectorized_expand_tokens(
                 pitch_targets, phoneme_durations, max_len=max_frame_len
             )
-            loss_pitch_unreduced = criterion_pitch(predicted_pitch, pitch_targets_frame)
+            loss_pitch_unreduced = criterion_pitch(pred_pitch_aligned, pitch_targets_frame)
             pitch_valid = mel_mask_2d & torch.isfinite(loss_pitch_unreduced)
         else:
             # Predictions already at phoneme level — compare directly.
@@ -131,10 +135,12 @@ def calculate_training_losses(
         if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
             # Same frame-level expansion for energy — mirrors the pitch above.
             max_frame_len = mel_mask_2d.size(1)
+            # Truncate in case the model expanded to more frames than the target.
+            pred_energy_aligned = predicted_energy[:, :max_frame_len]
             energy_targets_frame = vectorized_expand_tokens(
                 energy_targets, phoneme_durations, max_len=max_frame_len
             )
-            loss_energy_unreduced = criterion_energy(predicted_energy, energy_targets_frame)
+            loss_energy_unreduced = criterion_energy(pred_energy_aligned, energy_targets_frame)
             energy_valid = mel_mask_2d & torch.isfinite(loss_energy_unreduced)
         else:
             # Predictions already at phoneme level — compare directly.
