@@ -1307,6 +1307,35 @@ class KokoroTrainer:
             _SummaryWriter=SummaryWriter,
         )
 
+    def _log_lr_scalars(self, step: int) -> None:
+        """Write per-group learning-rate scalars to TensorBoard.
+
+        With two param groups (encoder + decoder), logs ``stats/lr_encoder``
+        and ``stats/lr_decoder`` separately.  With a single param group,
+        logs the legacy ``stats/learning_rate`` tag.
+        """
+        n_pg = len(self.optimizer.param_groups)
+        if n_pg > 1:
+            self.writer.add_scalar('stats/lr_encoder', self.optimizer.param_groups[0]['lr'], step)
+            self.writer.add_scalar('stats/lr_decoder', self.optimizer.param_groups[-1]['lr'], step)
+        else:
+            self.writer.add_scalar('stats/learning_rate', self.optimizer.param_groups[0]['lr'], step)
+
+    def _build_lr_postfix(self) -> dict:
+        """Return a dict of LR key(s) for the tqdm progress-bar postfix.
+
+        With two param groups returns ``{'lr_enc': <encoder_lr>,
+        'lr_dec': <decoder_lr>}``.  With one param group returns
+        ``{'lr': <lr>}``.
+        """
+        n_pg = len(self.optimizer.param_groups)
+        if n_pg > 1:
+            return {
+                'lr_enc': self.optimizer.param_groups[0]['lr'],
+                'lr_dec': self.optimizer.param_groups[-1]['lr'],
+            }
+        return {'lr': self.optimizer.param_groups[0]['lr']}
+
     def _log_histograms_epoch(self, epoch: int) -> None:
         """Log weight histograms for all named model parameters to TensorBoard (once per epoch)."""
         try:
@@ -2007,8 +2036,7 @@ class KokoroTrainer:
                         if loss_energy is not None:
                             self.writer.add_scalar('loss/energy', loss_energy.item(), self.optimizer_steps_completed)
                         # Learning Rate to track the scheduler
-                        current_lr = self.optimizer.param_groups[0]['lr']
-                        self.writer.add_scalar('stats/learning_rate', current_lr, self.optimizer_steps_completed)
+                        self._log_lr_scalars(self.optimizer_steps_completed)
 
                         # Force TensorBoard to update the file
                         self.writer.flush()
@@ -2136,8 +2164,8 @@ class KokoroTrainer:
                     'mel_loss': current_mel_loss,
                     'dur_loss': current_dur_loss,
                     'stop_loss': current_stop_loss,
-                    'lr': self.optimizer.param_groups[0]['lr']
                 }
+                postfix_dict.update(self._build_lr_postfix())
 
                 # Add variance losses if they exist
                 if has_pitch_loss:
@@ -2395,13 +2423,18 @@ class KokoroTrainer:
             if not self.scheduler_per_batch:
                 self.scheduler.step()
 
-            current_lr = self.optimizer.param_groups[0]['lr']
+            _n_pg_epoch = len(self.optimizer.param_groups)
+            if _n_pg_epoch > 1:
+                _lr_str = (f"LR enc: {self.optimizer.param_groups[0]['lr']:.8f}, "
+                           f"dec: {self.optimizer.param_groups[-1]['lr']:.8f}")
+            else:
+                _lr_str = f"LR: {self.optimizer.param_groups[0]['lr']:.8f}"
             logger.info(f"Epoch {epoch+1} completed. "
                         f"Avg Total Loss: {avg_total_loss:.4f}, "
                         f"Avg Mel Loss: {avg_mel_loss:.4f}, "
                         f"Avg Dur Loss: {avg_dur_loss:.4f}, "
                         f"Avg Stop Loss: {avg_stop_loss:.4f}, "
-                        f"Current LR: {current_lr:.8f}")
+                        f"{_lr_str}")
 
             # Log epoch-level train losses to TensorBoard
             self.writer.add_scalar('loss/train_total_epoch', avg_total_loss, epoch)
