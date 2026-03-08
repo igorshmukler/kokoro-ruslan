@@ -3,6 +3,8 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
+from kokoro.utils.lengths import vectorized_expand_tokens
+
 
 def calculate_training_losses(
     *,
@@ -105,28 +107,39 @@ def calculate_training_losses(
     loss_pitch = torch.tensor(0.0, device=device)
     if predicted_pitch is not None and pitch_targets is not None and criterion_pitch is not None:
         if predicted_pitch.dim() == 2 and predicted_pitch.size(1) != phoneme_durations.size(1):
-            pred_pitch_ph = average_by_duration(
-                predicted_pitch, phoneme_durations, phoneme_lengths
+            # predicted_pitch is frame-level; pitch_targets is phoneme-level.
+            # Expand phoneme-level targets to frame level so that *every* predicted
+            # frame receives an independent gradient signal.  Previously the code
+            # averaged predictions down to phoneme level first, which collapsed all
+            # intra-phoneme variation to a single gradient value and allowed the
+            # predictor to converge to a constant per phoneme (zero variance).
+            max_frame_len = mel_mask_2d.size(1)
+            pitch_targets_frame = vectorized_expand_tokens(
+                pitch_targets, phoneme_durations, max_len=max_frame_len
             )
+            loss_pitch_unreduced = criterion_pitch(predicted_pitch, pitch_targets_frame)
+            pitch_valid = mel_mask_2d & torch.isfinite(loss_pitch_unreduced)
         else:
-            pred_pitch_ph = predicted_pitch
-
-        loss_pitch_unreduced = criterion_pitch(pred_pitch_ph, pitch_targets)
-        pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
+            # Predictions already at phoneme level — compare directly.
+            loss_pitch_unreduced = criterion_pitch(predicted_pitch, pitch_targets)
+            pitch_valid = phoneme_mask_2d & torch.isfinite(loss_pitch_unreduced)
         if pitch_valid.any():
             loss_pitch = loss_pitch_unreduced[pitch_valid].mean()
 
     loss_energy = torch.tensor(0.0, device=device)
     if predicted_energy is not None and energy_targets is not None and criterion_energy is not None:
         if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
-            pred_energy_ph = average_by_duration(
-                predicted_energy, phoneme_durations, phoneme_lengths
+            # Same frame-level expansion for energy — mirrors the pitch above.
+            max_frame_len = mel_mask_2d.size(1)
+            energy_targets_frame = vectorized_expand_tokens(
+                energy_targets, phoneme_durations, max_len=max_frame_len
             )
+            loss_energy_unreduced = criterion_energy(predicted_energy, energy_targets_frame)
+            energy_valid = mel_mask_2d & torch.isfinite(loss_energy_unreduced)
         else:
-            pred_energy_ph = predicted_energy
-
-        loss_energy_unreduced = criterion_energy(pred_energy_ph, energy_targets)
-        energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
+            # Predictions already at phoneme level — compare directly.
+            loss_energy_unreduced = criterion_energy(predicted_energy, energy_targets)
+            energy_valid = phoneme_mask_2d & torch.isfinite(loss_energy_unreduced)
         if energy_valid.any():
             loss_energy = loss_energy_unreduced[energy_valid].mean()
 
