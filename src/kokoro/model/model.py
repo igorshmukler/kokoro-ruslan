@@ -72,6 +72,10 @@ class KokoroModel(nn.Module):
 
         # Text encoder: Embedding + Positional Encoding + Stack of Transformer Blocks
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
+        # Compensate for the √hidden_dim embedding scale applied in forward().
+        # Default Uniform(−1,1) init → post-scale magnitude ≈ ±27.7 for hidden_dim=768,
+        # which causes large initial gradients.  N(0, 1/√hidden_dim) keeps post-scale std≈1.
+        nn.init.normal_(self.text_embedding.weight, mean=0.0, std=1.0 / (hidden_dim ** 0.5))
 
         # Stress embedding: 3 entries {0=unstressed, 1=primary_stress, 2=secondary_stress}.
         # Added to (not concatenated with) the phoneme embedding at the encoder input so

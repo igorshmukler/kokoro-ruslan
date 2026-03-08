@@ -1765,7 +1765,9 @@ class KokoroTrainer:
                 max_mel_length = 1400  # Hard cap for sequence dimensions
                 max_duration_value = 150  # Hard cap for extreme durations
                 adaptive_loss_scale = 1.0
-                adaptive_clip_norm = 1.0  # Raised from 0.5: encoder needs more headroom
+                adaptive_clip_norm = 5.0  # Raised from 1.0: 1.0 cancelled encoder 3× LR benefit;
+                # with encoder_lr_multiplier=3.0, clipping at 1.0 applied the same absolute
+                # norm cap to both encoder and decoder, neutralising the multiplier entirely.
 
                 mel_length = mel_specs.shape[1]
                 max_duration_in_batch = phoneme_durations.max().item()
