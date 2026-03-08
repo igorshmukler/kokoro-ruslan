@@ -84,7 +84,7 @@ class KokoroModel(nn.Module):
         # stress conditioning signal without changing the hidden dimension.
         self.use_stress_embedding = use_stress_embedding
         if use_stress_embedding:
-            self.stress_embedding = nn.Embedding(3, hidden_dim)
+            self.stress_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
 
         self.positional_encoding = PositionalEncoding(
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
