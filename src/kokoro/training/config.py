@@ -66,14 +66,13 @@ class TrainingConfig:
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
     # Loss weights
-    duration_loss_weight: float = 0.35  # Raised from 0.1: stronger signal through frozen encoder path
+    duration_loss_weight: float = 0.35
     # Stop token BCE contribution to total loss.
-    # Reduced from 0.5: empirically the stop token BCE gradients (amplified by
-    # pos_weight) destabilise the decoder during the OneCycleLR ascending phase,
-    # causing val_stop to spike from 0.41 → 0.64 across epochs 3→6 while mel
-    # simultaneously regressed.  Reducing the weight limits the stop gradient's
-    # influence on the shared decoder representation during the ramp.
-    stop_token_loss_weight: float = 0.25
+    # Calibration: effective stop contribution = stop_token_loss_weight × pos_weight.
+    # With pos_weight=100 the weight must be scaled down proportionally from the
+    # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
+    #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
+    stop_token_loss_weight: float = 0.075
     pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
     energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
 
