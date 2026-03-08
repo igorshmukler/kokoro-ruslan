@@ -451,6 +451,18 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
         else:
             logger.info("No optimizer_steps_completed found in checkpoint, using default counter state")
 
+        # Restore best validation loss so early-stopping and best-model saving
+        # resume from the correct baseline rather than float('inf').
+        # load_checkpoint() only sets trainer.best_loss (from the 'loss'/train-loss
+        # key); the training loop checks trainer.best_val_loss, so without this
+        # the first post-resume epoch always "improves by inf" and overwrites the
+        # best checkpoint even when the new validation loss is actually worse.
+        if 'val_loss' in checkpoint:
+            trainer.best_val_loss = float(checkpoint['val_loss'])
+            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint")
+        else:
+            logger.info("No val_loss in checkpoint; best_val_loss remains inf (first epoch will always save)")
+
     trainer.dataset.phoneme_processor = phoneme_processor
 
     logger.info(f"Resumed from epoch {trainer.start_epoch}, best loss {trainer.best_loss:.4f}")
