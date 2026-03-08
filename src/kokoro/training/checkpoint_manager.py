@@ -19,6 +19,98 @@ from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 logger = logging.getLogger(__name__)
 
 
+def _purge_tb_events_after_step(
+    log_dir: str,
+    keep_up_to_step: int,
+    _SummaryWriter=None,
+) -> object:
+    """Rewrite TensorBoard event files keeping only events at step <= keep_up_to_step.
+
+    Reads every .tfevents file in *log_dir*, retains events whose global_step is
+    <= keep_up_to_step (plus metadata events that carry no step data), writes them
+    all into a single new event file, deletes the old files, and returns a fresh
+    SummaryWriter pointing at the same directory.
+
+    Falls back to a plain delete-and-reopen if the tensorboard event reader is
+    unavailable.
+    """
+    _SW = _SummaryWriter if _SummaryWriter is not None else SummaryWriter
+    log_dir_path = Path(log_dir)
+    event_files = sorted(log_dir_path.glob("events.out.tfevents.*"))
+
+    # kept_scalars: list of (tag, step, value) tuples to replay via add_scalar.
+    # Storing (tag, step, value) rather than raw proto bytes avoids all
+    # EventFileWriter API differences across PyTorch / TensorBoard versions.
+    kept_scalars: list = []
+    read_ok = False
+    if event_files:
+        try:
+            from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+
+            for ef in event_files:
+                try:
+                    loader = EventFileLoader(str(ef))
+                    for raw in loader.Load():
+                        if not raw.HasField('summary'):
+                            continue
+                        if raw.step > keep_up_to_step:
+                            continue
+                        for value in raw.summary.value:
+                            tag = value.tag
+                            # simple_value covers add_scalar calls;
+                            # tensor covers add_scalar calls in newer TB versions.
+                            if value.HasField('simple_value'):
+                                kept_scalars.append((tag, raw.step, value.simple_value))
+                            elif value.HasField('tensor'):
+                                try:
+                                    import numpy as np
+                                    from tensorboard.util.tensor_util import make_ndarray
+                                    arr = make_ndarray(value.tensor)
+                                    kept_scalars.append((tag, raw.step, float(arr)))
+                                except Exception:
+                                    pass  # skip non-scalar tensors
+                except Exception as _ef_err:
+                    logger.warning(f"Could not read TensorBoard event file {ef}: {_ef_err}")
+            read_ok = True
+            logger.info(
+                f"Read {len(kept_scalars)} scalar data points (step <= {keep_up_to_step}) "
+                f"from {len(event_files)} event file(s) in {log_dir}"
+            )
+        except ImportError:
+            logger.warning(
+                "tensorboard EventFileLoader not available — "
+                "falling back to delete-and-reopen (history will be lost)"
+            )
+
+    # Delete all existing event files
+    for ef in event_files:
+        try:
+            ef.unlink()
+        except OSError as _del_err:
+            logger.warning(f"Could not delete TensorBoard event file {ef}: {_del_err}")
+
+    # Open fresh writer (creates new event file)
+    new_writer = _SW(log_dir=log_dir)
+
+    if read_ok and kept_scalars:
+        # Replay via add_scalar — version-independent, works with any TensorBoard build.
+        try:
+            for tag, step, value in kept_scalars:
+                new_writer.add_scalar(tag, value, global_step=step)
+            new_writer.flush()
+            logger.info(
+                f"Replayed {len(kept_scalars)} scalar data points into new TensorBoard file "
+                f"(purged everything after step {keep_up_to_step})"
+            )
+        except Exception as _write_err:
+            logger.warning(
+                f"Could not replay historical scalars into TensorBoard writer: {_write_err}. "
+                "Chart history will start from the resume point."
+            )
+
+    return new_writer
+
+
 def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module] = None) -> Dict[str, Any]:
     """Build explicit architecture metadata for robust strict loading."""
     metadata = {
@@ -467,13 +559,19 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
 
     logger.info(f"Resumed from epoch {trainer.start_epoch}, best loss {trainer.best_loss:.4f}")
 
-    # Purge stale TensorBoard events from epochs after the resume point.
-    purge_step = trainer.current_optimizer_step + 1
+    # Rewrite TensorBoard event files: keep all events up to current_optimizer_step,
+    # discard everything after.  This preserves the full history visible in charts
+    # while removing any data written during the run that was interrupted/discarded.
     trainer.writer.close()
-    trainer.writer = _SW(log_dir=trainer.log_dir, purge_step=purge_step)
+    keep_up_to = trainer.current_optimizer_step
+    trainer.writer = _purge_tb_events_after_step(
+        log_dir=trainer.log_dir,
+        keep_up_to_step=keep_up_to,
+        _SummaryWriter=_SW,
+    )
     logger.info(
-        f"TensorBoard writer reopened with purge_step={purge_step} "
-        f"(hiding stale events from optimizer_step >= {purge_step})"
+        f"TensorBoard events rewritten: preserved step <= {keep_up_to}, "
+        f"purged everything after (optimizer_step={keep_up_to})"
     )
 
     # Reconstruct the OneCycleLR from the CURRENT config to avoid stale phase
