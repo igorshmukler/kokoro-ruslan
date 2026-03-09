@@ -25,13 +25,14 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 2.0  # Max LR = learning_rate * this value (lowered from 3.0: stop/encoder instability > epoch 6 with 3.0)
+    max_lr_multiplier: float = 1.5  # Max LR = learning_rate * this value (lowered from 2.0: encoder instability at ep7 with 2.0; peak decoder=1.5e-4)
     pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
-    # that the severely under-trained encoder layers get proportionally more gradient
-    # signal relative to the already-learning decoder.
-    encoder_lr_multiplier: float = 2.0
+    # that the encoder layers get proportionally more gradient signal vs the decoder.
+    # Lowered from 2.0 → 1.5: peak encoder was 4e-4 (2.0) → grad spikes to 13.6 by ep7;
+    # 1.5 gives peak encoder=2.25e-4, safely below the observed ~3.3e-4 instability threshold.
+    encoder_lr_multiplier: float = 1.5
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR

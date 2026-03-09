@@ -659,7 +659,32 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             final_lr = max_lr / 10000.0
             peak_step = int(pct_start * onecycle_steps)
 
-            if last_lr >= max_lr:
+            # Step-based positioning: use checkpoint global_step as the anchor whenever
+            # available.  LR-value matching (the fallback below) breaks when max_lr has
+            # been changed between runs — a lower new max_lr causes the saved LR to appear
+            # near-peak, which jumps the scheduler forward by many epochs on resume.
+            _saved_global_step = checkpoint.get('global_step') if checkpoint is not None else None
+            _grad_acc = getattr(config, 'gradient_accumulation_steps', 1)
+            if _saved_global_step is not None:
+                # Convert batch-level global_step → optimizer steps (accounting for accumulation)
+                target_step = max(0, min(onecycle_steps - 1,
+                                         int(_saved_global_step) // max(1, _grad_acc)))
+                # Compute the LR at target_step under the NEW schedule using the OneCycleLR
+                # cosine formula (phase 1: base_lr→max_lr; phase 2: max_lr→final_lr).
+                if target_step <= peak_step:
+                    _pct = target_step / max(1, peak_step)
+                    resume_lr = base_lr + (max_lr - base_lr) * (1.0 - math.cos(math.pi * _pct)) / 2.0
+                else:
+                    _decay_steps = onecycle_steps - peak_step
+                    _pct = (target_step - peak_step) / max(1, _decay_steps)
+                    resume_lr = final_lr + (max_lr - final_lr) * (1.0 + math.cos(math.pi * _pct)) / 2.0
+                resume_lr = max(base_lr, min(max_lr, resume_lr))
+                logger.info(
+                    f"Step-based scheduler resume: global_step={_saved_global_step} "
+                    f"→ optimizer_step={target_step}/{onecycle_steps}, "
+                    f"resume_lr={resume_lr:.2e} (decoder, new schedule max_lr={max_lr:.2e})"
+                )
+            elif last_lr >= max_lr:
                 target_step = peak_step
                 resume_lr   = max_lr
                 logger.info(
