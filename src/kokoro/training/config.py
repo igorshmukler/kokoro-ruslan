@@ -25,13 +25,13 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.5  # Max LR = learning_rate * this value (lowered from 2.0: encoder instability at ep7 with 2.0; peak decoder=1.5e-4)
+    max_lr_multiplier: float = 1.3  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
     pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # Lowered from 2.0 → 1.5: peak encoder was 4e-4 (2.0) → grad spikes to 13.6 by ep7;
-    # 1.5 gives peak encoder=2.25e-4, safely below the observed ~3.3e-4 instability threshold.
+    # 1.5 gives peak encoder = 1e-4 × 1.3 (max_lr) × 1.5 = 1.95e-4
+    # (was 2.25e-4 with max_lr_mult=1.5; ep7 spiked → reduced max_lr first)
     encoder_lr_multiplier: float = 1.5
 
     # Linear warmup before OneCycleLR
@@ -108,7 +108,11 @@ class TrainingConfig:
     # Lowered to 50 (36% correction): at rising LR the 100× per-stop gradient caused
     # stop loss spikes to 1.21 and grad_norm max to 39.8 by epoch 8.  Halving reduces
     # the per-stop gradient magnitude by 2× while still providing adequate stop signal.
-    stop_token_pos_weight: float = 50.0
+    # Lowered to 30 (22% correction): with max_lr_multiplier=1.5, val_stop is learning
+    # well (0.175→0.133) but mid-epoch stop-burst spikes (8.9, 6.9 in ep7) persist.
+    # pos_weight=30 halves gradient amplitude again; stop predictor has shown it can
+    # learn reliably at this level (was default before the regression fixes).
+    stop_token_pos_weight: float = 30.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
@@ -154,7 +158,7 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 2.0  # Global gradient clip ceiling; lowered from 5.0 (grad_norm max hit 39.8 by epoch 8)
+    max_grad_norm: float = 1.5  # Global gradient clip ceiling; lowered from 2.0 (secondary guard with max_lr_mult=1.3)
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
@@ -171,7 +175,7 @@ class TrainingConfig:
     grad_explosion_min_ema_steps: int = 100
 
     # Checkpointing
-    save_every: int = 2
+    save_every: int = 2  # Save every epoch (even if it not the best result); with LR-ramp instability risk, can't afford to lose 2 epochs
     resume_checkpoint: str = 'auto'
 
     # Validation settings
