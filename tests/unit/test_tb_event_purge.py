@@ -8,6 +8,8 @@ Tests verify that:
   - Events from multiple source files are handled correctly.
   - Edge cases (empty dir, keep_up_to=0, keep_up_to above all steps) work.
   - Fallback behaviour when EventFileLoader is unavailable is graceful.
+  - Images at step <= keep_up_to_step are preserved; images after are purged.
+  - Histograms at step <= keep_up_to_step are preserved; histograms after are purged.
   - resume_from_checkpoint invokes the purge with current_optimizer_step.
 """
 
@@ -67,6 +69,90 @@ def _read_scalar_steps(log_dir: Path, tag: str = "loss/total") -> list[int]:
 
 def _event_file_count(log_dir: Path) -> int:
     return len(list(log_dir.glob("events.out.tfevents.*")))
+
+
+def _write_images(log_dir: Path, steps: list[int], tag: str = "spec/mel") -> Path:
+    """Write one RGB image per step and flush/close. Returns the event file path."""
+    import numpy as np
+    sw = SummaryWriter(log_dir=str(log_dir))
+    for s in steps:
+        # CHW layout (3, 8, 8) — small enough to be fast in tests.
+        img = np.zeros((3, 8, 8), dtype=np.float32)
+        img[0] = float(s % 256) / 255.0  # vary red channel so steps are distinguishable
+        sw.add_image(tag, img, global_step=s)
+    sw.flush()
+    sw.close()
+    time.sleep(0.05)
+    files = sorted(log_dir.glob("events.out.tfevents.*"))
+    return files[-1]
+
+
+def _read_image_steps(log_dir: Path, tag: str = "spec/mel") -> list[int]:
+    """Return sorted global_step values for image *tag* across all event files."""
+    steps = []
+    for ef in sorted(log_dir.glob("events.out.tfevents.*")):
+        loader = EventFileLoader(str(ef))
+        for event in loader.Load():
+            if not event.HasField("summary"):
+                continue
+            for value in event.summary.value:
+                if value.tag != tag:
+                    continue
+                is_image = (
+                    # Legacy proto format
+                    value.HasField("image")
+                    # Modern tensor format with plugin metadata
+                    or (
+                        value.HasField("tensor")
+                        and value.HasField("metadata")
+                        and value.metadata.HasField("plugin_data")
+                        and value.metadata.plugin_data.plugin_name == "images"
+                    )
+                )
+                if is_image:
+                    steps.append(event.step)
+    return sorted(steps)
+
+
+def _write_histograms(log_dir: Path, steps: list[int], tag: str = "weights/enc") -> Path:
+    """Write one histogram per step and flush/close. Returns the event file path."""
+    import numpy as np
+    sw = SummaryWriter(log_dir=str(log_dir))
+    for s in steps:
+        data = np.random.default_rng(s).normal(size=100).astype(np.float32)
+        sw.add_histogram(tag, data, global_step=s)
+    sw.flush()
+    sw.close()
+    time.sleep(0.05)
+    files = sorted(log_dir.glob("events.out.tfevents.*"))
+    return files[-1]
+
+
+def _read_histogram_steps(log_dir: Path, tag: str = "weights/enc") -> list[int]:
+    """Return sorted global_step values for histogram *tag* across all event files."""
+    steps = []
+    for ef in sorted(log_dir.glob("events.out.tfevents.*")):
+        loader = EventFileLoader(str(ef))
+        for event in loader.Load():
+            if not event.HasField("summary"):
+                continue
+            for value in event.summary.value:
+                if value.tag != tag:
+                    continue
+                is_histo = (
+                    # Legacy proto format
+                    value.HasField("histo")
+                    # Modern tensor format with plugin metadata
+                    or (
+                        value.HasField("tensor")
+                        and value.HasField("metadata")
+                        and value.metadata.HasField("plugin_data")
+                        and value.metadata.plugin_data.plugin_name == "histograms"
+                    )
+                )
+                if is_histo:
+                    steps.append(event.step)
+    return sorted(steps)
 
 
 # ---------------------------------------------------------------------------
@@ -187,6 +273,104 @@ class TestFileManagement:
         writer.close()
 
         assert _read_scalar_steps(tmp_path) == [100, 200, 300]
+
+
+
+# ---------------------------------------------------------------------------
+# Images and histograms
+# ---------------------------------------------------------------------------
+
+class TestImagesAndHistograms:
+    """Images and histograms are preserved/purged by the same step threshold."""
+
+    # --- Images ---
+
+    def test_images_at_threshold_kept(self, tmp_path):
+        _write_images(tmp_path, [100, 200, 300])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=300)
+        writer.close()
+        assert _read_image_steps(tmp_path) == [100, 200, 300]
+
+    def test_images_after_threshold_purged(self, tmp_path):
+        _write_images(tmp_path, [100, 200, 300, 400])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=200)
+        writer.close()
+        assert _read_image_steps(tmp_path) == [100, 200]
+
+    def test_images_exact_boundary_included(self, tmp_path):
+        _write_images(tmp_path, [99, 100, 101])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=100)
+        writer.close()
+        assert _read_image_steps(tmp_path) == [99, 100]
+
+    def test_no_images_survive_when_keep_up_to_is_zero(self, tmp_path):
+        _write_images(tmp_path, [1, 2, 3])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=0)
+        writer.close()
+        assert _read_image_steps(tmp_path) == []
+
+    def test_images_and_scalars_filtered_together(self, tmp_path):
+        """Both scalars and images in the same file are filtered by the same threshold."""
+        import numpy as np
+        sw = SummaryWriter(log_dir=str(tmp_path))
+        for s in [100, 200, 300]:
+            sw.add_scalar("loss/total", float(s) * 0.1, global_step=s)
+            img = np.zeros((3, 8, 8), dtype=np.float32)
+            sw.add_image("spec/mel", img, global_step=s)
+        sw.flush()
+        sw.close()
+
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=200)
+        writer.close()
+
+        assert _read_scalar_steps(tmp_path) == [100, 200]
+        assert _read_image_steps(tmp_path) == [100, 200]
+
+    # --- Histograms ---
+
+    def test_histograms_at_threshold_kept(self, tmp_path):
+        _write_histograms(tmp_path, [100, 200, 300])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=300)
+        writer.close()
+        assert _read_histogram_steps(tmp_path) == [100, 200, 300]
+
+    def test_histograms_after_threshold_purged(self, tmp_path):
+        _write_histograms(tmp_path, [100, 200, 300, 400])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=200)
+        writer.close()
+        assert _read_histogram_steps(tmp_path) == [100, 200]
+
+    def test_histograms_exact_boundary_included(self, tmp_path):
+        _write_histograms(tmp_path, [99, 100, 101])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=100)
+        writer.close()
+        assert _read_histogram_steps(tmp_path) == [99, 100]
+
+    def test_no_histograms_survive_when_keep_up_to_is_zero(self, tmp_path):
+        _write_histograms(tmp_path, [1, 2, 3])
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=0)
+        writer.close()
+        assert _read_histogram_steps(tmp_path) == []
+
+    def test_scalars_images_histograms_all_filtered_consistently(self, tmp_path):
+        """All three event types in a single file are filtered by the same threshold."""
+        import numpy as np
+        sw = SummaryWriter(log_dir=str(tmp_path))
+        for s in [50, 100, 150, 200]:
+            sw.add_scalar("loss/total", float(s) * 0.1, global_step=s)
+            img = np.zeros((3, 8, 8), dtype=np.float32)
+            sw.add_image("spec/mel", img, global_step=s)
+            data = np.random.default_rng(s).normal(size=64).astype(np.float32)
+            sw.add_histogram("weights/enc", data, global_step=s)
+        sw.flush()
+        sw.close()
+
+        writer = _purge_tb_events_after_step(str(tmp_path), keep_up_to_step=100)
+        writer.close()
+
+        assert _read_scalar_steps(tmp_path) == [50, 100]
+        assert _read_image_steps(tmp_path) == [50, 100]
+        assert _read_histogram_steps(tmp_path) == [50, 100]
 
 
 # ---------------------------------------------------------------------------

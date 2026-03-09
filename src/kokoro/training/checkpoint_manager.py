@@ -31,6 +31,11 @@ def _purge_tb_events_after_step(
     all into a single new event file, deletes the old files, and returns a fresh
     SummaryWriter pointing at the same directory.
 
+    Preserved event types:
+      * Scalars  — replayed via ``add_scalar`` (float round-trip).
+      * Images   — replayed via ``file_writer.add_summary`` (lossless proto copy).
+      * Histograms — replayed via ``file_writer.add_summary`` (lossless proto copy).
+
     Falls back to a plain delete-and-reopen if the tensorboard event reader is
     unavailable.
     """
@@ -42,6 +47,11 @@ def _purge_tb_events_after_step(
     # Storing (tag, step, value) rather than raw proto bytes avoids all
     # EventFileWriter API differences across PyTorch / TensorBoard versions.
     kept_scalars: list = []
+    # kept_images / kept_histograms: list of (step, Summary.Value proto) tuples.
+    # We preserve the raw proto so the encoded bytes (PNG for images, bucket
+    # arrays for histograms) are copied verbatim without re-encoding.
+    kept_images: list = []
+    kept_histograms: list = []
     read_ok = False
     if event_files:
         try:
@@ -58,22 +68,40 @@ def _purge_tb_events_after_step(
                         for value in raw.summary.value:
                             tag = value.tag
                             # simple_value covers add_scalar calls;
-                            # tensor covers add_scalar calls in newer TB versions.
+                            # tensor covers scalars, images and histograms in
+                            # newer TensorBoard versions — distinguish by plugin.
                             if value.HasField('simple_value'):
                                 kept_scalars.append((tag, raw.step, value.simple_value))
                             elif value.HasField('tensor'):
-                                try:
-                                    import numpy as np
-                                    from tensorboard.util.tensor_util import make_ndarray
-                                    arr = make_ndarray(value.tensor)
-                                    kept_scalars.append((tag, raw.step, float(arr)))
-                                except Exception:
-                                    pass  # skip non-scalar tensors
+                                plugin = ""
+                                if (value.HasField('metadata')
+                                        and value.metadata.HasField('plugin_data')):
+                                    plugin = value.metadata.plugin_data.plugin_name
+                                if plugin == 'images':
+                                    kept_images.append((raw.step, value))
+                                elif plugin == 'histograms':
+                                    kept_histograms.append((raw.step, value))
+                                else:
+                                    # Attempt scalar conversion for plain tensor scalars.
+                                    try:
+                                        import numpy as np
+                                        from tensorboard.util.tensor_util import make_ndarray
+                                        arr = make_ndarray(value.tensor)
+                                        kept_scalars.append((tag, raw.step, float(arr)))
+                                    except Exception:
+                                        pass  # skip non-scalar tensors
+                            elif value.HasField('image'):
+                                # Legacy proto format (older TensorBoard builds).
+                                kept_images.append((raw.step, value))
+                            elif value.HasField('histo'):
+                                # Legacy proto format (older TensorBoard builds).
+                                kept_histograms.append((raw.step, value))
                 except Exception as _ef_err:
                     logger.warning(f"Could not read TensorBoard event file {ef}: {_ef_err}")
             read_ok = True
             logger.info(
-                f"Read {len(kept_scalars)} scalar data points (step <= {keep_up_to_step}) "
+                f"Read {len(kept_scalars)} scalars, {len(kept_images)} images, "
+                f"{len(kept_histograms)} histograms (step <= {keep_up_to_step}) "
                 f"from {len(event_files)} event file(s) in {log_dir}"
             )
         except ImportError:
@@ -92,21 +120,46 @@ def _purge_tb_events_after_step(
     # Open fresh writer (creates new event file)
     new_writer = _SW(log_dir=log_dir)
 
-    if read_ok and kept_scalars:
-        # Replay via add_scalar — version-independent, works with any TensorBoard build.
-        try:
-            for tag, step, value in kept_scalars:
-                new_writer.add_scalar(tag, value, global_step=step)
-            new_writer.flush()
-            logger.info(
-                f"Replayed {len(kept_scalars)} scalar data points into new TensorBoard file "
-                f"(purged everything after step {keep_up_to_step})"
-            )
-        except Exception as _write_err:
-            logger.warning(
-                f"Could not replay historical scalars into TensorBoard writer: {_write_err}. "
-                "Chart history will start from the resume point."
-            )
+    if read_ok:
+        # --- Scalars: replay via add_scalar (float, version-independent) ---
+        if kept_scalars:
+            try:
+                for tag, step, value in kept_scalars:
+                    new_writer.add_scalar(tag, value, global_step=step)
+                new_writer.flush()
+                logger.info(
+                    f"Replayed {len(kept_scalars)} scalars into new TensorBoard file "
+                    f"(purged everything after step {keep_up_to_step})"
+                )
+            except Exception as _write_err:
+                logger.warning(
+                    f"Could not replay historical scalars into TensorBoard writer: {_write_err}. "
+                    "Chart history will start from the resume point."
+                )
+
+        # --- Images & histograms: replay via file_writer.add_summary (lossless) ---
+        if kept_images or kept_histograms:
+            try:
+                from tensorboard.compat.proto.summary_pb2 import Summary
+
+                for step, val in kept_images:
+                    s = Summary(value=[val])
+                    new_writer.file_writer.add_summary(s, global_step=step)
+
+                for step, val in kept_histograms:
+                    s = Summary(value=[val])
+                    new_writer.file_writer.add_summary(s, global_step=step)
+
+                new_writer.flush()
+                logger.info(
+                    f"Replayed {len(kept_images)} images and {len(kept_histograms)} histograms "
+                    f"into new TensorBoard file (purged everything after step {keep_up_to_step})"
+                )
+            except Exception as _write_err:
+                logger.warning(
+                    f"Could not replay historical images/histograms into TensorBoard writer: {_write_err}. "
+                    "Image/histogram history will start from the resume point."
+                )
 
     return new_writer
 
