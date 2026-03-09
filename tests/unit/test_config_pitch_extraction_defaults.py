@@ -35,8 +35,8 @@ def test_training_config_convergence_fix_defaults():
 
     # Spec augment deferred until after the OneCycleLR peak (~epoch 15) to avoid
     # compounding ramp-phase instability (empirically caused val regression ep4→ep6)
-    assert config.spec_augment_start_epoch == 18, (
-        f"spec_augment_start_epoch should be 18 (was 5); got {config.spec_augment_start_epoch}"
+    assert config.spec_augment_start_epoch == 23, (
+        f"spec_augment_start_epoch should be 23; got {config.spec_augment_start_epoch}"
     )
 
     # Encoder FFN pre-clip loosened — the old 10.0 was zeroing microscopic-but-valid gradients
