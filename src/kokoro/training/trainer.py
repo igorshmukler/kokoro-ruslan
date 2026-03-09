@@ -179,6 +179,7 @@ class KokoroTrainer:
         self.start_epoch = 0
         self.best_loss = float('inf')
         self.best_val_loss = float('inf')
+        self.best_val_epoch = -1
         self.epochs_without_improvement = 0
         self.validation_losses = []
 
@@ -1618,11 +1619,13 @@ class KokoroTrainer:
     def save_checkpoint_with_scaler(
         self, epoch: int, loss: float, val_loss: float = None,
         val_mel_loss: float = None, val_stop_loss: float = None, val_dur_loss: float = None,
+        best_val_loss: float = None, best_val_epoch: int = -1,
     ):
         """Save checkpoint including scaler state and EMA weights"""
         model_metadata = build_model_metadata(self.config, self.model)
         checkpoint = {
             'epoch': epoch,
+            'global_step': self.current_optimizer_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
@@ -1634,6 +1637,9 @@ class KokoroTrainer:
             'val_mel_loss': val_mel_loss,
             'val_stop_loss': val_stop_loss,
             'val_dur_loss': val_dur_loss,
+            # Explicit best-model tracking so resume always restores the correct baseline
+            'best_val_loss': best_val_loss if best_val_loss is not None else val_loss,
+            'best_val_epoch': best_val_epoch,
             'config': self.config,
             'model_metadata': model_metadata,
         }
@@ -1805,9 +1811,7 @@ class KokoroTrainer:
                 max_mel_length = 1400  # Hard cap for sequence dimensions
                 max_duration_value = 150  # Hard cap for extreme durations
                 adaptive_loss_scale = 1.0
-                adaptive_clip_norm = 5.0  # Raised from 1.0: 1.0 cancelled encoder 3× LR benefit;
-                # with encoder_lr_multiplier=3.0, clipping at 1.0 applied the same absolute
-                # norm cap to both encoder and decoder, neutralising the multiplier entirely.
+                adaptive_clip_norm = getattr(self.config, 'max_grad_norm', 5.0)  # configurable ceiling
 
                 mel_length = mel_specs.shape[1]
                 max_duration_in_batch = phoneme_durations.max().item()
@@ -2527,6 +2531,7 @@ class KokoroTrainer:
                 if val_total_loss < (self.best_val_loss - min_delta):
                     improvement = self.best_val_loss - val_total_loss
                     self.best_val_loss = val_total_loss
+                    self.best_val_epoch = epoch
                     self.epochs_without_improvement = 0
                     logger.info(f"✓ Validation loss improved by {improvement:.4f} - saving best model")
 
@@ -2534,6 +2539,7 @@ class KokoroTrainer:
                     self.save_checkpoint_with_scaler(
                         epoch, avg_total_loss, val_loss=val_total_loss,
                         val_mel_loss=val_mel_loss, val_stop_loss=val_stop_loss, val_dur_loss=val_dur_loss,
+                        best_val_loss=self.best_val_loss, best_val_epoch=self.best_val_epoch,
                     )
                 else:
                     self.epochs_without_improvement += 1
@@ -2580,6 +2586,7 @@ class KokoroTrainer:
                     self.save_checkpoint_with_scaler(
                         epoch, avg_total_loss, val_loss=current_val_loss,
                         val_mel_loss=val_mel_loss, val_stop_loss=val_stop_loss, val_dur_loss=val_dur_loss,
+                        best_val_loss=self.best_val_loss, best_val_epoch=self.best_val_epoch,
                     )
                     logger.info(f"Periodic checkpoint saved for epoch {epoch+1}")
 

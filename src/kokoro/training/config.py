@@ -25,13 +25,13 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 5.0  # Max LR = learning_rate * this value (raised from 2.0: plateau fix)
-    pct_start: float = 0.3  # Percentage of cycle spent increasing LR (warmup)
+    max_lr_multiplier: float = 2.0  # Max LR = learning_rate * this value (lowered from 3.0: stop/encoder instability > epoch 6 with 3.0)
+    pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the severely under-trained encoder layers get proportionally more gradient
     # signal relative to the already-learning decoder.
-    encoder_lr_multiplier: float = 3.0
+    encoder_lr_multiplier: float = 2.0
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -41,7 +41,7 @@ class TrainingConfig:
     # EMA (Exponential Moving Average) of model weights
     use_ema: bool = True  # Enable EMA for better inference quality
     ema_decay: Optional[float] = None  # EMA decay rate; if None, trainer will compute a recommended value
-    ema_half_life_epochs: float = 1.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
+    ema_half_life_epochs: float = 2.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
     ema_update_every: int = 1  # Update EMA every N optimizer steps (1 = every step)
 
     # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
@@ -73,8 +73,8 @@ class TrainingConfig:
     # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
     #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
     stop_token_loss_weight: float = 0.075
-    pitch_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
-    energy_loss_weight: float = 0.1  # Normalized to [0,1], safe to use
+    pitch_loss_weight: float = 1.0  # Normalized to [0,1]; 1.0 gives pitch predictor adequate gradient signal vs mel loss
+    energy_loss_weight: float = 1.0  # Normalized to [0,1]; matched to pitch_loss_weight
 
     # SpecAugment (Park et al. 2019) — applied to teacher-forced mel decoder input only.
     # The unmasked original mel is still used as the loss target, so gradients for
@@ -86,12 +86,11 @@ class TrainingConfig:
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.3 and 50 epochs the LR peaks at ~epoch 15; starting spec
-    # augment before the peak compounds the ramp-phase instability and causes
-    # val_loss regression (observed: ep4→ep6 val 1.87→2.04 with start=5).
-    # Start at epoch 18: 3 epochs after the LR peak, once the schedule is
+    # With pct_start=0.2 and 100 epochs the LR peaks at epoch 20; starting spec
+    # augment before the peak compounds the ramp-phase instability.
+    # Start at epoch 23: 3 epochs after the LR peak, once the schedule is
     # descending and the model has stabilised.
-    spec_augment_start_epoch: int = 18
+    spec_augment_start_epoch: int = 23
     # Stop token class-imbalance correction.
     # BCE on stop tokens is skewed ~200:1 (negative frames : positive stop frame
     # per average-length Russian utterance).  pos_weight=150 gave true class-balance
@@ -105,7 +104,10 @@ class TrainingConfig:
     # → actual neg/pos imbalance = 136.8:1.  Previous value of 30 corrected only 22%.
     # 100 ≈ 73% correction — enough signal to learn stop reliably without over-correcting
     # (full correction at 137 causes premature stops during inference).
-    stop_token_pos_weight: float = 100.0
+    # Lowered to 50 (36% correction): at rising LR the 100× per-stop gradient caused
+    # stop loss spikes to 1.21 and grad_norm max to 39.8 by epoch 8.  Halving reduces
+    # the per-stop gradient magnitude by 2× while still providing adequate stop signal.
+    stop_token_pos_weight: float = 50.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
@@ -146,6 +148,12 @@ class TrainingConfig:
     max_frames_per_batch: int = 15000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
     max_batch_size: int = 8  # Maximum samples per batch
+
+    # Gradient clipping
+    # This is the base ceiling for the adaptive gradient clip norm used during the
+    # normal (non-outlier) training step.  The adaptive stabilizer may lower it
+    # further for batches with extreme mel lengths or durations.
+    max_grad_norm: float = 2.0  # Global gradient clip ceiling; lowered from 5.0 (grad_norm max hit 39.8 by epoch 8)
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0

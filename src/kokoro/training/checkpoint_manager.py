@@ -19,6 +19,151 @@ from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
 logger = logging.getLogger(__name__)
 
 
+def _purge_tb_events_after_step(
+    log_dir: str,
+    keep_up_to_step: int,
+    _SummaryWriter=None,
+) -> object:
+    """Rewrite TensorBoard event files keeping only events at step <= keep_up_to_step.
+
+    Reads every .tfevents file in *log_dir*, retains events whose global_step is
+    <= keep_up_to_step (plus metadata events that carry no step data), writes them
+    all into a single new event file, deletes the old files, and returns a fresh
+    SummaryWriter pointing at the same directory.
+
+    Preserved event types:
+      * Scalars  — replayed via ``add_scalar`` (float round-trip).
+      * Images   — replayed via ``file_writer.add_summary`` (lossless proto copy).
+      * Histograms — replayed via ``file_writer.add_summary`` (lossless proto copy).
+
+    Falls back to a plain delete-and-reopen if the tensorboard event reader is
+    unavailable.
+    """
+    _SW = _SummaryWriter if _SummaryWriter is not None else SummaryWriter
+    log_dir_path = Path(log_dir)
+    event_files = sorted(log_dir_path.glob("events.out.tfevents.*"))
+
+    # kept_scalars: list of (tag, step, value) tuples to replay via add_scalar.
+    # Storing (tag, step, value) rather than raw proto bytes avoids all
+    # EventFileWriter API differences across PyTorch / TensorBoard versions.
+    kept_scalars: list = []
+    # kept_images / kept_histograms: list of (step, Summary.Value proto) tuples.
+    # We preserve the raw proto so the encoded bytes (PNG for images, bucket
+    # arrays for histograms) are copied verbatim without re-encoding.
+    kept_images: list = []
+    kept_histograms: list = []
+    read_ok = False
+    if event_files:
+        try:
+            from tensorboard.backend.event_processing.event_file_loader import EventFileLoader
+
+            for ef in event_files:
+                try:
+                    loader = EventFileLoader(str(ef))
+                    for raw in loader.Load():
+                        if not raw.HasField('summary'):
+                            continue
+                        if raw.step > keep_up_to_step:
+                            continue
+                        for value in raw.summary.value:
+                            tag = value.tag
+                            # simple_value covers add_scalar calls;
+                            # tensor covers scalars, images and histograms in
+                            # newer TensorBoard versions — distinguish by plugin.
+                            if value.HasField('simple_value'):
+                                kept_scalars.append((tag, raw.step, value.simple_value))
+                            elif value.HasField('tensor'):
+                                plugin = ""
+                                if (value.HasField('metadata')
+                                        and value.metadata.HasField('plugin_data')):
+                                    plugin = value.metadata.plugin_data.plugin_name
+                                if plugin == 'images':
+                                    kept_images.append((raw.step, value))
+                                elif plugin == 'histograms':
+                                    kept_histograms.append((raw.step, value))
+                                else:
+                                    # Attempt scalar conversion for plain tensor scalars.
+                                    try:
+                                        import numpy as np
+                                        from tensorboard.util.tensor_util import make_ndarray
+                                        arr = make_ndarray(value.tensor)
+                                        kept_scalars.append((tag, raw.step, float(arr)))
+                                    except Exception:
+                                        pass  # skip non-scalar tensors
+                            elif value.HasField('image'):
+                                # Legacy proto format (older TensorBoard builds).
+                                kept_images.append((raw.step, value))
+                            elif value.HasField('histo'):
+                                # Legacy proto format (older TensorBoard builds).
+                                kept_histograms.append((raw.step, value))
+                except Exception as _ef_err:
+                    logger.warning(f"Could not read TensorBoard event file {ef}: {_ef_err}")
+            read_ok = True
+            logger.info(
+                f"Read {len(kept_scalars)} scalars, {len(kept_images)} images, "
+                f"{len(kept_histograms)} histograms (step <= {keep_up_to_step}) "
+                f"from {len(event_files)} event file(s) in {log_dir}"
+            )
+        except ImportError:
+            logger.warning(
+                "tensorboard EventFileLoader not available — "
+                "falling back to delete-and-reopen (history will be lost)"
+            )
+
+    # Delete all existing event files
+    for ef in event_files:
+        try:
+            ef.unlink()
+        except OSError as _del_err:
+            logger.warning(f"Could not delete TensorBoard event file {ef}: {_del_err}")
+
+    # Open fresh writer (creates new event file)
+    new_writer = _SW(log_dir=log_dir)
+
+    if read_ok:
+        # --- Scalars: replay via add_scalar (float, version-independent) ---
+        if kept_scalars:
+            try:
+                for tag, step, value in kept_scalars:
+                    new_writer.add_scalar(tag, value, global_step=step)
+                new_writer.flush()
+                logger.info(
+                    f"Replayed {len(kept_scalars)} scalars into new TensorBoard file "
+                    f"(purged everything after step {keep_up_to_step})"
+                )
+            except Exception as _write_err:
+                logger.warning(
+                    f"Could not replay historical scalars into TensorBoard writer: {_write_err}. "
+                    "Chart history will start from the resume point."
+                )
+
+        # --- Images & histograms: replay via file_writer.add_summary (lossless) ---
+        if kept_images or kept_histograms:
+            try:
+                from tensorboard.compat.proto.summary_pb2 import Summary
+
+                for step, val in kept_images:
+                    s = Summary(value=[val])
+                    new_writer.file_writer.add_summary(s, global_step=step)
+
+                for step, val in kept_histograms:
+                    s = Summary(value=[val])
+                    new_writer.file_writer.add_summary(s, global_step=step)
+
+                new_writer.flush()
+                logger.info(
+                    f"Replayed {len(kept_images)} images and {len(kept_histograms)} histograms "
+                    f"into new TensorBoard file (purged everything after step {keep_up_to_step})"
+                )
+            except Exception as _write_err:
+                logger.warning(
+                    f"Could not replay historical images/histograms into TensorBoard writer: {_write_err}. "
+                    "Image/histogram history will start from the resume point."
+                )
+
+    return new_writer
+
+
 def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module] = None) -> Dict[str, Any]:
     """Build explicit architecture metadata for robust strict loading."""
     metadata = {
@@ -453,27 +598,41 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
 
         # Restore best validation loss so early-stopping and best-model saving
         # resume from the correct baseline rather than float('inf').
-        # load_checkpoint() only sets trainer.best_loss (from the 'loss'/train-loss
-        # key); the training loop checks trainer.best_val_loss, so without this
-        # the first post-resume epoch always "improves by inf" and overwrites the
-        # best checkpoint even when the new validation loss is actually worse.
-        if 'val_loss' in checkpoint:
+        # Prefer the explicit 'best_val_loss' key (saved since the epoch-4 fix);
+        # fall back to 'val_loss' for older checkpoints that only stored the
+        # current-epoch validation loss.
+        if 'best_val_loss' in checkpoint and checkpoint['best_val_loss'] is not None:
+            trainer.best_val_loss = float(checkpoint['best_val_loss'])
+            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint (explicit key)")
+        elif 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
             trainer.best_val_loss = float(checkpoint['val_loss'])
-            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint")
+            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint (val_loss fallback)")
         else:
             logger.info("No val_loss in checkpoint; best_val_loss remains inf (first epoch will always save)")
+
+        if 'best_val_epoch' in checkpoint and checkpoint['best_val_epoch'] is not None:
+            trainer.best_val_epoch = int(checkpoint['best_val_epoch'])
+            logger.info(f"Restored best_val_epoch={trainer.best_val_epoch} from checkpoint")
+        else:
+            logger.info("No best_val_epoch in checkpoint; best_val_epoch remains -1")
 
     trainer.dataset.phoneme_processor = phoneme_processor
 
     logger.info(f"Resumed from epoch {trainer.start_epoch}, best loss {trainer.best_loss:.4f}")
 
-    # Purge stale TensorBoard events from epochs after the resume point.
-    purge_step = trainer.current_optimizer_step + 1
+    # Rewrite TensorBoard event files: keep all events up to current_optimizer_step,
+    # discard everything after.  This preserves the full history visible in charts
+    # while removing any data written during the run that was interrupted/discarded.
     trainer.writer.close()
-    trainer.writer = _SW(log_dir=trainer.log_dir, purge_step=purge_step)
+    keep_up_to = trainer.current_optimizer_step
+    trainer.writer = _purge_tb_events_after_step(
+        log_dir=trainer.log_dir,
+        keep_up_to_step=keep_up_to,
+        _SummaryWriter=_SW,
+    )
     logger.info(
-        f"TensorBoard writer reopened with purge_step={purge_step} "
-        f"(hiding stale events from optimizer_step >= {purge_step})"
+        f"TensorBoard events rewritten: preserved step <= {keep_up_to}, "
+        f"purged everything after (optimizer_step={keep_up_to})"
     )
 
     # Reconstruct the OneCycleLR from the CURRENT config to avoid stale phase

@@ -2,6 +2,11 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.30 (2026-03-09)
+
+- Improved tensorboard logs purge upon resuming from a checkpoint
+- Misc configuration changes to stabilize convergence
+
 ## 0.0.29 (2026-03-08)
 
 - Switched to Xavier init instead of Kaiming
