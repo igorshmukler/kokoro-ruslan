@@ -31,7 +31,7 @@ class TrainingConfig:
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the severely under-trained encoder layers get proportionally more gradient
     # signal relative to the already-learning decoder.
-    encoder_lr_multiplier: float = 3.0
+    encoder_lr_multiplier: float = 2.0
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -41,7 +41,7 @@ class TrainingConfig:
     # EMA (Exponential Moving Average) of model weights
     use_ema: bool = True  # Enable EMA for better inference quality
     ema_decay: Optional[float] = None  # EMA decay rate; if None, trainer will compute a recommended value
-    ema_half_life_epochs: float = 1.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
+    ema_half_life_epochs: float = 2.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
     ema_update_every: int = 1  # Update EMA every N optimizer steps (1 = every step)
 
     # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
@@ -86,12 +86,11 @@ class TrainingConfig:
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.3 and 50 epochs the LR peaks at ~epoch 15; starting spec
-    # augment before the peak compounds the ramp-phase instability and causes
-    # val_loss regression (observed: ep4→ep6 val 1.87→2.04 with start=5).
-    # Start at epoch 18: 3 epochs after the LR peak, once the schedule is
+    # With pct_start=0.2 and 100 epochs the LR peaks at epoch 20; starting spec
+    # augment before the peak compounds the ramp-phase instability.
+    # Start at epoch 23: 3 epochs after the LR peak, once the schedule is
     # descending and the model has stabilised.
-    spec_augment_start_epoch: int = 18
+    spec_augment_start_epoch: int = 23
     # Stop token class-imbalance correction.
     # BCE on stop tokens is skewed ~200:1 (negative frames : positive stop frame
     # per average-length Russian utterance).  pos_weight=150 gave true class-balance
@@ -146,6 +145,12 @@ class TrainingConfig:
     max_frames_per_batch: int = 15000  # Maximum mel frames per batch (auto-adjusted for MPS)
     min_batch_size: int = 4  # Minimum samples per batch
     max_batch_size: int = 8  # Maximum samples per batch
+
+    # Gradient clipping
+    # This is the base ceiling for the adaptive gradient clip norm used during the
+    # normal (non-outlier) training step.  The adaptive stabilizer may lower it
+    # further for batches with extreme mel lengths or durations.
+    max_grad_norm: float = 5.0  # Global gradient clip ceiling; 5.0 is safe for this architecture
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
