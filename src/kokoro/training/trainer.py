@@ -408,7 +408,7 @@ class KokoroTrainer:
         # are negative (0.0).  Without this the model learns to always predict 0
         # and achieves near-zero BCE loss while never detecting end-of-utterance.
         _stop_pos_w = torch.tensor(
-            [getattr(config, 'stop_token_pos_weight', 150.0)],
+            [getattr(config, 'stop_token_pos_weight', 30.0)],
             device=self.device
         )
         self.criterion_stop_token = nn.BCEWithLogitsLoss(
@@ -1445,24 +1445,14 @@ class KokoroTrainer:
                                  pitch_targets=pitches, energy_targets=energies,
                                  stress_indices=stress_indices)
 
-                    # Convert mel-frame level pitch/energy to phoneme level for loss calculation
-                    phoneme_pitches = None
-                    phoneme_energies = None
-                    if pitches is not None and predicted_pitch is not None:
-                        phoneme_pitches = self._average_pitch_energy_by_duration(
-                            pitches, phoneme_durations, phoneme_lengths
-                        )
-                    if energies is not None and predicted_energy is not None:
-                        phoneme_energies = self._average_pitch_energy_by_duration(
-                            energies, phoneme_durations, phoneme_lengths
-                        )
-
-                    # Loss calculation
+                    # Loss calculation — pass frame-level pitch/energy targets directly.
+                    # losses.py detects they are already frame-level and aligns lengths
+                    # without phoneme expansion (fixes double-averaging that froze f0_RMSE).
                     total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
                         predicted_mel, predicted_log_durations, predicted_stop_logits,
                         mel_specs, phoneme_durations, stop_token_targets,
                         mel_lengths, phoneme_lengths,
-                        predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+                        predicted_pitch, predicted_energy, pitches, energies
                     )
 
                     # Log spectrograms for first validation batch only
@@ -2842,26 +2832,19 @@ class KokoroTrainer:
                 logger.error(f"predicted_energy: {torch.isnan(predicted_energy).sum()} NaNs, {torch.isinf(predicted_energy).sum()} Infs")
             return None
 
-        # --- Pitch/energy mel-frame → phoneme-level averaging ------------
-        phoneme_pitches  = None
-        phoneme_energies = None
-        if pitches is not None and predicted_pitch is not None:
-            phoneme_pitches = self._average_pitch_energy_by_duration(
-                pitches, phoneme_durations, phoneme_lengths
-            )
-        if energies is not None and predicted_energy is not None:
-            phoneme_energies = self._average_pitch_energy_by_duration(
-                energies, phoneme_durations, phoneme_lengths
-            )
-
         # --- Loss calculation ---------------------------------------------
+        # Pass frame-level pitch/energy targets directly to losses.py, which
+        # detects they are already frame-level and skips phoneme expansion.
+        # Previously this block averaged targets to phoneme-level first, then
+        # losses.py expanded them back — creating phoneme-constant targets that
+        # prevented the pitch predictor from learning intra-phoneme variation.
         with self.get_autocast_context():
             total_loss, loss_mel, loss_duration, loss_stop_token, \
                 loss_pitch, loss_energy = self._calculate_losses(
                     predicted_mel, predicted_log_durations, predicted_stop_logits,
                     mel_specs, phoneme_durations, stop_token_targets,
                     mel_lengths, phoneme_lengths,
-                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies,
+                    predicted_pitch, predicted_energy, pitches, energies,
                 )
 
         # --- Finite-loss guard -------------------------------------------

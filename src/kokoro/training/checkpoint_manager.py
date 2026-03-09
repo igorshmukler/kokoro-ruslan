@@ -412,28 +412,51 @@ def load_checkpoint(
             # Define the namespace prefixes that represent newly-added sub-modules
             _NEW_VARIANCE_PREFIX = 'duration_adaptor.variance_adaptor.'
 
-            all_missing_are_new_variance = missing_keys and all(
-                k.startswith(_NEW_VARIANCE_PREFIX) for k in missing_keys
-            )
-            no_unexpected = not unexpected_keys
+            # Positional encoding migration: checkpoints trained with ALiBi decoder
+            # self-attention store 'alibi_slopes' buffers.  After the switch to RoPE
+            # (which uses persistent=False buffers — not in state_dict), these become
+            # unexpected keys.  They are deterministic constants (fixed function of
+            # num_heads); discarding them is safe.
+            _ALIBI_SUFFIX = '.alibi_slopes'
 
-            if all_missing_are_new_variance and no_unexpected:
-                logger.warning(
-                    "Checkpoint is missing variance_adaptor sub-module weights "
-                    f"({len(missing_keys)} keys). This is an expected architecture "
-                    "migration (old checkpoint predates the restructured VarianceAdaptor). "
-                    "Loading shared weights and initialising missing keys from scratch."
-                )
+            all_missing_are_known = (
+                not missing_keys
+                or all(k.startswith(_NEW_VARIANCE_PREFIX) for k in missing_keys)
+            )
+            all_unexpected_are_known = (
+                not unexpected_keys
+                or all(k.endswith(_ALIBI_SUFFIX) for k in unexpected_keys)
+            )
+
+            if all_missing_are_known and all_unexpected_are_known:
+                if missing_keys:
+                    logger.warning(
+                        "Checkpoint is missing variance_adaptor sub-module weights "
+                        f"({len(missing_keys)} keys). This is an expected architecture "
+                        "migration (old checkpoint predates the restructured VarianceAdaptor). "
+                        "Loading shared weights and initialising missing keys from scratch."
+                    )
+                if unexpected_keys:
+                    logger.warning(
+                        f"Checkpoint contains {len(unexpected_keys)} legacy ALiBi positional "
+                        "encoding buffer(s) (alibi_slopes) that are not used by the current "
+                        "RoPE-based model.  These will be discarded."
+                    )
                 # Load the compatible weights; missing keys keep their randomly-initialised values
                 incompatible = model.load_state_dict(model_state_dict, strict=False)
-                if incompatible.unexpected_keys:
+                residual_unexpected = [
+                    k for k in incompatible.unexpected_keys
+                    if not k.endswith(_ALIBI_SUFFIX)
+                ]
+                if residual_unexpected:
                     raise RuntimeError(
-                        "Partial checkpoint load produced unexpected keys, aborting. "
-                        f"Unexpected: {incompatible.unexpected_keys}"
+                        "Partial checkpoint load produced unexpected non-migration keys, aborting. "
+                        f"Unexpected: {residual_unexpected}"
                     )
                 logger.info(
-                    f"Partial load succeeded. {len(incompatible.missing_keys)} variance_adaptor "
-                    "keys will train from random initialisation."
+                    f"Partial load succeeded. "
+                    f"{len(incompatible.missing_keys)} keys initialised from scratch, "
+                    f"{len(incompatible.unexpected_keys)} legacy keys discarded."
                 )
             else:
                 raise RuntimeError(

@@ -107,20 +107,22 @@ def calculate_training_losses(
     loss_pitch = torch.tensor(0.0, device=device)
     if predicted_pitch is not None and pitch_targets is not None and criterion_pitch is not None:
         if predicted_pitch.dim() == 2 and predicted_pitch.size(1) != phoneme_durations.size(1):
-            # predicted_pitch is frame-level; pitch_targets is phoneme-level.
-            # Expand phoneme-level targets to frame level so that *every* predicted
-            # frame receives an independent gradient signal.  Previously the code
-            # averaged predictions down to phoneme level first, which collapsed all
-            # intra-phoneme variation to a single gradient value and allowed the
-            # predictor to converge to a constant per phoneme (zero variance).
+            # predicted_pitch is frame-level.
             max_frame_len = mel_mask_2d.size(1)
-            # The model may expand to more frames than the target batch was padded
-            # to (e.g. predicted 258 frames vs target 148).  Truncate to the
-            # shorter of the two so shapes agree for element-wise MSE.
             pred_pitch_aligned = predicted_pitch[:, :max_frame_len]
-            pitch_targets_frame = vectorized_expand_tokens(
-                pitch_targets, phoneme_durations, max_len=max_frame_len
-            )
+            if pitch_targets.size(1) == phoneme_durations.size(1):
+                # targets are phoneme-level (legacy path) → expand to frame-level.
+                # This path is kept for backward compatibility only; the normal
+                # training path now passes frame-level targets directly.
+                pitch_targets_frame = vectorized_expand_tokens(
+                    pitch_targets, phoneme_durations, max_len=max_frame_len
+                )
+            else:
+                # targets are already frame-level → truncate to align lengths.
+                # This is the normal path: frame-level targets passed directly from
+                # the dataset, avoiding the phoneme-averaging that caused f0_RMSE to
+                # freeze (frame→phoneme mean→re-expand = phoneme-constant targets).
+                pitch_targets_frame = pitch_targets[:, :max_frame_len]
             loss_pitch_unreduced = criterion_pitch(pred_pitch_aligned, pitch_targets_frame)
             pitch_valid = mel_mask_2d & torch.isfinite(loss_pitch_unreduced)
         else:
@@ -133,13 +135,17 @@ def calculate_training_losses(
     loss_energy = torch.tensor(0.0, device=device)
     if predicted_energy is not None and energy_targets is not None and criterion_energy is not None:
         if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
-            # Same frame-level expansion for energy — mirrors the pitch above.
+            # predicted_energy is frame-level.
             max_frame_len = mel_mask_2d.size(1)
-            # Truncate in case the model expanded to more frames than the target.
             pred_energy_aligned = predicted_energy[:, :max_frame_len]
-            energy_targets_frame = vectorized_expand_tokens(
-                energy_targets, phoneme_durations, max_len=max_frame_len
-            )
+            if energy_targets.size(1) == phoneme_durations.size(1):
+                # targets are phoneme-level (legacy path) → expand to frame-level.
+                energy_targets_frame = vectorized_expand_tokens(
+                    energy_targets, phoneme_durations, max_len=max_frame_len
+                )
+            else:
+                # targets are already frame-level → truncate to align lengths.
+                energy_targets_frame = energy_targets[:, :max_frame_len]
             loss_energy_unreduced = criterion_energy(pred_energy_aligned, energy_targets_frame)
             energy_valid = mel_mask_2d & torch.isfinite(loss_energy_unreduced)
         else:

@@ -175,7 +175,7 @@ class TrainingConfig:
     grad_explosion_min_ema_steps: int = 100
 
     # Checkpointing
-    save_every: int = 2  # Save every epoch (even if it not the best result); with LR-ramp instability risk, can't afford to lose 2 epochs
+    save_every: int = 5  # Save every X epochs (even if it not the best result); best model is always saved separately
     resume_checkpoint: str = 'auto'
 
     # Validation settings

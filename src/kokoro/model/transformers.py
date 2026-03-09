@@ -611,25 +611,32 @@ class ImprovedTransformerDecoder(nn.Module):
 class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     """
     Compatibility wrapper for TransformerEncoderBlock.
-    Uses pre-norm + GELU — norm is applied BEFORE each sublayer (attention and FFN),
-    which improves training stability and gradient flow.
+    Uses pre-norm + GELU + RoPE relative position encoding.
+    RoPE is MPS-safe (operates in native dtype, no mixed-dtype arithmetic).
+    use_relative_pos was previously False, which disabled all relative position
+    information in the 6 encoder self-attention layers.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  drop_path_rate: float = 0.0):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
-                        activation='gelu', use_relative_pos=False,
-                        drop_path_rate=drop_path_rate)
+                        activation='gelu', use_relative_pos=True,
+                        rel_pos_type='rope', drop_path_rate=drop_path_rate)
 
 
 class TransformerDecoder(ImprovedTransformerDecoder):
     """
     Compatibility wrapper for TransformerDecoder.
-    Uses pre-norm + GELU — norm is applied BEFORE each sublayer (self-attention,
-    cross-attention, and FFN), and a final LayerNorm is applied after all decoder
-    blocks.  This improves training stability and gradient flow compared to post-norm.
+    Uses pre-norm + GELU + RoPE relative position encoding for decoder self-attention.
+    Previously passed no rel_pos_type, defaulting to 'alibi' inside
+    ImprovedTransformerDecoder — but ALiBi is disabled at runtime on MPS
+    (see MultiHeadAttentionImproved.forward), leaving all 6 decoder self-attention
+    layers with zero relative position information on this device.
+    RoPE has no such guard and is fully MPS-safe.
+    Note: existing checkpoints store alibi_slopes buffers for decoder self-attention;
+    checkpoint_manager.py handles this as an expected migration key.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        activation='gelu')
+                        activation='gelu', rel_pos_type='rope')
 
