@@ -399,15 +399,16 @@ def load_checkpoint(
             missing_match = _re.search(r'Missing key\(s\) in state_dict:\s*(.*?)(?:\.\s*Unexpected|\Z)', error_str, _re.DOTALL)
             unexpected_match = _re.search(r'Unexpected key\(s\) in state_dict:\s*(.*?)(?:\.\s*Missing|\Z)', error_str, _re.DOTALL)
 
-            # Collect missing keys
+            # Collect missing keys — use findall to correctly parse quoted key names
+            # (avoids the trailing '."' suffix on the last key when splitting by comma)
             missing_keys: list = []
             if missing_match:
-                missing_keys = [k.strip().strip('"') for k in missing_match.group(1).split(',') if k.strip()]
+                missing_keys = _re.findall(r'"([^"]+)"', missing_match.group(1))
 
             # Collect unexpected keys (keys in ckpt but not in model)
             unexpected_keys: list = []
             if unexpected_match:
-                unexpected_keys = [k.strip().strip('"') for k in unexpected_match.group(1).split(',') if k.strip()]
+                unexpected_keys = _re.findall(r'"([^"]+)"', unexpected_match.group(1))
 
             # Define the namespace prefixes that represent newly-added sub-modules
             _NEW_VARIANCE_PREFIX = 'duration_adaptor.variance_adaptor.'
