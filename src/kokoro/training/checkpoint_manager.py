@@ -545,15 +545,23 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
 
         # Restore best validation loss so early-stopping and best-model saving
         # resume from the correct baseline rather than float('inf').
-        # load_checkpoint() only sets trainer.best_loss (from the 'loss'/train-loss
-        # key); the training loop checks trainer.best_val_loss, so without this
-        # the first post-resume epoch always "improves by inf" and overwrites the
-        # best checkpoint even when the new validation loss is actually worse.
-        if 'val_loss' in checkpoint:
+        # Prefer the explicit 'best_val_loss' key (saved since the epoch-4 fix);
+        # fall back to 'val_loss' for older checkpoints that only stored the
+        # current-epoch validation loss.
+        if 'best_val_loss' in checkpoint and checkpoint['best_val_loss'] is not None:
+            trainer.best_val_loss = float(checkpoint['best_val_loss'])
+            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint (explicit key)")
+        elif 'val_loss' in checkpoint and checkpoint['val_loss'] is not None:
             trainer.best_val_loss = float(checkpoint['val_loss'])
-            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint")
+            logger.info(f"Restored best_val_loss={trainer.best_val_loss:.4f} from checkpoint (val_loss fallback)")
         else:
             logger.info("No val_loss in checkpoint; best_val_loss remains inf (first epoch will always save)")
+
+        if 'best_val_epoch' in checkpoint and checkpoint['best_val_epoch'] is not None:
+            trainer.best_val_epoch = int(checkpoint['best_val_epoch'])
+            logger.info(f"Restored best_val_epoch={trainer.best_val_epoch} from checkpoint")
+        else:
+            logger.info("No best_val_epoch in checkpoint; best_val_epoch remains -1")
 
     trainer.dataset.phoneme_processor = phoneme_processor
 
