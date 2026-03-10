@@ -604,17 +604,11 @@ class ImprovedTransformerDecoder(nn.Module):
         return output, updated_caches
 
 
-# --- Compatibility Layer for Original Model (if needed) ---
-# If your main model (KokoroModel) expects 'TransformerEncoderBlock' and 'TransformerDecoder'
-# as directly defined classes (not the 'Improved' ones), these wrappers ensure compatibility.
-
 class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     """
     Compatibility wrapper for TransformerEncoderBlock.
     Uses pre-norm + GELU + RoPE relative position encoding.
     RoPE is MPS-safe (operates in native dtype, no mixed-dtype arithmetic).
-    use_relative_pos was previously False, which disabled all relative position
-    information in the 6 encoder self-attention layers.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  drop_path_rate: float = 0.0):
@@ -627,13 +621,7 @@ class TransformerDecoder(ImprovedTransformerDecoder):
     """
     Compatibility wrapper for TransformerDecoder.
     Uses pre-norm + GELU + RoPE relative position encoding for decoder self-attention.
-    Previously passed no rel_pos_type, defaulting to 'alibi' inside
-    ImprovedTransformerDecoder — but ALiBi is disabled at runtime on MPS
-    (see MultiHeadAttentionImproved.forward), leaving all 6 decoder self-attention
-    layers with zero relative position information on this device.
-    RoPE has no such guard and is fully MPS-safe.
-    Note: existing checkpoints store alibi_slopes buffers for decoder self-attention;
-    checkpoint_manager.py handles this as an expected migration key.
+    RoPE is fully MPS-safe.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int):

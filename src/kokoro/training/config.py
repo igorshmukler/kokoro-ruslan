@@ -25,14 +25,14 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.3  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
+    max_lr_multiplier: float = 1.2  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
     pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
     # 1.5 gives peak encoder = 1e-4 × 1.3 (max_lr) × 1.5 = 1.95e-4
     # (was 2.25e-4 with max_lr_mult=1.5; ep7 spiked → reduced max_lr first)
-    encoder_lr_multiplier: float = 1.5
+    encoder_lr_multiplier: float = 1.3
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -73,7 +73,7 @@ class TrainingConfig:
     # With pos_weight=100 the weight must be scaled down proportionally from the
     # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
     #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
-    stop_token_loss_weight: float = 0.075
+    stop_token_loss_weight: float = 0.06
     pitch_loss_weight: float = 1.0  # Normalized to [0,1]; 1.0 gives pitch predictor adequate gradient signal vs mel loss
     energy_loss_weight: float = 1.0  # Normalized to [0,1]; matched to pitch_loss_weight
 
@@ -112,7 +112,7 @@ class TrainingConfig:
     # well (0.175→0.133) but mid-epoch stop-burst spikes (8.9, 6.9 in ep7) persist.
     # pos_weight=30 halves gradient amplitude again; stop predictor has shown it can
     # learn reliably at this level (was default before the regression fixes).
-    stop_token_pos_weight: float = 30.0
+    stop_token_pos_weight: float = 50.0
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
@@ -158,7 +158,7 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 1.5  # Global gradient clip ceiling; lowered from 2.0 (secondary guard with max_lr_mult=1.3)
+    max_grad_norm: float = 2.0  # Global gradient clip ceiling; lowered from 2.0 (secondary guard with max_lr_mult=1.3)
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
