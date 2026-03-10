@@ -685,6 +685,9 @@ class KokoroTrainer:
         self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
         self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
         self.ffn_spike_clip_norm = getattr(config, 'ffn_spike_clip_norm', 15.0)
+        # Stop-head isolation clip: applied only to stop_token_predictor.weight/.bias
+        # before the global clip, so stop-gradient spikes cannot consume the mel budget.
+        self.stop_head_spike_clip_norm = getattr(config, 'stop_head_spike_clip_norm', 1.0)
 
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
@@ -1085,7 +1088,10 @@ class KokoroTrainer:
 
     def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
         """Clip localized spikes in mel projection/attention/FFN gradients before global norm checks."""
-        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0 and self.ffn_spike_clip_norm <= 0:
+        if (self.projection_spike_clip_norm <= 0
+                and self.attention_spike_clip_norm <= 0
+                and self.ffn_spike_clip_norm <= 0
+                and self.stop_head_spike_clip_norm <= 0):
             return {}
 
         projection_params = {
@@ -1093,6 +1099,13 @@ class KokoroTrainer:
             'mel_projection_in.bias',
             'mel_projection_out.weight',
             'mel_projection_out.bias',
+        }
+
+        # Stop-head parameters get their own tighter per-parameter ceiling so that
+        # a stop-gradient spike cannot bleed into mel/encoder gradient budget.
+        stop_head_params = {
+            'stop_token_predictor.weight',
+            'stop_token_predictor.bias',
         }
 
         attention_name_fragments = (
@@ -1123,6 +1136,8 @@ class KokoroTrainer:
             max_norm = None
             if name in projection_params and projection_max_norm > 0:
                 max_norm = projection_max_norm
+            elif name in stop_head_params and float(self.stop_head_spike_clip_norm) > 0:
+                max_norm = float(self.stop_head_spike_clip_norm)
             elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
                 max_norm = attention_max_norm
             elif encoder_ffn_max_norm > 0 and name.startswith('transformer_encoder_layers.') and any(fragment in name for fragment in ffn_name_fragments):

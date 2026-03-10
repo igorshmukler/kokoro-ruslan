@@ -28,6 +28,42 @@ logger = logging.getLogger(__name__)
 
 FEATURE_CACHE_VERSION = 6  # bumped: stress_indices added as a parallel phoneme-level tensor
 
+
+def build_stop_token_targets(
+    T: int,
+    tail: int = 4,
+    decay: float = 0.5,
+) -> torch.Tensor:
+    """Build a temporally-smoothed stop-token target vector of length T.
+
+    The stop boundary at frame T-1 is given target 1.0.  The ``tail``
+    frames immediately before it receive an exponentially decaying value
+    so the positive gradient is spread over a short window rather than
+    concentrated in a single frame:
+
+        frame[T-1-k] = decay^k,  for k = 0 … min(tail, T-1)
+
+    With ``tail=0`` the output is the original hard [0, 0, …, 0, 1] target.
+
+    Args:
+        T:      Number of mel frames (must be ≥ 0).
+        tail:   Number of frames before the stop frame to include in the
+                smoothing ramp.  Clamped to ``T-1`` automatically.
+        decay:  Per-step decay factor (0 < decay ≤ 1).  A value of 0.5
+                gives the tail [0.0625, 0.125, 0.25, 0.5, 1.0] for tail=4.
+
+    Returns:
+        Float32 tensor of shape (T,) with values in [0, 1].
+    """
+    targets = torch.zeros(T, dtype=torch.float32)
+    if T > 0:
+        n = min(tail + 1, T)           # frames to fill: stop frame + preceding tail
+        offsets = torch.arange(n, dtype=torch.float32)
+        values  = decay ** offsets     # [1.0, decay, decay^2, …]  largest at offset=0
+        targets[T - n : T] = values.flip(0)   # fill …→small→large→1.0
+    return targets
+
+
 try:
     from kokoro.model.variance_predictor import PitchExtractor, EnergyExtractor
     VARIANCE_AVAILABLE = True
@@ -726,9 +762,13 @@ class RuslanDataset(Dataset):
             )
 
         # --- Generate Stop Token Targets ---
-        stop_token_targets = torch.zeros(mel_spec.shape[1], dtype=torch.float32)
-        if mel_spec.shape[1] > 0:
-            stop_token_targets[-1] = 1.0
+        # Temporally-smoothed: 1.0 at the last frame with an exponentially
+        # decaying tail.  tail=0 → original hard target for backward-compat.
+        stop_token_targets = build_stop_token_targets(
+            T=mel_spec.shape[1],
+            tail=int(getattr(self.config, 'stop_token_smooth_tail', 4)),
+            decay=float(getattr(self.config, 'stop_token_smooth_decay', 0.5)),
+        )
 
         # --- Extract Pitch and Energy (if variance prediction enabled) ---
         pitch = None

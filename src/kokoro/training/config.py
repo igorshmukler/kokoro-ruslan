@@ -68,12 +68,12 @@ class TrainingConfig:
 
     # Loss weights
     duration_loss_weight: float = 0.35
-    # Stop token BCE contribution to total loss.
-    # Calibration: effective stop contribution = stop_token_loss_weight × pos_weight.
-    # With pos_weight=100 the weight must be scaled down proportionally from the
-    # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
-    #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
-    stop_token_loss_weight: float = 0.06
+    # Global scaling of the stop-token loss in the total loss sum.
+    # This parameter controls only how much stop learning contributes to the
+    # total gradient — it is intentionally decoupled from stop_token_pos_weight.
+    # Rule of thumb: stop should contribute ~1–3% of the mel gradient budget.
+    # Set independently of pos_weight; do NOT re-derive from pos_weight.
+    stop_token_loss_weight: float = 0.010
     pitch_loss_weight: float = 1.0  # Normalized to [0,1]; 1.0 gives pitch predictor adequate gradient signal vs mel loss
     energy_loss_weight: float = 1.0  # Normalized to [0,1]; matched to pitch_loss_weight
 
@@ -92,27 +92,29 @@ class TrainingConfig:
     # Start at epoch 23: 3 epochs after the LR peak, once the schedule is
     # descending and the model has stabilised.
     spec_augment_start_epoch: int = 23
-    # Stop token class-imbalance correction.
-    # BCE on stop tokens is skewed ~200:1 (negative frames : positive stop frame
-    # per average-length Russian utterance).  pos_weight=150 gave true class-balance
-    # during warmup but produced batch stop-loss spikes (>1.5 vs ~0.5 average)
-    # once the OneCycleLR ramp raised the LR past 1.2e-4.  With pos_weight=150 the
-    # gradient for a single missed stop token is 150× a non-stop frame; at higher
-    # LRs this overwhelms the mel gradient and corrupts the decoder representation
-    # (observed: stop spikes → grad_norm spikes to 18, stop val rising from
-    # 0.41 at epoch 3 to 0.64 at epoch 6 while mel simultaneously regressed).
-    # Data-driven calculation (500-sample RUSLAN cache): mean mel length = 137.8 frames
-    # → actual neg/pos imbalance = 136.8:1.  Previous value of 30 corrected only 22%.
-    # 100 ≈ 73% correction — enough signal to learn stop reliably without over-correcting
-    # (full correction at 137 causes premature stops during inference).
-    # Lowered to 50 (36% correction): at rising LR the 100× per-stop gradient caused
-    # stop loss spikes to 1.21 and grad_norm max to 39.8 by epoch 8.  Halving reduces
-    # the per-stop gradient magnitude by 2× while still providing adequate stop signal.
-    # Lowered to 30 (22% correction): with max_lr_multiplier=1.5, val_stop is learning
-    # well (0.175→0.133) but mid-epoch stop-burst spikes (8.9, 6.9 in ep7) persist.
-    # pos_weight=30 halves gradient amplitude again; stop predictor has shown it can
-    # learn reliably at this level (was default before the regression fixes).
+    # Class-imbalance correction for stop-token BCE.
+    # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
+    # so the model cannot collapse to always-predict-no-stop.
+    # Set this to approximate the actual neg/pos frame ratio in the corpus
+    # (500-sample RUSLAN: mean mel length ≈ 138 frames → ratio ≈ 137:1).
+    # This parameter is intentionally decoupled from stop_token_loss_weight:
+    #   • stop_token_pos_weight  → fixes class balance (sampling concern)
+    #   • stop_token_loss_weight → controls global loss contribution (scale concern)
+    # Do NOT scale pos_weight up/down to compensate for the global weight; adjust
+    # stop_token_loss_weight independently for that purpose.
+    # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 chosen as
+    # stable partial correction (~36%) that keeps the stop predictor learning.
     stop_token_pos_weight: float = 50.0
+    # Temporal smoothing of stop-token targets.
+    # Instead of a single hard 1.0 at the last frame, a short exponentially
+    # decaying tail is added to the frames immediately before it:
+    #   frame[T-1]          = 1.0          (the actual stop boundary)
+    #   frame[T-1-k]        = decay^k       for k = 1 … stop_token_smooth_tail
+    # This spreads the positive gradient over several frames, eliminating the
+    # single-frame spike that can cause grad-norm bursts when pos_weight is large.
+    # Set stop_token_smooth_tail=0 to disable (recover the original hard target).
+    stop_token_smooth_tail: int = 4
+    stop_token_smooth_decay: float = 0.5
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
@@ -170,6 +172,15 @@ class TrainingConfig:
     # Raised to 100.0: real instabilities are still caught by the global clip_grad_norm;
     # this pre-clip now only fires on genuine spikes, not on normal encoder gradients.
     encoder_ffn_spike_clip_norm: float = 100.0
+    # Per-parameter clip norm applied exclusively to the stop-token head
+    # (stop_token_predictor.weight and .bias) before the global clip.
+    # The stop head is a single Linear(hidden_dim→1); its gradient can spike disproportionately
+    # when pos_weight is large or the smoothing tail has a frame error near the boundary.
+    # A tight ceiling here prevents the stop head from corrupting the mel decoder's gradient
+    # budget while still giving the head a meaningful update signal.
+    # Set ≤ 0 to disable.  Chosen conservatively: the mel projection norms rarely exceed
+    # ~5 at steady state, so 1.0 is tight enough to isolate the head without starving it.
+    stop_head_spike_clip_norm: float = 1.0
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100
