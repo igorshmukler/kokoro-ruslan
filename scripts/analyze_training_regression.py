@@ -11,6 +11,7 @@ weight jump (likely where regression started).
 
 import sys
 import os
+import argparse
 # Make kokoro package importable when running from the project root
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 import torch
@@ -934,6 +935,240 @@ def tb_print_recommendations(ea):
         print()
 
 
+def tb_print_val_mel_series(ea):
+    """Per-epoch val mel with explicit Δ and regression flags."""
+    vm = _get(ea, "loss/val_mel_epoch")
+    if not vm:
+        return
+    print("\n" + "=" * 90)
+    print("TENSORBOARD — Val Mel Epoch Series")
+    print("=" * 90)
+    prev = None
+    for i, (s, v) in enumerate(vm):
+        if prev is None:
+            flag = ""
+        elif v > prev:
+            flag = f"  ▲ +{v - prev:.5f}  ← REGRESSION"
+        else:
+            flag = f"  ▼ {v - prev:+.5f}"
+        print(f"  Ep{i+1:02d}  step={s:>5}  val_mel={v:.5f}{flag}")
+        prev = v
+    # Summary
+    if len(vm) >= 2:
+        vals = [v for _, v in vm]
+        best = min(vals)
+        best_ep = vals.index(best) + 1
+        print(f"\n  best={best:.5f} at Ep{best_ep:02d}  "
+              f"total Δ={vals[-1] - vals[0]:+.5f}  "
+              f"last={vals[-1]:.5f}")
+
+
+def tb_print_mel_stop_window_correlation(ea):
+    """
+    200-step windowed table of mel mean, stop mean, and LR% side by side.
+    Makes it easy to see whether stop and mel move together (LR-driven)
+    or stop leads mel (stop-token source).
+    """
+    mel  = _get(ea, "loss/mel")
+    stop = _get(ea, "loss/stop")
+    lr   = _get(ea, "stats/lr_decoder")
+
+    if not mel:
+        return
+
+    print("\n" + "=" * 90)
+    print("TENSORBOARD — Mel vs Stop Loss Correlation (200-step windows)")
+    print("=" * 90)
+    print(f"  {'Window':<12}  {'mel mean':>9}  {'Δmel':>6}  "
+          f"{'stop mean':>9}  {'Δstop':>6}  {'LR%':>6}  co-move?")
+    print("  " + "-" * 72)
+
+    max_step  = mel[-1][0] if mel else 0
+    lr_max    = max(v for _, v in lr) if lr else 1.0
+    lr_lookup = {s: v for s, v in lr}
+
+    prev_mel_m = prev_stop_m = None
+    w_start = 0
+    w_size  = 200
+
+    # find first window that has data
+    first_step = mel[0][0]
+    w_start = (first_step // w_size) * w_size
+
+    while w_start <= max_step:
+        w_end = w_start + w_size
+        seg_mel  = [v for s, v in mel  if w_start <= s < w_end]
+        seg_stop = [v for s, v in stop if w_start <= s < w_end] if stop else []
+        # LR: nearest sample at midpoint
+        mid = w_start + w_size // 2
+        lr_here = min(lr_lookup.items(), key=lambda x: abs(x[0] - mid))[1] if lr_lookup else 0
+        lr_pct  = 100.0 * lr_here / lr_max if lr_max else 0
+
+        if seg_mel:
+            mm = statistics.mean(seg_mel)
+            sm = statistics.mean(seg_stop) if seg_stop else None
+
+            dmel  = mm - prev_mel_m  if prev_mel_m  is not None else None
+            dstop = (sm - prev_stop_m) if (prev_stop_m is not None and sm is not None) else None
+
+            mel_arr  = ("▲" if dmel  and dmel  > 0 else "▼") if dmel  is not None else " "
+            stop_arr = ("▲" if dstop and dstop > 0 else "▼") if dstop is not None else " "
+
+            # co-movement: both up or both down
+            comove = ""
+            if dmel is not None and dstop is not None:
+                if (dmel > 0 and dstop > 0):
+                    comove = "both↑ (LR pressure)"
+                elif (dmel < 0 and dstop < 0):
+                    comove = "both↓ (improving)"
+                elif dstop > 0 and dmel <= 0:
+                    comove = "stop↑ only (stop source)"
+                elif dmel > 0 and dstop <= 0:
+                    comove = "mel↑ only"
+
+            dmel_str  = f"{dmel:+.4f}" if dmel  is not None else "      "
+            dstop_str = f"{dstop:+.4f}" if dstop is not None else "      "
+            sm_str    = f"{sm:.5f}" if sm is not None else "       ?"
+
+            print(f"  {w_start:>5}–{w_end:<5}  {mm:>9.5f} {mel_arr} {dmel_str}  "
+                  f"{sm_str} {stop_arr} {dstop_str}  {lr_pct:>5.1f}%  {comove}")
+
+            prev_mel_m  = mm
+            prev_stop_m = sm
+
+        w_start = w_end
+
+
+def tb_print_lr_phase_detail(ea):
+    """
+    Detailed LR table from the point it reaches 90% of peak to current.
+    Shows % of peak per window and flags when decay begins.
+    """
+    lr  = _get(ea, "stats/lr_decoder")
+    enc = _get(ea, "stats/lr_encoder")
+    if not lr:
+        return
+
+    print("\n" + "=" * 90)
+    print("TENSORBOARD — LR Phase Detail (from 90% of peak onward)")
+    print("=" * 90)
+
+    max_lr    = max(v for _, v in lr)
+    curr_lr   = lr[-1][1]
+    curr_step = lr[-1][0]
+
+    # Find peak step (first step where LR >= 99% of max)
+    peak_step = next((s for s, v in lr if v >= max_lr * 0.99), None)
+    # Find 90% threshold step
+    thresh_90_step = next((s for s, v in lr if v >= max_lr * 0.90), None)
+
+    print(f"  peak LR : {max_lr:.8f}  at step ~{peak_step}")
+    print(f"  curr LR : {curr_lr:.8f}  at step {curr_step}  ({100 * curr_lr / max_lr:.1f}% of peak)")
+
+    # Phase
+    tail = [v for _, v in lr[-10:]]
+    still_rising = len(tail) >= 2 and tail[-1] > tail[0]
+    if still_rising:
+        phase = "WARMUP → approaching peak"
+    elif curr_lr >= max_lr * 0.99:
+        phase = "AT / NEAR PEAK"
+    elif curr_lr >= max_lr * 0.80:
+        phase = f"EARLY DECAY ({100 * curr_lr / max_lr:.1f}% of peak)"
+    else:
+        phase = f"DECAY ({100 * curr_lr / max_lr:.1f}% of peak)"
+    print(f"  phase   : {phase}")
+
+    # Show every ~100-step bucket from thresh_90_step onward
+    if thresh_90_step is not None:
+        print(f"\n  Step-by-step from ~90% of peak (step {thresh_90_step}):")
+        print(f"  {'step':>6}  {'lr_decoder':>12}  {'% peak':>7}  {'lr_encoder':>12}  {'% peak':>7}")
+        print("  " + "-" * 56)
+        enc_lookup = {s: v for s, v in enc} if enc else {}
+        seen_buckets = set()
+        for s, v in lr:
+            if s < thresh_90_step:
+                continue
+            bucket = (s // 100) * 100
+            if bucket in seen_buckets:
+                continue
+            seen_buckets.add(bucket)
+            dec_pct = 100.0 * v / max_lr
+            enc_v   = enc_lookup.get(s)
+            enc_max = max(v2 for _, v2 in enc) if enc else 1.0
+            enc_str = f"{enc_v:.8f}  {100*enc_v/enc_max:>6.1f}%" if enc_v else "          ?       ?"
+            flag = "  ← peak" if abs(s - peak_step) < 100 else ""
+            print(f"  {s:>6}  {v:.8f}  {dec_pct:>6.1f}%{flag}  {enc_str}")
+
+
+def tb_print_late_spike_context(ea):
+    """
+    For every grad spike after the first 10% of training steps,
+    print its LR (as % of peak) and the nearest stop loss value.
+    Makes it easy to attribute each spike to LR pressure vs stop burst.
+    """
+    gn   = _get(ea, "stats/grad_norm")
+    stop = _get(ea, "loss/stop")
+    lr   = _get(ea, "stats/lr_decoder")
+    if not gn:
+        return
+
+    step_range   = gn[-1][0] - gn[0][0]
+    early_cutoff = gn[0][0] + step_range * 0.10
+    late_spikes  = [(s, v) for s, v in gn if s > early_cutoff and v > 5.0]
+
+    if not late_spikes:
+        return
+
+    print("\n" + "=" * 90)
+    print(f"TENSORBOARD — Late Grad Spike Context ({len(late_spikes)} spikes >5.0 after init)")
+    print("=" * 90)
+
+    lr_max    = max(v for _, v in lr) if lr else 1.0
+    lr_lookup = {s: v for s, v in lr} if lr else {}
+    stop_list = stop if stop else []
+
+    # stop p75 for "elevated" threshold
+    stop_p75 = _pct(stop, 75) if stop else 0.0
+
+    print(f"  {'step':>6}  {'raw grad':>9}  {'lr %peak':>9}  {'stop nearby':>12}  {'stop elevated?':>15}  attribution")
+    print("  " + "-" * 80)
+
+    for s, v in sorted(late_spikes):
+        lr_here  = min(lr_lookup.items(), key=lambda x: abs(x[0] - s))[1] if lr_lookup else 0
+        lr_pct   = 100.0 * lr_here / lr_max if lr_max else 0
+        stop_here = min(stop_list, key=lambda x: abs(x[0] - s))[1] if stop_list else 0
+        stop_flag = "YES ▲" if stop_here > stop_p75 else "no"
+
+        # attribution heuristic
+        if stop_here > stop_p75 and lr_pct < 97:
+            attr = "stop burst"
+        elif lr_pct >= 97 and stop_here <= stop_p75:
+            attr = "LR at peak"
+        elif lr_pct >= 97 and stop_here > stop_p75:
+            attr = "LR peak + stop"
+        else:
+            attr = "outlier batch"
+
+        print(f"  {s:>6}  {v:>9.3f}  {lr_pct:>8.1f}%  {stop_here:>12.5f}  {stop_flag:>15}  {attr}")
+
+    # summary
+    attrs = []
+    for s, v in late_spikes:
+        lr_here  = min(lr_lookup.items(), key=lambda x: abs(x[0] - s))[1] if lr_lookup else 0
+        lr_pct   = 100.0 * lr_here / lr_max if lr_max else 0
+        stop_here = min(stop_list, key=lambda x: abs(x[0] - s))[1] if stop_list else 0
+        if stop_here > stop_p75 and lr_pct < 97:
+            attrs.append("stop")
+        elif lr_pct >= 97 and stop_here <= stop_p75:
+            attrs.append("lr")
+        elif lr_pct >= 97 and stop_here > stop_p75:
+            attrs.append("both")
+        else:
+            attrs.append("batch")
+    counts = {k: attrs.count(k) for k in set(attrs)}
+    print(f"\n  Attribution summary: " + "  ".join(f"{k}={n}" for k, n in sorted(counts.items())))
+
+
 def tb_analyze(log_dir: Path = TB_LOG_DIR):
     ea = _load_tb(log_dir)
     if ea is None:
@@ -943,15 +1178,36 @@ def tb_analyze(log_dir: Path = TB_LOG_DIR):
     print(f"[TensorBoard] {len(tags)} scalar tags available: {tags}")
 
     tb_print_step_loss_summary(ea)
+    tb_print_val_mel_series(ea)
     tb_print_epoch_table(ea)
+    tb_print_mel_stop_window_correlation(ea)
     tb_print_stop_token_analysis(ea)
     tb_print_gradient_analysis(ea)
+    tb_print_late_spike_context(ea)
     tb_print_lr_trajectory(ea)
+    tb_print_lr_phase_detail(ea)
     tb_print_regression_flags(ea)
     tb_print_recommendations(ea)
 
 
 def main():
+    global CHECKPOINT_DIR, TB_LOG_DIR
+
+    parser = argparse.ArgumentParser(
+        description="Checkpoint + TensorBoard regression analysis."
+    )
+    parser.add_argument(
+        "--model",
+        default=str(CHECKPOINT_DIR),
+        metavar="DIR",
+        help="Path to the model directory containing checkpoints and a logs/ sub-folder "
+             f"(default: {CHECKPOINT_DIR})",
+    )
+    args = parser.parse_args()
+
+    CHECKPOINT_DIR = Path(args.model)
+    TB_LOG_DIR     = CHECKPOINT_DIR / "logs"
+
     if not CHECKPOINT_DIR.is_dir():
         print(f"Directory not found: {CHECKPOINT_DIR}")
         return
@@ -981,7 +1237,7 @@ def main():
         print("\nNo NaN or Inf weights found in any checkpoint. Good.")
 
     # ── TensorBoard section ───────────────────────────────────────────────────
-    tb_analyze()
+    tb_analyze(TB_LOG_DIR)
 
 
 if __name__ == "__main__":

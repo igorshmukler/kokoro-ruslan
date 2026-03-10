@@ -267,6 +267,58 @@ Tips:
 - Use `--verbose` during a short validation run to get additional diagnostics printed to the training logs that complement TensorBoard (duration pred vs target stats, mask counts).
 
 
+## Diagnostics & Analysis
+
+`scripts/analyze_training_regression.py` is the primary diagnostic tool for monitoring training health and catching regressions. It combines checkpoint weight inspection with a comprehensive TensorBoard metrics analysis in a single terminal report.
+
+### Usage
+
+```shell
+# Default: reads my_model/ (checkpoints) and my_model/logs/ (TensorBoard events)
+python scripts/analyze_training_regression.py
+
+# Custom model directory
+python scripts/analyze_training_regression.py --model path/to/model
+```
+
+**Requirements:** `tensorboard` package installed; checkpoints present at `<model_dir>/checkpoint_epoch_N.pth`; TensorBoard event files in `<model_dir>/logs/`.
+
+### What it produces
+
+**Checkpoint weight analysis** (per epoch, per layer):
+- Weight norm table: norm, delta-norm, NaN/Inf flags for every saved checkpoint
+- Key layer weight norms and deltas across epochs (encoder, decoder, postnet, stop token projection)
+- Top-10 largest weight changes per epoch transition — useful for spotting sudden layer-level drift
+
+**TensorBoard analysis** (printed in order):
+| Section | What it shows |
+|---|---|
+| Step-level loss summary | All 6 losses (total, mel, duration, stop, pitch, energy): first/last/Δ/trend/mean/min/max |
+| Val mel epoch series | Per-epoch validation mel loss with explicit ▲/▼ Δ, best epoch, total Δ |
+| Epoch train/val table | Train vs val side-by-side per epoch with ▲ regression flags |
+| Mel vs stop 200-step window correlation | 200-step windows: mel mean/Δ, stop mean/Δ, LR%, co-move label (`both↑ LR pressure`, `both↓ improving`, `stop↑ only`, `mel↑ only`) |
+| Stop token analysis | Loss percentiles (p50/p90/p99), burst detection split first vs second half |
+| Gradient health | Spike counts (>5/10/20 thresholds), overall + per-epoch clipping saturation % |
+| Late spike context | Per-spike: raw grad norm, LR % of peak, stop nearby, stop elevated, attribution label (`LR at peak`, `LR peak + stop`, `stop burst`, `outlier batch`) |
+| LR trajectory | 8-point sample across training, phase detection (warmup/ramp/peak/decay) |
+| LR phase detail | 100-step resolution from 90% of peak — decoder and encoder % of peak |
+| Regression flag summary | PASS/WARN/FAIL checklist for 6 key indicators |
+| Analysis & recommendations | Prioritized CRITICAL / WARN / INFO recommendations with specific config guidance |
+
+### Interpreting co-move labels
+- **`both↑ (LR pressure)`** — mel and stop both rising together; root cause is LR, not a stop-specific problem
+- **`both↓ (improving)`** — healthy descent
+- **`stop↑ only (stop source)`** — stop rising while mel is stable or falling; investigate `stop_token_pos_weight` or `stop_token_loss_weight`
+- **`mel↑ only`** — mel regression without stop involvement; check for outlier batches or LR decay issues
+
+### Interpreting spike attributions
+| Label | Condition |
+|---|---|
+| `LR at peak` | LR ≥ 97% of peak, stop not elevated |
+| `LR peak + stop` | LR ≥ 97% of peak AND stop > p75 |
+| `stop burst` | Stop > p75 AND LR < 97% of peak |
+| `outlier batch` | Neither LR pressure nor elevated stop |
+
 ## Troubleshooting
 
 - MPS out-of-memory: lower `--max-frames` and/or `--batch-size`; see [MPS OOM Solutions](docs/MPS_OOM_SOLUTIONS.md).
