@@ -19,8 +19,8 @@ def test_training_config_convergence_fix_defaults():
     config = TrainingConfig()
 
     # Peak LR raised to allow the model to escape the loss plateau seen at 2e-4
-    assert config.max_lr_multiplier == 1.3, (
-        f"max_lr_multiplier should be 1.3; got {config.max_lr_multiplier}"
+    assert config.max_lr_multiplier == 1.2, (
+        f"max_lr_multiplier should be 1.2; got {config.max_lr_multiplier}"
     )
 
     # Encoder gets a separate higher LR to compensate for its much smaller Adam 2nd moments
