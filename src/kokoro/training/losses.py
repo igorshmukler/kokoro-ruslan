@@ -155,7 +155,6 @@ def calculate_training_losses(
         if energy_valid.any():
             loss_energy = loss_energy_unreduced[energy_valid].mean()
 
-    variance_diverged = False
     if loss_pitch > 10.0 or loss_energy > 10.0:
         logger.warning(f"⚠️  Variance predictor divergence detected - pitch: {loss_pitch:.2f}, energy: {loss_energy:.2f}")
 
@@ -171,25 +170,33 @@ def calculate_training_losses(
             logger.warning(f"   Energy predictions: [{pred_min:.3f}, {pred_max:.3f}]")
             logger.warning(f"   Energy targets: [{targ_min:.3f}, {targ_max:.3f}]")
 
-        logger.warning("   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
-
-        va = getattr(model, 'variance_adaptor', None)
-        if va is not None:
-            if hasattr(va, 'pitch_predictor') and va.pitch_predictor is not None:
-                va.pitch_predictor._init_weights()
-            if hasattr(va, 'energy_predictor') and va.energy_predictor is not None:
-                va.energy_predictor._init_weights()
-
-        loss_pitch = torch.tensor(0.0, device=device)
-        loss_energy = torch.tensor(0.0, device=device)
-        variance_diverged = True
+        # Clamp losses to a safe ceiling rather than zeroing them out or
+        # re-initialising weights mid-forward-pass.
+        #
+        # The previous approach called `_init_weights()` here — after the forward
+        # pass but before `.backward()` — which:
+        #   1. Randomly re-initialised the predictor weights while the corrupt
+        #      activations from those weights were still in the autograd graph,
+        #      so the computation graph referred to the OLD weights but .backward()
+        #      would update the NEW (reset) weights — a silent state mismatch.
+        #   2. Zeroed the pitch/energy loss, giving the variance predictor zero
+        #      gradient signal for that batch, preventing it from learning to
+        #      recover from the diverged state.
+        #   3. If triggered on consecutive batches the predictor oscillated
+        #      between random reinit and divergence with no chance to stabilise.
+        #
+        # Instead: hard-clamp the loss contribution (same ceiling as the normal
+        # path, already applied below) so the gradient magnitude is bounded but
+        # non-zero.  The predictor receives a corrective signal and can recover
+        # on its own.  If it does not recover within a few batches the finite-loss
+        # guard in _execute_training_step will skip the batch entirely.
+        logger.warning("   Clamping variance loss contribution to 10.0 (no weight reset)")
 
     loss_mel = torch.clamp(loss_mel, max=100.0)
     loss_duration = torch.clamp(loss_duration, max=100.0)
     loss_stop_token = torch.clamp(loss_stop_token, max=100.0)
-    if not variance_diverged:
-        loss_pitch = torch.clamp(loss_pitch, max=10.0)
-        loss_energy = torch.clamp(loss_energy, max=10.0)
+    loss_pitch = torch.clamp(loss_pitch, max=10.0)
+    loss_energy = torch.clamp(loss_energy, max=10.0)
 
     total_loss = (
         loss_mel

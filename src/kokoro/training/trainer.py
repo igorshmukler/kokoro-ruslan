@@ -465,13 +465,17 @@ class KokoroTrainer:
         encoder_lr_mult = float(getattr(config, 'encoder_lr_multiplier', 3.0))
         self._encoder_lr_multiplier = encoder_lr_mult
 
-        # Partition parameters into two groups:
-        #   1. encoder_params — text/stress embeddings + positional encoding +
+        # Partition parameters into three groups:
+        #   1. encoder_params    — text/stress embeddings + positional encoding +
         #      transformer encoder layers, higher LR multiplier, weight_decay=0
         #      (L2 on embedding rows counteracts learned representations; encoder
         #      transformer layers benefit from reduced regularisation given the
         #      elevated LR)
-        #   2. decoder_params — decoder and all other parameters, base LR
+        #   2. decoder_no_decay  — decoder biases and all norm affine params (scale +
+        #      shift).  weight_decay=0: penalising these toward zero fights the
+        #      learned statistics and hurts convergence.
+        #   3. decoder_decay     — all other decoder/variance-predictor weights,
+        #      regularised with the configured weight_decay.
         encoder_prefixes = (
             'text_embedding.',
             'stress_embedding.',
@@ -479,9 +483,17 @@ class KokoroTrainer:
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
         )
+        # Parameter names matching these patterns are excluded from weight decay.
+        # ".bias" catches every bias vector; the norm patterns catch LayerNorm /
+        # RMSNorm / BatchNorm affine weight and bias regardless of nesting depth.
+        _no_decay_suffixes = ('.bias',)
+        _no_decay_substrings = (
+            'norm.weight', 'norm.bias',
+            'layer_norm.weight', 'layer_norm.bias',
+        )
         seen_ids: set = set()
         encoder_params = []
-        decoder_params = []
+        decoder_named: list = []  # (name, param) for further splitting
         for name, param in self.model.named_parameters():
             if id(param) in seen_ids:
                 continue
@@ -489,14 +501,26 @@ class KokoroTrainer:
             if any(name.startswith(prefix) for prefix in encoder_prefixes):
                 encoder_params.append(param)
             else:
-                decoder_params.append(param)
+                decoder_named.append((name, param))
+
+        decoder_no_decay: list = []
+        decoder_decay: list = []
+        for _name, _param in decoder_named:
+            if (any(_name.endswith(s) for s in _no_decay_suffixes)
+                    or any(s in _name for s in _no_decay_substrings)):
+                decoder_no_decay.append(_param)
+            else:
+                decoder_decay.append(_param)
+        decoder_params = [p for _, p in decoder_named]  # kept for logging only
 
         encoder_lr = base_lr * encoder_lr_mult
         param_groups = [
-            {'params': encoder_params, 'lr': encoder_lr,
-             'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas},
-            {'params': decoder_params, 'lr': base_lr,
-             'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
+            {'params': encoder_params,   'lr': encoder_lr, 'weight_decay': 0.0,
+             'eps': adam_eps, 'betas': adam_betas},
+            {'params': decoder_no_decay, 'lr': base_lr,    'weight_decay': 0.0,
+             'eps': adam_eps, 'betas': adam_betas},
+            {'params': decoder_decay,    'lr': base_lr,    'weight_decay': weight_decay,
+             'eps': adam_eps, 'betas': adam_betas},
         ]
         if not encoder_params:
             # Fallback: single group (no identifiable encoder params)
@@ -506,9 +530,10 @@ class KokoroTrainer:
             logger.warning("No encoder params identified for separate LR group — using single param group")
         else:
             logger.info(
-                f"Optimizer param groups: encoder={len(encoder_params)} params "
-                f"(lr={encoder_lr:.2e}, wd=0.0), "
-                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e}, wd={weight_decay})"
+                f"Optimizer param groups: "
+                f"encoder={len(encoder_params)} params (lr={encoder_lr:.2e}, wd=0.0), "
+                f"decoder_no_decay={len(decoder_no_decay)} params (lr={base_lr:.2e}, wd=0.0), "
+                f"decoder_decay={len(decoder_decay)} params (lr={base_lr:.2e}, wd={weight_decay})"
             )
 
         try:
