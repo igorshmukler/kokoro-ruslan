@@ -688,11 +688,25 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             # been changed between runs — a lower new max_lr causes the saved LR to appear
             # near-peak, which jumps the scheduler forward by many epochs on resume.
             _saved_global_step = checkpoint.get('global_step') if checkpoint is not None else None
-            _grad_acc = getattr(config, 'gradient_accumulation_steps', 1)
             if _saved_global_step is not None:
-                # Convert batch-level global_step → optimizer steps (accounting for accumulation)
+                # global_step is saved as current_optimizer_step — already in optimizer-step
+                # units (incremented only on a successful optimizer.step(), never by batch
+                # count or gradient_accumulation_steps).
+                #
+                # OneCycleLR's internal step counter starts at 0 when the manual warmup
+                # ends.  We therefore subtract warmup_steps to get the correct OneCycleLR
+                # position.
+                #
+                # *** DO NOT divide by gradient_accumulation_steps here. ***
+                # global_step is already post-accumulation; dividing by _grad_acc would
+                # halve the resume position, restarting the LR ramp ~1 epoch early on
+                # every resume and causing mel-loss regression (observed epochs 5–6).
+                _warmup_done = (
+                    int(getattr(trainer, 'warmup_steps', 0))
+                    if getattr(trainer, 'use_warmup', False) else 0
+                )
                 target_step = max(0, min(onecycle_steps - 1,
-                                         int(_saved_global_step) // max(1, _grad_acc)))
+                                         int(_saved_global_step) - _warmup_done))
                 # Compute the LR at target_step under the NEW schedule using the OneCycleLR
                 # cosine formula (phase 1: base_lr→max_lr; phase 2: max_lr→final_lr).
                 if target_step <= peak_step:
@@ -705,7 +719,8 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 resume_lr = max(base_lr, min(max_lr, resume_lr))
                 logger.info(
                     f"Step-based scheduler resume: global_step={_saved_global_step} "
-                    f"→ optimizer_step={target_step}/{onecycle_steps}, "
+                    f"(warmup_done={_warmup_done}) "
+                    f"→ onecycle_step={target_step}/{onecycle_steps}, "
                     f"resume_lr={resume_lr:.2e} (decoder, new schedule max_lr={max_lr:.2e})"
                 )
             elif last_lr >= max_lr:
