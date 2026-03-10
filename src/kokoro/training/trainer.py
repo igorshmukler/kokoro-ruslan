@@ -1693,7 +1693,10 @@ class KokoroTrainer:
         loss_accumulation_interval = 10
         accumulated_losses = []
 
+        # Initial estimate only; for dynamic batching this may change when the
+        # sampler rebuilds batches at iterator start.
         num_batches = len(self.dataloader)
+        processed_loss_batches = 0
 
         # Gradient accumulation for larger effective batch sizes
         gradient_accumulation_steps = getattr(self.config, 'gradient_accumulation_steps', 1)
@@ -1715,6 +1718,26 @@ class KokoroTrainer:
         progress_bar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
         for batch_idx, batch in enumerate(progress_bar):
             try:
+                # DynamicFrameBatchSampler rebuilds self.batches inside __iter__.
+                # Once iteration has started, read the rebuilt count so
+                # is_last_batch/accumulation logic uses the current epoch's true size.
+                if batch_idx == 0:
+                    try:
+                        sampler_batches = getattr(self.batch_sampler, 'batches', None)
+                        if sampler_batches is not None:
+                            rebuilt_num_batches = len(sampler_batches)
+                            if rebuilt_num_batches > 0 and rebuilt_num_batches != num_batches:
+                                logger.info(
+                                    "Epoch %d batch count updated after sampler rebuild: %d -> %d",
+                                    epoch + 1,
+                                    num_batches,
+                                    rebuilt_num_batches,
+                                )
+                                num_batches = rebuilt_num_batches
+                    except Exception:
+                        # Keep the initial estimate if sampler internals are unavailable.
+                        pass
+
                 # Start interbatch profiling for this batch
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_batch()
@@ -2164,6 +2187,7 @@ class KokoroTrainer:
                     'dur': loss_duration.detach(),
                     'stop': loss_stop_token.detach(),
                 })
+                processed_loss_batches += 1
 
                 # Sync accumulated losses periodically to reduce overhead
                 if len(accumulated_losses) >= loss_accumulation_interval or batch_idx == num_batches - 1:
@@ -2342,11 +2366,15 @@ class KokoroTrainer:
         except Exception as e:
             logger.debug(f"Failed to log end-of-epoch train spectrograms: {e}")
 
+        if processed_loss_batches == 0:
+            logger.warning("No successful training batches were processed in this epoch")
+            return EpochMetrics(0.0, 0.0, 0.0, 0.0)
+
         return EpochMetrics(
-            total_loss=(total_loss_epoch / num_batches),
-            mel_loss=(mel_loss_epoch / num_batches),
-            dur_loss=(dur_loss_epoch / num_batches),
-            stop_loss=(stop_loss_epoch / num_batches),
+            total_loss=(total_loss_epoch / processed_loss_batches),
+            mel_loss=(mel_loss_epoch / processed_loss_batches),
+            dur_loss=(dur_loss_epoch / processed_loss_batches),
+            stop_loss=(stop_loss_epoch / processed_loss_batches),
         )
 
     def _snapshot_cache_stats(self, dataset) -> Optional[Dict[str, float]]:
