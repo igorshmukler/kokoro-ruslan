@@ -80,6 +80,7 @@ def load_checkpoints():
             "ema_updates": ck.get("ema_updates", "?"),
             "state_dict": ck.get("model_state_dict") or ck.get("state_dict") or {},
             "ema_state_dict": ck.get("ema_model_state_dict") or {},
+            "config": ck.get("config"),
         }
         records.append(rec)
     return records
@@ -1039,65 +1040,136 @@ def tb_print_mel_stop_window_correlation(ea):
         w_start = w_end
 
 
-def tb_print_lr_phase_detail(ea):
+def tb_print_lr_phase_detail(ea, records=None):
     """
-    Detailed LR table from the point it reaches 90% of peak to current.
-    Shows % of peak per window and flags when decay begins.
+    Detailed LR table from 90% of observed LR onward.
+    % columns are relative to the TRUE schedule peak derived from the saved
+    config (learning_rate × max_lr_multiplier at step warmup_steps +
+    pct_start × onecycle_steps), so you can see how far into the full
+    training arc you are — not just how far above the current-session max.
+    Falls back to observed max when config is unavailable.
     """
     lr  = _get(ea, "stats/lr_decoder")
     enc = _get(ea, "stats/lr_encoder")
     if not lr:
         return
 
+    # ── Derive true schedule peak from the saved config ───────────────────
+    true_peak_dec = None
+    true_peak_enc = None
+    abs_peak_step = None
+    cfg_note      = "(config unavailable — falling back to observed max)"
+    if records:
+        last = max(records, key=lambda r: r["epoch_num"])
+        cfg  = last.get("config")
+        if cfg is not None:
+            learning_rate = getattr(cfg, 'learning_rate',              1e-4)
+            max_lr_mult   = getattr(cfg, 'max_lr_multiplier',          1.1)
+            enc_lr_mult   = getattr(cfg, 'encoder_lr_multiplier',      1.3)
+            pct_start     = getattr(cfg, 'pct_start',                  0.2)
+            use_warmup    = getattr(cfg, 'use_warmup',                  True)
+            warmup_steps  = getattr(cfg, 'warmup_steps',               1200) if use_warmup else 0
+            num_epochs    = getattr(cfg, 'num_epochs',                  100)
+            # Derive steps_per_epoch from latest checkpoint: optimizer_steps / epoch_num
+            opt_steps = last.get("optimizer_steps")
+            ep_num    = last.get("epoch_num")
+            if isinstance(opt_steps, int) and isinstance(ep_num, int) and ep_num > 0:
+                steps_per_epoch = opt_steps // ep_num
+                total_steps     = num_epochs * steps_per_epoch
+                # Replicate _apply_warmup_guard
+                if warmup_steps >= total_steps:
+                    warmup_steps = max(0, total_steps - 1)
+                onecycle_steps  = max(1, total_steps - warmup_steps)
+                peak_onecycle   = int(pct_start * onecycle_steps)
+                abs_peak_step   = warmup_steps + peak_onecycle
+                true_peak_dec   = learning_rate * max_lr_mult
+                true_peak_enc   = learning_rate * max_lr_mult * enc_lr_mult
+                cfg_note        = (
+                    f"lr={learning_rate:.2e}  ×  max_lr_mult={max_lr_mult}  "
+                    f"steps/epoch={steps_per_epoch}  warmup={warmup_steps}  "
+                    f"onecycle={onecycle_steps}  pct_start={pct_start}"
+                )
+
+    # ── Observed data ──────────────────────────────────────────────────────
+    obs_max_dec = max(v for _, v in lr)
+    curr_lr     = lr[-1][1]
+    curr_step   = lr[-1][0]
+
+    # Reference peak for all % calculations
+    ref_peak_dec = true_peak_dec if true_peak_dec is not None else obs_max_dec
+    ref_peak_enc = true_peak_enc if true_peak_enc is not None else (max(v for _, v in enc) if enc else ref_peak_dec)
+
+    # Phase: is LR still rising?
+    tail = [v for _, v in lr[-10:]]
+    still_rising = len(tail) >= 2 and tail[-1] > tail[0]
+    # Past-peak step (only relevant when not still rising)
+    if not still_rising:
+        obs_peak_step = next((s for s, v in lr if v >= obs_max_dec * 0.99), None)
+    else:
+        obs_peak_step = None
+
     print("\n" + "=" * 90)
     print("TENSORBOARD — LR Phase Detail (from 90% of peak onward)")
     print("=" * 90)
+    print(f"  schedule      : {cfg_note}")
 
-    max_lr    = max(v for _, v in lr)
-    curr_lr   = lr[-1][1]
-    curr_step = lr[-1][0]
+    if true_peak_dec is not None:
+        steps_to_peak = abs_peak_step - curr_step
+        direction     = f"{steps_to_peak:+d} steps to peak" if steps_to_peak > 0 else f"{-steps_to_peak} steps past peak"
+        print(f"  true peak LR  : {true_peak_dec:.8f} (dec)   {true_peak_enc:.8f} (enc)   at step {abs_peak_step}  [{direction}]")
+    else:
+        print(f"  obs  max LR   : {obs_max_dec:.8f}")
 
-    # Find peak step (first step where LR >= 99% of max)
-    peak_step = next((s for s, v in lr if v >= max_lr * 0.99), None)
-    # Find 90% threshold step
-    thresh_90_step = next((s for s, v in lr if v >= max_lr * 0.90), None)
+    pct_now = 100.0 * curr_lr / ref_peak_dec
+    print(f"  curr LR (dec) : {curr_lr:.8f}  at step {curr_step}  ({pct_now:.3f}% of true peak)")
 
-    print(f"  peak LR : {max_lr:.8f}  at step ~{peak_step}")
-    print(f"  curr LR : {curr_lr:.8f}  at step {curr_step}  ({100 * curr_lr / max_lr:.1f}% of peak)")
-
-    # Phase
-    tail = [v for _, v in lr[-10:]]
-    still_rising = len(tail) >= 2 and tail[-1] > tail[0]
     if still_rising:
         phase = "WARMUP → approaching peak"
-    elif curr_lr >= max_lr * 0.99:
+    elif curr_lr >= ref_peak_dec * 0.99:
         phase = "AT / NEAR PEAK"
-    elif curr_lr >= max_lr * 0.80:
-        phase = f"EARLY DECAY ({100 * curr_lr / max_lr:.1f}% of peak)"
+    elif curr_lr >= ref_peak_dec * 0.80:
+        phase = f"EARLY DECAY ({100 * curr_lr / ref_peak_dec:.1f}% of peak)"
     else:
-        phase = f"DECAY ({100 * curr_lr / max_lr:.1f}% of peak)"
-    print(f"  phase   : {phase}")
+        phase = f"DECAY ({100 * curr_lr / ref_peak_dec:.1f}% of peak)"
+    print(f"  phase         : {phase}")
 
-    # Show every ~100-step bucket from thresh_90_step onward
-    if thresh_90_step is not None:
-        print(f"\n  Step-by-step from ~90% of peak (step {thresh_90_step}):")
-        print(f"  {'step':>6}  {'lr_decoder':>12}  {'% peak':>7}  {'lr_encoder':>12}  {'% peak':>7}")
-        print("  " + "-" * 56)
-        enc_lookup = {s: v for s, v in enc} if enc else {}
-        seen_buckets = set()
-        for s, v in lr:
-            if s < thresh_90_step:
-                continue
-            bucket = (s // 100) * 100
-            if bucket in seen_buckets:
-                continue
-            seen_buckets.add(bucket)
-            dec_pct = 100.0 * v / max_lr
-            enc_v   = enc_lookup.get(s)
-            enc_max = max(v2 for _, v2 in enc) if enc else 1.0
-            enc_str = f"{enc_v:.8f}  {100*enc_v/enc_max:>6.1f}%" if enc_v else "          ?       ?"
-            flag = "  ← peak" if abs(s - peak_step) < 100 else ""
-            print(f"  {s:>6}  {v:.8f}  {dec_pct:>6.1f}%{flag}  {enc_str}")
+    # ── Step-by-step table ─────────────────────────────────────────────────
+    # Start from the step where observed LR first hit 90% of observed max.
+    thresh_90_step = next((s for s, v in lr if v >= obs_max_dec * 0.90), lr[0][0])
+
+    print(f"\n  Step-by-step from step {thresh_90_step} onward  (% = fraction of true schedule peak):")
+    print(f"  {'step':>6}  {'lr_decoder':>12}  {'% true peak':>12}  {'lr_encoder':>12}  {'% true peak':>12}")
+    print("  " + "-" * 66)
+
+    enc_lookup  = {s: v for s, v in enc} if enc else {}
+    # Flag the bucket that contains the true absolute peak step (config-derived).
+    # Fall back to observed peak bucket when config isn't available.
+    flag_bucket = None
+    if abs_peak_step is not None:
+        flag_bucket = (abs_peak_step // 100) * 100
+    elif obs_peak_step is not None and not still_rising:
+        flag_bucket = (obs_peak_step // 100) * 100
+
+    seen_buckets = set()
+    for s, v in lr:
+        if s < thresh_90_step:
+            continue
+        bucket = (s // 100) * 100
+        if bucket in seen_buckets:
+            continue
+        seen_buckets.add(bucket)
+        dec_pct = 100.0 * v / ref_peak_dec
+        enc_v   = enc_lookup.get(s)
+        enc_str = f"{enc_v:.8f}  {100*enc_v/ref_peak_enc:>11.3f}%" if enc_v else "              ?             ?"
+        flag    = "  ← peak" if (flag_bucket is not None and bucket == flag_bucket) else ""
+        print(f"  {s:>6}  {v:.8f}  {dec_pct:>11.3f}%{flag}  {enc_str}")
+
+    # When still in warmup, append a projected-peak row so the table endpoint is visible.
+    if still_rising and abs_peak_step is not None and abs_peak_step > curr_step:
+        proj_bucket = (abs_peak_step // 100) * 100
+        if proj_bucket not in seen_buckets:
+            enc_proj = f"{true_peak_enc:.8f}  {'100.000%':>11}" if true_peak_enc else "?"
+            print(f"  {abs_peak_step:>6}  {true_peak_dec:.8f}  {'100.000%':>11}  ← peak (projected)  {enc_proj}")
 
 
 def tb_print_late_spike_context(ea):
@@ -1169,7 +1241,7 @@ def tb_print_late_spike_context(ea):
     print(f"\n  Attribution summary: " + "  ".join(f"{k}={n}" for k, n in sorted(counts.items())))
 
 
-def tb_analyze(log_dir: Path = TB_LOG_DIR):
+def tb_analyze(log_dir: Path = TB_LOG_DIR, records=None):
     ea = _load_tb(log_dir)
     if ea is None:
         return
@@ -1185,7 +1257,7 @@ def tb_analyze(log_dir: Path = TB_LOG_DIR):
     tb_print_gradient_analysis(ea)
     tb_print_late_spike_context(ea)
     tb_print_lr_trajectory(ea)
-    tb_print_lr_phase_detail(ea)
+    tb_print_lr_phase_detail(ea, records=records)
     tb_print_regression_flags(ea)
     tb_print_recommendations(ea)
 
@@ -1237,7 +1309,7 @@ def main():
         print("\nNo NaN or Inf weights found in any checkpoint. Good.")
 
     # ── TensorBoard section ───────────────────────────────────────────────────
-    tb_analyze(TB_LOG_DIR)
+    tb_analyze(TB_LOG_DIR, records=records)
 
 
 if __name__ == "__main__":
