@@ -167,11 +167,14 @@ class TrainingConfig:
     attention_spike_clip_norm: float = 20.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
     ffn_spike_clip_norm: float = 8.0
-    # Encoder FFN per-layer pre-clip. Previously 10.0 which was so tight it zeroed the
-    # already-microscopic encoder gradients (~1e-7), starving the encoder of all signal.
-    # Raised to 100.0: real instabilities are still caught by the global clip_grad_norm;
-    # this pre-clip now only fires on genuine spikes, not on normal encoder gradients.
-    encoder_ffn_spike_clip_norm: float = 100.0
+    # Encoder FFN per-layer pre-clip. Previously 10.0 (too tight, zeroed encoder grads);
+    # raised to 100.0 while encoder was passive (ep1-ep5 grads ~1e-7).
+    # By ep6 encoder FFN avg_grad reached 40-100 per tensor (active learning phase),
+    # so 100.0 provided no real protection and encoder attention was also fully uncapped.
+    # Set to 12.0: ~20% above the decoder FFN cap (8.0), proportional to the higher
+    # encoder LR multiplier (1.3×). Encoder attention is now also clipped at
+    # attention_spike_clip_norm (20.0) via the extended pre-clip in trainer.
+    encoder_ffn_spike_clip_norm: float = 20.0
     # Per-parameter clip norm applied exclusively to the stop-token head
     # (stop_token_predictor.weight and .bias) before the global clip.
     # The stop head is a single Linear(hidden_dim→1); its gradient can spike disproportionately

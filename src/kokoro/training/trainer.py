@@ -1138,7 +1138,7 @@ class KokoroTrainer:
                 max_norm = projection_max_norm
             elif name in stop_head_params and float(self.stop_head_spike_clip_norm) > 0:
                 max_norm = float(self.stop_head_spike_clip_norm)
-            elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
+            elif attention_max_norm > 0 and (name.startswith('decoder.layers.') or name.startswith('transformer_encoder_layers.')) and any(fragment in name for fragment in attention_name_fragments):
                 max_norm = attention_max_norm
             elif encoder_ffn_max_norm > 0 and name.startswith('transformer_encoder_layers.') and any(fragment in name for fragment in ffn_name_fragments):
                 # Encoder FFN layers are the primary spike source — use tighter clip
