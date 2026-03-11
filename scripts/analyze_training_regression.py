@@ -595,6 +595,14 @@ def _collect_diagnostics(ea):
     Gather all raw signals into a dict of structured findings.
     Used by both the flag summary and the recommendations section.
     """
+    # Cache diagnostics on the EventAccumulator instance to avoid repeated TB reads
+    try:
+        cache_key = '_diag_cache'
+        if ea is not None and hasattr(ea, cache_key):
+            return getattr(ea, cache_key)
+    except Exception:
+        pass
+
     d = {}
     gn  = _get(ea, "stats/grad_norm")
     gnc = _get(ea, "stats/grad_norm_clipped")
@@ -760,6 +768,12 @@ def _collect_diagnostics(ea):
         d["spikes_post_peak"]   = []
 
     return d
+    # store cache (best-effort)
+    try:
+        if ea is not None:
+            setattr(ea, '_diag_cache', d)
+    except Exception:
+        pass
 
 
 def tb_print_recommendations(ea):
@@ -771,7 +785,45 @@ def tb_print_recommendations(ea):
     print("TENSORBOARD — Analysis & Recommendations")
     print("=" * 90)
 
+    # collect diagnostics once (cached inside _collect_diagnostics)
     d = _collect_diagnostics(ea)
+    # Attempt to derive training config from latest checkpoint; fall back to default TrainingConfig
+    cfg = None
+    try:
+        records = load_checkpoints()
+        if records:
+            last = max(records, key=lambda r: r["epoch_num"])
+            cfg = last.get("config")
+    except Exception:
+        cfg = None
+
+    if cfg is None:
+        try:
+            from kokoro.training.config import TrainingConfig
+            cfg = TrainingConfig()
+        except Exception:
+            cfg = None
+
+    def cfg_get(attr, default):
+        return getattr(cfg, attr, default) if cfg is not None else default
+
+    # Helper suggestions derived from config
+    cur_max_lr_mult = cfg_get('max_lr_multiplier', 1.1)
+    suggest_max_lr_mult = max(0.1, cur_max_lr_mult - 0.1)
+    cur_enc_lr_mult = cfg_get('encoder_lr_multiplier', 1.3)
+    suggest_enc_lr_mult = max(0.1, cur_enc_lr_mult - 0.2)
+    cur_stop_pos = cfg_get('stop_token_pos_weight', 50.0)
+    suggest_stop_pos = max(1.0, int(cur_stop_pos * 0.7))
+    cur_stop_loss = cfg_get('stop_token_loss_weight', 0.06)
+    suggest_stop_loss = max(0.001, cur_stop_loss * 0.67)
+    cur_warmup = cfg_get('warmup_steps', 1200)
+    suggest_warmup = int(cur_warmup + 400)
+    cur_max_frames = cfg_get('max_frames_per_batch', 15000)
+    suggest_max_frames = max(1000, int(cur_max_frames * 0.85))
+    cur_weight_decay = cfg_get('weight_decay', 0.01)
+    suggest_weight_decay = cur_weight_decay * 2.0
+    cur_max_grad = cfg_get('max_grad_norm', 2.0)
+    suggest_max_grad = cur_max_grad + 0.5
     recs = []   # list of (priority, label, lines)  priority: 1=CRITICAL 2=WARN 3=INFO
 
     # ── 1. Val mel overall regression ──────────────────────────────────────
@@ -781,12 +833,12 @@ def tb_print_recommendations(ea):
         ]
         if d["val_train_gap"] is not None and d["val_train_gap"] > 0.8:
             body.append(f"  + Large val/train gap ({d['val_train_gap']:.4f}) suggests overfitting.")
-            body.append("    → Increase weight_decay (try 1e-3 → 2e-3).")
-            body.append("    → Increase dropout (e.g. +0.05 in transformer layers).")
+            body.append(f"    → Increase weight_decay (e.g. {cur_weight_decay:.4f} → {suggest_weight_decay:.4f}).")
+            body.append(f"    → Increase dropout (e.g. +0.05 to encoder_dropout {cfg_get('encoder_dropout', 0.1):.2f}).")
         if d["clip_sat_pct"] > 40:
             body.append("  + Clipping saturation coincides — gradient pressure is a co-driver.")
-            body.append("    → Reduce max_lr_multiplier (e.g. 1.2 → 1.0).")
-            body.append("    → Reduce encoder_lr_multiplier (e.g. 1.3 → 1.1).")
+            body.append(f"    → Reduce max_lr_multiplier (e.g. {cur_max_lr_mult:.2f} → {suggest_max_lr_mult:.2f}).")
+            body.append(f"    → Reduce encoder_lr_multiplier (e.g. {cur_enc_lr_mult:.2f} → {suggest_enc_lr_mult:.2f}).")
         if d["val_mel_regressions"]:
             ep_list = ", ".join(f"Ep{ep}" for ep, _ in d["val_mel_regressions"])
             body.append(f"  Regression epochs: {ep_list}.")
@@ -830,11 +882,11 @@ def tb_print_recommendations(ea):
         ]
         if co_pct > 40:
             body.append(f"  {co_pct:.0f}% co-occur with stop bursts → stop loss is the dominant source.")
-            body.append("    → Reduce stop_token_pos_weight (50 → 40).")
+            body.append(f"    → Reduce stop_token_pos_weight ({cur_stop_pos:.0f} → {suggest_stop_pos:.0f}).")
         if n_ramp > n_post and d["lr_phase"] in ("warmup", "peak"):
             body.append("  Most spikes during LR ramp → LR pressure is a co-driver.")
-            body.append("    → Increase warmup_steps (1200 → 1600) to soften the ramp slope.")
-        body.append("    → Lower max_frames (15000 → 13000) to reduce outlier batch contribution.")
+            body.append(f"    → Increase warmup_steps ({cur_warmup} → {suggest_warmup}) to soften the ramp slope.")
+        body.append(f"    → Lower max_frames ({cur_max_frames} → {suggest_max_frames}) to reduce outlier batch contribution.")
         recs.append((2, "WARN", body))
 
     elif n_late > 10:
@@ -873,8 +925,8 @@ def tb_print_recommendations(ea):
             f"Clipping saturation {sat:.1f}% — model is taking truncated steps on nearly half of batches.",
             f"  Trend: {trend}.",
         ]
-        body.append("    → Reduce max_lr_multiplier (e.g. 1.2 → 1.0) to lower peak gradient pressure.")
-        body.append("    → Alternatively reduce stop_token_loss_weight or pos_weight if stop dominates.")
+        body.append(f"    → Reduce max_lr_multiplier (e.g. {cur_max_lr_mult:.2f} → {suggest_max_lr_mult:.2f}) to lower peak gradient pressure.")
+        body.append(f"    → Alternatively reduce stop_token_loss_weight ({cur_stop_loss:.4f} → {suggest_stop_loss:.4f}) or pos_weight ({cur_stop_pos:.0f} → {suggest_stop_pos:.0f}) if stop dominates.")
         recs.append((1, "CRITICAL", body))
     elif sat > 20 and trend == "worsening":
         recs.append((2, "WARN", [
@@ -899,8 +951,8 @@ def tb_print_recommendations(ea):
     if gap is not None and gap > 1.0 and not d["val_mel_regressed"]:
         recs.append((2, "WARN", [
             f"Val/train mel gap = {gap:.4f} — overfitting signal.",
-            "    → Increase weight_decay (e.g. 1e-3 → 2e-3).",
-            "    → Increase dropout in transformer layers (+0.05).",
+            f"    → Increase weight_decay (e.g. {cur_weight_decay:.4f} → {suggest_weight_decay:.4f}).",
+            f"    → Increase dropout in transformer layers (+0.05 to encoder_dropout {cfg_get('encoder_dropout', 0.1):.2f}).",
         ]))
     elif gap is not None and gap > 0.5 and not d["val_mel_regressed"]:
         recs.append((3, "INFO", [
@@ -916,8 +968,8 @@ def tb_print_recommendations(ea):
         ]
         if d["stop_late_bursts"]:
             body.append(f"  Late stop bursts detected: {d['stop_late_bursts'][:4]}")
-        body.append("    → Reduce stop_token_pos_weight (50 → 35–40).")
-        body.append("    → Or reduce stop_token_loss_weight (0.06 → 0.04).")
+        body.append(f"    → Reduce stop_token_pos_weight ({cur_stop_pos:.0f} → {suggest_stop_pos:.0f}).")
+        body.append(f"    → Or reduce stop_token_loss_weight ({cur_stop_loss:.4f} → {suggest_stop_loss:.4f}).")
         body.append("    → These are multiplicative: effective scale = weight × pos_weight.")
         recs.append((2, "WARN", body))
 
@@ -928,8 +980,8 @@ def tb_print_recommendations(ea):
             "  This is the most common regression pattern (LR ramp → loss divergence).",
             f"  LR peak was step {d['lr_peak_step']}, regressions at epochs: "
             + ", ".join(f"Ep{ep}" for ep, _ in d["val_mel_regressions"]) + ".",
-            "    → Reduce max_lr_multiplier (1.2 → 1.1) for the next run.",
-            "    → Or increase pct_start (0.2 → 0.25) to spend more time in warmup.",
+            f"    → Reduce max_lr_multiplier ({cur_max_lr_mult:.2f} → {suggest_max_lr_mult:.2f}) for the next run.",
+            f"    → Or increase pct_start ({cfg_get('pct_start', 0.2):.2f} → {min(0.5, cfg_get('pct_start', 0.2) + 0.05):.2f}) to spend more time in warmup.",
         ]))
 
     # ── 7. All clear ────────────────────────────────────────────────────────
@@ -955,6 +1007,44 @@ def tb_print_recommendations(ea):
         for line in lines[1:]:
             print(f"            {line}")
         print()
+
+
+def collect_param_drills(ea, records=None, force=False):
+    """
+    Lazy, cached runner for expensive per-parameter analyses.
+    Returns a dict of drill results (e.g., spike cause analysis) and caches
+    results on `ea` so repeated calls are cheap.
+    """
+    try:
+        if ea is not None and hasattr(ea, '_param_drill_cache') and not force:
+            return getattr(ea, '_param_drill_cache')
+    except Exception:
+        pass
+
+    res = {}
+    # Expensive drill: gradient pre-clip pressure analysis
+    try:
+        # reuse tb_print_spike_cause_analysis internals by calling it in a dry-run
+        # but to avoid printing, replicate minimal computation here.
+        # We compute only the summary counts which are frequently useful.
+        if records and len(records) >= 2:
+            rec_b = records[-1]
+            rec_a = records[-2]
+            ps = rec_b.get('param_stats', {})
+            n_with_delta = sum(1 for v in ps.values() if v.get('delta') is not None)
+            res['param_delta_count'] = n_with_delta
+        else:
+            res['param_delta_count'] = 0
+    except Exception:
+        res['param_delta_count'] = 0
+
+    try:
+        if ea is not None:
+            setattr(ea, '_param_drill_cache', res)
+    except Exception:
+        pass
+
+    return res
 
 
 def tb_print_val_mel_series(ea):
