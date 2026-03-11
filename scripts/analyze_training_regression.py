@@ -1241,6 +1241,206 @@ def tb_print_late_spike_context(ea):
     print(f"\n  Attribution summary: " + "  ".join(f"{k}={n}" for k, n in sorted(counts.items())))
 
 
+def tb_print_spike_cause_analysis(ea, records=None):
+    """
+    Estimates per-tensor gradient pressure from consecutive checkpoint weight deltas.
+
+    For each parameter tensor in the most recent checkpoint pair, computes:
+        avg_grad ≈ weight_delta / (epoch_steps × lr)
+
+    and compares it to the tensor's pre-clip cap (as configured in trainer.py).
+    Groups results by pre-clip category, computes worst-case theoretical co-spike
+    norm (√Σcap²), and flags groups that are near or saturating their caps.
+
+    This makes it possible to see *structurally* which parameter groups drive
+    observed grad spikes — and whether any groups are effectively uncapped.
+    """
+    from collections import defaultdict
+
+    if not records or len(records) < 2:
+        return
+
+    # ── Find last checkpoint pair with valid weight deltas ─────────────────
+    rec_b = rec_a = None
+    for i in range(len(records) - 1, 0, -1):
+        ps = records[i].get("param_stats", {})
+        if any(v.get("delta") is not None for v in ps.values()):
+            rec_b = records[i]
+            rec_a = records[i - 1]
+            break
+    if rec_b is None:
+        return
+
+    steps_b = rec_b.get("optimizer_steps")
+    steps_a = rec_a.get("optimizer_steps")
+    if not (isinstance(steps_b, int) and isinstance(steps_a, int) and steps_b > steps_a):
+        return
+    ep_steps = steps_b - steps_a
+
+    # ── Average LR for this epoch from TB ─────────────────────────────────
+    lr_series  = _get(ea, "stats/lr_decoder")
+    enc_series = _get(ea, "stats/lr_encoder")
+
+    if lr_series:
+        in_range_dec = [v for s, v in lr_series if steps_a <= s <= steps_b]
+        avg_lr_dec = statistics.mean(in_range_dec) if in_range_dec else max(v for _, v in lr_series)
+    else:
+        return  # can't compute avg_grad without LR
+
+    if enc_series:
+        in_range_enc = [v for s, v in enc_series if steps_a <= s <= steps_b]
+        avg_lr_enc = statistics.mean(in_range_enc) if in_range_enc else None
+    else:
+        avg_lr_enc = None
+
+    cfg = rec_b.get("config")
+    enc_lr_mult = getattr(cfg, 'encoder_lr_multiplier', 1.3) if cfg else 1.3
+    if avg_lr_enc is None:
+        avg_lr_enc = avg_lr_dec * enc_lr_mult
+
+    # ── Pre-clip cap values from config (fall back to trainer.py defaults) ─
+    if cfg is not None:
+        dec_ffn_cap = getattr(cfg, 'ffn_spike_clip_norm',         8.0)
+        enc_ffn_cap = getattr(cfg, 'encoder_ffn_spike_clip_norm', 12.0)
+        attn_cap    = getattr(cfg, 'attention_spike_clip_norm',   20.0)
+        proj_cap    = getattr(cfg, 'projection_spike_clip_norm',  20.0)
+        stop_cap    = getattr(cfg, 'stop_head_spike_clip_norm',    1.0)
+    else:
+        dec_ffn_cap = 8.0
+        enc_ffn_cap = 12.0
+        attn_cap    = 20.0
+        proj_cap    = 20.0
+        stop_cap    = 1.0
+
+    # ── Classify each tensor → (category, cap, lr_for_tensor) ─────────────
+    def classify(name):
+        if re.search(r'decoder\.layers\.\d+\.(linear1|linear2)', name):
+            return ('dec_ffn',  dec_ffn_cap, avg_lr_dec)
+        if re.search(r'transformer_encoder_layers\.\d+\.(linear1|linear2)', name):
+            return ('enc_ffn',  enc_ffn_cap, avg_lr_enc)
+        if re.search(r'decoder\.layers\.\d+\.(self_attn|cross_attn)\.(w_q|w_k|w_v|w_o)', name):
+            return ('dec_attn', attn_cap,    avg_lr_dec)
+        if re.search(r'transformer_encoder_layers\.\d+\.self_attn\.(w_q|w_k|w_v|w_o)', name):
+            return ('enc_attn', attn_cap,    avg_lr_enc)
+        if re.search(r'(mel_projection|mel_linear)', name):
+            return ('mel_proj', proj_cap,    avg_lr_dec)
+        if re.search(r'stop_token_predictor', name):
+            return ('stop',     stop_cap,    avg_lr_dec)
+        return ('other', float('inf'), avg_lr_dec)
+
+    # ── Collect avg_grad per tensor ────────────────────────────────────────
+    groups = defaultdict(list)  # cat → list of (name, avg_grad, cap)
+    ps = rec_b.get("param_stats", {})
+    for name, s in ps.items():
+        delta = s.get("delta")
+        if delta is None:
+            continue
+        cat, cap, lr_t = classify(name)
+        if not lr_t or lr_t <= 0:
+            continue
+        avg_grad = delta / (ep_steps * lr_t)
+        groups[cat].append((name, avg_grad, cap))
+
+    if not groups:
+        return
+
+    # ── Observed max late spike ────────────────────────────────────────────
+    gn = _get(ea, "stats/grad_norm")
+    if gn:
+        step_range   = gn[-1][0] - gn[0][0]
+        early_cutoff = gn[0][0] + step_range * 0.10
+        obs_max      = max((v for s, v in gn if s > early_cutoff), default=0.0)
+    else:
+        obs_max = 0.0
+
+    # ── Print ──────────────────────────────────────────────────────────────
+    print("\n" + "=" * 90)
+    print("TENSORBOARD — Gradient Pre-Clip Pressure Analysis")
+    print("=" * 90)
+    print(f"  Checkpoint pair : {rec_a['file']}  →  {rec_b['file']}")
+    print(f"  Epoch steps     : {ep_steps}")
+    print(f"  Avg LR decoder  : {avg_lr_dec:.8f}   encoder: {avg_lr_enc:.8f}")
+    print(f"  Pre-clip caps   : dec_ffn={dec_ffn_cap}  enc_ffn={enc_ffn_cap}  "
+          f"attn={attn_cap}  mel_proj={proj_cap}  stop={stop_cap}")
+
+    CAT_LABELS = {
+        'dec_ffn':  'Decoder  FFN',
+        'enc_ffn':  'Encoder  FFN',
+        'dec_attn': 'Decoder Attn',
+        'enc_attn': 'Encoder Attn',
+        'mel_proj': 'Mel Proj    ',
+        'stop':     'Stop Head   ',
+        'other':    'Other(uncpd) ',
+    }
+    CAT_ORDER = ['dec_ffn', 'enc_ffn', 'dec_attn', 'enc_attn', 'mel_proj', 'stop', 'other']
+
+    print()
+    print(f"  {'Category':<14} {'N':>4}  {'min_g':>8}  {'avg_g':>8}  {'max_g':>8}  "
+          f"{'cap':>6}  {'≥50%cap':>8}  {'≥cap':>6}  {'√(N·cap²)':>10}  flags")
+    print("  " + "-" * 90)
+
+    theoretical_max_sq = 0.0
+    flags_list = []
+
+    for cat in CAT_ORDER:
+        if cat not in groups:
+            continue
+        entries = groups[cat]
+        grads   = [g for _, g, _ in entries]
+        cap     = entries[0][2]
+        n       = len(entries)
+        min_g   = min(grads)
+        avg_g   = statistics.mean(grads)
+        max_g   = max(grads)
+        near    = sum(1 for g in grads if g >= cap * 0.5)   # ≥ 50% of cap
+        sat     = sum(1 for g in grads if g >= cap)          # at or above cap
+
+        if cap != float('inf'):
+            cosp = math.sqrt(n * cap ** 2)
+            theoretical_max_sq += n * cap ** 2
+            cosp_str = f"±{cosp:>8.1f}"
+        else:
+            # For uncapped tensors, use actual avg_grad as a proxy
+            cosp = math.sqrt(sum(g ** 2 for g in grads))
+            cosp_str = f"~{cosp:>8.1f}"
+
+        flag = ""
+        if cap == float('inf') and max_g > 5.0:
+            flag = "UNCAPPED+HIGH"
+            flags_list.append(
+                f"  {CAT_LABELS.get(cat, cat)}: {n} uncapped tensors  max avg_grad={max_g:.2f}")
+        elif sat > 0:
+            flag = f"AT CAP ({sat}/{n})"
+            flags_list.append(
+                f"  {CAT_LABELS.get(cat, cat)}: {sat}/{n} tensors avg_grad ≥ cap  "
+                f"(avg={avg_g:.2f}  cap={cap})")
+        elif near > n // 2:
+            flag = "NEAR CAP"
+            flags_list.append(
+                f"  {CAT_LABELS.get(cat, cat)}: {near}/{n} tensors avg_grad ≥ 50% of cap  "
+                f"(avg={avg_g:.2f}  cap={cap})")
+
+        cap_str = f"{cap:.1f}" if cap != float('inf') else "  ∞"
+        print(f"  {CAT_LABELS.get(cat, cat):<14} {n:>4}  {min_g:>8.3f}  {avg_g:>8.3f}  "
+              f"{max_g:>8.3f}  {cap_str:>6}  {near:>4}/{n:<3}  {sat:>3}/{n:<3}  "
+              f"{cosp_str}  {flag}")
+
+    theoretical_max = math.sqrt(theoretical_max_sq)
+    print()
+    print(f"  Theoretical worst-case co-spike  √(Σ N·cap²) : {theoretical_max:.1f}")
+    if obs_max > 0:
+        print(f"  Observed max late spike in TB               : {obs_max:.2f}")
+        print(f"  Headroom (theory / observed)                : {theoretical_max / obs_max:.1f}×"
+              "  (< 2× means pre-clips are the binding constraint)")
+
+    if flags_list:
+        print(f"\n  Flagged groups:")
+        for fl in flags_list:
+            print(fl)
+    else:
+        print(f"\n  All groups below 50% of their pre-clip caps — gradient pressure nominal.")
+
+
 def tb_analyze(log_dir: Path = TB_LOG_DIR, records=None):
     ea = _load_tb(log_dir)
     if ea is None:
@@ -1256,6 +1456,7 @@ def tb_analyze(log_dir: Path = TB_LOG_DIR, records=None):
     tb_print_stop_token_analysis(ea)
     tb_print_gradient_analysis(ea)
     tb_print_late_spike_context(ea)
+    tb_print_spike_cause_analysis(ea, records=records)
     tb_print_lr_trajectory(ea)
     tb_print_lr_phase_detail(ea, records=records)
     tb_print_regression_flags(ea)
