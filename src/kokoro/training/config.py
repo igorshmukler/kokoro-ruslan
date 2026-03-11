@@ -104,7 +104,7 @@ class TrainingConfig:
     # stop_token_loss_weight independently for that purpose.
     # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 chosen as
     # stable partial correction (~36%) that keeps the stop predictor learning.
-    stop_token_pos_weight: float = 50.0
+    stop_token_pos_weight: float = 35.0
     # Temporal smoothing of stop-token targets.
     # Instead of a single hard 1.0 at the last frame, a short exponentially
     # decaying tail is added to the frames immediately before it:
@@ -113,7 +113,7 @@ class TrainingConfig:
     # This spreads the positive gradient over several frames, eliminating the
     # single-frame spike that can cause grad-norm bursts when pos_weight is large.
     # Set stop_token_smooth_tail=0 to disable (recover the original hard target).
-    stop_token_smooth_tail: int = 4
+    stop_token_smooth_tail: int = 6
     stop_token_smooth_decay: float = 0.5
 
     # Variance predictor settings
