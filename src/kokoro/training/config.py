@@ -166,7 +166,7 @@ class TrainingConfig:
     projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 20.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
-    ffn_spike_clip_norm: float = 15.0
+    ffn_spike_clip_norm: float = 8.0
     # Encoder FFN per-layer pre-clip. Previously 10.0 which was so tight it zeroed the
     # already-microscopic encoder gradients (~1e-7), starving the encoder of all signal.
     # Raised to 100.0: real instabilities are still caught by the global clip_grad_norm;
@@ -256,7 +256,7 @@ class TrainingConfig:
             from pathlib import Path
             self.feature_cache_dir = str(Path(self.data_dir) / ".feature_cache")
 
-        MPS_MAX_FRAMES_PER_BATCH = 15000
+        MPS_MAX_FRAMES_PER_BATCH = 12000
         MPS_MAX_BATCH_SIZE = 16
 
         # MPS-specific memory optimizations

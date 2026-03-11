@@ -1061,8 +1061,40 @@ class DynamicFrameBatchSampler(Sampler):
             if batch and (len(batch) >= self.min_batch_size or not self.drop_last):
                 batches.append(batch)
 
-        # Optionally shuffle order of batches so training sees varied sizes per epoch
-        if self.shuffle:
+        # Spread heavy batches evenly across the epoch so they cannot cluster
+        # into consecutive steps and cause correlated gradient spikes.
+        #
+        # Algorithm: sort all batches by estimated cost (max_frames × batch_size)
+        # descending, then divide into n_stripes = floor(sqrt(N)) groups ("stripes").
+        # Stripe 0 contains the heaviest batches (ranks 0, n_stripes, 2*n_stripes …),
+        # stripe 1 the next-heaviest, etc.  After shuffling within each stripe for
+        # randomness, the stripes are interleaved round-robin so the final sequence
+        # looks like: [s0[0], s1[0], …, s_{k-1}[0], s0[1], s1[1], …].
+        #
+        # Guarantee: any two batches from the same stripe are always exactly
+        # n_stripes positions apart in the output.  Since the heaviest batches all
+        # land in stripe 0, the minimum gap between any two top-tier outlier batches
+        # is n_stripes ≈ sqrt(N) steps — instead of 1 step with a plain shuffle.
+        if self.shuffle and len(batches) > 1:
+            n = len(batches)
+            n_stripes = max(2, int(n ** 0.5))
+            costs = [
+                max((self._get_sample_frames(idx) for idx in b), default=0) * len(b)
+                for b in batches
+            ]
+            order = sorted(range(n), key=lambda i: costs[i], reverse=True)
+            sorted_b = [batches[i] for i in order]
+            stripes = [sorted_b[k::n_stripes] for k in range(n_stripes)]
+            for s in stripes:
+                random.shuffle(s)
+            result = []
+            max_stripe_len = max(len(s) for s in stripes)
+            for i in range(max_stripe_len):
+                for s in stripes:
+                    if i < len(s):
+                        result.append(s[i])
+            batches = result
+        elif self.shuffle:
             random.shuffle(batches)
 
         return batches
