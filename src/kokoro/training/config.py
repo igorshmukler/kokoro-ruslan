@@ -160,7 +160,7 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 2.0  # Global gradient clip ceiling; lowered from 2.0 (secondary guard with max_lr_mult=1.3)
+    max_grad_norm: float = 2.0 # Global gradient clip ceiling
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
