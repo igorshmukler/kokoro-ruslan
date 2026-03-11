@@ -194,7 +194,7 @@ class TestDecayOneConstantPlateau:
 class TestConfigDefaults:
 
     def test_smooth_tail_default(self):
-        assert TrainingConfig.__dataclass_fields__['stop_token_smooth_tail'].default == 4
+        assert TrainingConfig.__dataclass_fields__['stop_token_smooth_tail'].default == 6
 
     def test_smooth_decay_default(self):
         assert TrainingConfig.__dataclass_fields__['stop_token_smooth_decay'].default == pytest.approx(0.5)

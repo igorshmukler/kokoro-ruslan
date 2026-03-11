@@ -100,9 +100,9 @@ class TestTrainingConfigDefaults:
         cfg = TrainingConfig.__new__(TrainingConfig)
         # Access the raw dataclass default without calling __post_init__
         # pos_weight is intentionally decoupled from stop_token_loss_weight.
-        # Current value: 50.0 (stable partial correction ~36% of true imbalance).
+        # Current value: 35.0 (stable partial correction ~?% of true imbalance).
         # History: 150 → spikes; 100 → grad_norm to 39.8; 50 → stable.
-        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 50.0
+        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 35.0
 
     def test_stop_token_pos_weight_custom_value_survives_post_init(self):
         cfg = TrainingConfig(stop_token_pos_weight=300.0)
