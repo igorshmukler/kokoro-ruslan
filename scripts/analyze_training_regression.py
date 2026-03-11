@@ -45,13 +45,29 @@ KEY_LAYERS = [
 
 def param_stats(tensor):
     t = tensor.float()
-    has_nan = bool(torch.isnan(t).any())
-    has_inf = bool(torch.isinf(t).any())
+    # Perform statistics under no_grad to avoid building/retaining autograd graph
+    with torch.no_grad():
+        has_nan = bool(torch.isnan(t).any())
+        has_inf = bool(torch.isinf(t).any())
+        # Compute statistics defensively: use population std (unbiased=False)
+        # to avoid Bessel-correction warnings when tensor has <=1 element.
+        numel = t.numel()
+        if numel == 0:
+            mean_val = 0.0
+            std_val = 0.0
+            max_abs = 0.0
+            norm_val = 0.0
+        else:
+            mean_val = t.mean().item()
+            std_val = t.std(unbiased=False).item()
+            max_abs = t.abs().max().item()
+            norm_val = t.norm(2).item()
+
     return {
-        "norm": t.norm(2).item(),
-        "mean": t.mean().item(),
-        "std": t.std().item(),
-        "max_abs": t.abs().max().item(),
+        "norm": norm_val,
+        "mean": mean_val,
+        "std": std_val,
+        "max_abs": max_abs,
         "nan": has_nan,
         "inf": has_inf,
     }
@@ -98,23 +114,25 @@ def compute_weight_stats(records):
         delta_norm = 0.0
         n_params = 0
 
-        for name, tensor in sd.items():
-            s = param_stats(tensor)
-            stats[name] = s
-            if s["nan"]:
-                any_nan = True
-            if s["inf"]:
-                any_inf = True
-            total_norm += s["norm"] ** 2
-            n_params += tensor.numel()
+        # Compute stats and deltas without tracking gradients
+        with torch.no_grad():
+            for name, tensor in sd.items():
+                s = param_stats(tensor)
+                stats[name] = s
+                if s["nan"]:
+                    any_nan = True
+                if s["inf"]:
+                    any_inf = True
+                total_norm += s["norm"] ** 2
+                n_params += tensor.numel()
 
-            # Delta from previous
-            if prev_state is not None and name in prev_state:
-                diff = (tensor.float() - prev_state[name].float()).norm(2).item()
-                stats[name]["delta"] = diff
-                delta_norm += diff ** 2
-            else:
-                stats[name]["delta"] = None
+                # Delta from previous
+                if prev_state is not None and name in prev_state:
+                    diff = (tensor.float() - prev_state[name].float()).norm(2).item()
+                    stats[name]["delta"] = diff
+                    delta_norm += diff ** 2
+                else:
+                    stats[name]["delta"] = None
 
         rec["param_stats"] = stats
         rec["total_weight_norm"] = math.sqrt(total_norm)
@@ -798,9 +816,12 @@ def tb_print_recommendations(ea):
         if co_pct > 50:
             body.append(f"  {co_pct:.0f}% of spikes co-occur with elevated stop loss.")
             body.append("    → Primary driver is stop BCE bursts.")
-            body.append("    → Reduce stop_token_pos_weight (50 → 35) or stop_token_loss_weight (0.06 → 0.04).")
+            # body.append("    → Reduce stop_token_pos_weight (50 → 35) or stop_token_loss_weight (0.06 → 0.04).")
             body.append("    → Add temporal smoothing to stop targets (soft labels near EOS).")
-        body.append("    → Reduce max_frames in DynamicFrameBatchSampler (15000 → 12000) to cut outlier batch size.")
+        # body.append("    → Reduce max_frames in DynamicFrameBatchSampler (15000 → 12000) to cut outlier batch size.")
+        # the above recommendation is obsolete
+        # we need to create a deep analysis of the outlier batches function and call it here
+        # then appent the recommendations it returns to this section
         recs.append((1, "CRITICAL", body))
 
     elif n_gt10 > 3:
