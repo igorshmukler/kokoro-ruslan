@@ -40,8 +40,8 @@ def test_training_config_convergence_fix_defaults():
     )
 
     # Encoder FFN pre-clip loosened — the old 10.0 was zeroing microscopic-but-valid gradients
-    assert config.encoder_ffn_spike_clip_norm == 100.0, (
-        f"encoder_ffn_spike_clip_norm should be 100.0 (was 10.0); got {config.encoder_ffn_spike_clip_norm}"
+    assert config.encoder_ffn_spike_clip_norm == 20.0, (
+        f"encoder_ffn_spike_clip_norm should be 20.0; got {config.encoder_ffn_spike_clip_norm}"
     )
 
 
