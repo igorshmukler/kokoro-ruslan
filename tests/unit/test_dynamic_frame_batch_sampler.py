@@ -136,10 +136,13 @@ def test_stripe_interleave_heavy_batches_are_spread():
     short = [10] * 90
     long_ = [900] * 10
     lengths = short + long_
+    # max_batch_size=1 forces every sample into its own batch → n=100 batches,
+    # n_stripes = int(sqrt(100)) = 10, n_heavy = 10 (= number of long samples).
+    # The anchor-first algorithm then places them at stride 10, giving min_gap=10.
     random.seed(7)
     ds = DummyDataset(lengths)
     sampler = DynamicFrameBatchSampler(ds, max_frames=500, min_batch_size=1,
-                                       max_batch_size=8, drop_last=False, shuffle=True)
+                                       max_batch_size=1, drop_last=False, shuffle=True)
 
     batches = list(sampler)
     n = len(batches)

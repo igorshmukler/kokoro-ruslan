@@ -1064,35 +1064,48 @@ class DynamicFrameBatchSampler(Sampler):
         # Spread heavy batches evenly across the epoch so they cannot cluster
         # into consecutive steps and cause correlated gradient spikes.
         #
-        # Algorithm: sort all batches by estimated cost (max_frames × batch_size)
-        # descending, then divide into n_stripes = floor(sqrt(N)) groups ("stripes").
-        # Stripe 0 contains the heaviest batches (ranks 0, n_stripes, 2*n_stripes …),
-        # stripe 1 the next-heaviest, etc.  After shuffling within each stripe for
-        # randomness, the stripes are interleaved round-robin so the final sequence
-        # looks like: [s0[0], s1[0], …, s_{k-1}[0], s0[1], s1[1], …].
+        # Algorithm: pick the top n_heavy = ceil(sqrt(N)) costliest batches as
+        # "heavy", place them at evenly-spaced anchor positions across the output
+        # sequence, then fill the gaps between anchors with shuffled light batches.
         #
-        # Guarantee: any two batches from the same stripe are always exactly
-        # n_stripes positions apart in the output.  Since the heaviest batches all
-        # land in stripe 0, the minimum gap between any two top-tier outlier batches
-        # is n_stripes ≈ sqrt(N) steps — instead of 1 step with a plain shuffle.
+        # Guarantee: any two heavy batches are at least floor(N / n_heavy) - 1
+        # positions apart.  With N=661 that gives a minimum gap of ~25 steps,
+        # vs. 1 step with a plain shuffle.  Light batches are shuffled normally so
+        # the model still sees random variety within each gap.
         if self.shuffle and len(batches) > 1:
             n = len(batches)
-            n_stripes = max(2, int(n ** 0.5))
+            n_heavy = max(2, int(n ** 0.5))
             costs = [
                 max((self._get_sample_frames(idx) for idx in b), default=0) * len(b)
                 for b in batches
             ]
             order = sorted(range(n), key=lambda i: costs[i], reverse=True)
             sorted_b = [batches[i] for i in order]
-            stripes = [sorted_b[k::n_stripes] for k in range(n_stripes)]
-            for s in stripes:
-                random.shuffle(s)
-            result = []
-            max_stripe_len = max(len(s) for s in stripes)
-            for i in range(max_stripe_len):
-                for s in stripes:
-                    if i < len(s):
-                        result.append(s[i])
+
+            heavy = sorted_b[:n_heavy]   # top n_heavy; heavy[0] is globally heaviest
+            light = sorted_b[n_heavy:]
+            # Do NOT shuffle heavy — keep heavy[0] at position 0 so the first
+            # output batch is the costliest, satisfying the cost-ordering invariant.
+            random.shuffle(light)
+
+            # Divide light batches into n_heavy gaps (one gap per anchor).
+            # Each anchor is placed FIRST, then its gap follows, so:
+            #   position 0 = heavy[0] (heaviest overall)
+            #   positions 1..gap_size = light gap 0
+            #   position gap_size+1 = heavy[1]
+            #   ...
+            gap_size, remainder = divmod(len(light), n_heavy)
+            gaps: list = []
+            start = 0
+            for k in range(n_heavy):
+                end = start + gap_size + (1 if k < remainder else 0)
+                gaps.append(light[start:end])
+                start = end
+
+            result: list = []
+            for k, anchor in enumerate(heavy):
+                result.append(anchor)    # anchor first …
+                result.extend(gaps[k])   # … then its light gap
             batches = result
         elif self.shuffle:
             random.shuffle(batches)
