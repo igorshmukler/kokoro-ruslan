@@ -1,3 +1,11 @@
+import torch
+import torch.nn as nn
+import pytest
+from types import SimpleNamespace
+
+from kokoro.training.config import TrainingConfig
+from kokoro.training.trainer import KokoroTrainer
+
 """
 Tests for the stop-token class-imbalance fix (0.0.21).
 
@@ -33,16 +41,6 @@ Tests:
   13. Total loss in _calculate_losses increases with higher pos_weight when
       the stop signal is wrong (positive frame predicted as negative)
 """
-
-import math
-import torch
-import torch.nn as nn
-import pytest
-from types import SimpleNamespace
-
-from kokoro.training.config import TrainingConfig
-from kokoro.training.trainer import KokoroTrainer
-
 
 # ---------------------------------------------------------------------------
 # Helpers

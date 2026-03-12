@@ -1,5 +1,3 @@
-"""Unit tests for trainer checkpoint step counter persistence and resume restoration."""
-
 from types import SimpleNamespace
 
 import torch
@@ -7,6 +5,7 @@ import torch
 from kokoro.training.trainer import KokoroTrainer
 import kokoro.training.trainer as trainer_module
 
+"""Unit tests for trainer checkpoint step counter persistence and resume restoration."""
 
 class _StateDictHolder:
     def __init__(self, payload=None):

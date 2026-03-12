@@ -1,3 +1,6 @@
+import pytest
+from kokoro.training.trainer import KokoroTrainer
+
 """
 Tests covering KokoroTrainer._apply_warmup_guard — the staticmethod extracted
 from KokoroTrainer.__init__ to guard OneCycleLR against receiving a
@@ -8,9 +11,6 @@ Before fix: onecycle_steps = total_steps - self.warmup_steps
 After fix:  Guard clamps warmup_steps to total_steps - 1 first, then
             onecycle_steps = max(1, total_steps - warmup_steps) >= 1
 """
-import pytest
-from kokoro.training.trainer import KokoroTrainer
-
 
 # ---------------------------------------------------------------------------
 # Normal operation: warmup_steps < total_steps — no clamping, no change

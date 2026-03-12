@@ -1,4 +1,3 @@
-import torch
 from src.kokoro.utils.ema import recommended_ema_decay
 
 

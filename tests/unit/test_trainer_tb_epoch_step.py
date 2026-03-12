@@ -1,3 +1,7 @@
+from unittest.mock import MagicMock
+
+from kokoro.training.trainer import KokoroTrainer
+
 """Unit tests verifying that epoch-level TensorBoard scalars (both train and
 validation) are logged using ``optimizer_steps_completed`` as the x-axis step,
 not the raw epoch index.
@@ -8,13 +12,6 @@ the epoch-level entries effectively invisible in TensorBoard.  The fix stores
 ``_epoch_step = self.optimizer_steps_completed`` and uses that for all
 epoch-level ``add_scalar`` calls.
 """
-
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call
-import torch
-import pytest
-
-from kokoro.training.trainer import KokoroTrainer
 
 
 def _make_minimal_trainer(optimizer_steps: int = 500):

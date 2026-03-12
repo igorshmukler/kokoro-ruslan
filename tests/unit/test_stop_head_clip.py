@@ -1,3 +1,11 @@
+import pytest
+import torch
+import torch.nn as nn
+from types import SimpleNamespace
+
+from kokoro.training.config import TrainingConfig
+from kokoro.training.trainer import KokoroTrainer
+
 """
 Tests for stop-head gradient isolation via per-parameter clipping.
 
@@ -18,16 +26,6 @@ Covered behaviours:
   9.  With stop_head_spike_clip_norm=0 stop-head grads are left untouched
   10. Both weight and bias of stop head are independently clipped
 """
-
-import math
-import pytest
-import torch
-import torch.nn as nn
-from types import SimpleNamespace
-
-from kokoro.training.config import TrainingConfig
-from kokoro.training.trainer import KokoroTrainer
-
 
 # ---------------------------------------------------------------------------
 # Minimal model fixture that mirrors the real model's named parameters

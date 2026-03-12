@@ -1,5 +1,3 @@
-import pytest
-
 from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 
