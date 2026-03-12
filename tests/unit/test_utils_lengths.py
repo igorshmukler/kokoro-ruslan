@@ -31,6 +31,32 @@ def test_vectorized_expand_tokens_3d_and_zero_durations():
     assert out.shape[1] >= 1
 
 
+def test_vectorized_expand_tokens_pad_when_max_len_larger():
+    tokens = torch.tensor([[1, 2]])
+    durations = torch.tensor([[1, 1]])
+    out = vectorized_expand_tokens(tokens, durations, max_len=4)
+    assert out.shape == (1, 4)
+    # padded values should be zero
+    assert out[0, 2] == 0
+    assert out[0, 3] == 0
+
+
+def test_vectorized_expand_tokens_fallback_on_exception(monkeypatch):
+    tokens = torch.tensor([[1, 2, 3]])
+    durations = torch.tensor([[1, 1, 1]])
+
+    # Force an exception inside the fast path to trigger fallback by monkeypatching
+    # a function used only in the fast path (`torch.arange`). The fallback uses
+    # `torch.repeat_interleave` and will still work.
+    def bad_arange(*args, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(torch, 'arange', bad_arange)
+
+    out = vectorized_expand_tokens(tokens, durations)
+    assert out.shape[1] >= 3
+
+
 def test_length_regulate_and_masking():
     enc = torch.tensor([[[1.0], [2.0], [0.0]]])  # (1,3,1)
     durations = torch.tensor([[1.0, 2.0, 0.0]])
