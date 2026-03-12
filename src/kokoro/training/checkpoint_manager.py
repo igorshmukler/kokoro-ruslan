@@ -399,41 +399,65 @@ def load_checkpoint(
             missing_match = _re.search(r'Missing key\(s\) in state_dict:\s*(.*?)(?:\.\s*Unexpected|\Z)', error_str, _re.DOTALL)
             unexpected_match = _re.search(r'Unexpected key\(s\) in state_dict:\s*(.*?)(?:\.\s*Missing|\Z)', error_str, _re.DOTALL)
 
-            # Collect missing keys
+            # Collect missing keys — use findall to correctly parse quoted key names
+            # (avoids the trailing '."' suffix on the last key when splitting by comma)
             missing_keys: list = []
             if missing_match:
-                missing_keys = [k.strip().strip('"') for k in missing_match.group(1).split(',') if k.strip()]
+                missing_keys = _re.findall(r'"([^"]+)"', missing_match.group(1))
 
             # Collect unexpected keys (keys in ckpt but not in model)
             unexpected_keys: list = []
             if unexpected_match:
-                unexpected_keys = [k.strip().strip('"') for k in unexpected_match.group(1).split(',') if k.strip()]
+                unexpected_keys = _re.findall(r'"([^"]+)"', unexpected_match.group(1))
 
             # Define the namespace prefixes that represent newly-added sub-modules
             _NEW_VARIANCE_PREFIX = 'duration_adaptor.variance_adaptor.'
 
-            all_missing_are_new_variance = missing_keys and all(
-                k.startswith(_NEW_VARIANCE_PREFIX) for k in missing_keys
-            )
-            no_unexpected = not unexpected_keys
+            # Positional encoding migration: checkpoints trained with ALiBi decoder
+            # self-attention store 'alibi_slopes' buffers.  After the switch to RoPE
+            # (which uses persistent=False buffers — not in state_dict), these become
+            # unexpected keys.  They are deterministic constants (fixed function of
+            # num_heads); discarding them is safe.
+            _ALIBI_SUFFIX = '.alibi_slopes'
 
-            if all_missing_are_new_variance and no_unexpected:
-                logger.warning(
-                    "Checkpoint is missing variance_adaptor sub-module weights "
-                    f"({len(missing_keys)} keys). This is an expected architecture "
-                    "migration (old checkpoint predates the restructured VarianceAdaptor). "
-                    "Loading shared weights and initialising missing keys from scratch."
-                )
+            all_missing_are_known = (
+                not missing_keys
+                or all(k.startswith(_NEW_VARIANCE_PREFIX) for k in missing_keys)
+            )
+            all_unexpected_are_known = (
+                not unexpected_keys
+                or all(k.endswith(_ALIBI_SUFFIX) for k in unexpected_keys)
+            )
+
+            if all_missing_are_known and all_unexpected_are_known:
+                if missing_keys:
+                    logger.warning(
+                        "Checkpoint is missing variance_adaptor sub-module weights "
+                        f"({len(missing_keys)} keys). This is an expected architecture "
+                        "migration (old checkpoint predates the restructured VarianceAdaptor). "
+                        "Loading shared weights and initialising missing keys from scratch."
+                    )
+                if unexpected_keys:
+                    logger.warning(
+                        f"Checkpoint contains {len(unexpected_keys)} legacy ALiBi positional "
+                        "encoding buffer(s) (alibi_slopes) that are not used by the current "
+                        "RoPE-based model.  These will be discarded."
+                    )
                 # Load the compatible weights; missing keys keep their randomly-initialised values
                 incompatible = model.load_state_dict(model_state_dict, strict=False)
-                if incompatible.unexpected_keys:
+                residual_unexpected = [
+                    k for k in incompatible.unexpected_keys
+                    if not k.endswith(_ALIBI_SUFFIX)
+                ]
+                if residual_unexpected:
                     raise RuntimeError(
-                        "Partial checkpoint load produced unexpected keys, aborting. "
-                        f"Unexpected: {incompatible.unexpected_keys}"
+                        "Partial checkpoint load produced unexpected non-migration keys, aborting. "
+                        f"Unexpected: {residual_unexpected}"
                     )
                 logger.info(
-                    f"Partial load succeeded. {len(incompatible.missing_keys)} variance_adaptor "
-                    "keys will train from random initialisation."
+                    f"Partial load succeeded. "
+                    f"{len(incompatible.missing_keys)} keys initialised from scratch, "
+                    f"{len(incompatible.unexpected_keys)} legacy keys discarded."
                 )
             else:
                 raise RuntimeError(
@@ -659,7 +683,47 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             final_lr = max_lr / 10000.0
             peak_step = int(pct_start * onecycle_steps)
 
-            if last_lr >= max_lr:
+            # Step-based positioning: use checkpoint global_step as the anchor whenever
+            # available.  LR-value matching (the fallback below) breaks when max_lr has
+            # been changed between runs — a lower new max_lr causes the saved LR to appear
+            # near-peak, which jumps the scheduler forward by many epochs on resume.
+            _saved_global_step = checkpoint.get('global_step') if checkpoint is not None else None
+            if _saved_global_step is not None:
+                # global_step is saved as current_optimizer_step — already in optimizer-step
+                # units (incremented only on a successful optimizer.step(), never by batch
+                # count or gradient_accumulation_steps).
+                #
+                # OneCycleLR's internal step counter starts at 0 when the manual warmup
+                # ends.  We therefore subtract warmup_steps to get the correct OneCycleLR
+                # position.
+                #
+                # *** DO NOT divide by gradient_accumulation_steps here. ***
+                # global_step is already post-accumulation; dividing by _grad_acc would
+                # halve the resume position, restarting the LR ramp ~1 epoch early on
+                # every resume and causing mel-loss regression (observed epochs 5–6).
+                _warmup_done = (
+                    int(getattr(trainer, 'warmup_steps', 0))
+                    if getattr(trainer, 'use_warmup', False) else 0
+                )
+                target_step = max(0, min(onecycle_steps - 1,
+                                         int(_saved_global_step) - _warmup_done))
+                # Compute the LR at target_step under the NEW schedule using the OneCycleLR
+                # cosine formula (phase 1: base_lr→max_lr; phase 2: max_lr→final_lr).
+                if target_step <= peak_step:
+                    _pct = target_step / max(1, peak_step)
+                    resume_lr = base_lr + (max_lr - base_lr) * (1.0 - math.cos(math.pi * _pct)) / 2.0
+                else:
+                    _decay_steps = onecycle_steps - peak_step
+                    _pct = (target_step - peak_step) / max(1, _decay_steps)
+                    resume_lr = final_lr + (max_lr - final_lr) * (1.0 + math.cos(math.pi * _pct)) / 2.0
+                resume_lr = max(base_lr, min(max_lr, resume_lr))
+                logger.info(
+                    f"Step-based scheduler resume: global_step={_saved_global_step} "
+                    f"(warmup_done={_warmup_done}) "
+                    f"→ onecycle_step={target_step}/{onecycle_steps}, "
+                    f"resume_lr={resume_lr:.2e} (decoder, new schedule max_lr={max_lr:.2e})"
+                )
+            elif last_lr >= max_lr:
                 target_step = peak_step
                 resume_lr   = max_lr
                 logger.info(

@@ -107,20 +107,22 @@ def calculate_training_losses(
     loss_pitch = torch.tensor(0.0, device=device)
     if predicted_pitch is not None and pitch_targets is not None and criterion_pitch is not None:
         if predicted_pitch.dim() == 2 and predicted_pitch.size(1) != phoneme_durations.size(1):
-            # predicted_pitch is frame-level; pitch_targets is phoneme-level.
-            # Expand phoneme-level targets to frame level so that *every* predicted
-            # frame receives an independent gradient signal.  Previously the code
-            # averaged predictions down to phoneme level first, which collapsed all
-            # intra-phoneme variation to a single gradient value and allowed the
-            # predictor to converge to a constant per phoneme (zero variance).
+            # predicted_pitch is frame-level.
             max_frame_len = mel_mask_2d.size(1)
-            # The model may expand to more frames than the target batch was padded
-            # to (e.g. predicted 258 frames vs target 148).  Truncate to the
-            # shorter of the two so shapes agree for element-wise MSE.
             pred_pitch_aligned = predicted_pitch[:, :max_frame_len]
-            pitch_targets_frame = vectorized_expand_tokens(
-                pitch_targets, phoneme_durations, max_len=max_frame_len
-            )
+            if pitch_targets.size(1) == phoneme_durations.size(1):
+                # targets are phoneme-level (legacy path) → expand to frame-level.
+                # This path is kept for backward compatibility only; the normal
+                # training path now passes frame-level targets directly.
+                pitch_targets_frame = vectorized_expand_tokens(
+                    pitch_targets, phoneme_durations, max_len=max_frame_len
+                )
+            else:
+                # targets are already frame-level → truncate to align lengths.
+                # This is the normal path: frame-level targets passed directly from
+                # the dataset, avoiding the phoneme-averaging that caused f0_RMSE to
+                # freeze (frame→phoneme mean→re-expand = phoneme-constant targets).
+                pitch_targets_frame = pitch_targets[:, :max_frame_len]
             loss_pitch_unreduced = criterion_pitch(pred_pitch_aligned, pitch_targets_frame)
             pitch_valid = mel_mask_2d & torch.isfinite(loss_pitch_unreduced)
         else:
@@ -133,13 +135,17 @@ def calculate_training_losses(
     loss_energy = torch.tensor(0.0, device=device)
     if predicted_energy is not None and energy_targets is not None and criterion_energy is not None:
         if predicted_energy.dim() == 2 and predicted_energy.size(1) != phoneme_durations.size(1):
-            # Same frame-level expansion for energy — mirrors the pitch above.
+            # predicted_energy is frame-level.
             max_frame_len = mel_mask_2d.size(1)
-            # Truncate in case the model expanded to more frames than the target.
             pred_energy_aligned = predicted_energy[:, :max_frame_len]
-            energy_targets_frame = vectorized_expand_tokens(
-                energy_targets, phoneme_durations, max_len=max_frame_len
-            )
+            if energy_targets.size(1) == phoneme_durations.size(1):
+                # targets are phoneme-level (legacy path) → expand to frame-level.
+                energy_targets_frame = vectorized_expand_tokens(
+                    energy_targets, phoneme_durations, max_len=max_frame_len
+                )
+            else:
+                # targets are already frame-level → truncate to align lengths.
+                energy_targets_frame = energy_targets[:, :max_frame_len]
             loss_energy_unreduced = criterion_energy(pred_energy_aligned, energy_targets_frame)
             energy_valid = mel_mask_2d & torch.isfinite(loss_energy_unreduced)
         else:
@@ -149,7 +155,6 @@ def calculate_training_losses(
         if energy_valid.any():
             loss_energy = loss_energy_unreduced[energy_valid].mean()
 
-    variance_diverged = False
     if loss_pitch > 10.0 or loss_energy > 10.0:
         logger.warning(f"⚠️  Variance predictor divergence detected - pitch: {loss_pitch:.2f}, energy: {loss_energy:.2f}")
 
@@ -165,25 +170,33 @@ def calculate_training_losses(
             logger.warning(f"   Energy predictions: [{pred_min:.3f}, {pred_max:.3f}]")
             logger.warning(f"   Energy targets: [{targ_min:.3f}, {targ_max:.3f}]")
 
-        logger.warning("   Auto-recovery: Resetting variance predictor weights and reducing loss contribution")
-
-        va = getattr(model, 'variance_adaptor', None)
-        if va is not None:
-            if hasattr(va, 'pitch_predictor') and va.pitch_predictor is not None:
-                va.pitch_predictor._init_weights()
-            if hasattr(va, 'energy_predictor') and va.energy_predictor is not None:
-                va.energy_predictor._init_weights()
-
-        loss_pitch = torch.tensor(0.0, device=device)
-        loss_energy = torch.tensor(0.0, device=device)
-        variance_diverged = True
+        # Clamp losses to a safe ceiling rather than zeroing them out or
+        # re-initialising weights mid-forward-pass.
+        #
+        # The previous approach called `_init_weights()` here — after the forward
+        # pass but before `.backward()` — which:
+        #   1. Randomly re-initialised the predictor weights while the corrupt
+        #      activations from those weights were still in the autograd graph,
+        #      so the computation graph referred to the OLD weights but .backward()
+        #      would update the NEW (reset) weights — a silent state mismatch.
+        #   2. Zeroed the pitch/energy loss, giving the variance predictor zero
+        #      gradient signal for that batch, preventing it from learning to
+        #      recover from the diverged state.
+        #   3. If triggered on consecutive batches the predictor oscillated
+        #      between random reinit and divergence with no chance to stabilise.
+        #
+        # Instead: hard-clamp the loss contribution (same ceiling as the normal
+        # path, already applied below) so the gradient magnitude is bounded but
+        # non-zero.  The predictor receives a corrective signal and can recover
+        # on its own.  If it does not recover within a few batches the finite-loss
+        # guard in _execute_training_step will skip the batch entirely.
+        logger.warning("   Clamping variance loss contribution to 10.0 (no weight reset)")
 
     loss_mel = torch.clamp(loss_mel, max=100.0)
     loss_duration = torch.clamp(loss_duration, max=100.0)
     loss_stop_token = torch.clamp(loss_stop_token, max=100.0)
-    if not variance_diverged:
-        loss_pitch = torch.clamp(loss_pitch, max=10.0)
-        loss_energy = torch.clamp(loss_energy, max=10.0)
+    loss_pitch = torch.clamp(loss_pitch, max=10.0)
+    loss_energy = torch.clamp(loss_energy, max=10.0)
 
     total_loss = (
         loss_mel

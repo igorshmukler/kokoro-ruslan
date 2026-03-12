@@ -99,9 +99,10 @@ class TestTrainingConfigDefaults:
     def test_stop_token_pos_weight_default_is_correct(self):
         cfg = TrainingConfig.__new__(TrainingConfig)
         # Access the raw dataclass default without calling __post_init__
-        # Default was 150.0; reduced to 30.0 after observing batch stop-loss
-        # spikes (>1.5) destabilise the decoder during the OneCycleLR ramp phase.
-        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 50.0
+        # pos_weight is intentionally decoupled from stop_token_loss_weight.
+        # Current value: 35.0 (stable partial correction ~?% of true imbalance).
+        # History: 150 → spikes; 100 → grad_norm to 39.8; 50 → stable.
+        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 35.0
 
     def test_stop_token_pos_weight_custom_value_survives_post_init(self):
         cfg = TrainingConfig(stop_token_pos_weight=300.0)

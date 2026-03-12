@@ -25,13 +25,14 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 2.0  # Max LR = learning_rate * this value (lowered from 3.0: stop/encoder instability > epoch 6 with 3.0)
+    max_lr_multiplier: float = 1.0  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
     pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
-    # that the severely under-trained encoder layers get proportionally more gradient
-    # signal relative to the already-learning decoder.
-    encoder_lr_multiplier: float = 2.0
+    # that the encoder layers get proportionally more gradient signal vs the decoder.
+    # 1.5 gives peak encoder = 1e-4 × 1.3 (max_lr) × 1.5 = 1.95e-4
+    # (was 2.25e-4 with max_lr_mult=1.5; ep7 spiked → reduced max_lr first)
+    encoder_lr_multiplier: float = 1.3
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -67,12 +68,12 @@ class TrainingConfig:
 
     # Loss weights
     duration_loss_weight: float = 0.35
-    # Stop token BCE contribution to total loss.
-    # Calibration: effective stop contribution = stop_token_loss_weight × pos_weight.
-    # With pos_weight=100 the weight must be scaled down proportionally from the
-    # value that worked at pos_weight=30, to keep the stop/mel gradient ratio stable:
-    #   0.25 × 30 = 7.5  →  keep at 7.5  →  7.5 / 100 = 0.075
-    stop_token_loss_weight: float = 0.075
+    # Global scaling of the stop-token loss in the total loss sum.
+    # This parameter controls only how much stop learning contributes to the
+    # total gradient — it is intentionally decoupled from stop_token_pos_weight.
+    # Rule of thumb: stop should contribute ~1–3% of the mel gradient budget.
+    # Set independently of pos_weight; do NOT re-derive from pos_weight.
+    stop_token_loss_weight: float = 0.010
     pitch_loss_weight: float = 1.0  # Normalized to [0,1]; 1.0 gives pitch predictor adequate gradient signal vs mel loss
     energy_loss_weight: float = 1.0  # Normalized to [0,1]; matched to pitch_loss_weight
 
@@ -91,23 +92,29 @@ class TrainingConfig:
     # Start at epoch 23: 3 epochs after the LR peak, once the schedule is
     # descending and the model has stabilised.
     spec_augment_start_epoch: int = 23
-    # Stop token class-imbalance correction.
-    # BCE on stop tokens is skewed ~200:1 (negative frames : positive stop frame
-    # per average-length Russian utterance).  pos_weight=150 gave true class-balance
-    # during warmup but produced batch stop-loss spikes (>1.5 vs ~0.5 average)
-    # once the OneCycleLR ramp raised the LR past 1.2e-4.  With pos_weight=150 the
-    # gradient for a single missed stop token is 150× a non-stop frame; at higher
-    # LRs this overwhelms the mel gradient and corrupts the decoder representation
-    # (observed: stop spikes → grad_norm spikes to 18, stop val rising from
-    # 0.41 at epoch 3 to 0.64 at epoch 6 while mel simultaneously regressed).
-    # Data-driven calculation (500-sample RUSLAN cache): mean mel length = 137.8 frames
-    # → actual neg/pos imbalance = 136.8:1.  Previous value of 30 corrected only 22%.
-    # 100 ≈ 73% correction — enough signal to learn stop reliably without over-correcting
-    # (full correction at 137 causes premature stops during inference).
-    # Lowered to 50 (36% correction): at rising LR the 100× per-stop gradient caused
-    # stop loss spikes to 1.21 and grad_norm max to 39.8 by epoch 8.  Halving reduces
-    # the per-stop gradient magnitude by 2× while still providing adequate stop signal.
-    stop_token_pos_weight: float = 50.0
+    # Class-imbalance correction for stop-token BCE.
+    # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
+    # so the model cannot collapse to always-predict-no-stop.
+    # Set this to approximate the actual neg/pos frame ratio in the corpus
+    # (500-sample RUSLAN: mean mel length ≈ 138 frames → ratio ≈ 137:1).
+    # This parameter is intentionally decoupled from stop_token_loss_weight:
+    #   • stop_token_pos_weight  → fixes class balance (sampling concern)
+    #   • stop_token_loss_weight → controls global loss contribution (scale concern)
+    # Do NOT scale pos_weight up/down to compensate for the global weight; adjust
+    # stop_token_loss_weight independently for that purpose.
+    # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 chosen as
+    # stable partial correction (~36%) that keeps the stop predictor learning.
+    stop_token_pos_weight: float = 35.0
+    # Temporal smoothing of stop-token targets.
+    # Instead of a single hard 1.0 at the last frame, a short exponentially
+    # decaying tail is added to the frames immediately before it:
+    #   frame[T-1]          = 1.0          (the actual stop boundary)
+    #   frame[T-1-k]        = decay^k       for k = 1 … stop_token_smooth_tail
+    # This spreads the positive gradient over several frames, eliminating the
+    # single-frame spike that can cause grad-norm bursts when pos_weight is large.
+    # Set stop_token_smooth_tail=0 to disable (recover the original hard target).
+    stop_token_smooth_tail: int = 6
+    stop_token_smooth_decay: float = 0.5
 
     # Variance predictor settings
     use_variance_predictor: bool = True  # Enabled with normalized [0,1] inputs and auto-reset
@@ -153,24 +160,42 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 2.0  # Global gradient clip ceiling; lowered from 5.0 (grad_norm max hit 39.8 by epoch 8)
+    max_grad_norm: float = 2.0 # Global gradient clip ceiling
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 20.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
-    ffn_spike_clip_norm: float = 15.0
-    # Encoder FFN per-layer pre-clip. Previously 10.0 which was so tight it zeroed the
-    # already-microscopic encoder gradients (~1e-7), starving the encoder of all signal.
-    # Raised to 100.0: real instabilities are still caught by the global clip_grad_norm;
-    # this pre-clip now only fires on genuine spikes, not on normal encoder gradients.
-    encoder_ffn_spike_clip_norm: float = 100.0
+    ffn_spike_clip_norm: float = 5.0
+    # Encoder FFN per-layer pre-clip. Previously 10.0 (too tight, zeroed encoder grads);
+    # raised to 100.0 while encoder was passive (ep1-ep5 grads ~1e-7).
+    # By ep6 encoder FFN avg_grad reached 40-100 per tensor (active learning phase),
+    # so 100.0 provided no real protection and encoder attention was also fully uncapped.
+    # Set to 12.0: ~20% above the decoder FFN cap (8.0), proportional to the higher
+    # encoder LR multiplier (1.3×). Encoder attention is now also clipped at
+    # attention_spike_clip_norm (20.0) via the extended pre-clip in trainer.
+    encoder_ffn_spike_clip_norm: float = 20.0
+    # Per-parameter clip norm applied exclusively to the stop-token head
+    # (stop_token_predictor.weight and .bias) before the global clip.
+    # The stop head is a single Linear(hidden_dim→1); its gradient can spike disproportionately
+    # when pos_weight is large or the smoothing tail has a frame error near the boundary.
+    # A tight ceiling here prevents the stop head from corrupting the mel decoder's gradient
+    # budget while still giving the head a meaningful update signal.
+    # Set ≤ 0 to disable.  Chosen conservatively: the mel projection norms rarely exceed
+    # ~5 at steady state, so 1.0 is tight enough to isolate the head without starving it.
+    stop_head_spike_clip_norm: float = 1.0
+    # Post-step max weight-norm clamp for decoder.layers.0.ff.linear1.weight.
+    # After every successful optimizer step the L2 norm of that weight matrix is
+    # projected back to this ceiling, preventing unconstrained growth of the
+    # first decoder FFN expansion layer while leaving gradients untouched.
+    # Set ≤ 0.0 to disable.
+    dec_ff0_linear1_max_weight_norm: float = 60.0
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100
 
     # Checkpointing
-    save_every: int = 2
+    save_every: int = 5  # Save every X epochs (even if it not the best result); best model is always saved separately
     resume_checkpoint: str = 'auto'
 
     # Validation settings
@@ -240,7 +265,7 @@ class TrainingConfig:
             from pathlib import Path
             self.feature_cache_dir = str(Path(self.data_dir) / ".feature_cache")
 
-        MPS_MAX_FRAMES_PER_BATCH = 20000
+        MPS_MAX_FRAMES_PER_BATCH = 12000
         MPS_MAX_BATCH_SIZE = 16
 
         # MPS-specific memory optimizations

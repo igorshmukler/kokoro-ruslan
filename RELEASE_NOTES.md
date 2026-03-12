@@ -2,6 +2,13 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.31 (2026-03-11)
+
+- Added training analysis script
+- Spread heavy batches more evenly across the epoch to prevent clustering
+- Added post-step max weight-norm clamp for decoder.layers.0.ff.linear1.weight
+- Misc configuration changes to stabilize convergence
+
 ## 0.0.30 (2026-03-09)
 
 - Improved tensorboard logs purge upon resuming from a checkpoint

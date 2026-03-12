@@ -198,6 +198,7 @@ class KokoroTrainer:
         self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
 
         self._setup_grad_explosion_tracker()
+        self._setup_weight_norm_constraints()
 
         self.optimizer_steps_completed = 0
 
@@ -408,7 +409,7 @@ class KokoroTrainer:
         # are negative (0.0).  Without this the model learns to always predict 0
         # and achieves near-zero BCE loss while never detecting end-of-utterance.
         _stop_pos_w = torch.tensor(
-            [getattr(config, 'stop_token_pos_weight', 150.0)],
+            [getattr(config, 'stop_token_pos_weight', 30.0)],
             device=self.device
         )
         self.criterion_stop_token = nn.BCEWithLogitsLoss(
@@ -465,13 +466,17 @@ class KokoroTrainer:
         encoder_lr_mult = float(getattr(config, 'encoder_lr_multiplier', 3.0))
         self._encoder_lr_multiplier = encoder_lr_mult
 
-        # Partition parameters into two groups:
-        #   1. encoder_params — text/stress embeddings + positional encoding +
+        # Partition parameters into three groups:
+        #   1. encoder_params    — text/stress embeddings + positional encoding +
         #      transformer encoder layers, higher LR multiplier, weight_decay=0
         #      (L2 on embedding rows counteracts learned representations; encoder
         #      transformer layers benefit from reduced regularisation given the
         #      elevated LR)
-        #   2. decoder_params — decoder and all other parameters, base LR
+        #   2. decoder_no_decay  — decoder biases and all norm affine params (scale +
+        #      shift).  weight_decay=0: penalising these toward zero fights the
+        #      learned statistics and hurts convergence.
+        #   3. decoder_decay     — all other decoder/variance-predictor weights,
+        #      regularised with the configured weight_decay.
         encoder_prefixes = (
             'text_embedding.',
             'stress_embedding.',
@@ -479,9 +484,17 @@ class KokoroTrainer:
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
         )
+        # Parameter names matching these patterns are excluded from weight decay.
+        # ".bias" catches every bias vector; the norm patterns catch LayerNorm /
+        # RMSNorm / BatchNorm affine weight and bias regardless of nesting depth.
+        _no_decay_suffixes = ('.bias',)
+        _no_decay_substrings = (
+            'norm.weight', 'norm.bias',
+            'layer_norm.weight', 'layer_norm.bias',
+        )
         seen_ids: set = set()
         encoder_params = []
-        decoder_params = []
+        decoder_named: list = []  # (name, param) for further splitting
         for name, param in self.model.named_parameters():
             if id(param) in seen_ids:
                 continue
@@ -489,14 +502,26 @@ class KokoroTrainer:
             if any(name.startswith(prefix) for prefix in encoder_prefixes):
                 encoder_params.append(param)
             else:
-                decoder_params.append(param)
+                decoder_named.append((name, param))
+
+        decoder_no_decay: list = []
+        decoder_decay: list = []
+        for _name, _param in decoder_named:
+            if (any(_name.endswith(s) for s in _no_decay_suffixes)
+                    or any(s in _name for s in _no_decay_substrings)):
+                decoder_no_decay.append(_param)
+            else:
+                decoder_decay.append(_param)
+        decoder_params = [p for _, p in decoder_named]  # kept for logging only
 
         encoder_lr = base_lr * encoder_lr_mult
         param_groups = [
-            {'params': encoder_params, 'lr': encoder_lr,
-             'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas},
-            {'params': decoder_params, 'lr': base_lr,
-             'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas},
+            {'params': encoder_params,   'lr': encoder_lr, 'weight_decay': 0.0,
+             'eps': adam_eps, 'betas': adam_betas},
+            {'params': decoder_no_decay, 'lr': base_lr,    'weight_decay': 0.0,
+             'eps': adam_eps, 'betas': adam_betas},
+            {'params': decoder_decay,    'lr': base_lr,    'weight_decay': weight_decay,
+             'eps': adam_eps, 'betas': adam_betas},
         ]
         if not encoder_params:
             # Fallback: single group (no identifiable encoder params)
@@ -506,9 +531,10 @@ class KokoroTrainer:
             logger.warning("No encoder params identified for separate LR group — using single param group")
         else:
             logger.info(
-                f"Optimizer param groups: encoder={len(encoder_params)} params "
-                f"(lr={encoder_lr:.2e}, wd=0.0), "
-                f"decoder/rest={len(decoder_params)} params (lr={base_lr:.2e}, wd={weight_decay})"
+                f"Optimizer param groups: "
+                f"encoder={len(encoder_params)} params (lr={encoder_lr:.2e}, wd=0.0), "
+                f"decoder_no_decay={len(decoder_no_decay)} params (lr={base_lr:.2e}, wd=0.0), "
+                f"decoder_decay={len(decoder_decay)} params (lr={base_lr:.2e}, wd={weight_decay})"
             )
 
         try:
@@ -643,6 +669,34 @@ class KokoroTrainer:
             self.ema_model = None
             logger.info("EMA disabled")
 
+    def _setup_weight_norm_constraints(self) -> None:
+        """Cache parameter references used by post-step weight-norm clamping."""
+        named_modules = dict(self.model.named_modules())
+        m = named_modules.get('decoder.layers.0.ff.linear1')
+        self._dec_ff0_linear1_weight = m.weight if m is not None else None
+        if self._dec_ff0_linear1_weight is None:
+            logger.warning(
+                "dec_ff0_linear1_max_weight_norm: module 'decoder.layers.0.ff.linear1' "
+                "not found in model — weight-norm clamp will be skipped."
+            )
+
+    @torch.no_grad()
+    def _apply_weight_norm_constraints(self) -> None:
+        """Project decoder.layers.0.ff.linear1.weight back onto its max-norm ball.
+
+        Called after every successful optimizer step.  The L2 norm of the full
+        weight matrix is compared against *dec_ff0_linear1_max_weight_norm* and
+        rescaled when it exceeds the ceiling.  This is equivalent to the PyTorch
+        max-norm constraint without registering a parametrization hook.
+        """
+        max_norm: float = getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
+        if max_norm <= 0.0 or self._dec_ff0_linear1_weight is None:
+            return
+        w = self._dec_ff0_linear1_weight
+        current_norm = w.norm(2).item()
+        if current_norm > max_norm:
+            w.mul_(max_norm / current_norm)
+
     def _setup_grad_explosion_tracker(self):
         """Initialize gradient explosion detection and localized spike clipping state."""
         config = self.config
@@ -660,6 +714,9 @@ class KokoroTrainer:
         self.projection_spike_clip_norm = getattr(config, 'projection_spike_clip_norm', 50.0)
         self.attention_spike_clip_norm = getattr(config, 'attention_spike_clip_norm', 20.0)
         self.ffn_spike_clip_norm = getattr(config, 'ffn_spike_clip_norm', 15.0)
+        # Stop-head isolation clip: applied only to stop_token_predictor.weight/.bias
+        # before the global clip, so stop-gradient spikes cannot consume the mel budget.
+        self.stop_head_spike_clip_norm = getattr(config, 'stop_head_spike_clip_norm', 1.0)
 
     def get_autocast_context(self):
         """Get the appropriate autocast context for the device"""
@@ -1060,7 +1117,10 @@ class KokoroTrainer:
 
     def _preclip_projection_spikes(self) -> Dict[str, Tuple[float, float]]:
         """Clip localized spikes in mel projection/attention/FFN gradients before global norm checks."""
-        if self.projection_spike_clip_norm <= 0 and self.attention_spike_clip_norm <= 0 and self.ffn_spike_clip_norm <= 0:
+        if (self.projection_spike_clip_norm <= 0
+                and self.attention_spike_clip_norm <= 0
+                and self.ffn_spike_clip_norm <= 0
+                and self.stop_head_spike_clip_norm <= 0):
             return {}
 
         projection_params = {
@@ -1068,6 +1128,13 @@ class KokoroTrainer:
             'mel_projection_in.bias',
             'mel_projection_out.weight',
             'mel_projection_out.bias',
+        }
+
+        # Stop-head parameters get their own tighter per-parameter ceiling so that
+        # a stop-gradient spike cannot bleed into mel/encoder gradient budget.
+        stop_head_params = {
+            'stop_token_predictor.weight',
+            'stop_token_predictor.bias',
         }
 
         attention_name_fragments = (
@@ -1098,7 +1165,9 @@ class KokoroTrainer:
             max_norm = None
             if name in projection_params and projection_max_norm > 0:
                 max_norm = projection_max_norm
-            elif attention_max_norm > 0 and name.startswith('decoder.layers.') and any(fragment in name for fragment in attention_name_fragments):
+            elif name in stop_head_params and float(self.stop_head_spike_clip_norm) > 0:
+                max_norm = float(self.stop_head_spike_clip_norm)
+            elif attention_max_norm > 0 and (name.startswith('decoder.layers.') or name.startswith('transformer_encoder_layers.')) and any(fragment in name for fragment in attention_name_fragments):
                 max_norm = attention_max_norm
             elif encoder_ffn_max_norm > 0 and name.startswith('transformer_encoder_layers.') and any(fragment in name for fragment in ffn_name_fragments):
                 # Encoder FFN layers are the primary spike source — use tighter clip
@@ -1445,24 +1514,14 @@ class KokoroTrainer:
                                  pitch_targets=pitches, energy_targets=energies,
                                  stress_indices=stress_indices)
 
-                    # Convert mel-frame level pitch/energy to phoneme level for loss calculation
-                    phoneme_pitches = None
-                    phoneme_energies = None
-                    if pitches is not None and predicted_pitch is not None:
-                        phoneme_pitches = self._average_pitch_energy_by_duration(
-                            pitches, phoneme_durations, phoneme_lengths
-                        )
-                    if energies is not None and predicted_energy is not None:
-                        phoneme_energies = self._average_pitch_energy_by_duration(
-                            energies, phoneme_durations, phoneme_lengths
-                        )
-
-                    # Loss calculation
+                    # Loss calculation — pass frame-level pitch/energy targets directly.
+                    # losses.py detects they are already frame-level and aligns lengths
+                    # without phoneme expansion (fixes double-averaging that froze f0_RMSE).
                     total_loss, loss_mel, loss_duration, loss_stop_token, loss_pitch, loss_energy = self._calculate_losses(
                         predicted_mel, predicted_log_durations, predicted_stop_logits,
                         mel_specs, phoneme_durations, stop_token_targets,
                         mel_lengths, phoneme_lengths,
-                        predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies
+                        predicted_pitch, predicted_energy, pitches, energies
                     )
 
                     # Log spectrograms for first validation batch only
@@ -1678,7 +1737,10 @@ class KokoroTrainer:
         loss_accumulation_interval = 10
         accumulated_losses = []
 
+        # Initial estimate only; for dynamic batching this may change when the
+        # sampler rebuilds batches at iterator start.
         num_batches = len(self.dataloader)
+        processed_loss_batches = 0
 
         # Gradient accumulation for larger effective batch sizes
         gradient_accumulation_steps = getattr(self.config, 'gradient_accumulation_steps', 1)
@@ -1700,6 +1762,26 @@ class KokoroTrainer:
         progress_bar = tqdm(self.dataloader, desc=f"Epoch {epoch+1}/{self.config.num_epochs}")
         for batch_idx, batch in enumerate(progress_bar):
             try:
+                # DynamicFrameBatchSampler rebuilds self.batches inside __iter__.
+                # Once iteration has started, read the rebuilt count so
+                # is_last_batch/accumulation logic uses the current epoch's true size.
+                if batch_idx == 0:
+                    try:
+                        sampler_batches = getattr(self.batch_sampler, 'batches', None)
+                        if sampler_batches is not None:
+                            rebuilt_num_batches = len(sampler_batches)
+                            if rebuilt_num_batches > 0 and rebuilt_num_batches != num_batches:
+                                logger.info(
+                                    "Epoch %d batch count updated after sampler rebuild: %d -> %d",
+                                    epoch + 1,
+                                    num_batches,
+                                    rebuilt_num_batches,
+                                )
+                                num_batches = rebuilt_num_batches
+                    except Exception:
+                        # Keep the initial estimate if sampler internals are unavailable.
+                        pass
+
                 # Start interbatch profiling for this batch
                 if enable_interbatch_profiling or is_profiling_epoch:
                     self.interbatch_profiler.start_batch()
@@ -2067,6 +2149,7 @@ class KokoroTrainer:
 
                     if step_successful:
                         self.optimizer_steps_completed += 1
+                        self._apply_weight_norm_constraints()
                     else:
                         logger.warning(
                             "Optimizer step skipped (AMP overflow/non-finite grads); "
@@ -2149,6 +2232,7 @@ class KokoroTrainer:
                     'dur': loss_duration.detach(),
                     'stop': loss_stop_token.detach(),
                 })
+                processed_loss_batches += 1
 
                 # Sync accumulated losses periodically to reduce overhead
                 if len(accumulated_losses) >= loss_accumulation_interval or batch_idx == num_batches - 1:
@@ -2327,11 +2411,15 @@ class KokoroTrainer:
         except Exception as e:
             logger.debug(f"Failed to log end-of-epoch train spectrograms: {e}")
 
+        if processed_loss_batches == 0:
+            logger.warning("No successful training batches were processed in this epoch")
+            return EpochMetrics(0.0, 0.0, 0.0, 0.0)
+
         return EpochMetrics(
-            total_loss=(total_loss_epoch / num_batches),
-            mel_loss=(mel_loss_epoch / num_batches),
-            dur_loss=(dur_loss_epoch / num_batches),
-            stop_loss=(stop_loss_epoch / num_batches),
+            total_loss=(total_loss_epoch / processed_loss_batches),
+            mel_loss=(mel_loss_epoch / processed_loss_batches),
+            dur_loss=(dur_loss_epoch / processed_loss_batches),
+            stop_loss=(stop_loss_epoch / processed_loss_batches),
         )
 
     def _snapshot_cache_stats(self, dataset) -> Optional[Dict[str, float]]:
@@ -2842,26 +2930,19 @@ class KokoroTrainer:
                 logger.error(f"predicted_energy: {torch.isnan(predicted_energy).sum()} NaNs, {torch.isinf(predicted_energy).sum()} Infs")
             return None
 
-        # --- Pitch/energy mel-frame → phoneme-level averaging ------------
-        phoneme_pitches  = None
-        phoneme_energies = None
-        if pitches is not None and predicted_pitch is not None:
-            phoneme_pitches = self._average_pitch_energy_by_duration(
-                pitches, phoneme_durations, phoneme_lengths
-            )
-        if energies is not None and predicted_energy is not None:
-            phoneme_energies = self._average_pitch_energy_by_duration(
-                energies, phoneme_durations, phoneme_lengths
-            )
-
         # --- Loss calculation ---------------------------------------------
+        # Pass frame-level pitch/energy targets directly to losses.py, which
+        # detects they are already frame-level and skips phoneme expansion.
+        # Previously this block averaged targets to phoneme-level first, then
+        # losses.py expanded them back — creating phoneme-constant targets that
+        # prevented the pitch predictor from learning intra-phoneme variation.
         with self.get_autocast_context():
             total_loss, loss_mel, loss_duration, loss_stop_token, \
                 loss_pitch, loss_energy = self._calculate_losses(
                     predicted_mel, predicted_log_durations, predicted_stop_logits,
                     mel_specs, phoneme_durations, stop_token_targets,
                     mel_lengths, phoneme_lengths,
-                    predicted_pitch, predicted_energy, phoneme_pitches, phoneme_energies,
+                    predicted_pitch, predicted_energy, pitches, energies,
                 )
 
         # --- Finite-loss guard -------------------------------------------

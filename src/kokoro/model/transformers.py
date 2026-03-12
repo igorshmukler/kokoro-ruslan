@@ -604,32 +604,27 @@ class ImprovedTransformerDecoder(nn.Module):
         return output, updated_caches
 
 
-# --- Compatibility Layer for Original Model (if needed) ---
-# If your main model (KokoroModel) expects 'TransformerEncoderBlock' and 'TransformerDecoder'
-# as directly defined classes (not the 'Improved' ones), these wrappers ensure compatibility.
-
 class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     """
     Compatibility wrapper for TransformerEncoderBlock.
-    Uses pre-norm + GELU — norm is applied BEFORE each sublayer (attention and FFN),
-    which improves training stability and gradient flow.
+    Uses pre-norm + GELU + RoPE relative position encoding.
+    RoPE is MPS-safe (operates in native dtype, no mixed-dtype arithmetic).
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  drop_path_rate: float = 0.0):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
-                        activation='gelu', use_relative_pos=False,
-                        drop_path_rate=drop_path_rate)
+                        activation='gelu', use_relative_pos=True,
+                        rel_pos_type='rope', drop_path_rate=drop_path_rate)
 
 
 class TransformerDecoder(ImprovedTransformerDecoder):
     """
     Compatibility wrapper for TransformerDecoder.
-    Uses pre-norm + GELU — norm is applied BEFORE each sublayer (self-attention,
-    cross-attention, and FFN), and a final LayerNorm is applied after all decoder
-    blocks.  This improves training stability and gradient flow compared to post-norm.
+    Uses pre-norm + GELU + RoPE relative position encoding for decoder self-attention.
+    RoPE is fully MPS-safe.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        activation='gelu')
+                        activation='gelu', rel_pos_type='rope')
 
