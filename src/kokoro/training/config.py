@@ -33,6 +33,13 @@ class TrainingConfig:
     # 1.5 gives peak encoder = 1e-4 × 1.3 (max_lr) × 1.5 = 1.95e-4
     # (was 2.25e-4 with max_lr_mult=1.5; ep7 spiked → reduced max_lr first)
     encoder_lr_multiplier: float = 1.3
+    # LR multiplier for the stop-token head's dedicated optimizer param group.
+    # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
+    # distribution (~137:1 neg/pos).  Running it at the same LR as the decoder
+    # lets OneCycleLR peak-phase spikes destabilize it.  0.1× (1e-5 at base LR
+    # 1e-4) keeps the effective step size well below the adaptive clip threshold
+    # while still giving the head meaningful updates every step.
+    stop_head_lr_multiplier: float = 0.1
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -102,9 +109,14 @@ class TrainingConfig:
     #   • stop_token_loss_weight → controls global loss contribution (scale concern)
     # Do NOT scale pos_weight up/down to compensate for the global weight; adjust
     # stop_token_loss_weight independently for that purpose.
-    # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 chosen as
-    # stable partial correction (~36%) that keeps the stop predictor learning.
-    stop_token_pos_weight: float = 35.0
+    # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 → 35 chosen as
+    # stable partial correction (~25%) that kept the stop predictor learning.
+    # Reduced to 25.0: stop head bias drifted steadily negative (−0.006 → −0.016
+    # across ep1-5) at 35.0 even with pos_weight, indicating the head is still
+    # treating most frames as non-stop.  With gradient isolation via detach now in
+    # place, 25.0 gives sufficient class-balance correction without over-amplifying
+    # the already-isolated stop gradient at the peak LR phase.
+    stop_token_pos_weight: float = 25.0
     # Temporal smoothing of stop-token targets.
     # Instead of a single hard 1.0 at the last frame, a short exponentially
     # decaying tail is added to the frames immediately before it:
@@ -181,9 +193,13 @@ class TrainingConfig:
     # when pos_weight is large or the smoothing tail has a frame error near the boundary.
     # A tight ceiling here prevents the stop head from corrupting the mel decoder's gradient
     # budget while still giving the head a meaningful update signal.
-    # Set ≤ 0 to disable.  Chosen conservatively: the mel projection norms rarely exceed
-    # ~5 at steady state, so 1.0 is tight enough to isolate the head without starving it.
-    stop_head_spike_clip_norm: float = 1.0
+    # Set ≤ 0 to disable.  With gradient isolation now provided by detaching
+    # decoder_outputs before the stop head (model.py _project_decoder_outputs),
+    # this clip defends only the stop head's own weight/bias against LR-phase
+    # spikes.  Reduced to 0.5: the stop head weight norm at ep5 is ~1.6 with
+    # a 1.0 clip already present; halving the ceiling throttles the peak-LR
+    # update magnitude proportionally without starving the head.
+    stop_head_spike_clip_norm: float = 0.5
     # Post-step max weight-norm clamp for decoder.layers.0.ff.linear1.weight.
     # After every successful optimizer step the L2 norm of each decoder FF weight
     # matrix is projected back to this ceiling, preventing unconstrained growth

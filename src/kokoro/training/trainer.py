@@ -122,7 +122,7 @@ class KokoroTrainer:
                 "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
             },
             "Learning Rate": {
-                "LR (encoder vs decoder)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder"]],
+                "LR (encoder vs decoder vs stop)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_stop_head"]],
             },
         })
 
@@ -466,7 +466,7 @@ class KokoroTrainer:
         encoder_lr_mult = float(getattr(config, 'encoder_lr_multiplier', 3.0))
         self._encoder_lr_multiplier = encoder_lr_mult
 
-        # Partition parameters into three groups:
+        # Partition parameters into four groups:
         #   1. encoder_params    — text/stress embeddings + positional encoding +
         #      transformer encoder layers, higher LR multiplier, weight_decay=0
         #      (L2 on embedding rows counteracts learned representations; encoder
@@ -477,6 +477,17 @@ class KokoroTrainer:
         #      learned statistics and hurts convergence.
         #   3. decoder_decay     — all other decoder/variance-predictor weights,
         #      regularised with the configured weight_decay.
+        #   4. stop_head         — stop_token_predictor.weight + .bias at a reduced
+        #      LR (stop_head_lr_multiplier × base_lr, default 0.1×).
+        #      Rationale: the stop head is a single Linear(hidden_dim→1) that
+        #      classifies a heavily imbalanced binary target (~137:1 neg/pos ratio).
+        #      Under the ascending phase of OneCycleLR its gradient amplified by
+        #      pos_weight spikes disproportionately and destabilises the run.
+        #      Isolating it to a lower LR caps the effective step size without
+        #      requiring changes to global gradient clipping.  Note: gradient flow
+        #      from the stop loss back into decoder_outputs is already detached
+        #      (model.py _project_decoder_outputs), so this group governs only
+        #      the stop head's own parameter updates.
         encoder_prefixes = (
             'text_embedding.',
             'stress_embedding.',
@@ -484,6 +495,9 @@ class KokoroTrainer:
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
         )
+        # stop_token_predictor parameters are carved out before the
+        # decoder_no_decay / decoder_decay split so they don't appear in both.
+        _stop_head_names = {'stop_token_predictor.weight', 'stop_token_predictor.bias'}
         # Parameter names matching these patterns are excluded from weight decay.
         # ".bias" catches every bias vector; the norm patterns catch LayerNorm /
         # RMSNorm / BatchNorm affine weight and bias regardless of nesting depth.
@@ -494,6 +508,7 @@ class KokoroTrainer:
         )
         seen_ids: set = set()
         encoder_params = []
+        stop_head_params: list = []
         decoder_named: list = []  # (name, param) for further splitting
         for name, param in self.model.named_parameters():
             if id(param) in seen_ids:
@@ -501,6 +516,8 @@ class KokoroTrainer:
             seen_ids.add(id(param))
             if any(name.startswith(prefix) for prefix in encoder_prefixes):
                 encoder_params.append(param)
+            elif name in _stop_head_names:
+                stop_head_params.append(param)
             else:
                 decoder_named.append((name, param))
 
@@ -515,12 +532,16 @@ class KokoroTrainer:
         decoder_params = [p for _, p in decoder_named]  # kept for logging only
 
         encoder_lr = base_lr * encoder_lr_mult
+        stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
+        stop_head_lr = base_lr * stop_head_lr_mult
         param_groups = [
-            {'params': encoder_params,   'lr': encoder_lr, 'weight_decay': 0.0,
+            {'params': encoder_params,   'lr': encoder_lr,   'weight_decay': 0.0,
              'eps': adam_eps, 'betas': adam_betas},
-            {'params': decoder_no_decay, 'lr': base_lr,    'weight_decay': 0.0,
+            {'params': decoder_no_decay, 'lr': base_lr,      'weight_decay': 0.0,
              'eps': adam_eps, 'betas': adam_betas},
-            {'params': decoder_decay,    'lr': base_lr,    'weight_decay': weight_decay,
+            {'params': decoder_decay,    'lr': base_lr,      'weight_decay': weight_decay,
+             'eps': adam_eps, 'betas': adam_betas},
+            {'params': stop_head_params, 'lr': stop_head_lr, 'weight_decay': 0.0,
              'eps': adam_eps, 'betas': adam_betas},
         ]
         if not encoder_params:
@@ -534,7 +555,8 @@ class KokoroTrainer:
                 f"Optimizer param groups: "
                 f"encoder={len(encoder_params)} params (lr={encoder_lr:.2e}, wd=0.0), "
                 f"decoder_no_decay={len(decoder_no_decay)} params (lr={base_lr:.2e}, wd=0.0), "
-                f"decoder_decay={len(decoder_decay)} params (lr={base_lr:.2e}, wd={weight_decay})"
+                f"decoder_decay={len(decoder_decay)} params (lr={base_lr:.2e}, wd={weight_decay}), "
+                f"stop_head={len(stop_head_params)} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
 
         try:
@@ -587,10 +609,22 @@ class KokoroTrainer:
             _max_lr_multiplier = getattr(config, 'max_lr_multiplier', 5.0)
             onecycle_div_factor = float(_max_lr_multiplier) if self.use_warmup else 25.0
 
-            # Build per-group max_lr: encoder group gets encoder_lr_multiplier x decoder max_lr
+            # Build per-group max_lr:
+            #   group 0 (encoder):          max_lr * encoder_lr_multiplier
+            #   groups 1..n-2 (decoder):    max_lr
+            #   group n-1 (stop head):      max_lr * stop_head_lr_multiplier
+            # The stop head is always the last param group when present.
             _enc_mult = getattr(self, '_encoder_lr_multiplier', 1.0)
+            _stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
             n_pg = len(self.optimizer.param_groups)
-            if n_pg > 1:
+            if n_pg >= 4:
+                # [encoder] + [decoder × (n_pg-2)] + [stop_head]
+                max_lr_arg = (
+                    [max_lr * _enc_mult]
+                    + [max_lr] * (n_pg - 2)
+                    + [max_lr * _stop_head_lr_mult]
+                )
+            elif n_pg > 1:
                 max_lr_arg = [max_lr * _enc_mult] + [max_lr] * (n_pg - 1)
             else:
                 max_lr_arg = max_lr
@@ -1438,29 +1472,45 @@ class KokoroTrainer:
     def _log_lr_scalars(self, step: int) -> None:
         """Write per-group learning-rate scalars to TensorBoard.
 
-        With two param groups (encoder + decoder), logs ``stats/lr_encoder``
-        and ``stats/lr_decoder`` separately.  With a single param group,
-        logs the legacy ``stats/learning_rate`` tag.
+        With 4 param groups (encoder, decoder_no_decay, decoder_decay, stop_head):
+          stats/lr_encoder   = group 0 (encoder)
+          stats/lr_decoder   = group 2 (decoder_decay, the canonical decoder LR reference)
+          stats/lr_stop_head = group 3 (stop_token_predictor)
+        With 3 groups (legacy, no stop_head split):
+          stats/lr_encoder = group 0, stats/lr_decoder = group 2 (or -1 if < 3 groups)
+        With a single param group: logs the legacy stats/learning_rate tag.
         """
         n_pg = len(self.optimizer.param_groups)
-        if n_pg > 1:
+        if n_pg >= 4:
+            self.writer.add_scalar('stats/lr_encoder',   self.optimizer.param_groups[0]['lr'],  step)
+            self.writer.add_scalar('stats/lr_decoder',   self.optimizer.param_groups[2]['lr'],   step)
+            self.writer.add_scalar('stats/lr_stop_head', self.optimizer.param_groups[-1]['lr'], step)
+        elif n_pg > 1:
             self.writer.add_scalar('stats/lr_encoder', self.optimizer.param_groups[0]['lr'], step)
-            self.writer.add_scalar('stats/lr_decoder', self.optimizer.param_groups[-1]['lr'], step)
+            # Use group 2 (decoder_decay) when present, else last group
+            dec_idx = min(2, n_pg - 1)
+            self.writer.add_scalar('stats/lr_decoder', self.optimizer.param_groups[dec_idx]['lr'], step)
         else:
             self.writer.add_scalar('stats/learning_rate', self.optimizer.param_groups[0]['lr'], step)
 
     def _build_lr_postfix(self) -> dict:
         """Return a dict of LR key(s) for the tqdm progress-bar postfix.
 
-        With two param groups returns ``{'lr_enc': <encoder_lr>,
-        'lr_dec': <decoder_lr>}``.  With one param group returns
-        ``{'lr': <lr>}``.
+        With ≥4 param groups returns enc/dec/stop.  With 2-3 returns enc/dec.
+        With one param group returns {'lr': <lr>}.
         """
         n_pg = len(self.optimizer.param_groups)
-        if n_pg > 1:
+        if n_pg >= 4:
+            return {
+                'lr_enc':  self.optimizer.param_groups[0]['lr'],
+                'lr_dec':  self.optimizer.param_groups[2]['lr'],
+                'lr_stop': self.optimizer.param_groups[-1]['lr'],
+            }
+        elif n_pg > 1:
+            dec_idx = min(2, n_pg - 1)
             return {
                 'lr_enc': self.optimizer.param_groups[0]['lr'],
-                'lr_dec': self.optimizer.param_groups[-1]['lr'],
+                'lr_dec': self.optimizer.param_groups[dec_idx]['lr'],
             }
         return {'lr': self.optimizer.param_groups[0]['lr']}
 

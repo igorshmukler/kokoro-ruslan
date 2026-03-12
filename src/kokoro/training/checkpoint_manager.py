@@ -470,7 +470,20 @@ def load_checkpoint(
                 "Checkpoint is missing optimizer/scheduler state required for training resume."
             )
 
-        optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+        except (ValueError, RuntimeError) as _opt_err:
+            _saved_n_groups = len(checkpoint_dict['optimizer_state_dict'].get('param_groups', []))
+            _curr_n_groups = len(optimizer.param_groups)
+            if _saved_n_groups != _curr_n_groups:
+                logger.warning(
+                    f"Optimizer param group count changed ({_saved_n_groups} → {_curr_n_groups}); "
+                    "skipping optimizer state restore — Adam moments will be re-initialized. "
+                    "This is expected when param groups are added or split between runs "
+                    "(e.g. adding a dedicated stop-head LR group)."
+                )
+            else:
+                raise
         scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
 
         if 'epoch' not in checkpoint_dict or 'loss' not in checkpoint_dict:
@@ -672,7 +685,13 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             # Use the last param group (decoder) as the reference for computing the schedule
             # position, since its LR range is [base_lr, max_lr] without the encoder scaling.
             n_pg = len(trainer.optimizer.param_groups)
-            ref_group_idx = n_pg - 1  # last group = decoder params
+            # Use the first decoder group (index 2 = decoder_decay, or index 1 in
+            # smaller setups) as the LR reference for schedule positioning.
+            # Must NOT use the stop head group (last group in the 4-group setup)
+            # because it has a scaled LR that would produce a wrong resume position.
+            ref_group_idx = min(2, n_pg - 1)
+            if n_pg >= 4 and ref_group_idx == n_pg - 1:
+                ref_group_idx = n_pg - 2  # fall back one group to stay off stop head
             encoder_lr_mult = getattr(trainer, '_encoder_lr_multiplier', 1.0)
             last_lr = trainer.optimizer.state_dict()['param_groups'][ref_group_idx]['lr']
 
@@ -745,8 +764,20 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 target_step = onecycle_steps - 1
                 resume_lr   = final_lr
 
-            # Build per-group max_lr: encoder group (group 0 when n_pg > 1) gets encoder_lr_mult × max_lr
-            if n_pg > 1:
+            # Build per-group max_lr mirroring trainer._setup_scheduler():
+            #   group 0 (encoder):          max_lr * encoder_lr_mult
+            #   groups 1..n-2 (decoder):    max_lr
+            #   group n-1 (stop head):      max_lr * stop_head_lr_mult  (when n_pg >= 4)
+            _stop_head_lr_mult = float(
+                getattr(getattr(trainer, 'config', None), 'stop_head_lr_multiplier', 0.1)
+            )
+            if n_pg >= 4:
+                max_lr_arg = (
+                    [max_lr * encoder_lr_mult]
+                    + [max_lr] * (n_pg - 2)
+                    + [max_lr * _stop_head_lr_mult]
+                )
+            elif n_pg > 1:
                 max_lr_arg = [max_lr * encoder_lr_mult] + [max_lr] * (n_pg - 1)
             else:
                 max_lr_arg = max_lr
@@ -768,11 +799,21 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             trainer.scheduler.last_epoch = target_step
             resume_lr = min(resume_lr, max_lr)
             for i, g in enumerate(trainer.optimizer.param_groups):
-                # Encoder group (group 0 in multi-group setup) keeps its higher LR
-                mult = encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0
+                # Encoder (group 0) keeps higher multiplier; stop head (last group
+                # when n_pg >= 4) keeps its reduced multiplier; decoder groups use 1.0.
+                if n_pg > 1 and i == 0:
+                    mult = encoder_lr_mult
+                elif n_pg >= 4 and i == n_pg - 1:
+                    mult = _stop_head_lr_mult
+                else:
+                    mult = 1.0
                 g['lr'] = resume_lr * mult
             trainer.scheduler._last_lr = [
-                resume_lr * (encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0)
+                resume_lr * (
+                    encoder_lr_mult if (n_pg > 1 and i == 0)
+                    else _stop_head_lr_mult if (n_pg >= 4 and i == n_pg - 1)
+                    else 1.0
+                )
                 for i in range(n_pg)
             ]
 

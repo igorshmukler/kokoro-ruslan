@@ -37,6 +37,7 @@ KEY_LAYERS = [
     "duration_predictor.linear",
     "pitch_predictor.linear",
     "energy_predictor.linear",
+    "stop_token_predictor",
     "decoder.layers.0.self_attn.w_o",
     "decoder.layers.0.ff.linear1",
     "decoder.layers.0.ff.linear2",
@@ -65,7 +66,7 @@ def classify_param(name: str, cfg=None):
         enc_ffn_cap = getattr(cfg, 'encoder_ffn_spike_clip_norm',     12.0)
         attn_cap    = getattr(cfg, 'attention_spike_clip_norm',        20.0)
         proj_cap    = getattr(cfg, 'projection_spike_clip_norm',       20.0)
-        stop_cap    = getattr(cfg, 'stop_head_spike_clip_norm',         1.0)
+        stop_cap    = getattr(cfg, 'stop_head_spike_clip_norm',         0.5)
     else:
         dec_ffn_cap = 8.0
         enc_ffn_cap = 12.0
@@ -789,6 +790,24 @@ def tb_print_stop_token_analysis(ea):
     print("\n" + "=" * 90)
     print("TENSORBOARD — Stop Token Analysis")
     print("=" * 90)
+
+    # ── Stop head isolation parameters ──────────────────────────────────────
+    print("  Stop head isolation parameters (from loaded config / defaults):")
+    # Read from last available checkpoint
+    stop_head = _get(ea, "stats/lr_stop_head")
+    if stop_head:
+        stop_lr_curr = stop_head[-1][1]
+        dec_series   = _get(ea, "stats/lr_decoder")
+        dec_lr_curr  = dec_series[-1][1] if dec_series else None
+        mult_actual  = (stop_lr_curr / dec_lr_curr) if dec_lr_curr and dec_lr_curr > 0 else None
+        print(f"    stats/lr_stop_head : {stop_lr_curr:.8f}  "
+              + (f"({mult_actual:.4f}× decoder LR)  " if mult_actual is not None else "")
+              + "[dedicated stop head param group active]")
+    else:
+        print("    stats/lr_stop_head : not found — stop head may share decoder LR group")
+    print("    gradient isolation : decoder_outputs detached before stop head (loss cannot")
+    print("                         back-propagate through mel decoder from BCE stop loss)")
+    print()
     series = _get(ea, "loss/stop")
     if not series:
         print("  No step-level stop data.")
@@ -889,7 +908,12 @@ def tb_print_lr_trajectory(ea):
     print("\n" + "=" * 90)
     print("TENSORBOARD — Learning Rate Trajectory")
     print("=" * 90)
-    for tag, label in [("stats/lr_decoder", "decoder"), ("stats/lr_encoder", "encoder")]:
+    groups = [
+        ("stats/lr_decoder",   "decoder"),
+        ("stats/lr_encoder",   "encoder"),
+        ("stats/lr_stop_head", "stop_head"),
+    ]
+    for tag, label in groups:
         series = _get(ea, tag)
         if not series:
             continue
@@ -1433,23 +1457,53 @@ def tb_print_recommendations(ea, records=None):
     def cfg_get(attr, default):
         return getattr(cfg, attr, default) if cfg is not None else default
 
-    cur_max_lr_mult  = cfg_get('max_lr_multiplier',       1.1)
-    cur_enc_lr_mult  = cfg_get('encoder_lr_multiplier',   1.3)
-    cur_stop_pos     = cfg_get('stop_token_pos_weight',   50.0)
-    cur_stop_loss    = cfg_get('stop_token_loss_weight',  0.06)
-    cur_warmup       = cfg_get('warmup_steps',            1200)
-    cur_weight_decay = cfg_get('weight_decay',            0.01)
-    cur_max_frames   = cfg_get('max_frames_per_batch',   15000)
+    cur_max_lr_mult     = cfg_get('max_lr_multiplier',         1.1)
+    cur_enc_lr_mult     = cfg_get('encoder_lr_multiplier',     1.3)
+    cur_stop_head_mult  = cfg_get('stop_head_lr_multiplier',   0.1)
+    cur_stop_pos        = cfg_get('stop_token_pos_weight',    25.0)
+    cur_stop_loss       = cfg_get('stop_token_loss_weight',   0.010)
+    cur_stop_clip       = cfg_get('stop_head_spike_clip_norm', 0.5)
+    cur_warmup          = cfg_get('warmup_steps',             1200)
+    cur_weight_decay    = cfg_get('weight_decay',             0.01)
+    cur_max_frames      = cfg_get('max_frames_per_batch',    15000)
 
     suggest_max_lr_mult  = max(0.1, cur_max_lr_mult  - 0.1)
     suggest_enc_lr_mult  = max(0.1, cur_enc_lr_mult  - 0.2)
     suggest_stop_pos     = max(1.0, int(cur_stop_pos  * 0.7))
     suggest_stop_loss    = max(0.001, cur_stop_loss   * 0.67)
+    suggest_stop_head_mult = max(0.01, cur_stop_head_mult * 0.5)
     suggest_warmup       = int(cur_warmup + 400)
     suggest_weight_decay = cur_weight_decay * 2.0
     suggest_max_frames   = max(1000, int(cur_max_frames * 0.85))
 
     recs = []  # (priority, label, lines)  1=CRITICAL 2=WARN 3=INFO
+
+    # ── Stop head isolation status ───────────────────────────────────────────
+    # Check whether the stop head LR group is active and at a sensible ratio
+    stop_lr_series = _get(ea, "stats/lr_stop_head")
+    dec_lr_series  = _get(ea, "stats/lr_decoder")
+    if stop_lr_series and dec_lr_series:
+        stop_lr_curr = stop_lr_series[-1][1]
+        dec_lr_curr  = dec_lr_series[-1][1]
+        actual_mult  = stop_lr_curr / dec_lr_curr if dec_lr_curr > 0 else 0.0
+        if abs(actual_mult - cur_stop_head_mult) < 0.01:
+            recs.append((3, "INFO", [
+                f"Stop head isolation active: LR multiply={actual_mult:.3f}× decoder  "
+                f"(cfg stop_head_lr_multiplier={cur_stop_head_mult}).",
+                f"  Gradient detach: decoder_outputs.detach() isolates mel decoder from BCE stop loss.",
+                f"  Pre-clip cap: {cur_stop_clip} (stop_head_spike_clip_norm).",
+            ]))
+        elif actual_mult > cur_stop_head_mult * 2:
+            recs.append((2, "WARN", [
+                f"Stop head LR ratio ({actual_mult:.3f}×) >> configured stop_head_lr_multiplier "
+                f"({cur_stop_head_mult}).  Checkpoint optimizer state may be stale.",
+                f"    → Verify optimizer resumed correctly (expect 4 param groups).",
+            ]))
+    elif not stop_lr_series:
+        recs.append((3, "INFO", [
+            "stats/lr_stop_head not found in TB — stop head may be sharing the decoder LR group "
+            "(pre-isolation checkpoint).  The dedicated param group becomes active next run.",
+        ]))
 
     # ── Gradual degradation (NEW) ────────────────────────────────────────────
     vm = d["val_mel_series"]
@@ -1518,6 +1572,11 @@ def tb_print_recommendations(ea, records=None):
         if co_pct > 40:
             body.append(f"  {co_pct:.0f}% co-occur with stop bursts.")
             body.append(f"    → Reduce stop_token_pos_weight ({cur_stop_pos:.0f} → {suggest_stop_pos:.0f}).")
+            if stop_lr_series is None:
+                body.append("    → stop_head_lr_multiplier group not yet active — ensure 4-group optimizer is loaded.")
+            else:
+                body.append(f"    → stop head LR group active at {cur_stop_head_mult}×; "
+                             f"further reduce to {suggest_stop_head_mult:.3f} if spikes persist.")
         if n_ramp > len(d["spikes_post_peak"]) and d["lr_phase"] in ("warmup", "peak"):
             body.append(f"    → Increase warmup_steps ({cur_warmup} → {suggest_warmup}).")
         recs.append((2, "WARN", body))
@@ -1570,6 +1629,9 @@ def tb_print_recommendations(ea, records=None):
         if d["stop_late_bursts"]:
             body.append(f"  Late stop bursts detected: {d['stop_late_bursts'][:4]}")
         body.append(f"    → Reduce stop_token_pos_weight ({cur_stop_pos:.0f} → {suggest_stop_pos:.0f}).")
+        if stop_lr_series is not None:
+            body.append(f"    → stop head LR isolation active ({cur_stop_head_mult}×); "
+                         f"consider reducing further to {suggest_stop_head_mult:.3f} if ratio persists.")
         recs.append((2, "WARN", body))
 
     # ── Attach imbalance diagnostics to CRITICAL items ───────────────────────
@@ -1677,6 +1739,18 @@ def tb_print_lr_phase_detail(ea, records=None):
     else:
         phase = f"DECAY ({100 * curr_lr / ref_peak_dec:.1f}% of peak)"
     print(f"  phase         : {phase}")
+
+    # Stop head LR (dedicated group, should track decoder × stop_head_lr_multiplier)
+    stop_series = _get(ea, "stats/lr_stop_head")
+    if stop_series:
+        stop_lr_curr = stop_series[-1][1]
+        stop_lr_max  = max(v for _, v in stop_series)
+        stop_pct     = 100.0 * stop_lr_curr / ref_peak_dec
+        stop_mult    = stop_lr_curr / curr_lr if curr_lr > 0 else 0.0
+        print(f"  stop head LR  : {stop_lr_curr:.8f}  at step {stop_series[-1][0]}  "
+              f"({stop_pct:.4f}% of dec peak  {stop_mult:.3f}× decoder)")
+    else:
+        print("  stop head LR  : no stats/lr_stop_head data (pre-isolation checkpoint or TB not refreshed)")
 
     thresh_90_step = next((s for s, v in lr if v >= obs_max_dec * 0.90), lr[0][0])
     print(f"\n  Step-by-step from step {thresh_90_step} onward:")
