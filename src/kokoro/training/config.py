@@ -25,7 +25,7 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.1  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
+    max_lr_multiplier: float = 1.0  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
     pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
@@ -166,7 +166,7 @@ class TrainingConfig:
     projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 20.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
-    ffn_spike_clip_norm: float = 8.0
+    ffn_spike_clip_norm: float = 5.0
     # Encoder FFN per-layer pre-clip. Previously 10.0 (too tight, zeroed encoder grads);
     # raised to 100.0 while encoder was passive (ep1-ep5 grads ~1e-7).
     # By ep6 encoder FFN avg_grad reached 40-100 per tensor (active learning phase),
