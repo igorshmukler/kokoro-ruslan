@@ -198,6 +198,7 @@ class KokoroTrainer:
         self.memory_report_interval = getattr(config, 'memory_report_interval', 50)
 
         self._setup_grad_explosion_tracker()
+        self._setup_weight_norm_constraints()
 
         self.optimizer_steps_completed = 0
 
@@ -667,6 +668,34 @@ class KokoroTrainer:
         else:
             self.ema_model = None
             logger.info("EMA disabled")
+
+    def _setup_weight_norm_constraints(self) -> None:
+        """Cache parameter references used by post-step weight-norm clamping."""
+        named_modules = dict(self.model.named_modules())
+        m = named_modules.get('decoder.layers.0.ff.linear1')
+        self._dec_ff0_linear1_weight = m.weight if m is not None else None
+        if self._dec_ff0_linear1_weight is None:
+            logger.warning(
+                "dec_ff0_linear1_max_weight_norm: module 'decoder.layers.0.ff.linear1' "
+                "not found in model — weight-norm clamp will be skipped."
+            )
+
+    @torch.no_grad()
+    def _apply_weight_norm_constraints(self) -> None:
+        """Project decoder.layers.0.ff.linear1.weight back onto its max-norm ball.
+
+        Called after every successful optimizer step.  The L2 norm of the full
+        weight matrix is compared against *dec_ff0_linear1_max_weight_norm* and
+        rescaled when it exceeds the ceiling.  This is equivalent to the PyTorch
+        max-norm constraint without registering a parametrization hook.
+        """
+        max_norm: float = getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
+        if max_norm <= 0.0 or self._dec_ff0_linear1_weight is None:
+            return
+        w = self._dec_ff0_linear1_weight
+        current_norm = w.norm(2).item()
+        if current_norm > max_norm:
+            w.mul_(max_norm / current_norm)
 
     def _setup_grad_explosion_tracker(self):
         """Initialize gradient explosion detection and localized spike clipping state."""
@@ -2120,6 +2149,7 @@ class KokoroTrainer:
 
                     if step_successful:
                         self.optimizer_steps_completed += 1
+                        self._apply_weight_norm_constraints()
                     else:
                         logger.warning(
                             "Optimizer step skipped (AMP overflow/non-finite grads); "

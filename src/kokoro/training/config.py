@@ -184,6 +184,12 @@ class TrainingConfig:
     # Set ≤ 0 to disable.  Chosen conservatively: the mel projection norms rarely exceed
     # ~5 at steady state, so 1.0 is tight enough to isolate the head without starving it.
     stop_head_spike_clip_norm: float = 1.0
+    # Post-step max weight-norm clamp for decoder.layers.0.ff.linear1.weight.
+    # After every successful optimizer step the L2 norm of that weight matrix is
+    # projected back to this ceiling, preventing unconstrained growth of the
+    # first decoder FFN expansion layer while leaving gradients untouched.
+    # Set ≤ 0.0 to disable.
+    dec_ff0_linear1_max_weight_norm: float = 60.0
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100
