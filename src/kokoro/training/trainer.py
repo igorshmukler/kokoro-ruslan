@@ -670,32 +670,50 @@ class KokoroTrainer:
             logger.info("EMA disabled")
 
     def _setup_weight_norm_constraints(self) -> None:
-        """Cache parameter references used by post-step weight-norm clamping."""
+        """Cache weight references for all decoder FF layers used by post-step norm clamping."""
         named_modules = dict(self.model.named_modules())
-        m = named_modules.get('decoder.layers.0.ff.linear1')
-        self._dec_ff0_linear1_weight = m.weight if m is not None else None
-        if self._dec_ff0_linear1_weight is None:
-            logger.warning(
-                "dec_ff0_linear1_max_weight_norm: module 'decoder.layers.0.ff.linear1' "
-                "not found in model — weight-norm clamp will be skipped."
-            )
+        n_decoder_layers = getattr(self.config, 'n_decoder_layers', 6)
+        self._dec_ff_weights: list = []
+        for i in range(n_decoder_layers):
+            for linear_name in ('linear1', 'linear2'):
+                m = named_modules.get(f'decoder.layers.{i}.ff.{linear_name}')
+                if m is not None:
+                    self._dec_ff_weights.append(m.weight)
+                else:
+                    logger.warning(
+                        f"dec_ffn_max_weight_norm: module 'decoder.layers.{i}.ff.{linear_name}' "
+                        "not found in model — weight-norm clamp will be skipped for this layer."
+                    )
+        # Legacy single-layer reference kept for backward compat with any external code.
+        self._dec_ff0_linear1_weight = self._dec_ff_weights[0] if self._dec_ff_weights else None
+        logger.info(
+            f"Weight-norm constraints registered for {len(self._dec_ff_weights)} "
+            "decoder FF weight matrices."
+        )
 
     @torch.no_grad()
     def _apply_weight_norm_constraints(self) -> None:
-        """Project decoder.layers.0.ff.linear1.weight back onto its max-norm ball.
+        """Project all decoder FF weights back onto their max-norm ball.
 
-        Called after every successful optimizer step.  The L2 norm of the full
-        weight matrix is compared against *dec_ff0_linear1_max_weight_norm* and
-        rescaled when it exceeds the ceiling.  This is equivalent to the PyTorch
-        max-norm constraint without registering a parametrization hook.
+        Called after every successful optimizer step.  The L2 norm of each
+        weight matrix is compared against *dec_ffn_max_weight_norm* and rescaled
+        when it exceeds the ceiling.  All decoder FF linear1 and linear2 weights
+        across all layers share the same cap.
+
+        Config key: dec_ffn_max_weight_norm (default 60.0).
+        Falls back to the legacy dec_ff0_linear1_max_weight_norm key if present.
+        Set to 0 or negative to disable.
         """
-        max_norm: float = getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
-        if max_norm <= 0.0 or self._dec_ff0_linear1_weight is None:
+        max_norm: float = getattr(
+            self.config, 'dec_ffn_max_weight_norm',
+            getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
+        )
+        if max_norm <= 0.0 or not self._dec_ff_weights:
             return
-        w = self._dec_ff0_linear1_weight
-        current_norm = w.norm(2).item()
-        if current_norm > max_norm:
-            w.mul_(max_norm / current_norm)
+        for w in self._dec_ff_weights:
+            current_norm = w.norm(2).item()
+            if current_norm > max_norm:
+                w.mul_(max_norm / current_norm)
 
     def _setup_grad_explosion_tracker(self):
         """Initialize gradient explosion detection and localized spike clipping state."""

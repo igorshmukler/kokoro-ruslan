@@ -2034,7 +2034,15 @@ def main():
     records = load_checkpoints()
     if not records:
         print("No checkpoints found.")
-        return
+        # If TensorBoard logs exist, run TB-only analysis so users can still
+        # inspect training behaviour even before the first checkpoint is saved.
+        if TB_LOG_DIR.is_dir():
+            print(f"No checkpoints found — falling back to TensorBoard logs at {TB_LOG_DIR} for analysis.")
+            tb_analyze(TB_LOG_DIR, records=None)
+            return
+        else:
+            print(f"No tensorboard logs found at: {TB_LOG_DIR}")
+            return
 
     print(f"Found {len(records)} checkpoint(s). Computing weight statistics...")
     records = compute_weight_stats(records)

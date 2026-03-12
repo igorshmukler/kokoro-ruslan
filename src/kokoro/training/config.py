@@ -25,7 +25,7 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.0  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
+    max_lr_multiplier: float = 1.1  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
     pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
@@ -185,11 +185,15 @@ class TrainingConfig:
     # ~5 at steady state, so 1.0 is tight enough to isolate the head without starving it.
     stop_head_spike_clip_norm: float = 1.0
     # Post-step max weight-norm clamp for decoder.layers.0.ff.linear1.weight.
-    # After every successful optimizer step the L2 norm of that weight matrix is
-    # projected back to this ceiling, preventing unconstrained growth of the
-    # first decoder FFN expansion layer while leaving gradients untouched.
-    # Set ≤ 0.0 to disable.
-    dec_ff0_linear1_max_weight_norm: float = 60.0
+    # After every successful optimizer step the L2 norm of each decoder FF weight
+    # matrix is projected back to this ceiling, preventing unconstrained growth
+    # across all decoder FFN layers while leaving gradients untouched.
+    # Covers all decoder.layers.{i}.ff.linear1 and linear2 weights (12 matrices
+    # for a 6-layer decoder).  Set ≤ 0.0 to disable.
+    # dec_ff0_linear1_max_weight_norm is the legacy single-layer key and is kept
+    # for backward compat; dec_ffn_max_weight_norm takes precedence when present.
+    dec_ffn_max_weight_norm: float = 50.0
+    dec_ff0_linear1_max_weight_norm: float = 60.0  # legacy — superseded by dec_ffn_max_weight_norm
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100
