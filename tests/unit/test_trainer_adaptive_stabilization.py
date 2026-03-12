@@ -61,6 +61,7 @@ def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> Kokor
     trainer.projection_spike_clip_norm = 30.0
     trainer.attention_spike_clip_norm = 20.0
     trainer.ffn_spike_clip_norm = 15.0
+    trainer._dec_ff0_linear1_weight = None
     trainer.optimizer_steps_completed = 0
     trainer.mixed_precision_stats = {
         "scale_updates": 0,

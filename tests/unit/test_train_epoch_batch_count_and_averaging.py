@@ -94,6 +94,7 @@ def _build_minimal_trainer(gradient_accumulation_steps: int) -> KokoroTrainer:
     trainer.projection_spike_clip_norm = 30.0
     trainer.attention_spike_clip_norm = 20.0
     trainer.ffn_spike_clip_norm = 15.0
+    trainer._dec_ff0_linear1_weight = None
     trainer.mixed_precision_stats = {
         "scale_updates": 0,
         "scale_decreases": 0,
