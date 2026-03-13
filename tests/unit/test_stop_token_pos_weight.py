@@ -411,3 +411,155 @@ class TestPosWeightDeviceConsistency:
         loss = criterion(logits, targets)
         assert loss.shape == (2, 10)
         assert torch.isfinite(loss).all()
+
+
+# ---------------------------------------------------------------------------
+# 14. Stop head LR multiplier applied during warmup
+#     Regression test for the bug where _step_scheduler_with_warmup applied
+#     mult=1.0 to every group except group 0 (encoder), so the stop head
+#     param group (last group) received the full base_lr instead of
+#     stop_head_lr_multiplier × base_lr.
+# ---------------------------------------------------------------------------
+class TestStopHeadLRMultiplierDuringWarmup:
+    """
+    _step_scheduler_with_warmup must scale the stop head group by
+    stop_head_lr_multiplier, not 1.0.
+    """
+
+    def _make_minimal_scheduler_trainer(self, stop_head_lr_mult: float = 0.1):
+        """
+        Build a minimal object that mimics the trainer state consumed by
+        _step_scheduler_with_warmup.  No model, dataset, or device needed.
+        """
+        base_lr        = 1e-4
+        enc_lr_mult    = 1.3
+        warmup_steps   = 10
+        warmup_start   = base_lr * 0.01
+        warmup_target  = base_lr
+
+        # Four param groups matching the real optimizer layout:
+        #   0: encoder  (lr = base_lr * enc_mult)
+        #   1: decoder_no_decay  (lr = base_lr)
+        #   2: decoder_decay     (lr = base_lr)
+        #   3: stop_head         (lr = base_lr * stop_head_mult)
+        optimizer = SimpleNamespace(param_groups=[
+            {'lr': base_lr * enc_lr_mult},   # 0 encoder
+            {'lr': base_lr},                  # 1 decoder_no_decay
+            {'lr': base_lr},                  # 2 decoder_decay
+            {'lr': base_lr * stop_head_lr_mult},  # 3 stop_head
+        ])
+
+        cfg = SimpleNamespace(stop_head_lr_multiplier=stop_head_lr_mult)
+
+        trainer = SimpleNamespace(
+            use_warmup=True,
+            warmup_steps=warmup_steps,
+            warmup_start_lr=warmup_start,
+            warmup_target_lr=warmup_target,
+            current_optimizer_step=0,
+            _encoder_lr_multiplier=enc_lr_mult,
+            config=cfg,
+            optimizer=optimizer,
+            scheduler=SimpleNamespace(step=lambda: None),
+        )
+        return trainer, base_lr, enc_lr_mult, stop_head_lr_mult, warmup_steps
+
+    def _run_warmup_step(self, trainer):
+        """Call the real _step_scheduler_with_warmup on the minimal trainer."""
+        KokoroTrainer._step_scheduler_with_warmup(trainer)
+
+    def test_stop_head_lr_is_scaled_by_multiplier_during_warmup(self):
+        """
+        At any warmup step the stop head LR must equal
+        stop_head_lr_multiplier × base_warmup_lr, NOT base_warmup_lr.
+        """
+        trainer, base_lr, enc_mult, stop_mult, warmup_steps = \
+            self._make_minimal_scheduler_trainer(stop_head_lr_mult=0.1)
+
+        # Advance to mid-warmup (step 5 of 10)
+        for _ in range(5):
+            self._run_warmup_step(trainer)
+
+        groups = trainer.optimizer.param_groups
+        enc_lr  = groups[0]['lr']
+        dec_lr  = groups[2]['lr']   # decoder_decay reference
+        stop_lr = groups[3]['lr']   # stop head
+
+        # Encoder should be encoder_lr_multiplier × decoder
+        assert enc_lr == pytest.approx(enc_mult * dec_lr, rel=1e-6), (
+            f"Encoder LR {enc_lr:.3e} != enc_mult({enc_mult}) × decoder LR {dec_lr:.3e}"
+        )
+
+        # Stop head must be stop_head_lr_multiplier × decoder, not equal to decoder
+        assert stop_lr == pytest.approx(stop_mult * dec_lr, rel=1e-6), (
+            f"Stop head LR {stop_lr:.3e} != stop_mult({stop_mult}) × decoder LR "
+            f"{dec_lr:.3e}. Got ratio {stop_lr / dec_lr:.4f}, expected {stop_mult}. "
+            "This is the regression: warmup was applying mult=1.0 to the stop group."
+        )
+
+    def test_stop_head_lr_ratio_is_maintained_all_warmup_steps(self):
+        """
+        The stop_head_lr / decoder_lr ratio must equal stop_head_lr_multiplier
+        at every warmup step, not just at the midpoint.
+        """
+        stop_mult = 0.1
+        trainer, base_lr, enc_mult, _, warmup_steps = \
+            self._make_minimal_scheduler_trainer(stop_head_lr_mult=stop_mult)
+
+        for step in range(warmup_steps):
+            self._run_warmup_step(trainer)
+            groups  = trainer.optimizer.param_groups
+            dec_lr  = groups[2]['lr']
+            stop_lr = groups[3]['lr']
+
+            if dec_lr > 0:
+                ratio = stop_lr / dec_lr
+                assert ratio == pytest.approx(stop_mult, rel=1e-5), (
+                    f"At warmup step {step + 1}: stop_lr/dec_lr = {ratio:.6f}, "
+                    f"expected {stop_mult}. The multiplier must be applied every step."
+                )
+
+    def test_decoder_groups_are_not_affected_by_stop_head_multiplier(self):
+        """
+        Groups 1 and 2 (decoder_no_decay and decoder_decay) must receive
+        base_lr × 1.0, unchanged by the stop_head_lr_multiplier setting.
+        """
+        trainer, base_lr, enc_mult, stop_mult, warmup_steps = \
+            self._make_minimal_scheduler_trainer(stop_head_lr_mult=0.1)
+
+        for _ in range(warmup_steps // 2):
+            self._run_warmup_step(trainer)
+
+        groups = trainer.optimizer.param_groups
+        dec_no_decay_lr = groups[1]['lr']
+        dec_decay_lr    = groups[2]['lr']
+
+        assert dec_no_decay_lr == pytest.approx(dec_decay_lr, rel=1e-8), (
+            "decoder_no_decay and decoder_decay should have the same LR"
+        )
+        # Both decoder groups must differ from the stop head (which has mult=0.1)
+        stop_lr = groups[3]['lr']
+        assert stop_lr != pytest.approx(dec_decay_lr, rel=0.05), (
+            f"Stop head LR {stop_lr:.3e} incorrectly matches decoder LR "
+            f"{dec_decay_lr:.3e} — multiplier is not being applied."
+        )
+
+    def test_stop_head_lr_multiplier_of_1_matches_decoder(self):
+        """
+        When stop_head_lr_multiplier=1.0, stop head should match the decoder LR
+        (edge case: explicit opt-out of isolation).
+        """
+        trainer, _, _, _, warmup_steps = \
+            self._make_minimal_scheduler_trainer(stop_head_lr_mult=1.0)
+
+        for _ in range(warmup_steps // 2):
+            self._run_warmup_step(trainer)
+
+        groups  = trainer.optimizer.param_groups
+        dec_lr  = groups[2]['lr']
+        stop_lr = groups[3]['lr']
+
+        assert stop_lr == pytest.approx(dec_lr, rel=1e-6), (
+            f"With stop_head_lr_multiplier=1.0, stop LR {stop_lr:.3e} "
+            f"should match decoder LR {dec_lr:.3e}"
+        )
