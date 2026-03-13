@@ -68,8 +68,8 @@ Examples:
     parser.add_argument(
         '--learning-rate', '-lr',
         type=float,
-        default=1e-4,
-        help='Learning rate (default: 1e-4)'
+        default=None,
+        help='Learning rate (default: use value from TrainingConfig)'
     )
 
     parser.add_argument(
@@ -252,11 +252,10 @@ def create_config_from_args(args) -> TrainingConfig:
     else:
         use_amp = default_amp
 
-    return TrainingConfig(
+    kwargs: dict = dict(
         data_dir=args.corpus,
         output_dir=args.output,
         batch_size=args.batch_size,
-        learning_rate=args.learning_rate,
         num_epochs=args.epochs,
         sample_rate=22050,
         hop_length=256,
@@ -285,3 +284,7 @@ def create_config_from_args(args) -> TrainingConfig:
         verbose=args.verbose,
         use_memory_cache=getattr(args, 'use_memory_cache', True),
     )
+    # Only override learning_rate when the user explicitly passed --learning-rate
+    if args.learning_rate is not None:
+        kwargs['learning_rate'] = args.learning_rate
+    return TrainingConfig(**kwargs)
