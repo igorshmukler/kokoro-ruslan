@@ -17,7 +17,7 @@ class TrainingConfig:
     output_dir: str = "output_models"
     num_epochs: int = 100
     batch_size: int = 16
-    learning_rate: float = 1e-4
+    learning_rate: float = 9.09e-5  # peak LR = learning_rate × max_lr_multiplier = 9.09e-5 × 1.1 ≈ 1.0e-4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
@@ -25,21 +25,20 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.1  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
+    max_lr_multiplier: float = 1.1  # Max LR = learning_rate * this value; with lr=9.09e-5 gives peak decoder ≈ 1.0e-4
     pct_start: float = 0.06  # Percentage of cycle spent increasing LR (warmup)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # 1.5 gives peak encoder = 1e-4 × 1.3 (max_lr) × 1.5 = 1.95e-4
-    # (was 2.25e-4 with max_lr_mult=1.5; ep7 spiked → reduced max_lr first)
+    # peak encoder = 9.09e-5 × 1.1 (max_lr) × 1.3 ≈ 1.3e-4
     encoder_lr_multiplier: float = 1.3
     # LR multiplier for the stop-token head's dedicated optimizer param group.
     # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
     # distribution (~137:1 neg/pos).  Running it at the same LR as the decoder
-    # lets OneCycleLR peak-phase spikes destabilize it.  0.1× (1e-5 at base LR
-    # 1e-4) keeps the effective step size well below the adaptive clip threshold
+    # lets OneCycleLR peak-phase spikes destabilize it.  0.2× should keep the
+    # effective step size well below the adaptive clip threshold
     # while still giving the head meaningful updates every step.
-    stop_head_lr_multiplier: float = 0.1
+    stop_head_lr_multiplier: float = 0.2
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
