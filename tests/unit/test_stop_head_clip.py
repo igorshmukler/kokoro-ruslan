@@ -87,7 +87,7 @@ def _inject_grad(module: nn.Linear, weight_norm: float, bias_norm: float) -> Non
 class TestConfigDefaults:
 
     def test_default_stop_head_clip_norm(self):
-        assert TrainingConfig.__dataclass_fields__['stop_head_spike_clip_norm'].default == pytest.approx(1.0)
+        assert TrainingConfig.__dataclass_fields__['stop_head_spike_clip_norm'].default == pytest.approx(0.5)
 
     def test_custom_value_survives_post_init(self):
         cfg = TrainingConfig(stop_head_spike_clip_norm=5.0)
