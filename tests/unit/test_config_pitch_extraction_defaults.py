@@ -19,13 +19,13 @@ def test_training_config_convergence_fix_defaults():
     config = TrainingConfig()
 
     # Peak LR raised to allow the model to escape the loss plateau seen at 2e-4
-    assert config.max_lr_multiplier == 1.1, (
-        f"max_lr_multiplier should be 1.1; got {config.max_lr_multiplier}"
+    assert config.max_lr_multiplier == 0.75, (
+        f"max_lr_multiplier should be 0.75; got {config.max_lr_multiplier}"
     )
 
     # Encoder gets a separate higher LR to compensate for its much smaller Adam 2nd moments
-    assert config.encoder_lr_multiplier == 1.3, (
-        f"encoder_lr_multiplier should be 1.3; got {config.encoder_lr_multiplier}"
+    assert config.encoder_lr_multiplier == 1.1, (
+        f"encoder_lr_multiplier should be 1.1; got {config.encoder_lr_multiplier}"
     )
 
     # Duration signal raised so the encoder receives stronger gradient from alignment
@@ -35,13 +35,13 @@ def test_training_config_convergence_fix_defaults():
 
     # Spec augment deferred until after the OneCycleLR peak (~epoch 15) to avoid
     # compounding ramp-phase instability (empirically caused val regression ep4→ep6)
-    assert config.spec_augment_start_epoch == 23, (
-        f"spec_augment_start_epoch should be 23; got {config.spec_augment_start_epoch}"
+    assert config.spec_augment_start_epoch == 35, (
+        f"spec_augment_start_epoch should be 35; got {config.spec_augment_start_epoch}"
     )
 
     # Encoder FFN pre-clip loosened — the old 10.0 was zeroing microscopic-but-valid gradients
-    assert config.encoder_ffn_spike_clip_norm == 20.0, (
-        f"encoder_ffn_spike_clip_norm should be 20.0; got {config.encoder_ffn_spike_clip_norm}"
+    assert config.encoder_ffn_spike_clip_norm == 8.0, (
+        f"encoder_ffn_spike_clip_norm should be 8.0; got {config.encoder_ffn_spike_clip_norm}"
     )
 
 
