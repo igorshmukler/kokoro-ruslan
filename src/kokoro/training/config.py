@@ -15,7 +15,7 @@ class TrainingConfig:
     # Basic training parameters
     data_dir: str = "data/processed_data"
     output_dir: str = "output_models"
-    num_epochs: int = 100
+    num_epochs: int = 26  # 26 × ~339 steps/epoch − 800 warmup ≈ 8,000 OneCycleLR steps
     batch_size: int = 16
     learning_rate: float = 9.09e-5  # peak LR = learning_rate × max_lr_multiplier = 9.09e-5 × 1.1 ≈ 1.0e-4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -25,12 +25,12 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 0.75  # Max LR = learning_rate * this value; with lr=9.09e-5 gives peak decoder ≈ 1.0e-4
-    pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
+    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 9.09e-5 × 1.1 ≈ 1.0e-4 (hard ceiling)
+    pct_start: float = 0.06  # Fraction of OneCycleLR cycle spent ascending to peak; with 8000 steps → peak at step ~480
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # peak encoder = 9.09e-5 × 1.1 (max_lr) × 1.3 ≈ 1.3e-4
+    # peak encoder = 9.09e-5 × 1.1 (max_lr) × 1.1 ≈ 1.1e-4
     encoder_lr_multiplier: float = 1.1
     # LR multiplier for the stop-token head's dedicated optimizer param group.
     # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
@@ -93,11 +93,11 @@ class TrainingConfig:
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.2 and 100 epochs the LR peaks at epoch 20; starting spec
-    # augment before the peak compounds the ramp-phase instability.
-    # Start at epoch 23: 3 epochs after the LR peak, once the schedule is
-    # descending and the model has stabilised.
-    spec_augment_start_epoch: int = 35
+    # With pct_start=0.06 and 8014 OneCycleLR steps (~339 steps/epoch) the LR
+    # peaks at OneCycleLR step ~480, i.e. absolute epoch ~4 (800 warmup + 480
+    # onecycle = 1280 steps / 339 ≈ epoch 3.8).  Start 2 epochs after peak so
+    # the schedule is solidly descending before augmentation noise is introduced.
+    spec_augment_start_epoch: int = 6
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.

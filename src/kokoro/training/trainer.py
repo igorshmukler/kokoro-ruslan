@@ -589,7 +589,9 @@ class KokoroTrainer:
             self.use_warmup = getattr(config, 'use_warmup', True)
             self.warmup_steps = getattr(config, 'warmup_steps', 500)
             self.warmup_start_lr = config.learning_rate * getattr(config, 'warmup_start_lr_ratio', 0.01)
-            self.warmup_target_lr = config.learning_rate
+            # Clamp warmup target to max_lr: when max_lr_multiplier < 1 (max_lr < learning_rate),
+            # ramping the warmup above max_lr creates a LR drop at the warmup→OneCycleLR boundary.
+            self.warmup_target_lr = min(config.learning_rate, max_lr)
             self.current_optimizer_step = 0
 
             if self.use_warmup:
@@ -602,12 +604,15 @@ class KokoroTrainer:
                 onecycle_steps = total_steps
 
             # When manual warmup is enabled, OneCycleLR must start exactly at
-            # `learning_rate` (where the warmup ends).  OneCycleLR's initial LR is
-            # max_lr / div_factor, so setting div_factor = max_lr_multiplier ensures
-            # a seamless handoff with no jump at step warmup_steps.
-            # When warmup is disabled, use the classic div_factor=25.0 (10x below base_lr).
+            # warmup_target_lr (= min(learning_rate, max_lr)).  OneCycleLR's initial LR is
+            # max_lr / div_factor, so div_factor = max_lr / warmup_target_lr = max_lr_multiplier
+            # (when max_lr_multiplier >= 1) ensures a seamless handoff.
+            # Guard: when max_lr_multiplier < 1 (max_lr < learning_rate), the raw formula
+            # gives div_factor < 1 → base_lr > max_lr, inverting the ascending cosine phase.
+            # Clamping div_factor to ≥ 1.0 ensures base_lr ≤ max_lr at all times.
+            # When warmup is disabled, use the classic div_factor=25.0 (ramp from max_lr/25).
             _max_lr_multiplier = getattr(config, 'max_lr_multiplier', 5.0)
-            onecycle_div_factor = float(_max_lr_multiplier) if self.use_warmup else 25.0
+            onecycle_div_factor = max(1.0, float(_max_lr_multiplier)) if self.use_warmup else 25.0
 
             # Build per-group max_lr:
             #   group 0 (encoder):          max_lr * encoder_lr_multiplier
@@ -1778,6 +1783,16 @@ class KokoroTrainer:
             'best_val_epoch': best_val_epoch,
             'config': self.config,
             'model_metadata': model_metadata,
+            # Snapshot of OneCycleLR params at save time so resume_from_checkpoint
+            # can detect when scheduler config has changed between runs and log a
+            # clear warning before step-based re-anchoring takes effect.
+            'scheduler_config': {
+                'onecycle_steps': getattr(self, '_onecycle_steps', None),
+                'max_lr': getattr(self, '_onecycle_max_lr', None),
+                'pct_start': getattr(self, '_onecycle_pct_start', None),
+                'div_factor': getattr(self, '_onecycle_div_factor', None),
+                'warmup_steps': self.warmup_steps if getattr(self, 'use_warmup', False) else 0,
+            },
         }
 
         if self.use_mixed_precision and self.scaler:

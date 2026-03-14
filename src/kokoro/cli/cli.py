@@ -61,8 +61,8 @@ Examples:
     parser.add_argument(
         '--epochs', '-e',
         type=int,
-        default=50,
-        help='Number of training epochs (default: 50)'
+        default=None,
+        help='Number of training epochs (default: use value from TrainingConfig)'
     )
 
     parser.add_argument(
@@ -256,7 +256,6 @@ def create_config_from_args(args) -> TrainingConfig:
         data_dir=args.corpus,
         output_dir=args.output,
         batch_size=args.batch_size,
-        num_epochs=args.epochs,
         sample_rate=22050,
         hop_length=256,
         win_length=1024,
@@ -287,4 +286,7 @@ def create_config_from_args(args) -> TrainingConfig:
     # Only override learning_rate when the user explicitly passed --learning-rate
     if args.learning_rate is not None:
         kwargs['learning_rate'] = args.learning_rate
+    # Only override num_epochs when the user explicitly passed --epochs
+    if args.epochs is not None:
+        kwargs['num_epochs'] = args.epochs
     return TrainingConfig(**kwargs)
