@@ -766,14 +766,14 @@ def tb_print_epoch_table(ea):
         val_vals   = {s: v for s, v in _get(ea, val_tag)} if val_tag else {}
 
         if train_tag:
-            row_t = f"  {label + ' train':<12}  "
+            row_t = f"  {label + ' train':<14}  "
             for s in epoch_steps:
                 v = train_vals.get(s)
-                row_t += f"  {'?':>12}  " if v is None else f"  {v:>12.5f}  "
+                row_t += f"  {'?':>14}  " if v is None else f"  {v:>12.5f}  "
             print(row_t)
 
         if val_tag:
-            row_v      = f"  {label + ' val':<12}  "
+            row_v      = f"  {label + ' val':<16}  "
             vals_list  = [val_vals.get(s) for s in epoch_steps]
             for i, (s, v) in enumerate(zip(epoch_steps, vals_list)):
                 flag = ""
@@ -781,7 +781,7 @@ def tb_print_epoch_table(ea):
                     prev = vals_list[i - 1]
                     if v is not None and prev is not None and v > prev:
                         flag = " ▲"
-                row_v += f"  {'?':>12}  " if v is None else f"  {v:>10.5f}{flag:2s}  "
+                row_v += f"  {'?':>14}  " if v is None else f"  {v:>10.5f}{flag:2s}  "
             print(row_v)
         print()
 
@@ -891,7 +891,7 @@ def tb_print_gradient_analysis(ea):
                     w_sat = sum(1 for _, v in window if abs(v - w_cap) < 1e-4)
                     w_pct = 100.0 * w_sat / len(window)
                     flag  = "" if w_pct < 20 else (" ⚠" if w_pct < 40 else " ✗")
-                    print(f"    Ep{i+1:02d} (steps {prev_b+1}–{b:>5}): "
+                    print(f"    Ep{i+1:02d} (steps {prev_b+1} –{b:>4}): "
                           f"{w_sat:>4}/{len(window):<5} = {w_pct:5.1f}%{flag}")
                 prev_b = b
             rest = [(s, v) for s, v in gnc if s > prev_b]
@@ -900,7 +900,7 @@ def tb_print_gradient_analysis(ea):
                 r_sat = sum(1 for _, v in rest if abs(v - r_cap) < 1e-4)
                 r_pct = 100.0 * r_sat / len(rest)
                 flag  = "" if r_pct < 20 else (" ⚠" if r_pct < 40 else " ✗")
-                print(f"    Ep?  (steps {prev_b+1}–{rest[-1][0]:>5}, in progress): "
+                print(f"    Ep?  (steps {prev_b+1} –{rest[-1][0]:>4}, in progress): "
                       f"{r_sat:>4}/{len(rest):<5} = {r_pct:5.1f}%{flag}")
 
 
