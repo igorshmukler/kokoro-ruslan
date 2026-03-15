@@ -16,6 +16,8 @@ output.wav
 mfa_output/
 __pycache__/
 
+# Tests coverage
+.coverage
 
 # Data directories
 data/raw/*

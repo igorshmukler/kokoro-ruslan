@@ -26,7 +26,7 @@ class TrainingConfig:
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
     max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 9.09e-5 × 1.1 ≈ 1.0e-4 (hard ceiling)
-    pct_start: float = 0.06  # Fraction of OneCycleLR cycle spent ascending to peak; with 8000 steps → peak at step ~480
+    pct_start: float = 0.15  # Fraction of OneCycleLR cycle spent ascending to peak; with ~8000 steps → peak at step ~1200 (absolute ~2000, epoch ~6)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
@@ -93,11 +93,12 @@ class TrainingConfig:
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.06 and 8014 OneCycleLR steps (~339 steps/epoch) the LR
-    # peaks at OneCycleLR step ~480, i.e. absolute epoch ~4 (800 warmup + 480
-    # onecycle = 1280 steps / 339 ≈ epoch 3.8).  Start 2 epochs after peak so
-    # the schedule is solidly descending before augmentation noise is introduced.
-    spec_augment_start_epoch: int = 10
+    # With pct_start=0.15 and ~8014 OneCycleLR steps (~339 steps/epoch) the LR
+    # peaks at OneCycleLR step ~1200, i.e. absolute epoch ~6 (800 warmup + 1200
+    # onecycle = 2000 steps / 339 ≈ epoch 5.9).  Start ~9 epochs after peak so
+    # the schedule is solidly descending (~85% of peak by ep11) before
+    # augmentation noise is introduced.
+    spec_augment_start_epoch: int = 15
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
@@ -178,13 +179,7 @@ class TrainingConfig:
     attention_spike_clip_norm: float = 8.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
     ffn_spike_clip_norm: float = 5.0
-    # Encoder FFN per-layer pre-clip. Previously 10.0 (too tight, zeroed encoder grads);
-    # raised to 100.0 while encoder was passive (ep1-ep5 grads ~1e-7).
-    # By ep6 encoder FFN avg_grad reached 40-100 per tensor (active learning phase),
-    # so 100.0 provided no real protection and encoder attention was also fully uncapped.
-    # Set to 12.0: ~20% above the decoder FFN cap (8.0), proportional to the higher
-    # encoder LR multiplier (1.3×). Encoder attention is now also clipped at
-    # attention_spike_clip_norm (20.0) via the extended pre-clip in trainer.
+    # Encoder FFN per-layer pre-clip
     encoder_ffn_spike_clip_norm: float = 8.0
     # Per-parameter clip norm applied exclusively to the stop-token head
     # (stop_token_predictor.weight and .bias) before the global clip.
