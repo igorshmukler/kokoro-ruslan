@@ -1597,7 +1597,7 @@ def tb_print_recommendations(ea, records=None):
     trend = d["clip_sat_trend"]
     if sat > 40 and trend != "improving":
         body = [
-            f"Clipping saturation {sat:.1f}% — model taking truncated steps on nearly half of batches.",
+            f"Clipping saturation {sat:.1f}% — model taking truncated steps on over 40% of batches.",
             f"  Trend: {trend}.",
             f"    → Reduce max_lr_multiplier ({cur_max_lr_mult:.2f} → {suggest_max_lr_mult:.2f}).",
         ]
