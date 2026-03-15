@@ -97,7 +97,7 @@ class TrainingConfig:
     # peaks at OneCycleLR step ~480, i.e. absolute epoch ~4 (800 warmup + 480
     # onecycle = 1280 steps / 339 ≈ epoch 3.8).  Start 2 epochs after peak so
     # the schedule is solidly descending before augmentation noise is introduced.
-    spec_augment_start_epoch: int = 6
+    spec_augment_start_epoch: int = 10
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
