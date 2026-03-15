@@ -1,3 +1,12 @@
+import torch
+import torch.nn as nn
+from typing import List
+
+from kokoro.data.audio_utils import PhonemeProcessorUtils
+from kokoro.data.russian_phoneme_processor import StressInfo
+from kokoro.data.dataset import FEATURE_CACHE_VERSION, collate_fn
+from kokoro.model.model import KokoroModel
+
 """
 Tests for the stress parallel embedding feature.
 
@@ -29,17 +38,6 @@ TestEncodeTextStressNone         – stress_indices=None is a no-op (backward co
 TestCollateStressIndices         – collate_fn produces (B, P) LongTensor
 TestCacheVersion                 – FEATURE_CACHE_VERSION == 6
 """
-
-import pytest
-import torch
-import torch.nn as nn
-from typing import List
-
-from kokoro.data.audio_utils import PhonemeProcessorUtils
-from kokoro.data.russian_phoneme_processor import StressInfo
-from kokoro.data.dataset import FEATURE_CACHE_VERSION, collate_fn
-from kokoro.model.model import KokoroModel
-
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 

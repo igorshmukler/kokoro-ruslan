@@ -1,14 +1,11 @@
-"""Unit tests for RotaryPositionalEncoding (RoPE) and its integration into
-MultiHeadAttentionImproved via rel_pos_type='rope'."""
-
-import math
-
 import pytest
 import torch
 
 from kokoro.model.positional_encoding import RotaryPositionalEncoding
 from kokoro.model import transformers
 
+"""Unit tests for RotaryPositionalEncoding (RoPE) and its integration into
+MultiHeadAttentionImproved via rel_pos_type='rope'."""
 
 # ---------------------------------------------------------------------------
 # Helpers

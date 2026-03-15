@@ -1,3 +1,9 @@
+import pytest
+import torch
+from types import SimpleNamespace
+
+from kokoro.training.trainer import KokoroTrainer, BatchOnDevice
+
 """
 Unit tests for KokoroTrainer._transfer_batch_to_device
 
@@ -8,12 +14,6 @@ The helper must:
   - Never mutate the original batch tensors
   - Set non_blocking=True only for 'cuda' devices
 """
-import pytest
-import torch
-from types import SimpleNamespace
-from unittest.mock import patch
-
-from kokoro.training.trainer import KokoroTrainer, BatchOnDevice
 
 REQUIRED_KEYS = [
     "mel_specs",

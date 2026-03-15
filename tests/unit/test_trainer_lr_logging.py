@@ -1,3 +1,10 @@
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from kokoro.training.trainer import KokoroTrainer
+
 """Unit tests for per-group LR TensorBoard logging and progress-bar postfix.
 
 Covers:
@@ -7,14 +14,6 @@ Covers:
   single-group returns lr key.
 - Epoch-end log string format (via train() logging path — light integration).
 """
-
-from types import SimpleNamespace
-from unittest.mock import MagicMock, call
-
-import pytest
-
-from kokoro.training.trainer import KokoroTrainer
-
 
 # ---------------------------------------------------------------------------
 # Helpers

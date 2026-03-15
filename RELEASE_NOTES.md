@@ -2,6 +2,12 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.32 (2026-03-13)
+
+- Perform post-step norm clamping on all decoder layers
+- Further tuning
+- Separate LR for stop
+
 ## 0.0.31 (2026-03-11)
 
 - Added training analysis script

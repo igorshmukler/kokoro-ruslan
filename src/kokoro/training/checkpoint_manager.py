@@ -470,7 +470,20 @@ def load_checkpoint(
                 "Checkpoint is missing optimizer/scheduler state required for training resume."
             )
 
-        optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+        try:
+            optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+        except (ValueError, RuntimeError) as _opt_err:
+            _saved_n_groups = len(checkpoint_dict['optimizer_state_dict'].get('param_groups', []))
+            _curr_n_groups = len(optimizer.param_groups)
+            if _saved_n_groups != _curr_n_groups:
+                logger.warning(
+                    f"Optimizer param group count changed ({_saved_n_groups} → {_curr_n_groups}); "
+                    "skipping optimizer state restore — Adam moments will be re-initialized. "
+                    "This is expected when param groups are added or split between runs "
+                    "(e.g. adding a dedicated stop-head LR group)."
+                )
+            else:
+                raise
         scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
 
         if 'epoch' not in checkpoint_dict or 'loss' not in checkpoint_dict:
@@ -549,7 +562,11 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
 
     checkpoint = None
     try:
-        checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+        # weights_only=False is required: checkpoints contain TrainingConfig and
+        # RussianPhonemeProcessor objects that weights_only=True (PyTorch >=2.6
+        # default) cannot deserialize.  These are our own trusted artifacts.
+        checkpoint = torch.load(checkpoint_path, map_location=trainer.device,
+                                weights_only=False)
     except Exception as e:
         logger.warning(f"Could not load raw checkpoint metadata: {e}")
 
@@ -557,7 +574,8 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
     if trainer.use_mixed_precision and trainer.scaler:
         try:
             if checkpoint is None:
-                checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+                checkpoint = torch.load(checkpoint_path, map_location=trainer.device,
+                                        weights_only=False)
             if 'scaler' in checkpoint:
                 trainer.scaler.load_state_dict(checkpoint['scaler'])
                 logger.info(f"Loaded {trainer.device_type.upper()} scaler state from checkpoint")
@@ -570,7 +588,8 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
     if trainer.use_ema and trainer.ema_model is not None:
         try:
             if checkpoint is None:
-                checkpoint = torch.load(checkpoint_path, map_location=trainer.device)
+                checkpoint = torch.load(checkpoint_path, map_location=trainer.device,
+                                        weights_only=False)
             if 'ema_model_state_dict' in checkpoint:
                 try:
                     trainer.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
@@ -672,16 +691,44 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             # Use the last param group (decoder) as the reference for computing the schedule
             # position, since its LR range is [base_lr, max_lr] without the encoder scaling.
             n_pg = len(trainer.optimizer.param_groups)
-            ref_group_idx = n_pg - 1  # last group = decoder params
+            # Use the first decoder group (index 2 = decoder_decay, or index 1 in
+            # smaller setups) as the LR reference for schedule positioning.
+            # Must NOT use the stop head group (last group in the 4-group setup)
+            # because it has a scaled LR that would produce a wrong resume position.
+            ref_group_idx = min(2, n_pg - 1)
+            if n_pg >= 4 and ref_group_idx == n_pg - 1:
+                ref_group_idx = n_pg - 2  # fall back one group to stay off stop head
             encoder_lr_mult = getattr(trainer, '_encoder_lr_multiplier', 1.0)
             last_lr = trainer.optimizer.state_dict()['param_groups'][ref_group_idx]['lr']
 
             _div_factor = getattr(trainer, '_onecycle_div_factor',
-                float(getattr(config, 'max_lr_multiplier', 5.0))
+                max(1.0, float(getattr(config, 'max_lr_multiplier', 5.0)))
                 if getattr(trainer, 'use_warmup', False) else 25.0)
             base_lr  = max_lr / _div_factor
             final_lr = max_lr / 10000.0
             peak_step = int(pct_start * onecycle_steps)
+
+            # Detect and log scheduler param changes since the saved checkpoint.
+            _saved_sched_cfg = checkpoint.get('scheduler_config') if checkpoint is not None else None
+            if _saved_sched_cfg is not None:
+                _changed = []
+                if _saved_sched_cfg.get('onecycle_steps') != onecycle_steps:
+                    _changed.append(f"onecycle_steps: {_saved_sched_cfg.get('onecycle_steps')} → {onecycle_steps}")
+                _saved_max_lr = _saved_sched_cfg.get('max_lr')
+                if _saved_max_lr is not None and abs(_saved_max_lr - max_lr) > 1e-10:
+                    _changed.append(f"max_lr: {_saved_max_lr:.2e} → {max_lr:.2e}")
+                if _saved_sched_cfg.get('pct_start') != pct_start:
+                    _changed.append(f"pct_start: {_saved_sched_cfg.get('pct_start')} → {pct_start}")
+                _saved_div = _saved_sched_cfg.get('div_factor')
+                if _saved_div is not None and abs(_saved_div - _div_factor) > 1e-6:
+                    _changed.append(f"div_factor: {_saved_div:.4g} → {_div_factor:.4g}")
+                if _changed:
+                    logger.warning(
+                        "Scheduler params changed since checkpoint — step-based positioning "
+                        "will re-anchor the new schedule. Changes:\n  " + "\n  ".join(_changed)
+                    )
+                else:
+                    logger.info("Scheduler params unchanged from checkpoint.")
 
             # Step-based positioning: use checkpoint global_step as the anchor whenever
             # available.  LR-value matching (the fallback below) breaks when max_lr has
@@ -712,11 +759,12 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 if target_step <= peak_step:
                     _pct = target_step / max(1, peak_step)
                     resume_lr = base_lr + (max_lr - base_lr) * (1.0 - math.cos(math.pi * _pct)) / 2.0
+                    resume_lr = max(base_lr, min(max_lr, resume_lr))
                 else:
                     _decay_steps = onecycle_steps - peak_step
                     _pct = (target_step - peak_step) / max(1, _decay_steps)
                     resume_lr = final_lr + (max_lr - final_lr) * (1.0 + math.cos(math.pi * _pct)) / 2.0
-                resume_lr = max(base_lr, min(max_lr, resume_lr))
+                    resume_lr = max(final_lr, min(max_lr, resume_lr))
                 logger.info(
                     f"Step-based scheduler resume: global_step={_saved_global_step} "
                     f"(warmup_done={_warmup_done}) "
@@ -745,8 +793,20 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 target_step = onecycle_steps - 1
                 resume_lr   = final_lr
 
-            # Build per-group max_lr: encoder group (group 0 when n_pg > 1) gets encoder_lr_mult × max_lr
-            if n_pg > 1:
+            # Build per-group max_lr mirroring trainer._setup_scheduler():
+            #   group 0 (encoder):          max_lr * encoder_lr_mult
+            #   groups 1..n-2 (decoder):    max_lr
+            #   group n-1 (stop head):      max_lr * stop_head_lr_mult  (when n_pg >= 4)
+            _stop_head_lr_mult = float(
+                getattr(getattr(trainer, 'config', None), 'stop_head_lr_multiplier', 0.1)
+            )
+            if n_pg >= 4:
+                max_lr_arg = (
+                    [max_lr * encoder_lr_mult]
+                    + [max_lr] * (n_pg - 2)
+                    + [max_lr * _stop_head_lr_mult]
+                )
+            elif n_pg > 1:
                 max_lr_arg = [max_lr * encoder_lr_mult] + [max_lr] * (n_pg - 1)
             else:
                 max_lr_arg = max_lr
@@ -768,11 +828,21 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             trainer.scheduler.last_epoch = target_step
             resume_lr = min(resume_lr, max_lr)
             for i, g in enumerate(trainer.optimizer.param_groups):
-                # Encoder group (group 0 in multi-group setup) keeps its higher LR
-                mult = encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0
+                # Encoder (group 0) keeps higher multiplier; stop head (last group
+                # when n_pg >= 4) keeps its reduced multiplier; decoder groups use 1.0.
+                if n_pg > 1 and i == 0:
+                    mult = encoder_lr_mult
+                elif n_pg >= 4 and i == n_pg - 1:
+                    mult = _stop_head_lr_mult
+                else:
+                    mult = 1.0
                 g['lr'] = resume_lr * mult
             trainer.scheduler._last_lr = [
-                resume_lr * (encoder_lr_mult if (n_pg > 1 and i == 0) else 1.0)
+                resume_lr * (
+                    encoder_lr_mult if (n_pg > 1 and i == 0)
+                    else _stop_head_lr_mult if (n_pg >= 4 and i == n_pg - 1)
+                    else 1.0
+                )
                 for i in range(n_pg)
             ]
 

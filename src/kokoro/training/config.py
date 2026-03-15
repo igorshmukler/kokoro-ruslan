@@ -15,34 +15,40 @@ class TrainingConfig:
     # Basic training parameters
     data_dir: str = "data/processed_data"
     output_dir: str = "output_models"
-    num_epochs: int = 100
+    num_epochs: int = 26  # 26 × ~339 steps/epoch − 800 warmup ≈ 8,000 OneCycleLR steps
     batch_size: int = 16
-    learning_rate: float = 1e-4
+    learning_rate: float = 9.09e-5  # peak LR = learning_rate × max_lr_multiplier = 9.09e-5 × 1.1 ≈ 1.0e-4
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
-    gradient_accumulation_steps: int = 2  # Effective batch size = batch_size * gradient_accumulation_steps
+    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * gradient_accumulation_steps
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.0  # Max LR = learning_rate * this value (lowered from 1.5: ep7 spiked at decoder LR ~1.18-1.22e-4 with 1.5; 1.3 gives peak decoder=1.3e-4)
-    pct_start: float = 0.2  # Percentage of cycle spent increasing LR (warmup)
+    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 9.09e-5 × 1.1 ≈ 1.0e-4 (hard ceiling)
+    pct_start: float = 0.15  # Fraction of OneCycleLR cycle spent ascending to peak; with ~8000 steps → peak at step ~1200 (absolute ~2000, epoch ~6)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # 1.5 gives peak encoder = 1e-4 × 1.3 (max_lr) × 1.5 = 1.95e-4
-    # (was 2.25e-4 with max_lr_mult=1.5; ep7 spiked → reduced max_lr first)
-    encoder_lr_multiplier: float = 1.3
+    # peak encoder = 9.09e-5 × 1.1 (max_lr) × 1.1 ≈ 1.1e-4
+    encoder_lr_multiplier: float = 1.1
+    # LR multiplier for the stop-token head's dedicated optimizer param group.
+    # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
+    # distribution (~137:1 neg/pos).  Running it at the same LR as the decoder
+    # lets OneCycleLR peak-phase spikes destabilize it.  0.2× should keep the
+    # effective step size well below the adaptive clip threshold
+    # while still giving the head meaningful updates every step.
+    stop_head_lr_multiplier: float = 0.2
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
-    warmup_steps: int = 1200  # Number of optimizer steps for linear warmup (not batches!)
+    warmup_steps: int = 800  # Number of optimizer steps for linear warmup (not batches!)
     warmup_start_lr_ratio: float = 0.01  # Start LR = learning_rate * this value
 
     # EMA (Exponential Moving Average) of model weights
     use_ema: bool = True  # Enable EMA for better inference quality
     ema_decay: Optional[float] = None  # EMA decay rate; if None, trainer will compute a recommended value
-    ema_half_life_epochs: float = 2.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
+    ema_half_life_epochs: float = 1.0  # Half-life in epochs used to compute recommended EMA when ema_decay is None
     ema_update_every: int = 1  # Update EMA every N optimizer steps (1 = every step)
 
     # Legacy CosineAnnealingWarmRestarts settings (used if use_onecycle_lr=False)
@@ -63,7 +69,7 @@ class TrainingConfig:
 
     # Stochastic depth (layer dropout) for regularization
     use_stochastic_depth: bool = True  # Enable layer dropout during training
-    stochastic_depth_rate: float = 0.1  # Maximum drop probability for last layer
+    stochastic_depth_rate: float = 0.05  # Maximum drop probability for last layer
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
     # Loss weights
@@ -87,11 +93,12 @@ class TrainingConfig:
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.2 and 100 epochs the LR peaks at epoch 20; starting spec
-    # augment before the peak compounds the ramp-phase instability.
-    # Start at epoch 23: 3 epochs after the LR peak, once the schedule is
-    # descending and the model has stabilised.
-    spec_augment_start_epoch: int = 23
+    # With pct_start=0.15 and ~8014 OneCycleLR steps (~339 steps/epoch) the LR
+    # peaks at OneCycleLR step ~1200, i.e. absolute epoch ~6 (800 warmup + 1200
+    # onecycle = 2000 steps / 339 ≈ epoch 5.9).  Start ~9 epochs after peak so
+    # the schedule is solidly descending (~85% of peak by ep11) before
+    # augmentation noise is introduced.
+    spec_augment_start_epoch: int = 15
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
@@ -102,9 +109,14 @@ class TrainingConfig:
     #   • stop_token_loss_weight → controls global loss contribution (scale concern)
     # Do NOT scale pos_weight up/down to compensate for the global weight; adjust
     # stop_token_loss_weight independently for that purpose.
-    # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 chosen as
-    # stable partial correction (~36%) that keeps the stop predictor learning.
-    stop_token_pos_weight: float = 35.0
+    # History: 150 → spikes at high LR; 100 → grad_norm to 39.8; 50 → 35 chosen as
+    # stable partial correction (~25%) that kept the stop predictor learning.
+    # Reduced to 25.0: stop head bias drifted steadily negative (−0.006 → −0.016
+    # across ep1-5) at 35.0 even with pos_weight, indicating the head is still
+    # treating most frames as non-stop.  With gradient isolation via detach now in
+    # place, 25.0 gives sufficient class-balance correction without over-amplifying
+    # the already-isolated stop gradient at the peak LR phase.
+    stop_token_pos_weight: float = 25.0
     # Temporal smoothing of stop-token targets.
     # Instead of a single hard 1.0 at the last frame, a short exponentially
     # decaying tail is added to the frames immediately before it:
@@ -160,36 +172,38 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 2.0 # Global gradient clip ceiling
+    max_grad_norm: float = 1.5 # Global gradient clip ceiling
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
-    attention_spike_clip_norm: float = 20.0
+    attention_spike_clip_norm: float = 8.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
     ffn_spike_clip_norm: float = 5.0
-    # Encoder FFN per-layer pre-clip. Previously 10.0 (too tight, zeroed encoder grads);
-    # raised to 100.0 while encoder was passive (ep1-ep5 grads ~1e-7).
-    # By ep6 encoder FFN avg_grad reached 40-100 per tensor (active learning phase),
-    # so 100.0 provided no real protection and encoder attention was also fully uncapped.
-    # Set to 12.0: ~20% above the decoder FFN cap (8.0), proportional to the higher
-    # encoder LR multiplier (1.3×). Encoder attention is now also clipped at
-    # attention_spike_clip_norm (20.0) via the extended pre-clip in trainer.
-    encoder_ffn_spike_clip_norm: float = 20.0
+    # Encoder FFN per-layer pre-clip
+    encoder_ffn_spike_clip_norm: float = 8.0
     # Per-parameter clip norm applied exclusively to the stop-token head
     # (stop_token_predictor.weight and .bias) before the global clip.
     # The stop head is a single Linear(hidden_dim→1); its gradient can spike disproportionately
     # when pos_weight is large or the smoothing tail has a frame error near the boundary.
     # A tight ceiling here prevents the stop head from corrupting the mel decoder's gradient
     # budget while still giving the head a meaningful update signal.
-    # Set ≤ 0 to disable.  Chosen conservatively: the mel projection norms rarely exceed
-    # ~5 at steady state, so 1.0 is tight enough to isolate the head without starving it.
-    stop_head_spike_clip_norm: float = 1.0
+    # Set ≤ 0 to disable.  With gradient isolation now provided by detaching
+    # decoder_outputs before the stop head (model.py _project_decoder_outputs),
+    # this clip defends only the stop head's own weight/bias against LR-phase
+    # spikes.  Reduced to 0.5: the stop head weight norm at ep5 is ~1.6 with
+    # a 1.0 clip already present; halving the ceiling throttles the peak-LR
+    # update magnitude proportionally without starving the head.
+    stop_head_spike_clip_norm: float = 0.5
     # Post-step max weight-norm clamp for decoder.layers.0.ff.linear1.weight.
-    # After every successful optimizer step the L2 norm of that weight matrix is
-    # projected back to this ceiling, preventing unconstrained growth of the
-    # first decoder FFN expansion layer while leaving gradients untouched.
-    # Set ≤ 0.0 to disable.
-    dec_ff0_linear1_max_weight_norm: float = 60.0
+    # After every successful optimizer step the L2 norm of each decoder FF weight
+    # matrix is projected back to this ceiling, preventing unconstrained growth
+    # across all decoder FFN layers while leaving gradients untouched.
+    # Covers all decoder.layers.{i}.ff.linear1 and linear2 weights (12 matrices
+    # for a 6-layer decoder).  Set ≤ 0.0 to disable.
+    # dec_ff0_linear1_max_weight_norm is the legacy single-layer key and is kept
+    # for backward compat; dec_ffn_max_weight_norm takes precedence when present.
+    dec_ffn_max_weight_norm: float = 28.0
+    dec_ff0_linear1_max_weight_norm: float = 60.0  # legacy — superseded by dec_ffn_max_weight_norm
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100

@@ -499,10 +499,19 @@ class KokoroModel(nn.Module):
     def _project_decoder_outputs(self, decoder_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project decoder outputs to mel frames and stop logits.
 
+        The stop head receives a detached view of decoder_outputs so that the
+        BCE stop loss cannot propagate gradients back into the mel decoder.
+        Rationale: stop_token_loss_weight=0.010 means the stop gradient
+        contributes only ~1% of the mel budget, but under the high-LR ascending
+        phase of OneCycleLR it can still spike disproportionately at the single
+        stop frame (×pos_weight) and corrupt the shared decoder representation.
+        Detaching isolates that instability entirely while the stop head still
+        receives its own gradient signal through its weight/bias.
+
         Returns: (predicted_mel_frames, predicted_stop_logits)
         """
         predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-        predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+        predicted_stop_logits = self.stop_token_predictor(decoder_outputs.detach()).squeeze(-1)
         return predicted_mel_frames, predicted_stop_logits
 
     def forward_training(

@@ -1,3 +1,9 @@
+import pytest
+import torch
+
+from kokoro.data.dataset import build_stop_token_targets
+from kokoro.training.config import TrainingConfig
+
 """
 Tests for stop-token temporal smoothing (build_stop_token_targets).
 
@@ -19,13 +25,6 @@ Covered behaviours:
   11. Config defaults: stop_token_smooth_tail=4, stop_token_smooth_decay=0.5
   12. Custom config values are respected
 """
-
-import pytest
-import torch
-
-from kokoro.data.dataset import build_stop_token_targets
-from kokoro.training.config import TrainingConfig
-
 
 # ---------------------------------------------------------------------------
 # helpers
