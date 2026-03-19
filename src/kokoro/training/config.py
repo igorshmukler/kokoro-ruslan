@@ -41,7 +41,9 @@ class TrainingConfig:
     stop_head_lr_multiplier: float = 0.2
     # LR multiplier applied specifically to decoder FFN layers (decoder.layers.*.ff.linear1/2).
     # Use <1.0 to reduce step size for the FFN subnetwork (helps stabilise persistent movers).
-    decoder_ffn_lr_multiplier: float = 0.5
+    # 0.5 was still insufficient — all decoder FFN linear1 layers remained 100% persistent movers.
+    # Lowered to 0.3: peak FFN LR = base_lr × max_lr_mult × 0.3 ≈ 1.65e-5 (was 2.75e-5 @ 0.5).
+    decoder_ffn_lr_multiplier: float = 0.3
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR

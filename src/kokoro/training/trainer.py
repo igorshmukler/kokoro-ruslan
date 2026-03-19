@@ -122,7 +122,7 @@ class KokoroTrainer:
                 "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
             },
             "Learning Rate": {
-                "LR (encoder vs decoder vs stop)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_stop_head"]],
+                "LR (encoder vs decoder vs stop vs ffn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_stop_head"]],
             },
         })
 
@@ -1519,33 +1519,72 @@ class KokoroTrainer:
     def _log_lr_scalars(self, step: int) -> None:
         """Write per-group learning-rate scalars to TensorBoard.
 
-        With 4 param groups (encoder, decoder_no_decay, decoder_decay, stop_head):
-          stats/lr_encoder   = group 0 (encoder)
-          stats/lr_decoder   = group 2 (decoder_decay, the canonical decoder LR reference)
-          stats/lr_stop_head = group 3 (stop_token_predictor)
-        With 3 groups (legacy, no stop_head split):
-          stats/lr_encoder = group 0, stats/lr_decoder = group 2 (or -1 if < 3 groups)
-        With a single param group: logs the legacy stats/learning_rate tag.
+        Resolves group indices by 'group_type' tag so the mapping is stable
+        regardless of how many groups are present.  Recognised group types:
+          encoder        → stats/lr_encoder
+          decoder_other  → stats/lr_decoder   (canonical decoder reference)
+          decoder_ffn    → stats/lr_decoder_ffn
+          stop_head      → stats/lr_stop_head
+        Falls back to positional heuristics for legacy (untagged) checkpoints.
         """
-        n_pg = len(self.optimizer.param_groups)
-        if n_pg >= 4:
-            self.writer.add_scalar('stats/lr_encoder',   self.optimizer.param_groups[0]['lr'],  step)
-            self.writer.add_scalar('stats/lr_decoder',   self.optimizer.param_groups[2]['lr'],   step)
-            self.writer.add_scalar('stats/lr_stop_head', self.optimizer.param_groups[-1]['lr'], step)
-        elif n_pg > 1:
-            self.writer.add_scalar('stats/lr_encoder', self.optimizer.param_groups[0]['lr'], step)
-            # Use group 2 (decoder_decay) when present, else last group
-            dec_idx = min(2, n_pg - 1)
-            self.writer.add_scalar('stats/lr_decoder', self.optimizer.param_groups[dec_idx]['lr'], step)
+        tagged: dict[str, float] = {}
+        untagged: list[float] = []
+        for pg in self.optimizer.param_groups:
+            gt = pg.get('group_type')
+            if gt:
+                tagged[gt] = pg['lr']
+            else:
+                untagged.append(pg['lr'])
+
+        if tagged:
+            if 'encoder' in tagged:
+                self.writer.add_scalar('stats/lr_encoder', tagged['encoder'], step)
+            if 'decoder_other' in tagged:
+                self.writer.add_scalar('stats/lr_decoder', tagged['decoder_other'], step)
+            if 'decoder_ffn' in tagged:
+                self.writer.add_scalar('stats/lr_decoder_ffn', tagged['decoder_ffn'], step)
+            if 'stop_head' in tagged:
+                self.writer.add_scalar('stats/lr_stop_head', tagged['stop_head'], step)
         else:
-            self.writer.add_scalar('stats/learning_rate', self.optimizer.param_groups[0]['lr'], step)
+            # Legacy fallback: positional heuristics
+            n_pg = len(self.optimizer.param_groups)
+            if n_pg >= 4:
+                self.writer.add_scalar('stats/lr_encoder',   self.optimizer.param_groups[0]['lr'], step)
+                self.writer.add_scalar('stats/lr_decoder',   self.optimizer.param_groups[2]['lr'], step)
+                self.writer.add_scalar('stats/lr_stop_head', self.optimizer.param_groups[-1]['lr'], step)
+            elif n_pg > 1:
+                self.writer.add_scalar('stats/lr_encoder', self.optimizer.param_groups[0]['lr'], step)
+                dec_idx = min(2, n_pg - 1)
+                self.writer.add_scalar('stats/lr_decoder', self.optimizer.param_groups[dec_idx]['lr'], step)
+            else:
+                self.writer.add_scalar('stats/learning_rate', self.optimizer.param_groups[0]['lr'], step)
 
     def _build_lr_postfix(self) -> dict:
         """Return a dict of LR key(s) for the tqdm progress-bar postfix.
 
-        With ≥4 param groups returns enc/dec/stop.  With 2-3 returns enc/dec.
-        With one param group returns {'lr': <lr>}.
+        Resolves groups by 'group_type' tag when available, else falls back to
+        positional heuristics for legacy (untagged) checkpoints.
         """
+        tagged: dict[str, float] = {}
+        for pg in self.optimizer.param_groups:
+            gt = pg.get('group_type')
+            if gt:
+                tagged[gt] = pg['lr']
+
+        if tagged:
+            result = {}
+            if 'encoder' in tagged:
+                result['lr_enc'] = tagged['encoder']
+            if 'decoder_other' in tagged:
+                result['lr_dec'] = tagged['decoder_other']
+            if 'decoder_ffn' in tagged:
+                result['lr_ffn'] = tagged['decoder_ffn']
+            if 'stop_head' in tagged:
+                result['lr_stop'] = tagged['stop_head']
+            if result:
+                return result
+
+        # Legacy fallback
         n_pg = len(self.optimizer.param_groups)
         if n_pg >= 4:
             return {
