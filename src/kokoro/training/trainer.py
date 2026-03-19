@@ -521,29 +521,53 @@ class KokoroTrainer:
             else:
                 decoder_named.append((name, param))
 
+        # Split decoder params into no_decay vs decay, and isolate FFN params
         decoder_no_decay: list = []
-        decoder_decay: list = []
+        decoder_decay_tuples: list = []  # (name, param) for decay candidates
         for _name, _param in decoder_named:
             if (any(_name.endswith(s) for s in _no_decay_suffixes)
                     or any(s in _name for s in _no_decay_substrings)):
                 decoder_no_decay.append(_param)
             else:
-                decoder_decay.append(_param)
+                decoder_decay_tuples.append((_name, _param))
+        # From decay candidates, carve out FFN params (decoder.layers.*.ff.*)
+        decoder_decay_ffn: list = []
+        decoder_decay_other: list = []
+        for _name, _param in decoder_decay_tuples:
+            if ".ff." in _name or ".ff" in _name:
+                decoder_decay_ffn.append(_param)
+            else:
+                decoder_decay_other.append(_param)
         decoder_params = [p for _, p in decoder_named]  # kept for logging only
 
         encoder_lr = base_lr * encoder_lr_mult
         stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
         stop_head_lr = base_lr * stop_head_lr_mult
-        param_groups = [
-            {'params': encoder_params,   'lr': encoder_lr,   'weight_decay': 0.0,
-             'eps': adam_eps, 'betas': adam_betas},
-            {'params': decoder_no_decay, 'lr': base_lr,      'weight_decay': 0.0,
-             'eps': adam_eps, 'betas': adam_betas},
-            {'params': decoder_decay,    'lr': base_lr,      'weight_decay': weight_decay,
-             'eps': adam_eps, 'betas': adam_betas},
-            {'params': stop_head_params, 'lr': stop_head_lr, 'weight_decay': 0.0,
-             'eps': adam_eps, 'betas': adam_betas},
-        ]
+        decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
+
+        # Build param groups, tagging each with a group_type for scheduler mapping
+        param_groups = []
+        param_groups.append({'params': encoder_params, 'lr': encoder_lr, 'weight_decay': 0.0,
+                             'eps': adam_eps, 'betas': adam_betas, 'group_type': 'encoder'})
+
+        # Decoder no-decay (biases / norms)
+        if decoder_no_decay:
+            param_groups.append({'params': decoder_no_decay, 'lr': base_lr, 'weight_decay': 0.0,
+                                 'eps': adam_eps, 'betas': adam_betas, 'group_type': 'decoder_other'})
+
+        # Decoder decay: separate FFN vs other so FFN can use reduced LR
+        if decoder_decay_other:
+            param_groups.append({'params': decoder_decay_other, 'lr': base_lr, 'weight_decay': weight_decay,
+                                 'eps': adam_eps, 'betas': adam_betas, 'group_type': 'decoder_other'})
+        if decoder_decay_ffn:
+            param_groups.append({'params': decoder_decay_ffn, 'lr': base_lr * decoder_ffn_lr_mult,
+                                 'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'decoder_ffn'})
+
+        # Stop head group (always present as its own group when identified)
+        if stop_head_params:
+            param_groups.append({'params': stop_head_params, 'lr': stop_head_lr, 'weight_decay': 0.0,
+                                 'eps': adam_eps, 'betas': adam_betas, 'group_type': 'stop_head'})
         if not encoder_params:
             # Fallback: single group (no identifiable encoder params)
             param_groups = [{'params': list(self.model.parameters()), 'lr': base_lr,
@@ -551,12 +575,18 @@ class KokoroTrainer:
             self._encoder_lr_multiplier = 1.0
             logger.warning("No encoder params identified for separate LR group — using single param group")
         else:
+            # Count params per logical group for logging
+            n_encoder = len(encoder_params)
+            n_decoder_no_decay = len(decoder_no_decay)
+            n_decoder_other = len(decoder_decay_other)
+            n_decoder_ffn = len(decoder_decay_ffn)
+            n_stop = len(stop_head_params)
             logger.info(
-                f"Optimizer param groups: "
-                f"encoder={len(encoder_params)} params (lr={encoder_lr:.2e}, wd=0.0), "
-                f"decoder_no_decay={len(decoder_no_decay)} params (lr={base_lr:.2e}, wd=0.0), "
-                f"decoder_decay={len(decoder_decay)} params (lr={base_lr:.2e}, wd={weight_decay}), "
-                f"stop_head={len(stop_head_params)} params (lr={stop_head_lr:.2e}, wd=0.0)"
+                f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
+                f"decoder_no_decay={n_decoder_no_decay} params (lr={base_lr:.2e}, wd=0.0), "
+                f"decoder_other_decay={n_decoder_other} params (lr={base_lr:.2e}, wd={weight_decay}), "
+                f"decoder_ffn_decay={n_decoder_ffn} params (lr={base_lr*decoder_ffn_lr_mult:.2e}, wd={weight_decay}), "
+                f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
 
         try:
@@ -621,18 +651,21 @@ class KokoroTrainer:
             # The stop head is always the last param group when present.
             _enc_mult = getattr(self, '_encoder_lr_multiplier', 1.0)
             _stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
-            n_pg = len(self.optimizer.param_groups)
-            if n_pg >= 4:
-                # [encoder] + [decoder × (n_pg-2)] + [stop_head]
-                max_lr_arg = (
-                    [max_lr * _enc_mult]
-                    + [max_lr] * (n_pg - 2)
-                    + [max_lr * _stop_head_lr_mult]
-                )
-            elif n_pg > 1:
-                max_lr_arg = [max_lr * _enc_mult] + [max_lr] * (n_pg - 1)
-            else:
-                max_lr_arg = max_lr
+            decoder_ffn_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
+
+            # Construct per-param-group max_lr list by inspecting the custom 'group_type'
+            max_lr_arg = []
+            for pg in self.optimizer.param_groups:
+                gt = pg.get('group_type', 'decoder_other')
+                if gt == 'encoder':
+                    max_lr_arg.append(max_lr * _enc_mult)
+                elif gt == 'decoder_ffn':
+                    max_lr_arg.append(max_lr * decoder_ffn_mult)
+                elif gt == 'stop_head':
+                    max_lr_arg.append(max_lr * _stop_head_lr_mult)
+                else:
+                    # decoder_other / decoder_no_decay etc.
+                    max_lr_arg.append(max_lr)
 
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
                 self.optimizer,

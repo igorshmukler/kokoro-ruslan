@@ -17,7 +17,7 @@ class TrainingConfig:
     output_dir: str = "output_models"
     num_epochs: int = 26  # 26 × ~339 steps/epoch − 800 warmup ≈ 8,000 OneCycleLR steps
     batch_size: int = 16
-    learning_rate: float = 9.09e-5  # peak LR = learning_rate × max_lr_multiplier = 9.09e-5 × 1.1 ≈ 1.0e-4
+    learning_rate: float = 5.0e-5  # peak LR = learning_rate × max_lr_multiplier = 5.0e-5 × 1.1 ≈ 5.5e-5
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
@@ -25,12 +25,12 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 9.09e-5 × 1.1 ≈ 1.0e-4 (hard ceiling)
-    pct_start: float = 0.15  # Fraction of OneCycleLR cycle spent ascending to peak; with ~8000 steps → peak at step ~1200 (absolute ~2000, epoch ~6)
+    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 5.0e-5 × 1.1 ≈ 5.5e-5 (hard ceiling)
+    pct_start: float = 0.45  # Fraction of OneCycleLR cycle spent ascending to peak; with ~8000 steps → peak at step ~3595 (absolute ~4395, epoch ~13)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # peak encoder = 9.09e-5 × 1.1 (max_lr) × 1.1 ≈ 1.1e-4
+    # peak encoder = 5.0e-5 × 1.1 (max_lr) × 1.1 ≈ 6.0e-5
     encoder_lr_multiplier: float = 1.1
     # LR multiplier for the stop-token head's dedicated optimizer param group.
     # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
@@ -39,6 +39,9 @@ class TrainingConfig:
     # effective step size well below the adaptive clip threshold
     # while still giving the head meaningful updates every step.
     stop_head_lr_multiplier: float = 0.2
+    # LR multiplier applied specifically to decoder FFN layers (decoder.layers.*.ff.linear1/2).
+    # Use <1.0 to reduce step size for the FFN subnetwork (helps stabilise persistent movers).
+    decoder_ffn_lr_multiplier: float = 0.5
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -98,7 +101,7 @@ class TrainingConfig:
     # onecycle = 2000 steps / 339 ≈ epoch 5.9).  Start ~9 epochs after peak so
     # the schedule is solidly descending (~85% of peak by ep11) before
     # augmentation noise is introduced.
-    spec_augment_start_epoch: int = 15
+    spec_augment_start_epoch: int = 16
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
