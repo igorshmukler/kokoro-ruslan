@@ -76,8 +76,9 @@ def classify_param(name: str, cfg=None):
 
     # ── Decoder FFN ──────────────────────────────────────────────────────────
     # Matches both direct children (.linear1) and sub-module children (.ff.linear1)
+    # lr_key = 'decoder_ffn' so the dedicated param group LR is used when available.
     if re.search(r'decoder\.layers\.\d+\.(?:ff\.)?(linear1|linear2)', name):
-        return ('dec_ffn',  dec_ffn_cap, 'decoder')
+        return ('dec_ffn',  dec_ffn_cap, 'decoder_ffn')
     # ── Encoder FFN ──────────────────────────────────────────────────────────
     if re.search(r'transformer_encoder_layers\.\d+\.(?:ff\.)?(linear1|linear2)', name):
         return ('enc_ffn',  enc_ffn_cap, 'encoder')
@@ -473,40 +474,55 @@ def print_gradual_degradation_report(records):
         # after the best epoch if early epochs pull the fit down (as seen when
         # epoch 1 loss >> epoch 2+).
         post_best = losses[best_idx:]
-        if len(post_best) >= 2:
+        if len(post_best) >= 3:
             slope_post, r2_post = _linear_slope(post_best)
+        elif len(post_best) == 2:
+            # Only 1 epoch post-best: 2-point fit always gives R²=1.0, which
+            # would spuriously trigger the SUSTAINED REGRESSION flag.  Compute
+            # slope but zero R² so no flag fires; the raw slope is still shown.
+            slope_post, _ = _linear_slope(post_best)
+            r2_post = 0.0
         else:
             slope_post, r2_post = slope_all, r2_all
 
         slope_flag = ""
         if slope_post > 0 and r2_post > 0.5:
-            slope_flag = "  ← SUSTAINED REGRESSION post-best  (R²={:.2f})".format(r2_post)
+            slope_flag = "  ← TRAIN LOSS rising post-best  (R²={:.2f})  [see TB val_mel for true regression signal]".format(r2_post)
         elif slope_post > 0 and r2_post > 0.25:
-            slope_flag = "  ← upward trend post-best  (R²={:.2f})".format(r2_post)
+            slope_flag = "  ← train loss upward trend post-best  (R²={:.2f})".format(r2_post)
 
-        print(f"  Loss trend (all)  slope={slope_all:+.6f}/epoch  R²={r2_all:.3f}")
+        print(f"  Loss trend (all)  slope={slope_all:+.6f}/epoch  R²={r2_all:.3f}  (train loss)")
         print(f"  Loss trend (post-best Ep{best_epoch:02d})  "
               f"slope={slope_post:+.6f}/epoch  R²={r2_post:.3f}{slope_flag}")
         if age >= 2:
-            print(f"  Best epoch        Ep{best_epoch:02d}  ({age} epochs ago)"
-                  f"  ← model has not improved for {age} epochs")
+            print(f"  Best epoch        Ep{best_epoch:02d}  ({age} epochs ago, train loss)"
+                  f"  ← train loss has not improved; check TB val_mel for true best")
         else:
-            print(f"  Best epoch        Ep{best_epoch:02d}  (most recent best)")
+            print(f"  Best epoch        Ep{best_epoch:02d}  (most recent best, train loss)")
     else:
         print("  Loss trend        insufficient float loss values")
 
     # ── 2. Delta norm trend  (is the model moving faster or slower?) ─────────
-    deltas = [(r['epoch_num'], r['total_delta_norm'])
-              for r in records if r['total_delta_norm'] is not None]
-    if len(deltas) >= 3:
-        delta_vals = [v for _, v in deltas]
-        slope, r2  = _linear_slope(delta_vals)
+    # Normalise each delta by its epoch gap so that multi-epoch spans (e.g.
+    # Ep4→Ep6 when Ep5 is missing) don't inflate the acceleration signal.
+    delta_records = [r for r in records if r['total_delta_norm'] is not None]
+    if len(delta_records) >= 3:
+        delta_per_ep = []
+        has_gap = False
+        for dr in delta_records:
+            idx = records.index(dr)
+            epoch_gap = dr['epoch_num'] - records[idx - 1]['epoch_num']
+            if epoch_gap > 1:
+                has_gap = True
+            delta_per_ep.append(dr['total_delta_norm'] / max(epoch_gap, 1))
+        slope, r2  = _linear_slope(delta_per_ep)
         accel_flag = ""
         if slope > 0 and r2 > 0.4:
             accel_flag = "  ← weight drift ACCELERATING  (R²={:.2f})".format(r2)
         elif slope < 0 and r2 > 0.4:
             accel_flag = "  ← weight drift decelerating (converging)  (R²={:.2f})".format(r2)
-        print(f"  Δ-norm trend      slope={slope:+.4f}/epoch  R²={r2:.3f}{accel_flag}")
+        gap_note = "  [epoch-gap normalised]" if has_gap else ""
+        print(f"  Δ-norm trend      slope={slope:+.4f}/epoch  R²={r2:.3f}{accel_flag}{gap_note}")
     else:
         print("  Δ-norm trend      insufficient data")
 
@@ -795,16 +811,23 @@ def tb_print_stop_token_analysis(ea):
     print("  Stop head isolation parameters (from loaded config / defaults):")
     # Read from last available checkpoint
     stop_head = _get(ea, "stats/lr_stop_head")
+    dec_series = _get(ea, "stats/lr_decoder")
+    dec_lr_curr = dec_series[-1][1] if dec_series else None
     if stop_head:
         stop_lr_curr = stop_head[-1][1]
-        dec_series   = _get(ea, "stats/lr_decoder")
-        dec_lr_curr  = dec_series[-1][1] if dec_series else None
         mult_actual  = (stop_lr_curr / dec_lr_curr) if dec_lr_curr and dec_lr_curr > 0 else None
         print(f"    stats/lr_stop_head : {stop_lr_curr:.8f}  "
               + (f"({mult_actual:.4f}× decoder LR)  " if mult_actual is not None else "")
               + "[dedicated stop head param group active]")
     else:
         print("    stats/lr_stop_head : not found — stop head may share decoder LR group")
+    ffn_series = _get(ea, "stats/lr_decoder_ffn")
+    if ffn_series:
+        ffn_lr_curr = ffn_series[-1][1]
+        ffn_mult    = (ffn_lr_curr / dec_lr_curr) if dec_lr_curr and dec_lr_curr > 0 else None
+        print(f"    stats/lr_decoder_ffn: {ffn_lr_curr:.8f}  "
+              + (f"({ffn_mult:.4f}× decoder LR)  " if ffn_mult is not None else "")
+              + "[dedicated decoder FFN param group active]")
     print("    gradient isolation : decoder_outputs detached before stop head (loss cannot")
     print("                         back-propagate through mel decoder from BCE stop loss)")
     print()
@@ -909,9 +932,10 @@ def tb_print_lr_trajectory(ea):
     print("TENSORBOARD — Learning Rate Trajectory")
     print("=" * 90)
     groups = [
-        ("stats/lr_decoder",   "decoder"),
-        ("stats/lr_encoder",   "encoder"),
-        ("stats/lr_stop_head", "stop_head"),
+        ("stats/lr_decoder",     "decoder"),
+        ("stats/lr_decoder_ffn", "decoder_ffn"),
+        ("stats/lr_encoder",     "encoder"),
+        ("stats/lr_stop_head",   "stop_head"),
     ]
     for tag, label in groups:
         series = _get(ea, tag)
@@ -1215,8 +1239,19 @@ def tb_print_regression_flags(ea):
         else:
             flags.append(("PASS", f"val_mel decreasing overall:  {vm[0]:.5f} → {vm[-1]:.5f}"))
         if d["val_mel_regressions"]:
-            flags.append(("WARN", "val_mel increased at epochs: "
-                          + ", ".join(f"Ep{ep}+Δ{dd:+.5f}" for ep, dd in d["val_mel_regressions"])))
+            # Only flag regressions that were not subsequently recovered.
+            # A regression at list-index i (stored ep = i+2) is recovered if
+            # any later val_mel value falls at or below the pre-regression value.
+            unrecovered = [
+                (ep, dd) for ep, dd in d["val_mel_regressions"]
+                if not any(v <= vm[ep - 2] for v in vm[ep:])
+            ]
+            if unrecovered:
+                flags.append(("WARN", "val_mel increased at epochs: "
+                              + ", ".join(f"Ep{ep}+Δ{dd:+.5f}" for ep, dd in unrecovered)))
+            else:
+                rstr = ", ".join(f"Ep{ep}Δ{dd:+.5f}" for ep, dd in d["val_mel_regressions"])
+                flags.append(("PASS", f"val_mel transient blip(s) at {rstr} — fully recovered"))
 
     # 1b. Gradual drift (new — catches slow upward slope even without individual bad epochs)
     if d.get("val_mel_gradual_drift"):
@@ -1231,11 +1266,17 @@ def tb_print_regression_flags(ea):
             flags.append(("FAIL", f"Val/train mel gap = {gap:.4f} — overfitting"))
         elif gap > 0.5:
             flags.append(("WARN", f"Val/train mel gap = {gap:.4f} at last epoch (mild overfitting)"))
-        elif gap < -0.1:
-            # Val is meaningfully better than train — atypical; usually means
-            # train set is harder, dropout is heavy, or val set is small/easy.
-            flags.append(("WARN", f"Val/train mel gap = {gap:.4f} (val < train) — "
-                          "unusual; check val set size/diversity or dropout level"))
+        elif gap < -0.4:
+            # Val is very much better than train — could indicate val set is
+            # too small/easy, or dropout is very high.
+            flags.append(("WARN", f"Val/train mel gap = {gap:.4f} (val << train) — "
+                          "unusually large; check val set size/diversity or dropout level"))
+        elif gap < 0.0:
+            # Val < train is normal for non-autoregressive TTS: dropout is
+            # active during training but not evaluation, so train loss is
+            # artificially inflated relative to val.
+            flags.append(("PASS", f"Val/train mel gap = {gap:.4f} "
+                          "(val < train — expected for TTS with dropout)"))
         else:
             flags.append(("PASS", f"Val/train mel gap = {gap:.4f}"))
 
@@ -1338,7 +1379,12 @@ def analyze_loss_imbalance(ea, records=None):
 
     cfg = rec_b.get("config")
     enc_lr_mult = getattr(cfg, 'encoder_lr_multiplier', 1.3) if cfg else 1.3
-    lr_map = {'decoder': avg_lr_dec, 'encoder': avg_lr_dec * enc_lr_mult}
+    ffn_lr_mult = getattr(cfg, 'decoder_ffn_lr_multiplier', 1.0) if cfg else 1.0
+    ffn_lr_tb   = _get(ea, "stats/lr_decoder_ffn")
+    in_range_ffn = [v for s, v in ffn_lr_tb if steps_a <= s <= steps_b] if ffn_lr_tb else []
+    avg_lr_ffn   = statistics.mean(in_range_ffn) if in_range_ffn else avg_lr_dec * ffn_lr_mult
+    lr_map = {'decoder': avg_lr_dec, 'encoder': avg_lr_dec * enc_lr_mult,
+              'decoder_ffn': avg_lr_ffn}
 
     ps = rec_b.get('param_stats', {})
     sd = rec_b.get('state_dict', {})
@@ -1547,11 +1593,17 @@ def tb_print_recommendations(ea, records=None):
         recs.append((1, "CRITICAL", body))
 
     elif d["val_mel_regressions"]:
-        ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in d["val_mel_regressions"])
-        recs.append((2, "WARN", [
-            f"val_mel regressed at: {ep_list}.",
-            "  Monitor closely. If it continues next epoch, reduce max_lr_multiplier by 0.1.",
-        ]))
+        # Filter to regressions not yet recovered (same logic as flag summary).
+        unrecovered_recs = [
+            (ep, dd) for ep, dd in d["val_mel_regressions"]
+            if not any(v <= vm[ep - 2] for v in vm[ep:])
+        ]
+        if unrecovered_recs:
+            ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in unrecovered_recs)
+            recs.append((2, "WARN", [
+                f"val_mel regressed at: {ep_list}.",
+                "  Monitor closely. If it continues next epoch, reduce max_lr_multiplier by 0.1.",
+            ]))
 
     # ── Grad spikes (existing) ───────────────────────────────────────────────
     n_late = len(d["late_spikes"])
@@ -1740,6 +1792,15 @@ def tb_print_lr_phase_detail(ea, records=None):
         phase = f"DECAY ({100 * curr_lr / ref_peak_dec:.1f}% of peak)"
     print(f"  phase         : {phase}")
 
+    # Decoder FFN LR (dedicated param group with decoder_ffn_lr_multiplier)
+    ffn_series = _get(ea, "stats/lr_decoder_ffn")
+    if ffn_series:
+        ffn_lr_curr = ffn_series[-1][1]
+        ffn_pct     = 100.0 * ffn_lr_curr / ref_peak_dec
+        ffn_mult    = ffn_lr_curr / curr_lr if curr_lr > 0 else 0.0
+        print(f"  decoder FFN LR: {ffn_lr_curr:.8f}  at step {ffn_series[-1][0]}  "
+              f"({ffn_pct:.4f}% of dec peak  {ffn_mult:.3f}× decoder)")
+
     # Stop head LR (dedicated group, should track decoder × stop_head_lr_multiplier)
     stop_series = _get(ea, "stats/lr_stop_head")
     if stop_series:
@@ -1884,11 +1945,21 @@ def tb_print_spike_cause_analysis(ea, records=None):
     else:
         avg_lr_enc = None
 
+    ffn_series = _get(ea, "stats/lr_decoder_ffn")
+    if ffn_series:
+        in_range_ffn = [v for s, v in ffn_series if steps_a <= s <= steps_b]
+        avg_lr_ffn   = statistics.mean(in_range_ffn) if in_range_ffn else None
+    else:
+        avg_lr_ffn = None
+
     cfg = rec_b.get("config")
     enc_lr_mult = getattr(cfg, 'encoder_lr_multiplier', 1.3) if cfg else 1.3
+    ffn_lr_mult = getattr(cfg, 'decoder_ffn_lr_multiplier', 1.0) if cfg else 1.0
     if avg_lr_enc is None:
         avg_lr_enc = avg_lr_dec * enc_lr_mult
-    lr_map = {'decoder': avg_lr_dec, 'encoder': avg_lr_enc}
+    if avg_lr_ffn is None:
+        avg_lr_ffn = avg_lr_dec * ffn_lr_mult
+    lr_map = {'decoder': avg_lr_dec, 'encoder': avg_lr_enc, 'decoder_ffn': avg_lr_ffn}
 
     groups   = defaultdict(list)   # cat -> [(name, avg_grad_rms, cap, numel)]
     ps       = rec_b.get("param_stats", {})
@@ -1928,7 +1999,8 @@ def tb_print_spike_cause_analysis(ea, records=None):
     print("=" * 90)
     print(f"  Checkpoint pair : {rec_a['file']}  →  {rec_b['file']}")
     print(f"  Epoch steps     : {ep_steps}")
-    print(f"  Avg LR decoder  : {avg_lr_dec:.8f}   encoder: {avg_lr_enc:.8f}")
+    ffn_lr_str = f"   ffn: {avg_lr_ffn:.8f}" if avg_lr_ffn is not None else ""
+    print(f"  Avg LR decoder  : {avg_lr_dec:.8f}   encoder: {avg_lr_enc:.8f}{ffn_lr_str}")
     print(f"  avg_grad_rms    = (Δ_L2 / √numel) / (steps × lr)   [per-element units, comparable to cap]")
 
     CAT_LABELS = {

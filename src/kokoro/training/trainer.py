@@ -1408,15 +1408,16 @@ class KokoroTrainer:
             encoder_lr_mult   = getattr(self, '_encoder_lr_multiplier', 1.0)
             stop_head_lr_mult = float(getattr(getattr(self, 'config', None),
                                               'stop_head_lr_multiplier', 0.1))
-            n_pg = len(self.optimizer.param_groups)
-            for i, param_group in enumerate(self.optimizer.param_groups):
-                # group 0: encoder  → encoder_lr_multiplier × base_lr
-                # group n-1 (when ≥4 groups): stop head → stop_head_lr_multiplier × base_lr
-                # all other groups: decoder → base_lr
-                if n_pg > 1 and i == 0:
+            decoder_ffn_lr_mult = float(getattr(getattr(self, 'config', None),
+                                                'decoder_ffn_lr_multiplier', 1.0))
+            for param_group in self.optimizer.param_groups:
+                gt = param_group.get('group_type')
+                if gt == 'encoder':
                     mult = encoder_lr_mult
-                elif n_pg >= 4 and i == n_pg - 1:
+                elif gt == 'stop_head':
                     mult = stop_head_lr_mult
+                elif gt == 'decoder_ffn':
+                    mult = decoder_ffn_lr_mult
                 else:
                     mult = 1.0
                 param_group['lr'] = base_lr * mult

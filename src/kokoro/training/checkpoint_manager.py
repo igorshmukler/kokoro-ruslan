@@ -793,23 +793,36 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 target_step = onecycle_steps - 1
                 resume_lr   = final_lr
 
-            # Build per-group max_lr mirroring trainer._setup_scheduler():
-            #   group 0 (encoder):          max_lr * encoder_lr_mult
-            #   groups 1..n-2 (decoder):    max_lr
-            #   group n-1 (stop head):      max_lr * stop_head_lr_mult  (when n_pg >= 4)
+            # Build per-group max_lr mirroring trainer._setup_scheduler().
+            # Uses 'group_type' tag on each param group when present;
+            # falls back to positional heuristic for legacy (untagged) checkpoints.
             _stop_head_lr_mult = float(
                 getattr(getattr(trainer, 'config', None), 'stop_head_lr_multiplier', 0.1)
             )
-            if n_pg >= 4:
-                max_lr_arg = (
-                    [max_lr * encoder_lr_mult]
-                    + [max_lr] * (n_pg - 2)
-                    + [max_lr * _stop_head_lr_mult]
-                )
-            elif n_pg > 1:
-                max_lr_arg = [max_lr * encoder_lr_mult] + [max_lr] * (n_pg - 1)
-            else:
-                max_lr_arg = max_lr
+            _decoder_ffn_lr_mult = float(
+                getattr(getattr(trainer, 'config', None), 'decoder_ffn_lr_multiplier', 1.0)
+            )
+            def _group_mult(pg, idx, n):
+                gt = pg.get('group_type')
+                if gt == 'encoder':
+                    return encoder_lr_mult
+                elif gt == 'decoder_ffn':
+                    return _decoder_ffn_lr_mult
+                elif gt == 'stop_head':
+                    return _stop_head_lr_mult
+                elif gt is not None:
+                    return 1.0
+                # Legacy positional fallback
+                if n > 1 and idx == 0:
+                    return encoder_lr_mult
+                if n >= 4 and idx == n - 1:
+                    return _stop_head_lr_mult
+                return 1.0
+
+            max_lr_arg = [max_lr * _group_mult(g, i, n_pg)
+                          for i, g in enumerate(trainer.optimizer.param_groups)]
+            if n_pg == 1:
+                max_lr_arg = max_lr_arg[0]
 
             saved_lr = [g['lr'] for g in trainer.optimizer.param_groups]
             trainer.scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -828,22 +841,10 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             trainer.scheduler.last_epoch = target_step
             resume_lr = min(resume_lr, max_lr)
             for i, g in enumerate(trainer.optimizer.param_groups):
-                # Encoder (group 0) keeps higher multiplier; stop head (last group
-                # when n_pg >= 4) keeps its reduced multiplier; decoder groups use 1.0.
-                if n_pg > 1 and i == 0:
-                    mult = encoder_lr_mult
-                elif n_pg >= 4 and i == n_pg - 1:
-                    mult = _stop_head_lr_mult
-                else:
-                    mult = 1.0
-                g['lr'] = resume_lr * mult
+                g['lr'] = resume_lr * _group_mult(g, i, n_pg)
             trainer.scheduler._last_lr = [
-                resume_lr * (
-                    encoder_lr_mult if (n_pg > 1 and i == 0)
-                    else _stop_head_lr_mult if (n_pg >= 4 and i == n_pg - 1)
-                    else 1.0
-                )
-                for i in range(n_pg)
+                resume_lr * _group_mult(g, i, n_pg)
+                for i, g in enumerate(trainer.optimizer.param_groups)
             ]
 
             logger.info(
