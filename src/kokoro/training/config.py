@@ -42,8 +42,10 @@ class TrainingConfig:
     # LR multiplier applied specifically to decoder FFN layers (decoder.layers.*.ff.linear1/2).
     # Use <1.0 to reduce step size for the FFN subnetwork (helps stabilise persistent movers).
     # 0.5 was still insufficient — all decoder FFN linear1 layers remained 100% persistent movers.
-    # Lowered to 0.3: peak FFN LR = base_lr × max_lr_mult × 0.3 ≈ 1.65e-5 (was 2.75e-5 @ 0.5).
-    decoder_ffn_lr_multiplier: float = 0.3
+    # 0.3: peak FFN LR ≈ 1.65e-5. Still too high — 3 consecutive val_mel regressions Ep9-11 at
+    # 99% of LR peak, all mel-only (stop/duration kept improving → FFN is confirmed driver).
+    # Lowered to 0.2: peak FFN LR = base_lr × max_lr_mult × 0.2 ≈ 1.10e-5.
+    decoder_ffn_lr_multiplier: float = 0.2
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR

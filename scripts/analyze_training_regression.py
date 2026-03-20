@@ -1600,9 +1600,23 @@ def tb_print_recommendations(ea, records=None):
         ]
         if unrecovered_recs:
             ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in unrecovered_recs)
+            n_consec = len(unrecovered_recs)
+            if n_consec >= 2:
+                action = (
+                    "  2+ consecutive regressions — if next epoch also rises:\n"
+                    "    → If decoder FFN is a persistent mover: lower decoder_ffn_lr_multiplier by 0.1\n"
+                    "    → Otherwise: reduce max_lr_multiplier by 0.1\n"
+                    "    → Consider resuming from best checkpoint."
+                )
+            else:
+                action = (
+                    "  Monitor closely. If it continues next epoch:\n"
+                    "    → lower decoder_ffn_lr_multiplier by 0.1 (if FFN layers are persistent movers)\n"
+                    "    → or reduce max_lr_multiplier by 0.1"
+                )
             recs.append((2, "WARN", [
                 f"val_mel regressed at: {ep_list}.",
-                "  Monitor closely. If it continues next epoch, reduce max_lr_multiplier by 0.1.",
+                action,
             ]))
 
     # ── Grad spikes (existing) ───────────────────────────────────────────────
