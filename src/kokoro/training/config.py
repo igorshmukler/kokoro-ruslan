@@ -17,7 +17,7 @@ class TrainingConfig:
     output_dir: str = "output_models"
     num_epochs: int = 26  # 26 × ~339 steps/epoch − 800 warmup ≈ 8,000 OneCycleLR steps
     batch_size: int = 16
-    learning_rate: float = 5.0e-5  # peak LR = learning_rate × max_lr_multiplier = 5.0e-5 × 1.1 ≈ 5.5e-5
+    learning_rate: float = 5.5e-5  # peak LR = learning_rate × max_lr_multiplier = 5.5e-5 × 1.1 = 6.05e-5
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
@@ -25,12 +25,20 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 5.0e-5 × 1.1 ≈ 5.5e-5 (hard ceiling)
+    # 1.1 → 1.05 (Ep10 of prior run): 2 consecutive regressions; clipping 0.3%→3.8%; encoder FFN
+    # emerged as top-2/3/10 delta movers alongside decoder attention — broad LR peak pressure.
+    # 1.05 run: better best (0.89290 Ep07 vs 0.89001), but regressions arrived 1 ep earlier
+    # (Ep08 +0.0124, Ep09 +0.0240 accelerating) with same encoder FFN top-mover signature.
+    # Clipping was 0.3% at Ep09 — not gradient noise, sustained cosine ascent destabilising
+    # encoder FFN representations at ~98-99% of peak. Both 1.1× and 1.05× hit the same wall.
+    # 1.05 → 1.0: dec peak 5.25→5.0e-5, enc peak 5.775→5.5e-5, FFN 1.05→1.0e-5 (−5% uniform).
+    # Resume from Ep07 (best checkpoint, val_mel=0.89290).
+    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 5.0e-5 × 1.0 = 5.0e-5 (hard ceiling)
     pct_start: float = 0.45  # Fraction of OneCycleLR cycle spent ascending to peak; with ~8000 steps → peak at step ~3595 (absolute ~4395, epoch ~13)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # peak encoder = 5.0e-5 × 1.1 (max_lr) × 1.1 ≈ 6.0e-5
+    # peak encoder = 5.0e-5 × 1.0 (max_lr) × 1.1 = 5.5e-5
     encoder_lr_multiplier: float = 1.1
     # LR multiplier for the stop-token head's dedicated optimizer param group.
     # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
@@ -209,7 +217,7 @@ class TrainingConfig:
     # for a 6-layer decoder).  Set ≤ 0.0 to disable.
     # dec_ff0_linear1_max_weight_norm is the legacy single-layer key and is kept
     # for backward compat; dec_ffn_max_weight_norm takes precedence when present.
-    dec_ffn_max_weight_norm: float = 28.0
+    dec_ffn_max_weight_norm: float = 40.0
     dec_ff0_linear1_max_weight_norm: float = 60.0  # legacy — superseded by dec_ffn_max_weight_norm
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0

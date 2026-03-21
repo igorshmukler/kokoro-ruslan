@@ -942,8 +942,17 @@ def tb_print_lr_trajectory(ea):
         if not series:
             continue
         vals = [v for _, v in series]
-        print(f"  {label}: first={vals[0]:.7f}  last={vals[-1]:.7f}  "
-              f"max={max(vals):.7f}  trend={'UP ▲' if vals[-1] > vals[0] else 'DOWN ▼'}")
+        peak_val = max(vals)
+        last_val = vals[-1]
+        # If the peak is significantly above the last value, it indicates a mid-run LR
+        # group change (e.g. multiplier was lowered and training resumed from a checkpoint),
+        # causing old TB events to show a higher historical max.
+        if peak_val > last_val * 1.1:
+            max_note = f"  ⚠ historical max from pre-resume run (lr group changed mid-training)"
+        else:
+            max_note = ""
+        print(f"  {label}: first={vals[0]:.7f}  last={last_val:.7f}  "
+              f"max={peak_val:.7f}  trend={'UP ▲' if last_val > vals[0] else 'DOWN ▼'}{max_note}")
         n         = len(series)
         step_size = max(1, n // 8)
         samples   = series[::step_size] + [series[-1]]
@@ -1602,12 +1611,21 @@ def tb_print_recommendations(ea, records=None):
             ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in unrecovered_recs)
             n_consec = len(unrecovered_recs)
             if n_consec >= 2:
-                action = (
-                    "  2+ consecutive regressions — if next epoch also rises:\n"
-                    "    → If decoder FFN is a persistent mover: lower decoder_ffn_lr_multiplier by 0.1\n"
-                    "    → Otherwise: reduce max_lr_multiplier by 0.1\n"
-                    "    → Consider resuming from best checkpoint."
-                )
+                last_delta = abs(unrecovered_recs[-1][1])
+                if last_delta >= 0.010:
+                    action = (
+                        "  2nd consecutive rise ≥ 0.010 — ACT NOW (do not wait for next epoch):\n"
+                        "    → If encoder FFN or decoder attention are new top movers: reduce max_lr_multiplier by 0.1\n"
+                        "    → If decoder FFN still sole dominant mover: lower decoder_ffn_lr_multiplier by 0.1\n"
+                        "    → Resume from best checkpoint."
+                    )
+                else:
+                    action = (
+                        "  2+ consecutive regressions — if next epoch also rises:\n"
+                        "    → If decoder FFN is a persistent mover: lower decoder_ffn_lr_multiplier by 0.1\n"
+                        "    → Otherwise: reduce max_lr_multiplier by 0.1\n"
+                        "    → Consider resuming from best checkpoint."
+                    )
             else:
                 action = (
                     "  Monitor closely. If it continues next epoch:\n"

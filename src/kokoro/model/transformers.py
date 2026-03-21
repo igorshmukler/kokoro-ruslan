@@ -452,8 +452,10 @@ class ImprovedTransformerDecoderBlock(nn.Module):
     """Enhanced Transformer decoder block with improved architecture"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 activation: str = 'gelu', rel_pos_type: str = 'alibi'):
+                 activation: str = 'gelu', rel_pos_type: str = 'alibi',
+                 drop_path_rate: float = 0.0):
         super().__init__()
+        self.drop_path_rate = drop_path_rate
 
         # Decoder self-attention: uses relative positional encoding.
         # Pass rel_pos_type so callers can choose 'rope' (MPS-safe) or 'alibi'.
@@ -517,7 +519,7 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                        attn_mask=tgt_mask,
                                                        key_padding_mask=tgt_key_padding_mask,
                                                        kv_cache=self_attn_kv_cache)
-        tgt = tgt + self.dropout1(attn_output)
+        tgt = tgt + self.dropout1(drop_path(attn_output, self.drop_path_rate, self.training))
 
         # Cross-attention
         tgt_norm = self.norm2(tgt)
@@ -526,10 +528,10 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                   key_padding_mask=memory_key_padding_mask,
                                                   precomputed_k=cached_k,
                                                   precomputed_v=cached_v)
-        tgt = tgt + self.dropout2(cross_attn_output)
+        tgt = tgt + self.dropout2(drop_path(cross_attn_output, self.drop_path_rate, self.training))
 
         # Feed-forward
-        tgt = tgt + self.dropout3(self.ff(self.norm3(tgt)))
+        tgt = tgt + self.dropout3(drop_path(self.ff(self.norm3(tgt)), self.drop_path_rate, self.training))
 
         return tgt, updated_cache
 
@@ -539,15 +541,20 @@ class ImprovedTransformerDecoder(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int, activation: str = 'gelu',
-                 rel_pos_type: str = 'alibi'):
+                 rel_pos_type: str = 'alibi',
+                 drop_path_rates: Optional[list] = None):
         super().__init__()
         self.num_layers = num_layers
+
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * num_layers
 
         self.layers = nn.ModuleList([
             ImprovedTransformerDecoderBlock(
                 d_model, nhead, dim_feedforward, dropout, activation,
-                rel_pos_type=rel_pos_type
-            ) for _ in range(num_layers)
+                rel_pos_type=rel_pos_type,
+                drop_path_rate=drop_path_rates[i]
+            ) for i in range(num_layers)
         ])
 
         # Final LayerNorm applied after all blocks (pre-norm architecture)
@@ -624,7 +631,9 @@ class TransformerDecoder(ImprovedTransformerDecoder):
     RoPE is fully MPS-safe.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
-                 dropout: float, num_layers: int):
+                 dropout: float, num_layers: int,
+                 drop_path_rates: Optional[list] = None):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        activation='gelu', rel_pos_type='rope')
+                        activation='gelu', rel_pos_type='rope',
+                        drop_path_rates=drop_path_rates)
 

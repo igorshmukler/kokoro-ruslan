@@ -91,14 +91,18 @@ class KokoroModel(nn.Module):
         )
 
         # Stochastic depth: linearly increase drop_path from 0 to stochastic_depth_rate
-        drop_path_rates = [
+        encoder_drop_path_rates = [
             (i / max(n_encoder_layers - 1, 1)) * stochastic_depth_rate if use_stochastic_depth else 0.0
             for i in range(n_encoder_layers)
+        ]
+        decoder_drop_path_rates = [
+            (i / max(n_decoder_layers - 1, 1)) * stochastic_depth_rate if use_stochastic_depth else 0.0
+            for i in range(n_decoder_layers)
         ]
 
         self.transformer_encoder_layers = nn.ModuleList([
             TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout,
-                                   drop_path_rate=drop_path_rates[i])
+                                   drop_path_rate=encoder_drop_path_rates[i])
             for i in range(n_encoder_layers)
         ])
 
@@ -156,7 +160,8 @@ class KokoroModel(nn.Module):
             nhead=n_heads,
             dim_feedforward=decoder_ff_dim,
             dropout=encoder_dropout,
-            num_layers=n_decoder_layers
+            num_layers=n_decoder_layers,
+            drop_path_rates=decoder_drop_path_rates
         )
 
         # Output projection for Mel Spectrogram
