@@ -108,8 +108,14 @@ class KokoroModel(nn.Module):
 
         # Variance Adaptor (includes duration, pitch, energy predictors) or a
         # simple fallback adaptor that provides the same unified interface.
+        # NOTE: VarianceAdaptor is owned exclusively by VarianceAdaptorWrapper
+        # (registered as duration_adaptor.variance_adaptor).  Do NOT also store
+        # it as self.variance_adaptor — doing so causes PyTorch to register the
+        # same parameters under two distinct paths in state_dict / named_parameters(),
+        # doubling checkpoint size and corrupting weight-delta analysis.
+        # External callers should use the variance_adaptor property below.
         if self.use_variance_predictor:
-            self.variance_adaptor = VarianceAdaptor(
+            self.duration_adaptor = VarianceAdaptorWrapper(VarianceAdaptor(
                 hidden_dim=hidden_dim,
                 filter_size=variance_filter_size,
                 kernel_size=variance_kernel_size,
@@ -118,10 +124,8 @@ class KokoroModel(nn.Module):
                 pitch_min=pitch_min,
                 pitch_max=pitch_max,
                 energy_min=energy_min,
-                energy_max=energy_max
-            )
-            # Wrap to provide a consistent interface
-            self.duration_adaptor = VarianceAdaptorWrapper(self.variance_adaptor)
+                energy_max=energy_max,
+            ))
             logger.info("Variance predictor enabled (pitch/energy)")
         else:
             # Fallback duration predictor - keep as a small module but expose
@@ -183,6 +187,18 @@ class KokoroModel(nn.Module):
         if self.gradient_checkpointing:
             logger.info(f"Gradient checkpointing enabled with {checkpoint_segments} segments")
             logger.info(f"Encoder layers: {n_encoder_layers}, Decoder layers: {n_decoder_layers}")
+
+    @property
+    def variance_adaptor(self) -> Optional['VarianceAdaptor']:
+        """Convenience accessor for the wrapped VarianceAdaptor.
+
+        Parameters are registered only under ``duration_adaptor.variance_adaptor``
+        to avoid duplicate entries in ``state_dict`` / ``named_parameters()``.
+        Returns ``None`` when the variance predictor is disabled.
+        """
+        if self.use_variance_predictor:
+            return self.duration_adaptor.variance_adaptor
+        return None
 
     def enable_gradient_checkpointing(self, segments: int = None):
         """Enable gradient checkpointing"""
@@ -422,23 +438,13 @@ class KokoroModel(nn.Module):
                 del stress_indices
 
             # 2. Use unified duration adaptor (either VarianceAdaptorWrapper or
-            #    SimpleDurationAdaptor). Compute phoneme-level pitch/energy
-            #    averages when provided (training path), then delegate to the
-            #    adaptor which always returns the same canonical tuple.
-            phoneme_pitch = None
-            phoneme_energy = None
-
-            if (not inference) and (pitch_targets is not None):
-                phoneme_pitch = self._average_by_duration(
-                    pitch_targets, phoneme_durations, text_padding_mask
-                )
-                del pitch_targets
-
-            if (not inference) and (energy_targets is not None):
-                phoneme_energy = self._average_by_duration(
-                    energy_targets, phoneme_durations, text_padding_mask
-                )
-                del energy_targets
+            #    SimpleDurationAdaptor). Pass frame-level pitch/energy targets
+            #    directly — VarianceAdaptor.forward detects that their length
+            #    does not match the phoneme count and skips the expand step,
+            #    supplying the continuous intra-phoneme variation to the
+            #    pitch/energy embeddings instead of piecewise-constant averages.
+            frame_pitch  = pitch_targets  if (not inference) else None
+            frame_energy = energy_targets if (not inference) else None
 
             duration_target = phoneme_durations.float() if (not inference and phoneme_durations is not None) else None
 
@@ -449,14 +455,17 @@ class KokoroModel(nn.Module):
              frame_mask) = self.duration_adaptor(
                 text_encoded,
                 mask=text_padding_mask,
-                pitch_target=phoneme_pitch,
-                energy_target=phoneme_energy,
+                pitch_target=frame_pitch,
+                energy_target=frame_energy,
                 duration_target=duration_target,
                 inference=inference,
+                # Frame-level targets from the dataset; explicit flag prevents
+                # the phoneme-count size-equality heuristic from misrouting them.
+                pitch_target_is_frame_level=(not inference),
             )
 
             # free intermediates
-            del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations, text_padding_mask
+            del text_encoded, frame_pitch, frame_energy, phoneme_durations, text_padding_mask
 
             expanded_encoder_outputs = adapted_encoder_output
             encoder_output_padding_mask = frame_mask

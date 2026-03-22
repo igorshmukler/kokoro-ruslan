@@ -351,20 +351,20 @@ class KokoroTrainer:
             config.hidden_dim,
             n_encoder_layers=getattr(config, 'n_encoder_layers', 6),
             n_heads=getattr(config, 'n_heads', 8),
-            encoder_ff_dim=getattr(config, 'encoder_ff_dim', 2048),
+            encoder_ff_dim=getattr(config, 'encoder_ff_dim', 3072),
             encoder_dropout=getattr(config, 'encoder_dropout', 0.1),
             n_decoder_layers=getattr(config, 'n_decoder_layers', 6),
-            decoder_ff_dim=getattr(config, 'decoder_ff_dim', 2048),
+            decoder_ff_dim=getattr(config, 'decoder_ff_dim', 3072),
             max_decoder_seq_len=getattr(config, 'max_decoder_seq_len', 4000),
             use_variance_predictor=getattr(config, 'use_variance_predictor', True),
             variance_filter_size=getattr(config, 'variance_filter_size', 256),
             variance_kernel_size=getattr(config, 'variance_kernel_size', 3),
             variance_dropout=getattr(config, 'variance_dropout', 0.1),
             n_variance_bins=getattr(config, 'n_variance_bins', 256),
-            pitch_min=getattr(config, 'pitch_min', 50.0),
-            pitch_max=getattr(config, 'pitch_max', 800.0),
+            pitch_min=getattr(config, 'pitch_min', 0.0),
+            pitch_max=getattr(config, 'pitch_max', 1.0),
             energy_min=getattr(config, 'energy_min', 0.0),
-            energy_max=getattr(config, 'energy_max', 100.0),
+            energy_max=getattr(config, 'energy_max', 1.0),
             use_stochastic_depth=getattr(config, 'use_stochastic_depth', True),
             stochastic_depth_rate=getattr(config, 'stochastic_depth_rate', 0.1)
         )
@@ -418,8 +418,8 @@ class KokoroTrainer:
         if getattr(config, 'use_variance_predictor', True):
             # Huber loss for pitch/energy for the same reason: prevents gradient
             # vanishing as predictions converge; delta is tunable via config.
-            _pitch_huber_delta  = float(getattr(config, 'pitch_huber_delta',  10.0))
-            _energy_huber_delta = float(getattr(config, 'energy_huber_delta', 0.5))
+            _pitch_huber_delta  = float(getattr(config, 'pitch_huber_delta',  0.05))
+            _energy_huber_delta = float(getattr(config, 'energy_huber_delta', 0.05))
             self.criterion_pitch  = nn.HuberLoss(reduction='none', delta=_pitch_huber_delta)
             self.criterion_energy = nn.HuberLoss(reduction='none', delta=_energy_huber_delta)
             logger.info(
@@ -501,10 +501,17 @@ class KokoroTrainer:
         # Parameter names matching these patterns are excluded from weight decay.
         # ".bias" catches every bias vector; the norm patterns catch LayerNorm /
         # RMSNorm / BatchNorm affine weight and bias regardless of nesting depth.
+        # "duration_adaptor." covers all variance/pitch/energy/duration predictor
+        # weights: these are small regression heads (~L2 norm 1.4) with weak
+        # gradient signals.  At weight_decay=0.01 the L2 penalty overwhelms the
+        # gradient and drives the weights toward zero, leaving only the bias
+        # (which learns the training-set mean F0/energy) — a degenerate solution
+        # that causes F0 RMSE to plateau even as mel loss continues to improve.
         _no_decay_suffixes = ('.bias',)
         _no_decay_substrings = (
             'norm.weight', 'norm.bias',
             'layer_norm.weight', 'layer_norm.bias',
+            'duration_adaptor.',
         )
         seen_ids: set = set()
         encoder_params = []

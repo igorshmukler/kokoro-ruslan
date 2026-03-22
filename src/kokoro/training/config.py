@@ -97,6 +97,14 @@ class TrainingConfig:
     stop_token_loss_weight: float = 0.010
     pitch_loss_weight: float = 1.0  # Normalized to [0,1]; 1.0 gives pitch predictor adequate gradient signal vs mel loss
     energy_loss_weight: float = 1.0  # Normalized to [0,1]; matched to pitch_loss_weight
+    # HuberLoss delta for pitch and energy predictors.
+    # Pitch/energy targets are normalized to [0, 1], so max error = 1.0.
+    # delta must be << 1.0 to place large errors in the linear (L1) regime;
+    # delta=10.0 (old default) kept ALL errors in the quadratic (MSE) regime,
+    # causing gradient vanishing near convergence.  0.05 means errors > 0.05
+    # normalized units receive a constant-magnitude L1 gradient.
+    pitch_huber_delta: float = 0.05
+    energy_huber_delta: float = 0.05  # matched to pitch; old default was 0.5 (still MSE for small errors)
 
     # SpecAugment (Park et al. 2019) — applied to teacher-forced mel decoder input only.
     # The unmasked original mel is still used as the loss target, so gradients for
@@ -217,7 +225,7 @@ class TrainingConfig:
     # for a 6-layer decoder).  Set ≤ 0.0 to disable.
     # dec_ff0_linear1_max_weight_norm is the legacy single-layer key and is kept
     # for backward compat; dec_ffn_max_weight_norm takes precedence when present.
-    dec_ffn_max_weight_norm: float = 40.0
+    dec_ffn_max_weight_norm: float = 55.0
     dec_ff0_linear1_max_weight_norm: float = 60.0  # legacy — superseded by dec_ffn_max_weight_norm
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0

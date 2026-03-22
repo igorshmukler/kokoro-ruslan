@@ -210,14 +210,18 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
         # value and is the authoritative record of what was actually trained.
         enc_layers = getattr(model, 'transformer_encoder_layers', None)
         if enc_layers and len(enc_layers) > 0:
-            linear1 = getattr(enc_layers[0], 'linear1', None)
+            # GLUFeedForward is at enc_layers[i].ff; linear1 is enc_layers[i].ff.linear1
+            ff_block = getattr(enc_layers[0], 'ff', None)
+            linear1 = getattr(ff_block, 'linear1', None) if ff_block is not None else None
             if linear1 is not None and hasattr(linear1, 'out_features'):
                 metadata['architecture']['encoder_ff_dim'] = int(linear1.out_features // 2)
 
         decoder = getattr(model, 'decoder', None)
         dec_layers = getattr(decoder, 'layers', None) if decoder is not None else None
         if dec_layers and len(dec_layers) > 0:
-            linear1 = getattr(dec_layers[0], 'linear1', None)
+            # GLUFeedForward is at dec_layers[i].ff; linear1 is dec_layers[i].ff.linear1
+            ff_block = getattr(dec_layers[0], 'ff', None)
+            linear1 = getattr(ff_block, 'linear1', None) if ff_block is not None else None
             if linear1 is not None and hasattr(linear1, 'out_features'):
                 metadata['architecture']['decoder_ff_dim'] = int(linear1.out_features // 2)
 

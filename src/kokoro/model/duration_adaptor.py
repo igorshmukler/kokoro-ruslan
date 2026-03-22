@@ -33,14 +33,17 @@ class VarianceAdaptorWrapper(BaseDurationAdaptor):
                 energy_target: Optional[torch.Tensor] = None,
                 duration_target: Optional[torch.Tensor] = None,
                 inference: bool = False,
+                pitch_target_is_frame_level: bool = False,
                 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        # Pass through to underlying variance adaptor
+        # Pass through to underlying variance adaptor, forwarding the
+        # frame-level flag so it reaches VarianceAdaptor.forward.
         return self.variance_adaptor(
             text_encoded,
             mask=mask,
             pitch_target=pitch_target,
             energy_target=energy_target,
             duration_target=duration_target,
+            pitch_target_is_frame_level=pitch_target_is_frame_level,
         )
 
 
