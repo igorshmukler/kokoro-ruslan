@@ -77,8 +77,14 @@ class TrainingConfig:
     n_encoder_layers: int = 6
     n_decoder_layers: int = 6
     n_heads: int = 8
-    encoder_ff_dim: int = 3072
-    decoder_ff_dim: int = 3072
+    # GLU FFN uses dim_feedforward×2 for linear1 (gate+linear split), so the
+    # effective expansion is 2×dim_feedforward/hidden_dim.  With 3072 this was
+    # 8× hidden_dim on linear1 (4.7M params/layer), making FFN 63.7% of total
+    # model params — far too dominant for a 22K-utterance dataset.  Reducing to
+    # 2048 gives 5.3× expansion (LLaMA/PaLM convention for GLU: ~2.67× hidden),
+    # cutting FFN params by 34% and rebalancing FFN vs attention capacity.
+    encoder_ff_dim: int = 2048
+    decoder_ff_dim: int = 2048
     encoder_dropout: float = 0.1
     max_decoder_seq_len: int = 4000
 

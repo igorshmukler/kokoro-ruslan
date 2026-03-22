@@ -70,8 +70,11 @@ class GLUFeedForward(nn.Module):
           → activation(gate) * linear
           → dropout
           → linear2 (dim_feedforward → d_model)
+          → dropout
 
-    Weight matrices are initialised with Xavier uniform; biases are zeroed.
+    linear2 uses Xavier with gain=0.5 so that the FFN branch starts as a
+    near-identity (small contribution to the residual stream) and must earn
+    its influence during training, preventing early-epoch FFN dominance.
     """
 
     def __init__(self, d_model: int, dim_feedforward: int, dropout: float,
@@ -88,14 +91,14 @@ class GLUFeedForward(nn.Module):
         nn.init.xavier_uniform_(self.linear1.weight)
         if self.linear1.bias is not None:
             nn.init.zeros_(self.linear1.bias)
-        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.xavier_uniform_(self.linear2.weight, gain=0.5)
         if self.linear2.bias is not None:
             nn.init.zeros_(self.linear2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear1(x)
         gate, linear = x.chunk(2, dim=-1)
-        return self.linear2(self.dropout(self.activation(gate) * linear))
+        return self.dropout(self.linear2(self.dropout(self.activation(gate) * linear)))
 
 
 class MultiHeadAttentionImproved(nn.Module):
