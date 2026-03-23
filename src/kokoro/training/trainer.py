@@ -528,13 +528,23 @@ class KokoroTrainer:
             else:
                 decoder_named.append((name, param))
 
-        # Split decoder params into no_decay vs decay, and isolate FFN params
+        # Split decoder params into no_decay vs decay, and isolate FFN params.
+        # FFN biases must go to a dedicated FFN no-decay group (not the general
+        # decoder_no_decay) so they receive the reduced FFN LR.  Previously,
+        # FFN biases landed in decoder_no_decay with full decoder LR (5×
+        # their own weights' LR), zero weight decay, no norm constraint, and
+        # no pre-clipping — causing the bias to explode (0.126 → 2.950 in 8
+        # epochs) and saturate the GLU gate open.
         decoder_no_decay: list = []
+        decoder_ffn_no_decay: list = []
         decoder_decay_tuples: list = []  # (name, param) for decay candidates
         for _name, _param in decoder_named:
             if (any(_name.endswith(s) for s in _no_decay_suffixes)
                     or any(s in _name for s in _no_decay_substrings)):
-                decoder_no_decay.append(_param)
+                if ".ff." in _name:
+                    decoder_ffn_no_decay.append(_param)
+                else:
+                    decoder_no_decay.append(_param)
             else:
                 decoder_decay_tuples.append((_name, _param))
         # From decay candidates, carve out FFN params (decoder.layers.*.ff.*)
@@ -570,6 +580,10 @@ class KokoroTrainer:
             param_groups.append({'params': decoder_decay_ffn, 'lr': base_lr * decoder_ffn_lr_mult,
                                  'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'decoder_ffn'})
+        if decoder_ffn_no_decay:
+            param_groups.append({'params': decoder_ffn_no_decay, 'lr': base_lr * decoder_ffn_lr_mult,
+                                 'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'decoder_ffn'})
 
         # Stop head group (always present as its own group when identified)
         if stop_head_params:
@@ -587,12 +601,15 @@ class KokoroTrainer:
             n_decoder_no_decay = len(decoder_no_decay)
             n_decoder_other = len(decoder_decay_other)
             n_decoder_ffn = len(decoder_decay_ffn)
+            n_decoder_ffn_nd = len(decoder_ffn_no_decay)
             n_stop = len(stop_head_params)
+            ffn_lr = base_lr * decoder_ffn_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
                 f"decoder_no_decay={n_decoder_no_decay} params (lr={base_lr:.2e}, wd=0.0), "
                 f"decoder_other_decay={n_decoder_other} params (lr={base_lr:.2e}, wd={weight_decay}), "
-                f"decoder_ffn_decay={n_decoder_ffn} params (lr={base_lr*decoder_ffn_lr_mult:.2e}, wd={weight_decay}), "
+                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={weight_decay}), "
+                f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
 
