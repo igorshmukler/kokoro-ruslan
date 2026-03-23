@@ -154,6 +154,7 @@ def test_setup_sets_none_and_warns_when_module_absent():
     trainer = KokoroTrainer.__new__(KokoroTrainer)
     trainer.model = _EmptyModel()
     trainer.config = SimpleNamespace(dec_ff0_linear1_max_weight_norm=60.0)
+    trainer._enc_ff_weights = []
 
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -256,6 +257,7 @@ def test_apply_is_noop_when_weight_ref_is_none():
     trainer.config = SimpleNamespace(dec_ff0_linear1_max_weight_norm=60.0)
     trainer._dec_ff0_linear1_weight = None
     trainer._dec_ff_weights = []
+    trainer._enc_ff_weights = []
     # Must not raise
     trainer._apply_weight_norm_constraints()
 
