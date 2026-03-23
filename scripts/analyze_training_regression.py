@@ -1336,9 +1336,9 @@ def tb_print_regression_flags(ea):
                 if len(rpp) >= 2:
                     trend = rpp[-1][1] - rpp[0][1]
                     if trend > 0.05:
-                        flags.append(("WARN", f"val_mel UP post LR peak (step {peak_step}): Δ={trend:+.5f}"))
+                        flags.append(("WARN", f"val_mel UP post LR warmup peak (step {peak_step}): Δ={trend:+.5f}"))
                     else:
-                        flags.append(("PASS", f"val_mel stable/down post LR peak (step {peak_step})"))
+                        flags.append(("PASS", f"val_mel stable/down post LR warmup peak (step {peak_step})"))
 
     for lbl, msg in flags:
         icon = "✓" if lbl == "PASS" else ("⚠" if lbl == "WARN" else "✗")
