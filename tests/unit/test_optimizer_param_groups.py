@@ -43,6 +43,8 @@ class _FakeModel(nn.Module):
         # Decoder / rest (no encoder prefix)
         self.decoder_layers = nn.Linear(8, 8)
         self.output_projection = nn.Linear(8, 4)
+        # Stop head — carved out into its own param group
+        self.stop_token_predictor = nn.Linear(8, 1)
 
 
 class _DecoderOnlyModel(nn.Module):

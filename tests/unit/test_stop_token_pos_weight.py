@@ -443,10 +443,10 @@ class TestStopHeadLRMultiplierDuringWarmup:
         #   2: decoder_decay     (lr = base_lr)
         #   3: stop_head         (lr = base_lr * stop_head_mult)
         optimizer = SimpleNamespace(param_groups=[
-            {'lr': base_lr * enc_lr_mult},   # 0 encoder
-            {'lr': base_lr},                  # 1 decoder_no_decay
-            {'lr': base_lr},                  # 2 decoder_decay
-            {'lr': base_lr * stop_head_lr_mult},  # 3 stop_head
+            {'lr': base_lr * enc_lr_mult,       'group_type': 'encoder'},        # 0 encoder
+            {'lr': base_lr,                     'group_type': 'decoder_other'},  # 1 decoder_no_decay
+            {'lr': base_lr,                     'group_type': 'decoder_other'},  # 2 decoder_decay
+            {'lr': base_lr * stop_head_lr_mult, 'group_type': 'stop_head'},      # 3 stop_head
         ])
 
         cfg = SimpleNamespace(stop_head_lr_multiplier=stop_head_lr_mult)
