@@ -494,6 +494,7 @@ class KokoroTrainer:
             'encoder_positional_encoding.',
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
+            'encoder_norm.',          # final LayerNorm after encoder stack
         )
         # stop_token_predictor parameters are carved out before the
         # decoder_no_decay / decoder_decay split so they don't appear in both.
@@ -737,18 +738,25 @@ class KokoroTrainer:
         self.ema_update_every = getattr(config, 'ema_update_every', 1)
 
         if cfg_ema is None and self.use_ema:
+            # Use actual optimizer steps per epoch from the dataloader (accounts
+            # for dynamic batching) rather than n_train / batch_size which assumes
+            # fixed-size batches and gives the wrong step count.
+            grad_accum = int(getattr(config, 'gradient_accumulation_steps', 1))
             try:
-                n_train = len(self.dataset)
+                batches_per_epoch = len(self.dataloader)
             except Exception:
-                n_train = 0
-            effective_batch = int(getattr(config, 'batch_size', 1) * getattr(config, 'gradient_accumulation_steps', 1))
+                batches_per_epoch = 0
+            optimizer_steps_per_epoch = max(1, (batches_per_epoch + grad_accum - 1) // grad_accum)
             k = float(getattr(config, 'ema_half_life_epochs', 1.0))
-            self.ema_decay = recommended_ema_decay(n_train=n_train, batch_size=effective_batch, k=k)
+            # recommended_ema_decay expects (n_train, batch_size) such that
+            # n_train / batch_size = steps_per_epoch.  Pass the actual optimizer
+            # steps directly by setting n_train=steps and batch_size=1.
+            self.ema_decay = recommended_ema_decay(n_train=optimizer_steps_per_epoch, batch_size=1, k=k)
             try:
                 config.ema_decay = self.ema_decay
             except Exception:
                 pass
-            logger.info(f"Computed EMA decay: {self.ema_decay:.6f} (n_train={n_train}, eff_batch={effective_batch}, k={k})")
+            logger.info(f"Computed EMA decay: {self.ema_decay:.6f} (optimizer_steps_per_epoch={optimizer_steps_per_epoch}, half_life_epochs={k})")
         else:
             self.ema_decay = float(cfg_ema) if cfg_ema is not None else 0.9999
             logger.info(f"EMA decay: {self.ema_decay:.6f} (source={'config' if cfg_ema is not None else 'default'})")
@@ -766,9 +774,10 @@ class KokoroTrainer:
             logger.info("EMA disabled")
 
     def _setup_weight_norm_constraints(self) -> None:
-        """Cache weight references for all decoder FF layers used by post-step norm clamping."""
+        """Cache weight references for decoder and encoder FF layers used by post-step norm clamping."""
         named_modules = dict(self.model.named_modules())
         n_decoder_layers = getattr(self.config, 'n_decoder_layers', 6)
+        n_encoder_layers = getattr(self.config, 'n_encoder_layers', 6)
         self._dec_ff_weights: list = []
         for i in range(n_decoder_layers):
             for linear_name in ('linear1', 'linear2'):
@@ -782,9 +791,24 @@ class KokoroTrainer:
                     )
         # Legacy single-layer reference kept for backward compat with any external code.
         self._dec_ff0_linear1_weight = self._dec_ff_weights[0] if self._dec_ff_weights else None
+
+        # Encoder FFN weights — same GLUFeedForward architecture, same max-norm ceiling.
+        # Encoder FFN receives 5.5× higher LR than decoder FFN but previously had
+        # zero weight norm constraints, allowing unconstrained growth at LR peak.
+        self._enc_ff_weights: list = []
+        for i in range(n_encoder_layers):
+            for linear_name in ('linear1', 'linear2'):
+                m = named_modules.get(f'transformer_encoder_layers.{i}.ff.{linear_name}')
+                if m is not None:
+                    self._enc_ff_weights.append(m.weight)
+                else:
+                    logger.warning(
+                        f"enc_ffn_max_weight_norm: module 'transformer_encoder_layers.{i}.ff.{linear_name}' "
+                        "not found in model — weight-norm clamp will be skipped for this layer."
+                    )
         logger.info(
             f"Weight-norm constraints registered for {len(self._dec_ff_weights)} "
-            "decoder FF weight matrices."
+            f"decoder FF and {len(self._enc_ff_weights)} encoder FF weight matrices."
         )
 
     @torch.no_grad()
@@ -804,12 +828,15 @@ class KokoroTrainer:
             self.config, 'dec_ffn_max_weight_norm',
             getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
         )
-        if max_norm <= 0.0 or not self._dec_ff_weights:
-            return
-        for w in self._dec_ff_weights:
-            current_norm = w.norm(2).item()
-            if current_norm > max_norm:
-                w.mul_(max_norm / current_norm)
+        if max_norm > 0.0:
+            for w in self._dec_ff_weights:
+                current_norm = w.norm(2).item()
+                if current_norm > max_norm:
+                    w.mul_(max_norm / current_norm)
+            for w in self._enc_ff_weights:
+                current_norm = w.norm(2).item()
+                if current_norm > max_norm:
+                    w.mul_(max_norm / current_norm)
 
     def _setup_grad_explosion_tracker(self):
         """Initialize gradient explosion detection and localized spike clipping state."""
@@ -1262,9 +1289,11 @@ class KokoroTrainer:
             '.cross_attn.w_o.weight',
         )
 
-        # linear1 and linear2 in decoder and encoder FFN layers are the consistent
-        # high-delta culprits identified via checkpoint regression analysis.
-        ffn_name_fragments = ('.linear1.weight', '.linear2.weight')
+        # linear1 and linear2 weights AND biases in decoder and encoder FFN layers
+        # are the consistent high-delta culprits identified via checkpoint regression
+        # analysis.  Biases were previously excluded, allowing them to escape all
+        # gradient stabilization.
+        ffn_name_fragments = ('.linear1.weight', '.linear2.weight', '.linear1.bias', '.linear2.bias')
 
         clipped: Dict[str, Tuple[float, float]] = {}
         projection_max_norm = float(self.projection_spike_clip_norm)

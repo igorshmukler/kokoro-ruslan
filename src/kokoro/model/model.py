@@ -106,6 +106,13 @@ class KokoroModel(nn.Module):
             for i in range(n_encoder_layers)
         ])
 
+        # Final LayerNorm after encoder stack (required for pre-norm architecture).
+        # Each encoder block outputs x + sublayer(norm(x)), accumulating unnormalized
+        # residual contributions.  Without a final norm, the encoder output magnitude
+        # drifts as weights change, destabilizing downstream cross-attention and
+        # variance predictors — especially near the LR peak.
+        self.encoder_norm = nn.LayerNorm(hidden_dim)
+
         # Variance Adaptor (includes duration, pitch, energy predictors) or a
         # simple fallback adaptor that provides the same unified interface.
         # NOTE: VarianceAdaptor is owned exclusively by VarianceAdaptorWrapper
@@ -350,6 +357,9 @@ class KokoroModel(nn.Module):
 
             # Use checkpointed encoder layers (logging handled internally)
             x = self._checkpoint_encoder_layers(text_emb, self.transformer_encoder_layers, mask)
+
+            # Final LayerNorm (pre-norm architecture requires this after the last block)
+            x = self.encoder_norm(x)
 
             return x
 
