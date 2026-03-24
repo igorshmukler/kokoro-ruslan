@@ -415,6 +415,47 @@ def flag_regression_epoch(records):
 # NEW: Gradual degradation detector
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _get_cfg_from_records(records):
+    """Extract config from the latest checkpoint record, or fall back to TrainingConfig."""
+    cfg = None
+    if records:
+        try:
+            last = max(records, key=lambda r: r["epoch_num"])
+            cfg = last.get("config")
+        except Exception:
+            pass
+    if cfg is None:
+        try:
+            from kokoro.training.config import TrainingConfig
+            cfg = TrainingConfig()
+        except Exception:
+            pass
+    return cfg
+
+
+def _spec_augment_display_epoch(cfg):
+    """Return 1-indexed display epoch where SpecAugment activates, or None.
+
+    The training loop is 0-indexed (epoch=0 → Ep01), so the display epoch
+    is ``spec_augment_start_epoch + 1``.
+    """
+    if cfg is None:
+        return None
+    if not getattr(cfg, 'use_spec_augment', False):
+        return None
+    start = getattr(cfg, 'spec_augment_start_epoch', None)
+    if start is None:
+        return None
+    return start + 1
+
+
+def _is_spec_augment_transient(epoch_1indexed, sa_epoch, window=5):
+    """True if *epoch_1indexed* falls within the SpecAugment adaptation window."""
+    if sa_epoch is None:
+        return False
+    return sa_epoch <= epoch_1indexed < sa_epoch + window
+
+
 def _linear_slope(ys):
     """Least-squares slope over evenly-spaced indices.  Returns (slope, r_squared)."""
     n = len(ys)
@@ -644,12 +685,13 @@ def _series_stats(series):
 # NEW: TB gradual degradation — per-loss-component trend table
 # ─────────────────────────────────────────────────────────────────────────────
 
-def tb_print_per_loss_trend(ea):
+def tb_print_per_loss_trend(ea, cfg=None):
     """
     For each tracked loss component, fit a linear slope across epoch-level
     validation values.  Surfaces components that are quietly climbing while the
     aggregate looks stable — the primary cause of gradual degradation.
     """
+    sa_epoch = _spec_augment_display_epoch(cfg)
     print("\n" + "=" * 90)
     print("TENSORBOARD — Per-Loss Component Trend (gradual degradation detector)")
     print("=" * 90)
@@ -680,14 +722,34 @@ def tb_print_per_loss_trend(ea):
         best_ep_idx = vals.index(best_val) + 1
         best_age    = len(vals) - best_ep_idx  # epochs since best
 
+        # If SpecAugment is active and the best epoch predates the onset,
+        # recompute best age only from the post-augment segment so that the
+        # expected augmentation transient does not inflate the "plateaued" age.
+        display_best_age = best_age
+        if sa_epoch is not None and best_ep_idx < sa_epoch and len(vals) >= sa_epoch:
+            sa_vals = vals[sa_epoch - 1:]  # post-augment segment
+            if sa_vals:
+                sa_best_idx = sa_vals.index(min(sa_vals))
+                sa_age = len(sa_vals) - sa_best_idx - 1
+                display_best_age = sa_age
+
         if slope > 0 and r2 > 0.6:
-            verdict = "SUSTAINED REGRESSION ▲"
+            if sa_epoch is not None and best_ep_idx < sa_epoch:
+                verdict = f"SpecAugment adapting (best pre-augment Ep{best_ep_idx:02d})"
+            else:
+                verdict = "SUSTAINED REGRESSION ▲"
         elif slope > 0 and r2 > 0.3:
-            verdict = "weak upward drift ▲"
+            if sa_epoch is not None and best_ep_idx < sa_epoch:
+                verdict = f"SpecAugment adapting (best pre-augment Ep{best_ep_idx:02d})"
+            else:
+                verdict = "weak upward drift ▲"
         elif slope < 0 and r2 > 0.4:
             verdict = "improving ▼"
-        elif best_age >= 2:
-            verdict = f"plateaued (best {best_age} ep ago)"
+        elif display_best_age >= 2:
+            if sa_epoch is not None and best_ep_idx < sa_epoch and display_best_age < 2:
+                verdict = f"SpecAugment adapting"
+            else:
+                verdict = f"plateaued (best {display_best_age} ep ago)"
         else:
             verdict = "stable"
 
@@ -725,19 +787,24 @@ def tb_print_step_loss_summary(ea):
               f"{s['mean']:>9.5f}  {s['min']:>9.5f}  {s['max']:>9.5f}")
 
 
-def tb_print_val_mel_series(ea):
+def tb_print_val_mel_series(ea, cfg=None):
     vm = _get(ea, "loss/val_mel_epoch")
     if not vm:
         return
+    sa_epoch = _spec_augment_display_epoch(cfg)
     print("\n" + "=" * 90)
     print("TENSORBOARD — Val Mel Epoch Series")
     print("=" * 90)
     prev = None
     for i, (s, v) in enumerate(vm):
+        ep = i + 1
         if prev is None:
             flag = ""
         elif v > prev:
-            flag = f"  ▲ +{v - prev:.5f}  ← REGRESSION"
+            if _is_spec_augment_transient(ep, sa_epoch):
+                flag = f"  ▲ +{v - prev:.5f}  (SpecAugment adaptation)"
+            else:
+                flag = f"  ▲ +{v - prev:.5f}  ← REGRESSION"
         else:
             flag = f"  ▼ {v - prev:+.5f}"
         print(f"  Ep{i+1:02d}  step={s:>5}  val_mel={v:.5f}{flag}")
@@ -1232,7 +1299,8 @@ def _collect_diagnostics(ea):
     return d
 
 
-def tb_print_regression_flags(ea):
+def tb_print_regression_flags(ea, cfg=None):
+    sa_epoch = _spec_augment_display_epoch(cfg)
     print("\n" + "=" * 90)
     print("TENSORBOARD — Regression Flag Summary")
     print("=" * 90)
@@ -1255,9 +1323,23 @@ def tb_print_regression_flags(ea):
                 (ep, dd) for ep, dd in d["val_mel_regressions"]
                 if not any(v <= vm[ep - 2] for v in vm[ep:])
             ]
-            if unrecovered:
-                flags.append(("WARN", "val_mel increased at epochs: "
-                              + ", ".join(f"Ep{ep}+Δ{dd:+.5f}" for ep, dd in unrecovered)))
+            # Separate SpecAugment-onset regressions from real ones
+            sa_unrec = [(ep, dd) for ep, dd in unrecovered
+                        if _is_spec_augment_transient(ep, sa_epoch)]
+            real_unrec = [(ep, dd) for ep, dd in unrecovered
+                         if not _is_spec_augment_transient(ep, sa_epoch)]
+            if real_unrec:
+                msg = "val_mel increased at epochs: " + ", ".join(
+                    f"Ep{ep}+Δ{dd:+.5f}" for ep, dd in real_unrec)
+                if sa_unrec:
+                    msg += "  (+ " + ", ".join(
+                        f"Ep{ep}" for ep, _ in sa_unrec) + " from SpecAugment onset)"
+                flags.append(("WARN", msg))
+            elif sa_unrec:
+                flags.append(("PASS",
+                    "val_mel increases at " + ", ".join(
+                        f"Ep{ep}+Δ{dd:+.5f}" for ep, dd in sa_unrec)
+                    + " — SpecAugment adaptation transient (not regression)"))
             else:
                 rstr = ", ".join(f"Ep{ep}Δ{dd:+.5f}" for ep, dd in d["val_mel_regressions"])
                 flags.append(("PASS", f"val_mel transient blip(s) at {rstr} — fully recovered"))
@@ -1333,6 +1415,14 @@ def tb_print_regression_flags(ea):
             if peak_step:
                 vm_series = _get(ea, "loss/val_mel_epoch")
                 rpp       = [(s, v) for s, v in vm_series if s > peak_step]
+                # Exclude post-peak data that falls within the SpecAugment
+                # adaptation window — those increases are expected and transient.
+                if sa_epoch is not None:
+                    steps_per_ep = vm_series[1][0] - vm_series[0][0] if len(vm_series) >= 2 else 338
+                    sa_step = (sa_epoch - 1) * steps_per_ep
+                    rpp_filtered = [(s, v) for s, v in rpp if s < sa_step]
+                    if len(rpp_filtered) >= 2:
+                        rpp = rpp_filtered
                 if len(rpp) >= 2:
                     trend = rpp[-1][1] - rpp[0][1]
                     if trend > 0.05:
@@ -1495,19 +1585,8 @@ def tb_print_recommendations(ea, records=None):
     print("=" * 90)
 
     d   = _collect_diagnostics(ea)
-    cfg = None
-    if records:
-        try:
-            last = max(records, key=lambda r: r["epoch_num"])
-            cfg  = last.get("config")
-        except Exception:
-            pass
-    if cfg is None:
-        try:
-            from kokoro.training.config import TrainingConfig
-            cfg = TrainingConfig()
-        except Exception:
-            pass
+    cfg = _get_cfg_from_records(records)
+    sa_epoch = _spec_augment_display_epoch(cfg)
 
     def cfg_get(attr, default):
         return getattr(cfg, attr, default) if cfg is not None else default
@@ -1563,27 +1642,44 @@ def tb_print_recommendations(ea, records=None):
     # ── Gradual degradation (NEW) ────────────────────────────────────────────
     vm = d["val_mel_series"]
     if d.get("val_mel_gradual_drift") and not d["val_mel_regressed"]:
-        slope = d["val_mel_slope"]
-        r2    = d["val_mel_r2"]
-        body  = [
-            f"val_mel shows sustained upward drift: slope={slope:+.6f}/ep  R²={r2:.3f}.",
-            "  No single epoch looks alarming, but the trend is real.",
-        ]
-        if len(vm) >= 3:
-            best_ep = vm.index(min(vm)) + 1
-            age     = len(vm) - best_ep
-            if age >= 2:
-                body.append(f"  Best checkpoint was Ep{best_ep:02d}, {age} epochs ago — "
-                             "model has not improved since.")
-        gap = d["val_train_gap"]
-        if gap is not None and gap > 0.4:
-            body.append(f"  Val/train gap = {gap:.4f} — overfitting is a co-driver.")
-            body.append(f"    → Increase weight_decay "
-                        f"({cur_weight_decay:.4f} → {suggest_weight_decay:.4f}).")
-        body.append(f"    → Reduce max_lr_multiplier "
-                    f"({cur_max_lr_mult:.2f} → {suggest_max_lr_mult:.2f}) to soften weight updates.")
-        body.append("    → Consider rolling back to the best checkpoint and resuming from there.")
-        recs.append((1 if r2 > 0.6 else 2, "CRITICAL" if r2 > 0.6 else "WARN", body))
+        # Check if the drift is primarily caused by SpecAugment onset
+        best_ep = vm.index(min(vm)) + 1 if len(vm) >= 3 else None
+        drift_from_specaug = (
+            sa_epoch is not None
+            and best_ep is not None
+            and best_ep < sa_epoch
+        )
+        if drift_from_specaug:
+            # SpecAugment explains the drift — downgrade to INFO
+            slope = d["val_mel_slope"]
+            r2    = d["val_mel_r2"]
+            recs.append((3, "INFO", [
+                f"val_mel upward drift (slope={slope:+.6f}/ep  R²={r2:.3f}) coincides with "
+                f"SpecAugment activation at Ep{sa_epoch:02d}.",
+                f"  Best was Ep{best_ep:02d} (pre-augment). This is an expected adaptation transient.",
+                "  Monitor: val_mel should plateau and begin recovering within 3–5 epochs.",
+            ]))
+        else:
+            slope = d["val_mel_slope"]
+            r2    = d["val_mel_r2"]
+            body  = [
+                f"val_mel shows sustained upward drift: slope={slope:+.6f}/ep  R²={r2:.3f}.",
+                "  No single epoch looks alarming, but the trend is real.",
+            ]
+            if len(vm) >= 3:
+                age = len(vm) - best_ep if best_ep else 0
+                if age >= 2:
+                    body.append(f"  Best checkpoint was Ep{best_ep:02d}, {age} epochs ago — "
+                                 "model has not improved since.")
+            gap = d["val_train_gap"]
+            if gap is not None and gap > 0.4:
+                body.append(f"  Val/train gap = {gap:.4f} — overfitting is a co-driver.")
+                body.append(f"    → Increase weight_decay "
+                            f"({cur_weight_decay:.4f} → {suggest_weight_decay:.4f}).")
+            body.append(f"    → Reduce max_lr_multiplier "
+                        f"({cur_max_lr_mult:.2f} → {suggest_max_lr_mult:.2f}) to soften weight updates.")
+            body.append("    → Consider rolling back to the best checkpoint and resuming from there.")
+            recs.append((1 if r2 > 0.6 else 2, "CRITICAL" if r2 > 0.6 else "WARN", body))
 
     # ── Val mel overall regression (existing) ───────────────────────────────
     if d["val_mel_regressed"]:
@@ -1607,11 +1703,31 @@ def tb_print_recommendations(ea, records=None):
             (ep, dd) for ep, dd in d["val_mel_regressions"]
             if not any(v <= vm[ep - 2] for v in vm[ep:])
         ]
-        if unrecovered_recs:
-            ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in unrecovered_recs)
-            n_consec = len(unrecovered_recs)
+        # Exclude SpecAugment-onset transients from escalation logic
+        real_unrec = [
+            (ep, dd) for ep, dd in unrecovered_recs
+            if not _is_spec_augment_transient(ep, sa_epoch)
+        ]
+        sa_unrec = [
+            (ep, dd) for ep, dd in unrecovered_recs
+            if _is_spec_augment_transient(ep, sa_epoch)
+        ]
+        if sa_unrec and not real_unrec:
+            # All unrecovered regressions are from SpecAugment onset — INFO only
+            ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in sa_unrec)
+            recs.append((3, "INFO", [
+                f"val_mel increased at: {ep_list}.",
+                "  These coincide with SpecAugment activation — expected adaptation transient.",
+                "  Monitor: should plateau within 3–5 epochs as model adapts to masked inputs.",
+            ]))
+        elif real_unrec:
+            ep_list = ", ".join(f"Ep{ep} Δ{dd:+.4f}" for ep, dd in real_unrec)
+            if sa_unrec:
+                ep_list += "  (+ " + ", ".join(
+                    f"Ep{ep}" for ep, _ in sa_unrec) + " from SpecAugment)"
+            n_consec = len(real_unrec)
             if n_consec >= 2:
-                last_delta = abs(unrecovered_recs[-1][1])
+                last_delta = abs(real_unrec[-1][1])
                 if last_delta >= 0.010:
                     action = (
                         "  2nd consecutive rise ≥ 0.010 — ACT NOW (do not wait for next epoch):\n"
@@ -2164,13 +2280,14 @@ def tb_analyze(log_dir: Path = TB_LOG_DIR, records=None):
     ea = _load_tb(log_dir)
     if ea is None:
         return
+    cfg = _get_cfg_from_records(records)
     print(f"\n[TensorBoard] Log dir: {log_dir}")
     tags = sorted(ea.Tags().get("scalars", []))
     print(f"[TensorBoard] {len(tags)} scalar tags available: {tags}")
 
     tb_print_step_loss_summary(ea)
-    tb_print_val_mel_series(ea)
-    tb_print_per_loss_trend(ea)            # NEW — gradual degradation per component
+    tb_print_val_mel_series(ea, cfg=cfg)
+    tb_print_per_loss_trend(ea, cfg=cfg)
     tb_print_epoch_table(ea)
     tb_print_mel_stop_window_correlation(ea)
     tb_print_stop_token_analysis(ea)
@@ -2179,7 +2296,7 @@ def tb_analyze(log_dir: Path = TB_LOG_DIR, records=None):
     tb_print_spike_cause_analysis(ea, records=records)
     tb_print_lr_trajectory(ea)
     tb_print_lr_phase_detail(ea, records=records)
-    tb_print_regression_flags(ea)
+    tb_print_regression_flags(ea, cfg=cfg)
     tb_print_recommendations(ea, records=records)
 
 
