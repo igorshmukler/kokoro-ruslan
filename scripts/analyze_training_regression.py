@@ -449,10 +449,36 @@ def _spec_augment_display_epoch(cfg):
     return start + 1
 
 
-def _is_spec_augment_transient(epoch_1indexed, sa_epoch, window=5):
-    """True if *epoch_1indexed* falls within the SpecAugment adaptation window."""
+def _compute_sa_window(vm_vals, sa_epoch):
+    """Compute effective SpecAugment adaptation window from val_mel data.
+
+    Extends beyond the default 5 if val_mel keeps rising continuously
+    from SA onset — the adaptation tail can exceed 5 epochs.
+    """
+    if sa_epoch is None or not vm_vals:
+        return 5
+    start_idx = sa_epoch - 1  # 0-based
+    if start_idx <= 0 or start_idx >= len(vm_vals):
+        return 5
+    window = 0
+    for i in range(start_idx, len(vm_vals)):
+        if vm_vals[i] > vm_vals[i - 1]:
+            window += 1
+        else:
+            break
+    return max(5, window)
+
+
+def _is_spec_augment_transient(epoch_1indexed, sa_epoch, window=5, vm_vals=None):
+    """True if *epoch_1indexed* falls within the SpecAugment adaptation window.
+
+    If *vm_vals* (list of val_mel values) is provided, the window is extended
+    dynamically as long as val_mel keeps rising continuously from SA onset.
+    """
     if sa_epoch is None:
         return False
+    if vm_vals is not None:
+        window = _compute_sa_window(vm_vals, sa_epoch)
     return sa_epoch <= epoch_1indexed < sa_epoch + window
 
 
@@ -723,24 +749,30 @@ def tb_print_per_loss_trend(ea, cfg=None):
         best_age    = len(vals) - best_ep_idx  # epochs since best
 
         # If SpecAugment is active and the best epoch predates the onset,
-        # recompute best age only from the post-augment segment so that the
-        # expected augmentation transient does not inflate the "plateaued" age.
+        # recompute best age AND best epoch from the post-augment segment
+        # so the displayed pair is consistent.
+        display_best_ep = best_ep_idx
         display_best_age = best_age
         if sa_epoch is not None and best_ep_idx < sa_epoch and len(vals) >= sa_epoch:
             sa_vals = vals[sa_epoch - 1:]  # post-augment segment
             if sa_vals:
                 sa_best_idx = sa_vals.index(min(sa_vals))
-                sa_age = len(sa_vals) - sa_best_idx - 1
-                display_best_age = sa_age
+                display_best_age = len(sa_vals) - sa_best_idx - 1
+                display_best_ep = sa_epoch + sa_best_idx
 
-        if slope > 0 and r2 > 0.6:
+        # SA adaptation tail: post-SA segment still rising even if overall slope is negative
+        if (sa_epoch is not None and best_ep_idx < sa_epoch
+                and len(vals) >= sa_epoch
+                and vals[-1] > vals[sa_epoch - 1]):
+            verdict = f"SpecAugment adapting (pre-SA best Ep{best_ep_idx:02d})"
+        elif slope > 0 and r2 > 0.6:
             if sa_epoch is not None and best_ep_idx < sa_epoch:
-                verdict = f"SpecAugment adapting (best pre-augment Ep{best_ep_idx:02d})"
+                verdict = f"SpecAugment adapting (pre-SA best Ep{best_ep_idx:02d})"
             else:
                 verdict = "SUSTAINED REGRESSION ▲"
         elif slope > 0 and r2 > 0.3:
             if sa_epoch is not None and best_ep_idx < sa_epoch:
-                verdict = f"SpecAugment adapting (best pre-augment Ep{best_ep_idx:02d})"
+                verdict = f"SpecAugment adapting (pre-SA best Ep{best_ep_idx:02d})"
             else:
                 verdict = "weak upward drift ▲"
         elif slope < 0 and r2 > 0.4:
@@ -751,7 +783,7 @@ def tb_print_per_loss_trend(ea, cfg=None):
             verdict = "stable"
 
         print(f"  {label:<12} {len(vals):>4}  {vals[0]:>9.5f}  {vals[-1]:>9.5f}  "
-              f"{slope:>+10.6f}  {r2:>6.3f}  {'Ep'+str(best_ep_idx):>7}  "
+              f"{slope:>+10.6f}  {r2:>6.3f}  {'Ep'+str(display_best_ep):>7}  "
               f"{display_best_age:>8}  {verdict}")
 
     if not header_printed:
@@ -789,6 +821,7 @@ def tb_print_val_mel_series(ea, cfg=None):
     if not vm:
         return
     sa_epoch = _spec_augment_display_epoch(cfg)
+    vm_vals = [v for _, v in vm]
     print("\n" + "=" * 90)
     print("TENSORBOARD — Val Mel Epoch Series")
     print("=" * 90)
@@ -798,7 +831,7 @@ def tb_print_val_mel_series(ea, cfg=None):
         if prev is None:
             flag = ""
         elif v > prev:
-            if _is_spec_augment_transient(ep, sa_epoch):
+            if _is_spec_augment_transient(ep, sa_epoch, vm_vals=vm_vals):
                 flag = f"  ▲ +{v - prev:.5f}  (SpecAugment adaptation)"
             else:
                 flag = f"  ▲ +{v - prev:.5f}  ← REGRESSION"
@@ -868,6 +901,8 @@ def tb_print_epoch_table(ea):
 
 def tb_print_stop_token_analysis(ea, cfg=None):
     sa_epoch = _spec_augment_display_epoch(cfg)
+    _vm_raw = _get(ea, "loss/val_mel_epoch")
+    _vm_vals = [v for _, v in _vm_raw] if _vm_raw else None
     print("\n" + "=" * 90)
     print("TENSORBOARD — Stop Token Analysis")
     print("=" * 90)
@@ -929,7 +964,7 @@ def tb_print_stop_token_analysis(ea, cfg=None):
             for i, (s, v) in enumerate(ep):
                 prev_v = ep[i - 1][1] if i > 0 else None
                 if prev_v is not None and v > prev_v:
-                    if _is_spec_augment_transient(i + 1, sa_epoch):
+                    if _is_spec_augment_transient(i + 1, sa_epoch, vm_vals=_vm_vals):
                         flag = " ▲ (SpecAugment)"
                     else:
                         flag = " ▲ REGRESSION"
@@ -1329,9 +1364,9 @@ def tb_print_regression_flags(ea, cfg=None):
             ]
             # Separate SpecAugment-onset regressions from real ones
             sa_unrec = [(ep, dd) for ep, dd in unrecovered
-                        if _is_spec_augment_transient(ep, sa_epoch)]
+                        if _is_spec_augment_transient(ep, sa_epoch, vm_vals=vm)]
             real_unrec = [(ep, dd) for ep, dd in unrecovered
-                         if not _is_spec_augment_transient(ep, sa_epoch)]
+                         if not _is_spec_augment_transient(ep, sa_epoch, vm_vals=vm)]
             if real_unrec:
                 msg = "val_mel increased at epochs: " + ", ".join(
                     f"Ep{ep}+Δ{dd:+.5f}" for ep, dd in real_unrec)
@@ -1710,11 +1745,11 @@ def tb_print_recommendations(ea, records=None):
         # Exclude SpecAugment-onset transients from escalation logic
         real_unrec = [
             (ep, dd) for ep, dd in unrecovered_recs
-            if not _is_spec_augment_transient(ep, sa_epoch)
+            if not _is_spec_augment_transient(ep, sa_epoch, vm_vals=vm)
         ]
         sa_unrec = [
             (ep, dd) for ep, dd in unrecovered_recs
-            if _is_spec_augment_transient(ep, sa_epoch)
+            if _is_spec_augment_transient(ep, sa_epoch, vm_vals=vm)
         ]
         if sa_unrec and not real_unrec:
             # All unrecovered regressions are from SpecAugment onset — INFO only
@@ -1735,7 +1770,7 @@ def tb_print_recommendations(ea, records=None):
             last_reg_ep = real_unrec[-1][0]  # 1-indexed
             strand_ended = False
             for ep_1 in range(last_reg_ep + 1, len(vm) + 1):
-                if _is_spec_augment_transient(ep_1, sa_epoch):
+                if _is_spec_augment_transient(ep_1, sa_epoch, vm_vals=vm):
                     continue
                 if vm[ep_1 - 1] <= vm[ep_1 - 2]:
                     strand_ended = True
