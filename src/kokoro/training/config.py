@@ -15,9 +15,9 @@ class TrainingConfig:
     # Basic training parameters
     data_dir: str = "data/processed_data"
     output_dir: str = "output_models"
-    num_epochs: int = 26  # 26 × ~339 steps/epoch − 800 warmup ≈ 8,000 OneCycleLR steps
+    num_epochs: int = 60  # 60 × ~339 steps/epoch − 1200 warmup ≈ 19,140 OneCycleLR steps
     batch_size: int = 16
-    learning_rate: float = 5.5e-5  # peak LR = learning_rate × max_lr_multiplier = 5.5e-5 × 1.1 = 6.05e-5
+    learning_rate: float = 7.0e-5  # peak LR = learning_rate × max_lr_multiplier = 7.0e-5 × 1.2 = 8.4e-5
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
@@ -33,8 +33,8 @@ class TrainingConfig:
     # encoder FFN representations at ~98-99% of peak. Both 1.1× and 1.05× hit the same wall.
     # 1.05 → 1.0: dec peak 5.25→5.0e-5, enc peak 5.775→5.5e-5, FFN 1.05→1.0e-5 (−5% uniform).
     # Resume from Ep07 (best checkpoint, val_mel=0.89290).
-    max_lr_multiplier: float = 1.1   # Peak decoder LR = learning_rate × this = 5.0e-5 × 1.0 = 5.0e-5 (hard ceiling)
-    pct_start: float = 0.45  # Fraction of OneCycleLR cycle spent ascending to peak; with ~8000 steps → peak at step ~3595 (absolute ~4395, epoch ~13)
+    max_lr_multiplier: float = 1.2   # Peak decoder LR = learning_rate × this = 7.0e-5 × 1.2 = 8.4e-5
+    pct_start: float = 0.30  # Fraction of OneCycleLR cycle spent ascending to peak; with ~19140 steps → peak at step ~5742 (absolute ~6942, epoch ~20)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
@@ -57,7 +57,7 @@ class TrainingConfig:
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
-    warmup_steps: int = 800  # Number of optimizer steps for linear warmup (not batches!)
+    warmup_steps: int = 1200  # Number of optimizer steps for linear warmup (not batches!)
     warmup_start_lr_ratio: float = 0.01  # Start LR = learning_rate * this value
 
     # EMA (Exponential Moving Average) of model weights
@@ -85,12 +85,12 @@ class TrainingConfig:
     # cutting FFN params by 34% and rebalancing FFN vs attention capacity.
     encoder_ff_dim: int = 2048
     decoder_ff_dim: int = 2048
-    encoder_dropout: float = 0.1
+    encoder_dropout: float = 0.15
     max_decoder_seq_len: int = 4000
 
     # Stochastic depth (layer dropout) for regularization
     use_stochastic_depth: bool = True  # Enable layer dropout during training
-    stochastic_depth_rate: float = 0.05  # Maximum drop probability for last layer
+    stochastic_depth_rate: float = 0.1  # Maximum drop probability for last layer
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
     # Loss weights
@@ -127,7 +127,7 @@ class TrainingConfig:
     # onecycle = 2000 steps / 339 ≈ epoch 5.9).  Start ~9 epochs after peak so
     # the schedule is solidly descending (~85% of peak by ep11) before
     # augmentation noise is introduced.
-    spec_augment_start_epoch: int = 16
+    spec_augment_start_epoch: int = 10
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
@@ -287,7 +287,7 @@ class TrainingConfig:
 
     # Optimizer behavior
     # AdamW regularization and numerical stability
-    weight_decay: float = 0.01   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
+    weight_decay: float = 0.02   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
     adam_eps: float = 1e-8       # AdamW epsilon for numerical stability
     adam_betas: tuple = (0.9, 0.999)  # AdamW beta coefficients (momentum, RMS)
     # None = auto (enabled on CUDA, disabled otherwise)
