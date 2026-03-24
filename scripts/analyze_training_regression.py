@@ -746,16 +746,13 @@ def tb_print_per_loss_trend(ea, cfg=None):
         elif slope < 0 and r2 > 0.4:
             verdict = "improving ▼"
         elif display_best_age >= 2:
-            if sa_epoch is not None and best_ep_idx < sa_epoch and display_best_age < 2:
-                verdict = f"SpecAugment adapting"
-            else:
-                verdict = f"plateaued (best {display_best_age} ep ago)"
+            verdict = f"plateaued (best {display_best_age} ep ago)"
         else:
             verdict = "stable"
 
         print(f"  {label:<12} {len(vals):>4}  {vals[0]:>9.5f}  {vals[-1]:>9.5f}  "
               f"{slope:>+10.6f}  {r2:>6.3f}  {'Ep'+str(best_ep_idx):>7}  "
-              f"{best_age:>8}  {verdict}")
+              f"{display_best_age:>8}  {verdict}")
 
     if not header_printed:
         print("  No epoch-level loss tags with ≥ 3 data points found.")
@@ -869,7 +866,8 @@ def tb_print_epoch_table(ea):
         print()
 
 
-def tb_print_stop_token_analysis(ea):
+def tb_print_stop_token_analysis(ea, cfg=None):
+    sa_epoch = _spec_augment_display_epoch(cfg)
     print("\n" + "=" * 90)
     print("TENSORBOARD — Stop Token Analysis")
     print("=" * 90)
@@ -930,7 +928,13 @@ def tb_print_stop_token_analysis(ea):
             print(f"\n  Epoch-level stop ({label}):")
             for i, (s, v) in enumerate(ep):
                 prev_v = ep[i - 1][1] if i > 0 else None
-                flag   = " ▲ REGRESSION" if prev_v is not None and v > prev_v else ""
+                if prev_v is not None and v > prev_v:
+                    if _is_spec_augment_transient(i + 1, sa_epoch):
+                        flag = " ▲ (SpecAugment)"
+                    else:
+                        flag = " ▲ REGRESSION"
+                else:
+                    flag = ""
                 print(f"    Ep{i+1:02d}  step={s:>5}  {v:.5f}{flag}")
 
 
@@ -1726,7 +1730,31 @@ def tb_print_recommendations(ea, records=None):
                 ep_list += "  (+ " + ", ".join(
                     f"Ep{ep}" for ep, _ in sa_unrec) + " from SpecAugment)"
             n_consec = len(real_unrec)
-            if n_consec >= 2:
+            # Detect whether the regression strand has ended:
+            # if any non-SA epoch after the last regression showed improvement.
+            last_reg_ep = real_unrec[-1][0]  # 1-indexed
+            strand_ended = False
+            for ep_1 in range(last_reg_ep + 1, len(vm) + 1):
+                if _is_spec_augment_transient(ep_1, sa_epoch):
+                    continue
+                if vm[ep_1 - 1] <= vm[ep_1 - 2]:
+                    strand_ended = True
+                    break
+            if strand_ended:
+                action = (
+                    f"  Regression strand (Ep{real_unrec[0][0]}–{last_reg_ep}) has ended — "
+                    f"subsequent epochs stabilised.\n"
+                    f"  val_mel has not recovered to best ({min(vm):.5f} at "
+                    f"Ep{vm.index(min(vm))+1:02d}).\n"
+                    "  No immediate action needed; monitor post-SpecAugment recovery."
+                ) if sa_epoch else (
+                    f"  Regression strand (Ep{real_unrec[0][0]}–{last_reg_ep}) has ended — "
+                    f"subsequent epochs stabilised.\n"
+                    f"  val_mel has not recovered to best ({min(vm):.5f} at "
+                    f"Ep{vm.index(min(vm))+1:02d}).\n"
+                    "  Monitor for further recovery."
+                )
+            elif n_consec >= 2:
                 last_delta = abs(real_unrec[-1][1])
                 if last_delta >= 0.010:
                     action = (
@@ -1748,7 +1776,7 @@ def tb_print_recommendations(ea, records=None):
                     "    → lower decoder_ffn_lr_multiplier by 0.1 (if FFN layers are persistent movers)\n"
                     "    → or reduce max_lr_multiplier by 0.1"
                 )
-            recs.append((2, "WARN", [
+            recs.append((3 if strand_ended else 2, "INFO" if strand_ended else "WARN", [
                 f"val_mel regressed at: {ep_list}.",
                 action,
             ]))
@@ -2290,7 +2318,7 @@ def tb_analyze(log_dir: Path = TB_LOG_DIR, records=None):
     tb_print_per_loss_trend(ea, cfg=cfg)
     tb_print_epoch_table(ea)
     tb_print_mel_stop_window_correlation(ea)
-    tb_print_stop_token_analysis(ea)
+    tb_print_stop_token_analysis(ea, cfg=cfg)
     tb_print_gradient_analysis(ea)
     tb_print_late_spike_context(ea)
     tb_print_spike_cause_analysis(ea, records=records)
