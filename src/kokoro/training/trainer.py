@@ -1996,6 +1996,8 @@ class KokoroTrainer:
                                     rebuilt_num_batches,
                                 )
                                 num_batches = rebuilt_num_batches
+                                progress_bar.total = rebuilt_num_batches
+                                progress_bar.refresh()
                     except Exception:
                         # Keep the initial estimate if sampler internals are unavailable.
                         pass
