@@ -122,12 +122,11 @@ class TrainingConfig:
     spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.15 and ~8014 OneCycleLR steps (~339 steps/epoch) the LR
-    # peaks at OneCycleLR step ~1200, i.e. absolute epoch ~6 (800 warmup + 1200
-    # onecycle = 2000 steps / 339 ≈ epoch 5.9).  Start ~9 epochs after peak so
-    # the schedule is solidly descending (~85% of peak by ep11) before
-    # augmentation noise is introduced.
-    spec_augment_start_epoch: int = 10
+    # With pct_start=0.30 and ~19080 OneCycleLR steps the LR peaks at step
+    # ~6924 (absolute ~Ep20).  SpecAugment should activate AFTER the LR-pressure
+    # regression stabilises — at Ep15 the cosine ascent is ~95% of peak and
+    # regressions from Ep7-10 will have fully extinguished.
+    spec_augment_start_epoch: int = 15
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
