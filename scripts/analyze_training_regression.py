@@ -1769,6 +1769,8 @@ def tb_print_recommendations(ea, records=None):
             # if any non-SA epoch after the last regression showed improvement.
             last_reg_ep = real_unrec[-1][0]  # 1-indexed
             strand_ended = False
+            is_decelerating = False
+            lr_ascending = d.get("lr_still_rising", False)
             for ep_1 in range(last_reg_ep + 1, len(vm) + 1):
                 if _is_spec_augment_transient(ep_1, sa_epoch, vm_vals=vm):
                     continue
@@ -1791,7 +1793,24 @@ def tb_print_recommendations(ea, records=None):
                 )
             elif n_consec >= 2:
                 last_delta = abs(real_unrec[-1][1])
-                if last_delta >= 0.010:
+                # Detect decelerating regression during LR ascent —
+                # if each successive delta is smaller than the previous,
+                # the regression is self-correcting (expected OneCycle behaviour).
+                deltas = [abs(dd) for _, dd in real_unrec]
+                is_decelerating = (
+                    len(deltas) >= 2
+                    and all(deltas[i] < deltas[i - 1] for i in range(1, len(deltas)))
+                )
+                if is_decelerating and lr_ascending:
+                    decel_pct = 100.0 * (1.0 - deltas[-1] / deltas[0])
+                    projected = deltas[-1] * (deltas[-1] / deltas[-2]) if deltas[-2] > 0 else 0
+                    action = (
+                        f"  Regression is decelerating ({decel_pct:.0f}% smaller than first).\n"
+                        f"  LR still ascending — this is expected OneCycle cosine-ascent pressure.\n"
+                        f"  Projected next Δ: ~{projected:+.4f} (should stabilise within 2-3 epochs).\n"
+                        "  No intervention needed. Continue training."
+                    )
+                elif last_delta >= 0.010:
                     action = (
                         "  2nd consecutive rise ≥ 0.010 — ACT NOW (do not wait for next epoch):\n"
                         "    → If encoder FFN or decoder attention are new top movers: reduce max_lr_multiplier by 0.1\n"
@@ -1811,7 +1830,10 @@ def tb_print_recommendations(ea, records=None):
                     "    → lower decoder_ffn_lr_multiplier by 0.1 (if FFN layers are persistent movers)\n"
                     "    → or reduce max_lr_multiplier by 0.1"
                 )
-            recs.append((3 if strand_ended else 2, "INFO" if strand_ended else "WARN", [
+            is_lr_decel = is_decelerating and lr_ascending and not strand_ended
+            severity = 3 if (strand_ended or is_lr_decel) else 2
+            label = "INFO" if (strand_ended or is_lr_decel) else "WARN"
+            recs.append((severity, label, [
                 f"val_mel regressed at: {ep_list}.",
                 action,
             ]))
