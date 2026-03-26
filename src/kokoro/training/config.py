@@ -286,7 +286,7 @@ class TrainingConfig:
 
     # Optimizer behavior
     # AdamW regularization and numerical stability
-    weight_decay: float = 0.02   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
+    weight_decay: float = 0.03   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
     adam_eps: float = 1e-8       # AdamW epsilon for numerical stability
     adam_betas: tuple = (0.9, 0.999)  # AdamW beta coefficients (momentum, RMS)
     # None = auto (enabled on CUDA, disabled otherwise)
