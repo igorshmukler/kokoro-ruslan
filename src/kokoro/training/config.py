@@ -34,7 +34,7 @@ class TrainingConfig:
     # 1.05 → 1.0: dec peak 5.25→5.0e-5, enc peak 5.775→5.5e-5, FFN 1.05→1.0e-5 (−5% uniform).
     # Resume from Ep07 (best checkpoint, val_mel=0.89290).
     max_lr_multiplier: float = 1.2   # Peak decoder LR = learning_rate × this = 7.0e-5 × 1.2 = 8.4e-5
-    pct_start: float = 0.30  # Fraction of OneCycleLR cycle spent ascending to peak; with ~19140 steps → peak at step ~5742 (absolute ~6942, epoch ~20)
+    pct_start: float = 0.25  # Fraction of OneCycleLR cycle spent ascending to peak — shorter climb, more decay time for refinement
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
@@ -54,6 +54,12 @@ class TrainingConfig:
     # 99% of LR peak, all mel-only (stop/duration kept improving → FFN is confirmed driver).
     # Lowered to 0.2: peak FFN LR = base_lr × max_lr_mult × 0.2 ≈ 1.10e-5.
     decoder_ffn_lr_multiplier: float = 0.2
+    # LR multiplier for decoder self-attention and cross-attention layers
+    # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
+    # Dec layers 3-5 self_attn consumed 59% of all weight deltas by Ep32 with
+    # Dec.5 w_o growing 27.7→88.2 (3.2×) — driven by running at full base LR.
+    # 0.4× dampens attention updates while still allowing meaningful learning.
+    decoder_attn_lr_multiplier: float = 0.4
 
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
@@ -126,7 +132,7 @@ class TrainingConfig:
     # ~6924 (absolute ~Ep20).  SpecAugment should activate AFTER the LR-pressure
     # regression stabilises — at Ep15 the cosine ascent is ~95% of peak and
     # regressions from Ep7-10 will have fully extinguished.
-    spec_augment_start_epoch: int = 15
+    spec_augment_start_epoch: int = 12
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
@@ -204,7 +210,7 @@ class TrainingConfig:
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
-    attention_spike_clip_norm: float = 5.0
+    attention_spike_clip_norm: float = 4.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
     ffn_spike_clip_norm: float = 5.0
     # Encoder FFN per-layer pre-clip
@@ -286,7 +292,7 @@ class TrainingConfig:
 
     # Optimizer behavior
     # AdamW regularization and numerical stability
-    weight_decay: float = 0.03   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
+    weight_decay: float = 0.04   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
     adam_eps: float = 1e-8       # AdamW epsilon for numerical stability
     adam_betas: tuple = (0.9, 0.999)  # AdamW beta coefficients (momentum, RMS)
     # None = auto (enabled on CUDA, disabled otherwise)

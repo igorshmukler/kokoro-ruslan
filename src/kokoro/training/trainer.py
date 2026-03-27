@@ -122,7 +122,7 @@ class KokoroTrainer:
                 "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
             },
             "Learning Rate": {
-                "LR (encoder vs decoder vs stop vs ffn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_stop_head"]],
+                "LR (encoder vs decoder vs stop vs ffn vs attn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_decoder_attn", "stats/lr_stop_head"]],
             },
         })
 
@@ -538,22 +538,29 @@ class KokoroTrainer:
         # epochs) and saturate the GLU gate open.
         decoder_no_decay: list = []
         decoder_ffn_no_decay: list = []
+        decoder_attn_no_decay: list = []
         decoder_decay_tuples: list = []  # (name, param) for decay candidates
         for _name, _param in decoder_named:
             if (any(_name.endswith(s) for s in _no_decay_suffixes)
                     or any(s in _name for s in _no_decay_substrings)):
                 if ".ff." in _name:
                     decoder_ffn_no_decay.append(_param)
+                elif ".self_attn." in _name or ".cross_attn." in _name:
+                    decoder_attn_no_decay.append(_param)
                 else:
                     decoder_no_decay.append(_param)
             else:
                 decoder_decay_tuples.append((_name, _param))
         # From decay candidates, carve out FFN params (decoder.layers.*.ff.*)
+        # and attention params (decoder.layers.*.self_attn.* / .cross_attn.*)
         decoder_decay_ffn: list = []
+        decoder_decay_attn: list = []
         decoder_decay_other: list = []
         for _name, _param in decoder_decay_tuples:
             if ".ff." in _name or ".ff" in _name:
                 decoder_decay_ffn.append(_param)
+            elif ".self_attn." in _name or ".cross_attn." in _name:
+                decoder_decay_attn.append(_param)
             else:
                 decoder_decay_other.append(_param)
         decoder_params = [p for _, p in decoder_named]  # kept for logging only
@@ -562,21 +569,30 @@ class KokoroTrainer:
         stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
         stop_head_lr = base_lr * stop_head_lr_mult
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
+        decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
 
         # Build param groups, tagging each with a group_type for scheduler mapping
         param_groups = []
         param_groups.append({'params': encoder_params, 'lr': encoder_lr, 'weight_decay': 0.0,
                              'eps': adam_eps, 'betas': adam_betas, 'group_type': 'encoder'})
 
-        # Decoder no-decay (biases / norms)
+        # Decoder no-decay (biases / norms — excluding FFN and attention)
         if decoder_no_decay:
             param_groups.append({'params': decoder_no_decay, 'lr': base_lr, 'weight_decay': 0.0,
                                  'eps': adam_eps, 'betas': adam_betas, 'group_type': 'decoder_other'})
 
-        # Decoder decay: separate FFN vs other so FFN can use reduced LR
+        # Decoder decay: separate FFN, attention, and other
         if decoder_decay_other:
             param_groups.append({'params': decoder_decay_other, 'lr': base_lr, 'weight_decay': weight_decay,
                                  'eps': adam_eps, 'betas': adam_betas, 'group_type': 'decoder_other'})
+        if decoder_decay_attn:
+            param_groups.append({'params': decoder_decay_attn, 'lr': base_lr * decoder_attn_lr_mult,
+                                 'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'decoder_attn'})
+        if decoder_attn_no_decay:
+            param_groups.append({'params': decoder_attn_no_decay, 'lr': base_lr * decoder_attn_lr_mult,
+                                 'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'decoder_attn'})
         if decoder_decay_ffn:
             param_groups.append({'params': decoder_decay_ffn, 'lr': base_lr * decoder_ffn_lr_mult,
                                  'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas,
@@ -603,12 +619,17 @@ class KokoroTrainer:
             n_decoder_other = len(decoder_decay_other)
             n_decoder_ffn = len(decoder_decay_ffn)
             n_decoder_ffn_nd = len(decoder_ffn_no_decay)
+            n_decoder_attn = len(decoder_decay_attn)
+            n_decoder_attn_nd = len(decoder_attn_no_decay)
             n_stop = len(stop_head_params)
             ffn_lr = base_lr * decoder_ffn_lr_mult
+            attn_lr = base_lr * decoder_attn_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
                 f"decoder_no_decay={n_decoder_no_decay} params (lr={base_lr:.2e}, wd=0.0), "
                 f"decoder_other_decay={n_decoder_other} params (lr={base_lr:.2e}, wd={weight_decay}), "
+                f"decoder_attn_decay={n_decoder_attn} params (lr={attn_lr:.2e}, wd={weight_decay}), "
+                f"decoder_attn_no_decay={n_decoder_attn_nd} params (lr={attn_lr:.2e}, wd=0.0), "
                 f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={weight_decay}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
@@ -1577,6 +1598,7 @@ class KokoroTrainer:
         regardless of how many groups are present.  Recognised group types:
           encoder        → stats/lr_encoder
           decoder_other  → stats/lr_decoder   (canonical decoder reference)
+          decoder_attn   → stats/lr_decoder_attn
           decoder_ffn    → stats/lr_decoder_ffn
           stop_head      → stats/lr_stop_head
         Falls back to positional heuristics for legacy (untagged) checkpoints.
@@ -1597,6 +1619,8 @@ class KokoroTrainer:
                 self.writer.add_scalar('stats/lr_decoder', tagged['decoder_other'], step)
             if 'decoder_ffn' in tagged:
                 self.writer.add_scalar('stats/lr_decoder_ffn', tagged['decoder_ffn'], step)
+            if 'decoder_attn' in tagged:
+                self.writer.add_scalar('stats/lr_decoder_attn', tagged['decoder_attn'], step)
             if 'stop_head' in tagged:
                 self.writer.add_scalar('stats/lr_stop_head', tagged['stop_head'], step)
         else:
