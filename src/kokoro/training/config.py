@@ -61,6 +61,11 @@ class TrainingConfig:
     # 0.4× dampens attention updates while still allowing meaningful learning.
     decoder_attn_lr_multiplier: float = 0.4
 
+    # QK-normalization: per-head RMSNorm on Q and K after projection.
+    # Decouples attention logit scale from weight norms, preventing unbounded
+    # decoder attention weight growth.  Requires training from scratch.
+    qk_norm: bool = True
+
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
     warmup_steps: int = 1200  # Number of optimizer steps for linear warmup (not batches!)

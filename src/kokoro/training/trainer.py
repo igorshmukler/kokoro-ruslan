@@ -366,7 +366,8 @@ class KokoroTrainer:
             energy_min=getattr(config, 'energy_min', 0.0),
             energy_max=getattr(config, 'energy_max', 1.0),
             use_stochastic_depth=getattr(config, 'use_stochastic_depth', True),
-            stochastic_depth_rate=getattr(config, 'stochastic_depth_rate', 0.1)
+            stochastic_depth_rate=getattr(config, 'stochastic_depth_rate', 0.1),
+            qk_norm=getattr(config, 'qk_norm', False)
         )
         self.model.to(self.device)
 
