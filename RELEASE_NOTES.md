@@ -2,6 +2,16 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.33 (2026-03-28)
+
+### QK-normalization (`transformers.py`, `model.py`, `config.py`, `trainer.py`)
+
+- **Per-head RMSNorm on Q and K projections** (`transformers.py`): `MultiHeadAttentionImproved` now accepts a `qk_norm: bool = False` parameter. When enabled, `nn.RMSNorm(d_k)` is applied independently to Q and K after the linear projection but **before** RoPE. This decouples attention logit magnitudes from the projection weight norms, breaking the self-reinforcing growth loop (larger `w_o` → larger outputs → larger gradients → larger `w_o`) that caused unbounded decoder attention weight growth across training runs.
+- **Threaded through all constructor chains**: `qk_norm` is propagated through `ImprovedTransformerEncoderBlock`, `ImprovedTransformerDecoderBlock` (both self-attn and cross-attn), `ImprovedTransformerDecoder`, and the compatibility wrappers `TransformerEncoderBlock` and `TransformerDecoder`.
+- **Model constructor** (`model.py`): `KokoroModel.__init__` accepts `qk_norm: bool = False` and passes it to all encoder blocks and the decoder.
+- **Config field** (`config.py`): `TrainingConfig.qk_norm: bool = False` added. Set to `True` to enable QK-norm for new training runs. Incompatible with prior checkpoints (new `q_norm`/`k_norm` parameters in state dict).
+- **Trainer wiring** (`trainer.py`): `_setup_model()` passes `qk_norm` from config to `KokoroModel`.
+
 ## 0.0.32 (2026-03-13)
 
 - Perform post-step norm clamping on all decoder layers
