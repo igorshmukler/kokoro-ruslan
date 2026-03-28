@@ -1,3 +1,8 @@
+import torch
+import pytest
+
+from kokoro.training.trainer import KokoroTrainer
+
 """
 Unit tests for KokoroTrainer._apply_spec_augment and its epoch gate.
 
@@ -10,12 +15,6 @@ Covers:
   - use_spec_augment=False path passes mel_specs through unchanged
   - spec_augment_start_epoch gate: augment suppressed before the epoch threshold
 """
-import torch
-import pytest
-from unittest.mock import MagicMock
-
-from kokoro.training.trainer import KokoroTrainer
-
 
 def _mel(B=2, T=100, mel_dim=80):
     """Return a fixed-seed mel tensor filled with non-zero values."""

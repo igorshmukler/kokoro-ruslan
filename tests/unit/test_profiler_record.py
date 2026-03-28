@@ -1,3 +1,11 @@
+import contextlib
+from unittest.mock import patch, MagicMock
+
+import pytest
+import torch
+
+from kokoro.training.trainer import KokoroTrainer
+
 """
 Unit tests for KokoroTrainer._profiler_record
 
@@ -8,15 +16,6 @@ The helper must:
   - Not execute torch.profiler.record_function when active=False
   - Execute torch.profiler.record_function with the correct name when active=True
 """
-import contextlib
-from contextlib import nullcontext
-from unittest.mock import patch, MagicMock
-
-import pytest
-import torch
-
-from kokoro.training.trainer import KokoroTrainer
-
 
 def _make_trainer() -> KokoroTrainer:
     """Minimal trainer sufficient to call _profiler_record."""

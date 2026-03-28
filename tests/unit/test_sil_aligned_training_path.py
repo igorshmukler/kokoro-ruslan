@@ -1,3 +1,12 @@
+import pytest
+from unittest.mock import MagicMock
+from pathlib import Path
+from typing import List, Tuple
+
+from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
+from kokoro.data.audio_utils import PhonemeProcessorUtils
+from kokoro.data.mfa_integration import MFAIntegration, PhonemeAlignment, WordAlignment
+
 """
 Tests for the training/inference phoneme-sequence alignment fix (v0.0.22).
 
@@ -25,16 +34,6 @@ TestDatasetPhonemePathUsesSil   – structural guarantee: dataset uses sil path
 TestCacheVersionBump            – FEATURE_CACHE_VERSION == 4
 TestInferenceTrainingConsistency – the produced sequences are identical
 """
-
-import pytest
-from unittest.mock import MagicMock, patch
-from pathlib import Path
-from typing import List, Tuple
-
-from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor
-from kokoro.data.audio_utils import PhonemeProcessorUtils
-from kokoro.data.mfa_integration import MFAIntegration, PhonemeAlignment, WordAlignment
-
 
 # ---------------------------------------------------------------------------
 # Helpers

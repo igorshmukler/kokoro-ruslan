@@ -42,7 +42,7 @@ class KokoroModel(nn.Module):
                  n_variance_bins: int = 256, pitch_min: float = 50.0,
                  pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0,
                  use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1,
-                 use_stress_embedding: bool = True):
+                 use_stress_embedding: bool = True, qk_norm: bool = False):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
@@ -91,21 +91,39 @@ class KokoroModel(nn.Module):
         )
 
         # Stochastic depth: linearly increase drop_path from 0 to stochastic_depth_rate
-        drop_path_rates = [
+        encoder_drop_path_rates = [
             (i / max(n_encoder_layers - 1, 1)) * stochastic_depth_rate if use_stochastic_depth else 0.0
             for i in range(n_encoder_layers)
+        ]
+        decoder_drop_path_rates = [
+            (i / max(n_decoder_layers - 1, 1)) * stochastic_depth_rate if use_stochastic_depth else 0.0
+            for i in range(n_decoder_layers)
         ]
 
         self.transformer_encoder_layers = nn.ModuleList([
             TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout,
-                                   drop_path_rate=drop_path_rates[i])
+                                   drop_path_rate=encoder_drop_path_rates[i],
+                                   qk_norm=qk_norm)
             for i in range(n_encoder_layers)
         ])
 
+        # Final LayerNorm after encoder stack (required for pre-norm architecture).
+        # Each encoder block outputs x + sublayer(norm(x)), accumulating unnormalized
+        # residual contributions.  Without a final norm, the encoder output magnitude
+        # drifts as weights change, destabilizing downstream cross-attention and
+        # variance predictors — especially near the LR peak.
+        self.encoder_norm = nn.LayerNorm(hidden_dim)
+
         # Variance Adaptor (includes duration, pitch, energy predictors) or a
         # simple fallback adaptor that provides the same unified interface.
+        # NOTE: VarianceAdaptor is owned exclusively by VarianceAdaptorWrapper
+        # (registered as duration_adaptor.variance_adaptor).  Do NOT also store
+        # it as self.variance_adaptor — doing so causes PyTorch to register the
+        # same parameters under two distinct paths in state_dict / named_parameters(),
+        # doubling checkpoint size and corrupting weight-delta analysis.
+        # External callers should use the variance_adaptor property below.
         if self.use_variance_predictor:
-            self.variance_adaptor = VarianceAdaptor(
+            self.duration_adaptor = VarianceAdaptorWrapper(VarianceAdaptor(
                 hidden_dim=hidden_dim,
                 filter_size=variance_filter_size,
                 kernel_size=variance_kernel_size,
@@ -114,10 +132,8 @@ class KokoroModel(nn.Module):
                 pitch_min=pitch_min,
                 pitch_max=pitch_max,
                 energy_min=energy_min,
-                energy_max=energy_max
-            )
-            # Wrap to provide a consistent interface
-            self.duration_adaptor = VarianceAdaptorWrapper(self.variance_adaptor)
+                energy_max=energy_max,
+            ))
             logger.info("Variance predictor enabled (pitch/energy)")
         else:
             # Fallback duration predictor - keep as a small module but expose
@@ -156,7 +172,9 @@ class KokoroModel(nn.Module):
             nhead=n_heads,
             dim_feedforward=decoder_ff_dim,
             dropout=encoder_dropout,
-            num_layers=n_decoder_layers
+            num_layers=n_decoder_layers,
+            drop_path_rates=decoder_drop_path_rates,
+            qk_norm=qk_norm
         )
 
         # Output projection for Mel Spectrogram
@@ -178,6 +196,18 @@ class KokoroModel(nn.Module):
         if self.gradient_checkpointing:
             logger.info(f"Gradient checkpointing enabled with {checkpoint_segments} segments")
             logger.info(f"Encoder layers: {n_encoder_layers}, Decoder layers: {n_decoder_layers}")
+
+    @property
+    def variance_adaptor(self) -> Optional['VarianceAdaptor']:
+        """Convenience accessor for the wrapped VarianceAdaptor.
+
+        Parameters are registered only under ``duration_adaptor.variance_adaptor``
+        to avoid duplicate entries in ``state_dict`` / ``named_parameters()``.
+        Returns ``None`` when the variance predictor is disabled.
+        """
+        if self.use_variance_predictor:
+            return self.duration_adaptor.variance_adaptor
+        return None
 
     def enable_gradient_checkpointing(self, segments: int = None):
         """Enable gradient checkpointing"""
@@ -330,6 +360,9 @@ class KokoroModel(nn.Module):
             # Use checkpointed encoder layers (logging handled internally)
             x = self._checkpoint_encoder_layers(text_emb, self.transformer_encoder_layers, mask)
 
+            # Final LayerNorm (pre-norm architecture requires this after the last block)
+            x = self.encoder_norm(x)
+
             return x
 
     def _predict_durations(self, text_encoded: torch.Tensor) -> torch.Tensor:
@@ -417,23 +450,13 @@ class KokoroModel(nn.Module):
                 del stress_indices
 
             # 2. Use unified duration adaptor (either VarianceAdaptorWrapper or
-            #    SimpleDurationAdaptor). Compute phoneme-level pitch/energy
-            #    averages when provided (training path), then delegate to the
-            #    adaptor which always returns the same canonical tuple.
-            phoneme_pitch = None
-            phoneme_energy = None
-
-            if (not inference) and (pitch_targets is not None):
-                phoneme_pitch = self._average_by_duration(
-                    pitch_targets, phoneme_durations, text_padding_mask
-                )
-                del pitch_targets
-
-            if (not inference) and (energy_targets is not None):
-                phoneme_energy = self._average_by_duration(
-                    energy_targets, phoneme_durations, text_padding_mask
-                )
-                del energy_targets
+            #    SimpleDurationAdaptor). Pass frame-level pitch/energy targets
+            #    directly — VarianceAdaptor.forward detects that their length
+            #    does not match the phoneme count and skips the expand step,
+            #    supplying the continuous intra-phoneme variation to the
+            #    pitch/energy embeddings instead of piecewise-constant averages.
+            frame_pitch  = pitch_targets  if (not inference) else None
+            frame_energy = energy_targets if (not inference) else None
 
             duration_target = phoneme_durations.float() if (not inference and phoneme_durations is not None) else None
 
@@ -444,14 +467,17 @@ class KokoroModel(nn.Module):
              frame_mask) = self.duration_adaptor(
                 text_encoded,
                 mask=text_padding_mask,
-                pitch_target=phoneme_pitch,
-                energy_target=phoneme_energy,
+                pitch_target=frame_pitch,
+                energy_target=frame_energy,
                 duration_target=duration_target,
                 inference=inference,
+                # Frame-level targets from the dataset; explicit flag prevents
+                # the phoneme-count size-equality heuristic from misrouting them.
+                pitch_target_is_frame_level=(not inference),
             )
 
             # free intermediates
-            del text_encoded, phoneme_pitch, phoneme_energy, phoneme_durations, text_padding_mask
+            del text_encoded, frame_pitch, frame_energy, phoneme_durations, text_padding_mask
 
             expanded_encoder_outputs = adapted_encoder_output
             encoder_output_padding_mask = frame_mask
@@ -499,10 +525,19 @@ class KokoroModel(nn.Module):
     def _project_decoder_outputs(self, decoder_outputs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project decoder outputs to mel frames and stop logits.
 
+        The stop head receives a detached view of decoder_outputs so that the
+        BCE stop loss cannot propagate gradients back into the mel decoder.
+        Rationale: stop_token_loss_weight=0.010 means the stop gradient
+        contributes only ~1% of the mel budget, but under the high-LR ascending
+        phase of OneCycleLR it can still spike disproportionately at the single
+        stop frame (×pos_weight) and corrupt the shared decoder representation.
+        Detaching isolates that instability entirely while the stop head still
+        receives its own gradient signal through its weight/bias.
+
         Returns: (predicted_mel_frames, predicted_stop_logits)
         """
         predicted_mel_frames = self.mel_projection_out(decoder_outputs)
-        predicted_stop_logits = self.stop_token_predictor(decoder_outputs).squeeze(-1)
+        predicted_stop_logits = self.stop_token_predictor(decoder_outputs.detach()).squeeze(-1)
         return predicted_mel_frames, predicted_stop_logits
 
     def forward_training(

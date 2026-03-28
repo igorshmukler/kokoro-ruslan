@@ -16,7 +16,7 @@ Covered behaviours
       is below the ceiling
   8.  After clamping, the weight norm is ≤ max_norm (within float tolerance)
   9.  max_norm ≤ 0.0 skips the clamp even when the weight has a huge norm
-  10. The constraint only touches linear1.weight; linear2.weight is unaffected
+  10. The constraint clamps both linear1.weight and linear2.weight in every decoder FF layer
   11. _apply_weight_norm_constraints is a no-op when _dec_ff0_linear1_weight is
       None (missing-module path does not raise)
   12. Weight direction (unit vector) is preserved after clamping
@@ -154,6 +154,7 @@ def test_setup_sets_none_and_warns_when_module_absent():
     trainer = KokoroTrainer.__new__(KokoroTrainer)
     trainer.model = _EmptyModel()
     trainer.config = SimpleNamespace(dec_ff0_linear1_max_weight_norm=60.0)
+    trainer._enc_ff_weights = []
 
     with warnings.catch_warnings(record=True):
         warnings.simplefilter("always")
@@ -225,10 +226,11 @@ def test_apply_is_noop_when_max_norm_disabled(max_norm):
 
 
 # ---------------------------------------------------------------------------
-# 10: linear2 is untouched
+# 10: both linear1 and linear2 are clamped
 # ---------------------------------------------------------------------------
 
-def test_apply_does_not_modify_linear2_weight():
+def test_apply_also_clamps_linear2_weight():
+    """_apply_weight_norm_constraints constrains all decoder FF weights (linear1 and linear2)."""
     max_norm = 60.0
     trainer = _make_trainer(max_norm=max_norm)
     trainer._setup_weight_norm_constraints()
@@ -238,13 +240,11 @@ def test_apply_does_not_modify_linear2_weight():
     _set_weight_norm(trainer._dec_ff0_linear1_weight, 300.0)
     _set_weight_norm(linear2.weight, 300.0)
 
-    norm2_before = linear2.weight.norm(2).item()
     trainer._apply_weight_norm_constraints()
 
-    # linear1 was clamped
+    # both linear1 and linear2 were clamped
     assert trainer._dec_ff0_linear1_weight.norm(2).item() <= max_norm + 1e-5
-    # linear2 was NOT touched
-    assert abs(linear2.weight.norm(2).item() - norm2_before) < 1e-5
+    assert linear2.weight.norm(2).item() <= max_norm + 1e-5
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +256,8 @@ def test_apply_is_noop_when_weight_ref_is_none():
     trainer = KokoroTrainer.__new__(KokoroTrainer)
     trainer.config = SimpleNamespace(dec_ff0_linear1_max_weight_norm=60.0)
     trainer._dec_ff0_linear1_weight = None
+    trainer._dec_ff_weights = []
+    trainer._enc_ff_weights = []
     # Must not raise
     trainer._apply_weight_norm_constraints()
 

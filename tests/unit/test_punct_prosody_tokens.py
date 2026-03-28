@@ -1,3 +1,9 @@
+import pytest
+
+from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor, StressInfo
+from kokoro.data.audio_utils import PhonemeProcessorUtils
+from kokoro.data.dataset import FEATURE_CACHE_VERSION
+
 """
 Tests for the prosody-conditioning punctuation token feature (v0.0.22).
 
@@ -31,14 +37,6 @@ TestFlattenWithSilInjectsPunct – correct token order (phonemes→punct→sil)
 TestEndToEndTokenSequence    – full round-trip: text → flat sequence
 TestCacheVersion             – FEATURE_CACHE_VERSION == 5
 """
-
-import pytest
-from typing import Optional
-
-from kokoro.data.russian_phoneme_processor import RussianPhonemeProcessor, StressInfo
-from kokoro.data.audio_utils import PhonemeProcessorUtils
-from kokoro.data.dataset import FEATURE_CACHE_VERSION
-
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 

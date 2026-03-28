@@ -289,7 +289,8 @@ class VarianceAdaptor(nn.Module):
                 pitch_target: Optional[torch.Tensor] = None,
                 energy_target: Optional[torch.Tensor] = None,
                 duration_target: Optional[torch.Tensor] = None,
-                mel_target: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, ...]:
+                mel_target: Optional[torch.Tensor] = None,
+                pitch_target_is_frame_level: bool = False) -> Tuple[torch.Tensor, ...]:
         """
         Forward pass through variance adaptor.
 
@@ -300,10 +301,15 @@ class VarianceAdaptor(nn.Module):
         Args:
             encoder_output: Phoneme-level encoder output (batch, n_phonemes, hidden_dim)
             mask: Phoneme-level padding mask (batch, n_phonemes) — True for padding
-            pitch_target: Token-level normalized pitch targets (batch, n_phonemes).
-                          May be in Hz; will be auto-converted to [0, 1] if needed.
-            energy_target: Token-level normalized energy targets (batch, n_phonemes).
-                           Will be auto-converted to [0, 1] if needed.
+            pitch_target: Pitch targets — either phoneme-level (batch, n_phonemes)
+                          or frame-level (batch, n_frames).  Phoneme-level targets
+                          are detected when their length matches ``encoder_output``
+                          and are expanded to frame-level via ``_expand_targets``;
+                          frame-level targets are aligned (truncated/padded) to
+                          the expanded length directly, preserving intra-phoneme
+                          variation.  Values may be in Hz; auto-converted to [0,1].
+            energy_target: Energy targets — same dual-level handling as
+                           ``pitch_target``.
             duration_target: Ground-truth frame counts per phoneme (batch, n_phonemes).
                              If None, model predictions are used (inference mode).
                              NOTE: if your duration predictor is trained in log-domain,
@@ -311,6 +317,12 @@ class VarianceAdaptor(nn.Module):
                              exp() to duration_pred before using it for inference.
             mel_target: Ground-truth mel spectrogram (batch, n_frames, n_mels) used
                         only to determine the target frame length for alignment.
+            pitch_target_is_frame_level: When True, ``pitch_target`` and
+                        ``energy_target`` are treated as frame-level tensors
+                        regardless of their length, bypassing the phoneme-count
+                        size-equality heuristic.  Pass True from training paths
+                        that supply dataset frame-level targets to avoid
+                        misrouting for short utterances where n_frames ≈ n_phonemes.
 
         Returns:
             Tuple of:
@@ -360,22 +372,56 @@ class VarianceAdaptor(nn.Module):
         energy_pred = self.energy_predictor(x, frame_mask)
 
         # 6. Determine values to embed
-        #    Training:  expand token-level targets to frame-level, then normalize.
-        #    Inference: clamp model predictions into [0, 1] (no Hz heuristic applied
-        #               to raw logits — that would silently corrupt predictions).
+        #    Training:  align targets to the current frame length.
+        #      • Phoneme-level targets (length == n_phonemes): expand via
+        #        repeat_interleave so each phoneme's value fills its frames.
+        #      • Frame-level targets (length != n_phonemes): truncate or
+        #        zero-pad to match the expanded length.  This preserves
+        #        intra-phoneme F0/energy variation instead of collapsing it
+        #        to a piecewise-constant signal.
+        #    Inference: clamp model predictions into [0, 1] (no Hz heuristic
+        #               applied to raw logits — that would silently corrupt).
+        n_phonemes = encoder_output.size(1)
+        frame_len  = x.size(1)
+
         if pitch_target is not None:
-            # Expand token-level targets → frame-level before normalization
-            pitch_frame = self._expand_targets_to_frame_level(
-                pitch_target, durations_to_use, max_len=max_len
-            )
+            # Determine whether the target is phoneme-level or frame-level.
+            # The explicit flag takes precedence over the size-equality heuristic
+            # to avoid ambiguity when n_phonemes happens to equal the frame count
+            # (e.g. single-phoneme or very short utterances).
+            is_phoneme_level = (not pitch_target_is_frame_level
+                                and pitch_target.size(1) == n_phonemes)
+            if is_phoneme_level:
+                # Phoneme-level path: expand to frame level (legacy / explicit)
+                pitch_frame = self._expand_targets_to_frame_level(
+                    pitch_target, durations_to_use, max_len=max_len
+                )
+            else:
+                # Frame-level path: align length to the expanded frame count
+                t_len = pitch_target.size(1)
+                if t_len >= frame_len:
+                    pitch_frame = pitch_target[:, :frame_len]
+                else:
+                    pitch_frame = F.pad(pitch_target, (0, frame_len - t_len))
             p_val = self._maybe_normalize_pitch(pitch_frame, device=device)
         else:
             p_val = pitch_pred.clamp(0.0, 1.0)
 
         if energy_target is not None:
-            energy_frame = self._expand_targets_to_frame_level(
-                energy_target, durations_to_use, max_len=max_len
-            )
+            is_phoneme_level = (not pitch_target_is_frame_level
+                                and energy_target.size(1) == n_phonemes)
+            if is_phoneme_level:
+                # Phoneme-level path: expand to frame level (legacy / explicit)
+                energy_frame = self._expand_targets_to_frame_level(
+                    energy_target, durations_to_use, max_len=max_len
+                )
+            else:
+                # Frame-level path: align length to the expanded frame count
+                t_len = energy_target.size(1)
+                if t_len >= frame_len:
+                    energy_frame = energy_target[:, :frame_len]
+                else:
+                    energy_frame = F.pad(energy_target, (0, frame_len - t_len))
             e_val = self._maybe_normalize_energy(energy_frame, device=device)
         else:
             e_val = energy_pred.clamp(0.0, 1.0)

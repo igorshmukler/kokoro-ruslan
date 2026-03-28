@@ -1,9 +1,3 @@
-"""
-Tests covering duration decoding in VarianceAdaptor inference mode.
-
-Duration predictor outputs are trained in log1p-domain, so inference must decode
-with expm1 before rounding: round(expm1(log1p(d))) == d.
-"""
 import math
 import torch
 import torch.nn as nn
@@ -11,6 +5,12 @@ import pytest
 
 from kokoro.model.variance_predictor import VarianceAdaptor
 
+"""
+Tests covering duration decoding in VarianceAdaptor inference mode.
+
+Duration predictor outputs are trained in log1p-domain, so inference must decode
+with expm1 before rounding: round(expm1(log1p(d))) == d.
+"""
 
 # ---------------------------------------------------------------------------
 # Helper: a fixed-output duration predictor (bypasses learning)

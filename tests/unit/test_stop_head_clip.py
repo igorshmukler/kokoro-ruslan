@@ -1,3 +1,11 @@
+import pytest
+import torch
+import torch.nn as nn
+from types import SimpleNamespace
+
+from kokoro.training.config import TrainingConfig
+from kokoro.training.trainer import KokoroTrainer
+
 """
 Tests for stop-head gradient isolation via per-parameter clipping.
 
@@ -18,16 +26,6 @@ Covered behaviours:
   9.  With stop_head_spike_clip_norm=0 stop-head grads are left untouched
   10. Both weight and bias of stop head are independently clipped
 """
-
-import math
-import pytest
-import torch
-import torch.nn as nn
-from types import SimpleNamespace
-
-from kokoro.training.config import TrainingConfig
-from kokoro.training.trainer import KokoroTrainer
-
 
 # ---------------------------------------------------------------------------
 # Minimal model fixture that mirrors the real model's named parameters
@@ -89,7 +87,7 @@ def _inject_grad(module: nn.Linear, weight_norm: float, bias_norm: float) -> Non
 class TestConfigDefaults:
 
     def test_default_stop_head_clip_norm(self):
-        assert TrainingConfig.__dataclass_fields__['stop_head_spike_clip_norm'].default == pytest.approx(1.0)
+        assert TrainingConfig.__dataclass_fields__['stop_head_spike_clip_norm'].default == pytest.approx(0.5)
 
     def test_custom_value_survives_post_init(self):
         cfg = TrainingConfig(stop_head_spike_clip_norm=5.0)

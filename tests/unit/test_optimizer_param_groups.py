@@ -43,6 +43,8 @@ class _FakeModel(nn.Module):
         # Decoder / rest (no encoder prefix)
         self.decoder_layers = nn.Linear(8, 8)
         self.output_projection = nn.Linear(8, 4)
+        # Stop head — carved out into its own param group
+        self.stop_token_predictor = nn.Linear(8, 1)
 
 
 class _DecoderOnlyModel(nn.Module):
@@ -84,11 +86,11 @@ def _make_trainer(
 # ---------------------------------------------------------------------------
 
 class TestParamGroupStructure:
-    def test_creates_three_param_groups(self):
+    def test_creates_four_param_groups(self):
         trainer = _make_trainer(_FakeModel())
         trainer._setup_optimizer()
-        assert len(trainer.optimizer.param_groups) == 3, (
-            "Expected 3 groups: encoder, decoder_no_decay, decoder_decay"
+        assert len(trainer.optimizer.param_groups) == 4, (
+            "Expected 4 groups: encoder, decoder_no_decay, decoder_decay, decoupled_weight_decay"
         )
 
     def test_all_params_covered_across_groups(self):

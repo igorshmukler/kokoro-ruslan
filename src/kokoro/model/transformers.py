@@ -70,8 +70,11 @@ class GLUFeedForward(nn.Module):
           → activation(gate) * linear
           → dropout
           → linear2 (dim_feedforward → d_model)
+          → dropout
 
-    Weight matrices are initialised with Xavier uniform; biases are zeroed.
+    linear2 uses Xavier with gain=0.5 so that the FFN branch starts as a
+    near-identity (small contribution to the residual stream) and must earn
+    its influence during training, preventing early-epoch FFN dominance.
     """
 
     def __init__(self, d_model: int, dim_feedforward: int, dropout: float,
@@ -88,14 +91,14 @@ class GLUFeedForward(nn.Module):
         nn.init.xavier_uniform_(self.linear1.weight)
         if self.linear1.bias is not None:
             nn.init.zeros_(self.linear1.bias)
-        nn.init.xavier_uniform_(self.linear2.weight)
+        nn.init.xavier_uniform_(self.linear2.weight, gain=0.5)
         if self.linear2.bias is not None:
             nn.init.zeros_(self.linear2.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear1(x)
         gate, linear = x.chunk(2, dim=-1)
-        return self.linear2(self.dropout(self.activation(gate) * linear))
+        return self.dropout(self.linear2(self.dropout(self.activation(gate) * linear)))
 
 
 class MultiHeadAttentionImproved(nn.Module):
@@ -103,7 +106,7 @@ class MultiHeadAttentionImproved(nn.Module):
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1,
                  use_relative_pos: bool = False, max_relative_distance: int = 32,
-                 rel_pos_type: str = 'alibi'):
+                 rel_pos_type: str = 'alibi', qk_norm: bool = False):
         super().__init__()
         assert d_model % num_heads == 0, f"d_model ({d_model}) must be divisible by num_heads ({num_heads})"
 
@@ -112,6 +115,7 @@ class MultiHeadAttentionImproved(nn.Module):
         self.d_k = d_model // num_heads # Dimension of each head's key/query/value
         self.use_relative_pos = use_relative_pos
         self.rel_pos_type = rel_pos_type
+        self.qk_norm = qk_norm
 
         # Linear projections for Query, Key, Value
         self.w_q = nn.Linear(d_model, d_model, bias=False)
@@ -120,6 +124,13 @@ class MultiHeadAttentionImproved(nn.Module):
 
         # Output linear projection
         self.w_o = nn.Linear(d_model, d_model)
+
+        # QK-normalization: per-head RMSNorm on Q and K after projection.
+        # Decouples attention logit magnitude from weight norm, preventing
+        # the self-reinforcing growth loop (larger w → larger output → larger grad → larger w).
+        if qk_norm:
+            self.q_norm = nn.RMSNorm(self.d_k)
+            self.k_norm = nn.RMSNorm(self.d_k)
 
         if use_relative_pos:
             if rel_pos_type == 'rope':
@@ -233,7 +244,15 @@ class MultiHeadAttentionImproved(nn.Module):
 
         seq_len_k = K.size(2)
 
-        # 2a. Apply RoPE to Q and K (MPS-compatible relative positional encoding)
+        # 2a-i. Apply QK-normalization before positional encoding.
+        # RMSNorm on the last dim (d_k) of each head independently.
+        # Applied before RoPE so that rotary embeddings operate on unit-scale vectors,
+        # keeping dot-product magnitudes bounded regardless of projection weight growth.
+        if self.qk_norm:
+            Q = self.q_norm(Q)
+            K = self.k_norm(K)
+
+        # 2a-ii. Apply RoPE to Q and K (MPS-compatible relative positional encoding)
         # RoPE operates on Q/K in their native dtype — no dtype mixing, no MPS bugs.
         if self.use_relative_pos and self.rel_pos_type == 'rope':
             Q, K = self.rope(Q, K)
@@ -404,13 +423,15 @@ class ImprovedTransformerEncoderBlock(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', use_relative_pos: bool = False,
-                 drop_path_rate: float = 0.0, rel_pos_type: str = 'alibi'):
+                 drop_path_rate: float = 0.0, rel_pos_type: str = 'alibi',
+                 qk_norm: bool = False):
         super().__init__()
         self.drop_path_rate = drop_path_rate
 
         # Self-attention module
         self.self_attn = MultiHeadAttentionImproved(
-            d_model, nhead, dropout, use_relative_pos, rel_pos_type=rel_pos_type
+            d_model, nhead, dropout, use_relative_pos, rel_pos_type=rel_pos_type,
+            qk_norm=qk_norm
         )
 
         # GLU-style feedforward (Gated Linear Unit)
@@ -452,17 +473,21 @@ class ImprovedTransformerDecoderBlock(nn.Module):
     """Enhanced Transformer decoder block with improved architecture"""
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 activation: str = 'gelu', rel_pos_type: str = 'alibi'):
+                 activation: str = 'gelu', rel_pos_type: str = 'alibi',
+                 drop_path_rate: float = 0.0, qk_norm: bool = False):
         super().__init__()
+        self.drop_path_rate = drop_path_rate
 
         # Decoder self-attention: uses relative positional encoding.
         # Pass rel_pos_type so callers can choose 'rope' (MPS-safe) or 'alibi'.
         self.self_attn = MultiHeadAttentionImproved(
-            d_model, nhead, dropout, use_relative_pos=True, rel_pos_type=rel_pos_type
+            d_model, nhead, dropout, use_relative_pos=True, rel_pos_type=rel_pos_type,
+            qk_norm=qk_norm
         )
 
         # Cross-attention (encoder-decoder attention): no relative pos, queries from decoder, keys/values from encoder
-        self.cross_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=False)
+        self.cross_attn = MultiHeadAttentionImproved(d_model, nhead, dropout, use_relative_pos=False,
+                                                     qk_norm=qk_norm)
 
         # GLU-style feedforward
         self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation)
@@ -517,7 +542,7 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                        attn_mask=tgt_mask,
                                                        key_padding_mask=tgt_key_padding_mask,
                                                        kv_cache=self_attn_kv_cache)
-        tgt = tgt + self.dropout1(attn_output)
+        tgt = tgt + self.dropout1(drop_path(attn_output, self.drop_path_rate, self.training))
 
         # Cross-attention
         tgt_norm = self.norm2(tgt)
@@ -526,10 +551,10 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                   key_padding_mask=memory_key_padding_mask,
                                                   precomputed_k=cached_k,
                                                   precomputed_v=cached_v)
-        tgt = tgt + self.dropout2(cross_attn_output)
+        tgt = tgt + self.dropout2(drop_path(cross_attn_output, self.drop_path_rate, self.training))
 
         # Feed-forward
-        tgt = tgt + self.dropout3(self.ff(self.norm3(tgt)))
+        tgt = tgt + self.dropout3(drop_path(self.ff(self.norm3(tgt)), self.drop_path_rate, self.training))
 
         return tgt, updated_cache
 
@@ -539,15 +564,22 @@ class ImprovedTransformerDecoder(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int, activation: str = 'gelu',
-                 rel_pos_type: str = 'alibi'):
+                 rel_pos_type: str = 'alibi',
+                 drop_path_rates: Optional[list] = None,
+                 qk_norm: bool = False):
         super().__init__()
         self.num_layers = num_layers
+
+        if drop_path_rates is None:
+            drop_path_rates = [0.0] * num_layers
 
         self.layers = nn.ModuleList([
             ImprovedTransformerDecoderBlock(
                 d_model, nhead, dim_feedforward, dropout, activation,
-                rel_pos_type=rel_pos_type
-            ) for _ in range(num_layers)
+                rel_pos_type=rel_pos_type,
+                drop_path_rate=drop_path_rates[i],
+                qk_norm=qk_norm
+            ) for i in range(num_layers)
         ])
 
         # Final LayerNorm applied after all blocks (pre-norm architecture)
@@ -611,10 +643,11 @@ class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     RoPE is MPS-safe (operates in native dtype, no mixed-dtype arithmetic).
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 drop_path_rate: float = 0.0):
+                 drop_path_rate: float = 0.0, qk_norm: bool = False):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
                         activation='gelu', use_relative_pos=True,
-                        rel_pos_type='rope', drop_path_rate=drop_path_rate)
+                        rel_pos_type='rope', drop_path_rate=drop_path_rate,
+                        qk_norm=qk_norm)
 
 
 class TransformerDecoder(ImprovedTransformerDecoder):
@@ -624,7 +657,11 @@ class TransformerDecoder(ImprovedTransformerDecoder):
     RoPE is fully MPS-safe.
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
-                 dropout: float, num_layers: int):
+                 dropout: float, num_layers: int,
+                 drop_path_rates: Optional[list] = None,
+                 qk_norm: bool = False):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
-                        activation='gelu', rel_pos_type='rope')
+                        activation='gelu', rel_pos_type='rope',
+                        drop_path_rates=drop_path_rates,
+                        qk_norm=qk_norm)
 
