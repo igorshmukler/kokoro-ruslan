@@ -35,6 +35,7 @@ def _purge_tb_events_after_step(
       * Scalars  — replayed via ``add_scalar`` (float round-trip).
       * Images   — replayed via ``file_writer.add_summary`` (lossless proto copy).
       * Histograms — replayed via ``file_writer.add_summary`` (lossless proto copy).
+      * Custom scalars layout — replayed via ``file_writer.add_summary`` (lossless proto copy).
 
     Falls back to a plain delete-and-reopen if the tensorboard event reader is
     unavailable.
@@ -52,6 +53,9 @@ def _purge_tb_events_after_step(
     # arrays for histograms) are copied verbatim without re-encoding.
     kept_images: list = []
     kept_histograms: list = []
+    # kept_custom_scalars: list of (step, Summary.Value proto) for the
+    # custom_scalars layout plugin (written by add_custom_scalars).
+    kept_custom_scalars: list = []
     read_ok = False
     if event_files:
         try:
@@ -81,6 +85,8 @@ def _purge_tb_events_after_step(
                                     kept_images.append((raw.step, value))
                                 elif plugin == 'histograms':
                                     kept_histograms.append((raw.step, value))
+                                elif plugin == 'custom_scalars':
+                                    kept_custom_scalars.append((raw.step, value))
                                 else:
                                     # Attempt scalar conversion for plain tensor scalars.
                                     try:
@@ -101,8 +107,8 @@ def _purge_tb_events_after_step(
             read_ok = True
             logger.info(
                 f"Read {len(kept_scalars)} scalars, {len(kept_images)} images, "
-                f"{len(kept_histograms)} histograms (step <= {keep_up_to_step}) "
-                f"from {len(event_files)} event file(s) in {log_dir}"
+                f"{len(kept_histograms)} histograms, {len(kept_custom_scalars)} custom scalar layouts "
+                f"(step <= {keep_up_to_step}) from {len(event_files)} event file(s) in {log_dir}"
             )
         except ImportError:
             logger.warning(
@@ -137,8 +143,8 @@ def _purge_tb_events_after_step(
                     "Chart history will start from the resume point."
                 )
 
-        # --- Images & histograms: replay via file_writer.add_summary (lossless) ---
-        if kept_images or kept_histograms:
+        # --- Images, histograms & custom scalars layout: replay via file_writer.add_summary (lossless) ---
+        if kept_images or kept_histograms or kept_custom_scalars:
             try:
                 from tensorboard.compat.proto.summary_pb2 import Summary
 
@@ -150,15 +156,20 @@ def _purge_tb_events_after_step(
                     s = Summary(value=[val])
                     new_writer.file_writer.add_summary(s, global_step=step)
 
+                for step, val in kept_custom_scalars:
+                    s = Summary(value=[val])
+                    new_writer.file_writer.add_summary(s, global_step=step)
+
                 new_writer.flush()
                 logger.info(
-                    f"Replayed {len(kept_images)} images and {len(kept_histograms)} histograms "
+                    f"Replayed {len(kept_images)} images, {len(kept_histograms)} histograms, "
+                    f"and {len(kept_custom_scalars)} custom scalar layouts "
                     f"into new TensorBoard file (purged everything after step {keep_up_to_step})"
                 )
             except Exception as _write_err:
                 logger.warning(
-                    f"Could not replay historical images/histograms into TensorBoard writer: {_write_err}. "
-                    "Image/histogram history will start from the resume point."
+                    f"Could not replay historical images/histograms/custom scalars into TensorBoard writer: {_write_err}. "
+                    "Image/histogram/custom scalar history will start from the resume point."
                 )
 
     return new_writer
