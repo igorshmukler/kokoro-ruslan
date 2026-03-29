@@ -62,7 +62,11 @@ class TrainingConfig:
     # Dec layers 3-5 self_attn consumed 59% of all weight deltas by Ep32 with
     # Dec.5 w_o growing 27.7→88.2 (3.2×) — driven by running at full base LR.
     # 0.4× dampens attention updates while still allowing meaningful learning.
-    decoder_attn_lr_multiplier: float = 0.4
+    # QK-norm run Ep20: dec.5.self_attn.w_o growth rate 2.73/ep and accelerating
+    # (1.89→2.31→2.54→2.73 per epoch across Ep12-20), past the 2.0/ep threshold.
+    # Norm now 45.2 (vs. 27.7 at Ep1). Lowered 0.4→0.35 (12.5% reduction) to
+    # limit further acceleration while preserving meaningful attn learning.
+    decoder_attn_lr_multiplier: float = 0.35
 
     # QK-normalization: per-head RMSNorm on Q and K after projection.
     # Decouples attention logit scale from weight norms, preventing unbounded
