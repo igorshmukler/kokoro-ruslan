@@ -53,7 +53,10 @@ class TrainingConfig:
     # 0.3: peak FFN LR ≈ 1.65e-5. Still too high — 3 consecutive val_mel regressions Ep9-11 at
     # 99% of LR peak, all mel-only (stop/duration kept improving → FFN is confirmed driver).
     # Lowered to 0.2: peak FFN LR = base_lr × max_lr_mult × 0.2 ≈ 1.10e-5.
-    decoder_ffn_lr_multiplier: float = 0.2
+    # QK-norm run: FFN became dominant mover (5/6 epochs #1) once self-attn growth was suppressed.
+    # dec.0.ff.linear1 norm 35.97→44.17 over Ep1-8, growth rate accelerating 1.35→2.24/ep.
+    # Val_mel plateau at ~1.062 for 3 epochs at 89.7% of LR peak. Lowered 0.2→0.15.
+    decoder_ffn_lr_multiplier: float = 0.15
     # LR multiplier for decoder self-attention and cross-attention layers
     # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
     # Dec layers 3-5 self_attn consumed 59% of all weight deltas by Ep32 with
