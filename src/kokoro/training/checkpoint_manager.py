@@ -870,6 +870,8 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             logger.info(
                 f"OneCycleLR reconstructed from current config after resume: "
                 f"decoder max_lr={max_lr:.2e}, encoder max_lr={max_lr * encoder_lr_mult:.2e}, "
+                f"decoder_attn max_lr={max_lr * _decoder_attn_lr_mult:.2e}, "
+                f"decoder_ffn max_lr={max_lr * _decoder_ffn_lr_mult:.2e}, "
                 f"total_steps={onecycle_steps}, pct_start={pct_start}, "
                 f"last_lr={last_lr:.2e} → positioned at step {target_step}/{onecycle_steps}, "
                 f"resume_lr={resume_lr:.2e}"

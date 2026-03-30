@@ -1662,6 +1662,8 @@ class KokoroTrainer:
                 result['lr_enc'] = tagged['encoder']
             if 'decoder_other' in tagged:
                 result['lr_dec'] = tagged['decoder_other']
+            if 'decoder_attn' in tagged:
+                result['lr_attn'] = tagged['decoder_attn']
             if 'decoder_ffn' in tagged:
                 result['lr_ffn'] = tagged['decoder_ffn']
             if 'stop_head' in tagged:
