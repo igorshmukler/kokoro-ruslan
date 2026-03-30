@@ -817,12 +817,17 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             _decoder_ffn_lr_mult = float(
                 getattr(getattr(trainer, 'config', None), 'decoder_ffn_lr_multiplier', 1.0)
             )
+            _decoder_attn_lr_mult = float(
+                getattr(getattr(trainer, 'config', None), 'decoder_attn_lr_multiplier', 1.0)
+            )
             def _group_mult(pg, idx, n):
                 gt = pg.get('group_type')
                 if gt == 'encoder':
                     return encoder_lr_mult
                 elif gt == 'decoder_ffn':
                     return _decoder_ffn_lr_mult
+                elif gt == 'decoder_attn':
+                    return _decoder_attn_lr_mult
                 elif gt == 'stop_head':
                     return _stop_head_lr_mult
                 elif gt is not None:

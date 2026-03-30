@@ -699,6 +699,7 @@ class KokoroTrainer:
             _enc_mult = getattr(self, '_encoder_lr_multiplier', 1.0)
             _stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
             decoder_ffn_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
+            decoder_attn_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
 
             # Construct per-param-group max_lr list by inspecting the custom 'group_type'
             max_lr_arg = []
@@ -708,6 +709,8 @@ class KokoroTrainer:
                     max_lr_arg.append(max_lr * _enc_mult)
                 elif gt == 'decoder_ffn':
                     max_lr_arg.append(max_lr * decoder_ffn_mult)
+                elif gt == 'decoder_attn':
+                    max_lr_arg.append(max_lr * decoder_attn_mult)
                 elif gt == 'stop_head':
                     max_lr_arg.append(max_lr * _stop_head_lr_mult)
                 else:
@@ -737,7 +740,10 @@ class KokoroTrainer:
             self._onecycle_div_factor = onecycle_div_factor
             logger.info(
                 f"OneCycleLR scheduler initialized: decoder max_lr={max_lr:.2e}, "
-                f"encoder max_lr={max_lr * _enc_mult:.2e}, total_steps={onecycle_steps} "
+                f"encoder max_lr={max_lr * _enc_mult:.2e}, "
+                f"decoder_attn max_lr={max_lr * decoder_attn_mult:.2e}, "
+                f"decoder_ffn max_lr={max_lr * decoder_ffn_mult:.2e}, "
+                f"total_steps={onecycle_steps} "
                 f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})"
             )
         else:

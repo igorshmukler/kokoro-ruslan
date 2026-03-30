@@ -59,17 +59,7 @@ class TrainingConfig:
     decoder_ffn_lr_multiplier: float = 0.15
     # LR multiplier for decoder self-attention and cross-attention layers
     # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
-    # Dec layers 3-5 self_attn consumed 59% of all weight deltas by Ep32 with
-    # Dec.5 w_o growing 27.7→88.2 (3.2×) — driven by running at full base LR.
-    # 0.4× dampens attention updates while still allowing meaningful learning.
-    # QK-norm run Ep20: dec.5.self_attn.w_o growth rate 2.73/ep, lowered 0.4→0.35.
-    # Ep24: 0.35 failed to decelerate growth — rate ACCELERATED 2.73→2.93→3.13/ep.
-    # Norm now 54.4 (vs. 27.7 at Ep1, 2×). Per-epoch clip rate rising Ep21-24:
-    # 0.6%→1.2%→1.5%→2.1%. Lowered 0.35→0.30 at Ep24 resume.
-    # Ep28: 0.30 failed — 2 full windows (Ep24→26: 3.19/ep, Ep26→28: 3.34/ep).
-    # Re-acceleration confirmed. Norm 64.9 (2.34×). Grad cluster 5 spikes in
-    # steps 9496–9669. In-progress Ep30 clip 6.6%. Lowered 0.30→0.25 at Ep28.
-    decoder_attn_lr_multiplier: float = 0.25
+    decoder_attn_lr_multiplier: float = 0.40
 
     # QK-normalization: per-head RMSNorm on Q and K after projection.
     # Decouples attention logit scale from weight norms, preventing unbounded
