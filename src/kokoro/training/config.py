@@ -66,7 +66,10 @@ class TrainingConfig:
     # Ep24: 0.35 failed to decelerate growth — rate ACCELERATED 2.73→2.93→3.13/ep.
     # Norm now 54.4 (vs. 27.7 at Ep1, 2×). Per-epoch clip rate rising Ep21-24:
     # 0.6%→1.2%→1.5%→2.1%. Lowered 0.35→0.30 at Ep24 resume.
-    decoder_attn_lr_multiplier: float = 0.30
+    # Ep28: 0.30 failed — 2 full windows (Ep24→26: 3.19/ep, Ep26→28: 3.34/ep).
+    # Re-acceleration confirmed. Norm 64.9 (2.34×). Grad cluster 5 spikes in
+    # steps 9496–9669. In-progress Ep30 clip 6.6%. Lowered 0.30→0.25 at Ep28.
+    decoder_attn_lr_multiplier: float = 0.25
 
     # QK-normalization: per-head RMSNorm on Q and K after projection.
     # Decouples attention logit scale from weight norms, preventing unbounded
@@ -261,7 +264,7 @@ class TrainingConfig:
     # Validation settings
     validation_split: float = 0.1  # 10% of data for validation
     validation_interval: int = 1  # Run validation every N epochs
-    early_stopping_patience: int = 10  # Stop if no improvement for N epochs
+    early_stopping_patience: int = 15  # Stop if no improvement for N epochs
     early_stopping_min_delta: float = 0.001  # Minimum improvement to count
 
     # Montreal Forced Aligner (MFA) settings
