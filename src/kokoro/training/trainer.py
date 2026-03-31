@@ -1491,6 +1491,8 @@ class KokoroTrainer:
                                               'stop_head_lr_multiplier', 0.1))
             decoder_ffn_lr_mult = float(getattr(getattr(self, 'config', None),
                                                 'decoder_ffn_lr_multiplier', 1.0))
+            decoder_attn_lr_mult = float(getattr(getattr(self, 'config', None),
+                                                 'decoder_attn_lr_multiplier', 1.0))
             for param_group in self.optimizer.param_groups:
                 gt = param_group.get('group_type')
                 if gt == 'encoder':
@@ -1499,6 +1501,8 @@ class KokoroTrainer:
                     mult = stop_head_lr_mult
                 elif gt == 'decoder_ffn':
                     mult = decoder_ffn_lr_mult
+                elif gt == 'decoder_attn':
+                    mult = decoder_attn_lr_mult
                 else:
                     mult = 1.0
                 param_group['lr'] = base_lr * mult
