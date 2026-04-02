@@ -34,7 +34,8 @@ class KokoroModel(nn.Module):
 
     def __init__(self, vocab_size: int, mel_dim: int = 80, hidden_dim: int = 512,
                  n_encoder_layers: int = 6, n_heads: int = 8, encoder_ff_dim: int = 2048,
-                 encoder_dropout: float = 0.1, decoder_input_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
+                 encoder_dropout: float = 0.1, decoder_dropout: float = None,
+                 decoder_input_dropout: float = 0.1, n_decoder_layers: int = 6, decoder_ff_dim: int = 2048,
                  max_decoder_seq_len: int = 4000, enable_profiling: bool = False,
                  gradient_checkpointing: bool = True, checkpoint_segments: int = 2,
                  use_variance_predictor: bool = True, variance_filter_size: int = 256,
@@ -70,6 +71,10 @@ class KokoroModel(nn.Module):
 
         # Allow configuring the dropout applied to decoder input projection
         self.decoder_input_dropout = decoder_input_dropout
+
+        # Decoder internal dropout (attention/FFN residuals). Falls back to
+        # encoder_dropout when not specified, preserving backward compat.
+        self._decoder_dropout = decoder_dropout if decoder_dropout is not None else encoder_dropout
 
         # Text encoder: Embedding + Positional Encoding + Stack of Transformer Blocks
         self.text_embedding = nn.Embedding(vocab_size, hidden_dim)
@@ -171,7 +176,7 @@ class KokoroModel(nn.Module):
             d_model=hidden_dim,
             nhead=n_heads,
             dim_feedforward=decoder_ff_dim,
-            dropout=encoder_dropout,
+            dropout=self._decoder_dropout,
             num_layers=n_decoder_layers,
             drop_path_rates=decoder_drop_path_rates,
             qk_norm=qk_norm

@@ -284,8 +284,8 @@ class KokoroTrainer:
             train_indices = indices[:split_idx]
             val_indices = indices[split_idx:]
             logger.info(f"Dataset split: {len(train_indices)} training, {len(val_indices)} validation samples")
-            self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices)
-            self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices)
+            self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices, is_training=True)
+            self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices, is_training=False)
         else:
             logger.info("No validation split - using all data for training")
             self.dataset = full_dataset
@@ -353,6 +353,8 @@ class KokoroTrainer:
             n_heads=getattr(config, 'n_heads', 8),
             encoder_ff_dim=getattr(config, 'encoder_ff_dim', 3072),
             encoder_dropout=getattr(config, 'encoder_dropout', 0.1),
+            decoder_dropout=getattr(config, 'decoder_dropout', None),
+            decoder_input_dropout=getattr(config, 'decoder_input_dropout', 0.1),
             n_decoder_layers=getattr(config, 'n_decoder_layers', 6),
             decoder_ff_dim=getattr(config, 'decoder_ff_dim', 3072),
             max_decoder_seq_len=getattr(config, 'max_decoder_seq_len', 4000),
@@ -1528,17 +1530,20 @@ class KokoroTrainer:
         Returns a masked clone; the original tensor is NOT modified.
         Only the teacher-forced input is masked; the loss target remains the
         unmasked ground-truth mel, so gradients on unmasked frames are exact.
+        Masks are generated independently per sample for maximum diversity.
         """
         B, T, mel_dim = mel_specs.shape
         masked = mel_specs.clone()
-        for _ in range(num_time_masks):
-            t = torch.randint(0, max(1, min(time_mask_max, T // 4)), (1,)).item()
-            t0 = torch.randint(0, max(1, T - t), (1,)).item()
-            masked[:, t0:t0 + t, :] = 0.0
-        for _ in range(num_freq_masks):
-            f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
-            f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
-            masked[:, :, f0:f0 + f] = 0.0
+        time_limit = max(1, min(time_mask_max, T // 4))
+        for b in range(B):
+            for _ in range(num_time_masks):
+                t = torch.randint(0, time_limit, (1,)).item()
+                t0 = torch.randint(0, max(1, T - t), (1,)).item()
+                masked[b, t0:t0 + t, :] = 0.0
+            for _ in range(num_freq_masks):
+                f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
+                f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
+                masked[b, :, f0:f0 + f] = 0.0
         return masked
 
     def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
@@ -2892,7 +2897,7 @@ class KokoroTrainer:
                                f"(best: {self.best_val_loss:.4f})")
 
                 # Early stopping check
-                patience = getattr(self.config, 'early_stopping_patience', 10)
+                patience = getattr(self.config, 'early_stopping_patience', 15)
                 if self.epochs_without_improvement >= patience:
                     logger.info(f"Early stopping triggered after {patience} epochs without improvement")
                     logger.info(f"Best validation loss: {self.best_val_loss:.4f}")

@@ -2,6 +2,38 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.34 (2026-04-02)
+
+### Model size reduction (`config.py`)
+
+- **`hidden_dim` 768 → 512**: cuts total parameters from ~35M to ~16M. With 22K training utterances (~1,600 params/sample at 35M), the model was deep in the overfitting regime. At 16M (~730 params/sample) the capacity/data ratio is far more tractable.
+- **`encoder_ff_dim` / `decoder_ff_dim` 2048 → 1536**: GLU FFN expansion rebalanced from 5.3× to 4×, reducing FFN dominance in total parameter count.
+
+### Decoder dropout separation (`config.py`, `model.py`, `trainer.py`)
+
+- **`decoder_dropout: float = 0.25`** (new config field): dedicated dropout rate for decoder attention/FFN residual connections, separate from `encoder_dropout` (0.15). The decoder is more prone to overfitting due to teacher forcing and benefits from stronger regularization.
+- **`decoder_input_dropout: float = 0.15`** (new config field): dropout on projected mel input before it enters the decoder (was hardcoded 0.1).
+- **Model wiring** (`model.py`): `KokoroModel.__init__` accepts `decoder_dropout` (default `None` → falls back to `encoder_dropout` for backward compatibility). Stored as `self._decoder_dropout` and passed to `TransformerDecoder`.
+- **Trainer wiring** (`trainer.py`): passes both `decoder_dropout` and `decoder_input_dropout` from config to `KokoroModel`.
+
+### SpecAugment improvements (`config.py`, `trainer.py`)
+
+- **Reduced masking intensity**: `spec_augment_time_mask_max` 30 → 10, `spec_augment_num_time_masks` 2 → 1, `spec_augment_freq_mask_max` 10 → 5. Worst-case temporal masking drops from ~43% to ~7%, preventing the catastrophic autoregressive pathway disruption observed in the previous run (Ep13 shock of +0.053 that never recovered).
+- **Per-sample masking** (`trainer.py`): `_apply_spec_augment` now generates independent masks for each sample in the batch instead of applying one mask batch-wide. Improves gradient diversity across the batch.
+
+### Speed perturbation augmentation (`config.py`, `dataset.py`, `trainer.py`)
+
+- **Audio-level speed perturbation** (`dataset.py`): randomly resamples training audio by a factor in [0.9, 1.1] before feature extraction, effectively multiplying dataset diversity by ~1.5× without additional data. Applied per-sample in `__getitem__` after audio normalization but before mel computation via `torchaudio.functional.resample`.
+- **MFA duration rescaling**: phoneme durations are scaled by `1/factor` (speed up → shorter durations) with `clamp(min=1)`. Existing frame-sum correction handles any rounding residual.
+- **Cache bypass**: augmented samples skip both cache load and save (stochastic perturbation is incompatible with deterministic caching); unperturbed samples use the cache normally.
+- **Training-only**: `is_training` flag added to `RuslanDataset.__init__`; trainer passes `is_training=True` for train, `is_training=False` for validation. Speed perturbation is never applied to validation data.
+- New config fields: `use_speed_perturbation: bool = True`, `speed_perturb_range: float = 0.1`, `speed_perturb_prob: float = 0.5`.
+
+### Training schedule (`config.py`)
+
+- **`num_epochs` 60 → 100**: extends OneCycleLR to ~32,700 steps, adding ~67% more cosine-decay refinement time. Combined with the smaller model, estimated val_mel at Ep100: ~0.70 (central), range 0.65–0.74.
+- **`early_stopping_patience` 10 → 15**: prevents premature stopping during the SpecAugment adaptation window.
+
 ## 0.0.33 (2026-03-28)
 
 ### QK-normalization (`transformers.py`, `model.py`, `config.py`, `trainer.py`)

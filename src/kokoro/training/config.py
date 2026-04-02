@@ -15,7 +15,7 @@ class TrainingConfig:
     # Basic training parameters
     data_dir: str = "data/processed_data"
     output_dir: str = "output_models"
-    num_epochs: int = 60  # 60 × ~339 steps/epoch − 1200 warmup ≈ 19,140 OneCycleLR steps
+    num_epochs: int = 100  # 100 × ~339 steps/epoch − 1200 warmup ≈ 32,700 OneCycleLR steps
     batch_size: int = 16
     learning_rate: float = 7.0e-5  # peak LR = learning_rate × max_lr_multiplier = 7.0e-5 × 1.2 = 8.4e-5
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -77,7 +77,7 @@ class TrainingConfig:
 
     # Model parameters
     n_mels: int = 80
-    hidden_dim: int = 768
+    hidden_dim: int = 512
     n_encoder_layers: int = 6
     n_decoder_layers: int = 6
     n_heads: int = 8
@@ -87,9 +87,15 @@ class TrainingConfig:
     # model params — far too dominant for a 22K-utterance dataset.  Reducing to
     # 2048 gives 5.3× expansion (LLaMA/PaLM convention for GLU: ~2.67× hidden),
     # cutting FFN params by 34% and rebalancing FFN vs attention capacity.
-    encoder_ff_dim: int = 2048
-    decoder_ff_dim: int = 2048
+    encoder_ff_dim: int = 1536
+    decoder_ff_dim: int = 1536
     encoder_dropout: float = 0.15
+    # Separate dropout for decoder attention/FFN residual connections.
+    # The decoder is more prone to overfitting than the encoder due to
+    # teacher forcing, so it benefits from stronger regularization.
+    decoder_dropout: float = 0.25
+    # Dropout applied to the projected mel input before it enters the decoder.
+    decoder_input_dropout: float = 0.15
     max_decoder_seq_len: int = 4000
 
     # Stochastic depth (layer dropout) for regularization
@@ -121,9 +127,9 @@ class TrainingConfig:
     # unmasked frames are unaffected.  Masking forces the decoder to rely on encoder
     # context rather than memorising the previous mel frame.
     use_spec_augment: bool = True
-    spec_augment_time_mask_max: int = 30   # Max consecutive frames masked per mask
-    spec_augment_freq_mask_max: int = 10   # Max consecutive mel bins masked per mask
-    spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
+    spec_augment_time_mask_max: int = 10   # Max consecutive frames masked per mask
+    spec_augment_freq_mask_max: int = 5   # Max consecutive mel bins masked per mask
+    spec_augment_num_time_masks: int = 1   # Number of independent time masks per batch
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
     # With pct_start=0.30 and ~19080 OneCycleLR steps the LR peaks at step
@@ -182,6 +188,15 @@ class TrainingConfig:
     n_fft: int = 1024
     f_min: float = 0.0
     f_max: float = 8000.0
+
+    # Speed perturbation: randomly resample audio by a factor in
+    # [1 - speed_perturb_range, 1 + speed_perturb_range] before feature
+    # extraction.  Applied per-sample in the training dataset only;
+    # augmented samples bypass the feature cache.  Effectively multiplies
+    # dataset diversity without collecting more data.
+    use_speed_perturbation: bool = True
+    speed_perturb_range: float = 0.1   # ±10% speed (factors 0.9–1.1)
+    speed_perturb_prob: float = 0.5    # Probability of perturbing each sample
 
     # Data loading
     num_workers: int = 0
