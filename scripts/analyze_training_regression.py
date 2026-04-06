@@ -18,6 +18,7 @@ import torch
 import re
 import math
 import statistics
+import pickle
 from pathlib import Path
 from collections import defaultdict
 
@@ -30,6 +31,64 @@ except ImportError:
 
 CHECKPOINT_DIR = Path("my_model")
 TB_LOG_DIR = Path("my_model/logs")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stats cache helpers — makes repeat runs nearly instant
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Bump when the cached record schema changes (invalidates all existing caches)
+_CACHE_VERSION = 3
+
+# Keys to exclude from the cache (large tensor dicts; not needed after stats computed)
+_STATE_DICT_KEYS = ("state_dict", "ema_state_dict")
+
+
+def _master_cache_path() -> Path:
+    return CHECKPOINT_DIR / ".analysis_stats_cache.pkl"
+
+
+def _load_master_cache(files: list) -> tuple:
+    """
+    Return (records, persistent_counts) if a valid cache exists for *files*,
+    otherwise return (None, None).  Validity = version matches AND all
+    checkpoint file mtimes match those recorded when the cache was written.
+    """
+    cache_path = _master_cache_path()
+    if not cache_path.exists():
+        return None, None
+    try:
+        with open(cache_path, "rb") as fh:
+            data = pickle.load(fh)
+        if data.get("version") != _CACHE_VERSION:
+            return None, None
+        recorded = data.get("mtimes", {})
+        for f in files:
+            if recorded.get(str(f)) != f.stat().st_mtime:
+                return None, None
+        return data["records"], data.get("persistent_counts", {})
+    except Exception:
+        return None, None
+
+
+def _save_master_cache(files: list, records: list, persistent_counts: dict):
+    """Persist *records* (minus large tensor dicts) to the master cache file."""
+    cache_path = _master_cache_path()
+    slim_records = [
+        {k: v for k, v in r.items() if k not in _STATE_DICT_KEYS}
+        for r in records
+    ]
+    data = {
+        "version": _CACHE_VERSION,
+        "mtimes": {str(f): f.stat().st_mtime for f in files},
+        "records": slim_records,
+        "persistent_counts": persistent_counts,
+    }
+    try:
+        with open(cache_path, "wb") as fh:
+            pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        print(f"[cache] Warning: could not write stats cache: {exc}")
+
 
 KEY_LAYERS = [
     "mel_projection",
@@ -128,7 +187,7 @@ def param_stats(tensor):
         numel = t.numel()
         if numel == 0:
             return {"norm": 0.0, "mean": 0.0, "std": 0.0,
-                    "max_abs": 0.0, "nan": has_nan, "inf": has_inf}
+                    "max_abs": 0.0, "nan": has_nan, "inf": has_inf, "numel": 0}
         return {
             "norm":    t.norm(2).item(),
             "mean":    t.mean().item(),
@@ -136,6 +195,7 @@ def param_stats(tensor):
             "max_abs": t.abs().max().item(),
             "nan":     has_nan,
             "inf":     has_inf,
+            "numel":   numel,
         }
 
 
@@ -152,7 +212,18 @@ def load_checkpoints():
     for f in files:
         epoch_num = int(re.search(r"epoch_(\d+)", f.name).group(1))
         try:
-            ck = torch.load(f, map_location="cpu", weights_only=False)
+            # mmap=True (PyTorch ≥ 2.1) avoids reading tensor data for keys we
+            # immediately drop, turning the optimizer-state load into a no-op.
+            try:
+                ck = torch.load(f, map_location="cpu", weights_only=False, mmap=True)
+            except TypeError:
+                ck = torch.load(f, map_location="cpu", weights_only=False)
+
+            # Drop optimizer / scaler state immediately — ~50 % of each file.
+            # With mmap=True those pages are never read from disk at all.
+            for _key in ("optimizer_state_dict", "ema_optimizer_state_dict",
+                         "scaler_state_dict"):
+                ck.pop(_key, None)
         except Exception as e:
             print(f"[LOAD ERROR] {f.name}: {e}")
             continue
@@ -246,6 +317,12 @@ def compute_weight_stats(records):
 
         # Build minimal float32 prev_state for next iteration — release old one
         prev_state = {k: v.float() for k, v in sd.items()}
+
+    # Release tensor data from all records now that stats are computed.
+    # param_stats["numel"] is stored, so downstream code never needs the tensors.
+    for rec in records:
+        rec.pop("state_dict", None)
+        rec.pop("ema_state_dict", None)
 
     return records
 
@@ -1525,7 +1602,6 @@ def analyze_loss_imbalance(ea, records=None):
               'decoder_ffn': avg_lr_ffn}
 
     ps = rec_b.get('param_stats', {})
-    sd = rec_b.get('state_dict', {})
     # Two parallel tallies:
     #   cat_delta_sums  — total |Δw|_L2 per category (numel-weighted; large tensors dominate)
     #   cat_rms_sums    — total avg_grad_rms per category (per-element; useful for cap comparison)
@@ -1543,9 +1619,9 @@ def analyze_loss_imbalance(ea, records=None):
         lr_t = lr_map.get(lr_key, avg_lr_dec)
         if not lr_t or lr_t <= 0:
             continue
-        tensor = sd.get(name)
-        numel  = (tensor.numel() if tensor is not None
-                  else max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12))))
+        # Use numel stored in param_stats (added since cache v2); fall back to estimate
+        numel = (s.get("numel")
+                 or max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12))))
         avg_grad_rms = (delta / math.sqrt(numel)) / (ep_steps * lr_t)
         per_tensor.append((name, cat, avg_grad_rms, cap, numel, delta))
         cat_delta_sums[cat] = cat_delta_sums.get(cat, 0.0) + delta
@@ -2196,7 +2272,6 @@ def tb_print_spike_cause_analysis(ea, records=None):
 
     groups   = defaultdict(list)   # cat -> [(name, avg_grad_rms, cap, numel)]
     ps       = rec_b.get("param_stats", {})
-    sd       = rec_b.get("state_dict", {})
     unmatched = []  # (name, avg_grad_rms) for 'other' bucket
 
     for name, s in ps.items():
@@ -2207,9 +2282,9 @@ def tb_print_spike_cause_analysis(ea, records=None):
         lr_t = lr_map.get(lr_key, avg_lr_dec)
         if not lr_t or lr_t <= 0:
             continue
-        # numel from the actual tensor when available, fall back to norm²/mean² estimate
-        tensor = sd.get(name)
-        numel  = tensor.numel() if tensor is not None else max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12)))
+        # Use numel stored in param_stats (added since cache v2); fall back to estimate
+        numel = (s.get("numel")
+                 or max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12))))
         # per-element RMS change per step
         avg_grad_rms = (delta / math.sqrt(numel)) / (ep_steps * lr_t)
         groups[cat].append((name, avg_grad_rms, cap, numel))
@@ -2410,23 +2485,43 @@ def main():
         print(f"Directory not found: {CHECKPOINT_DIR}")
         return
 
-    print(f"Loading checkpoints from {CHECKPOINT_DIR} ...")
-    records = load_checkpoints()
-    if not records:
-        print("No checkpoints found.")
-        # If TensorBoard logs exist, run TB-only analysis so users can still
-        # inspect training behaviour even before the first checkpoint is saved.
-        if TB_LOG_DIR.is_dir():
-            print(f"No checkpoints found — falling back to TensorBoard logs at {TB_LOG_DIR} for analysis.")
-            tb_analyze(TB_LOG_DIR, records=None)
-            return
-        else:
-            print(f"No tensorboard logs found at: {TB_LOG_DIR}")
-            return
+    # ── Discover checkpoint files (needed for both cache key and loading) ────
+    ck_files = sorted(
+        CHECKPOINT_DIR.glob("checkpoint_epoch_*.pth"),
+        key=lambda p: int(re.search(r"epoch_(\d+)", p.name).group(1)),
+    )
 
-    print(f"Found {len(records)} checkpoint(s). Computing weight statistics...")
-    records = compute_weight_stats(records)
-    records, persistent_counts = compute_rank_stability(records)
+    # ── Try the stats cache first — avoids re-loading all checkpoint files ───
+    cached_records, persistent_counts = _load_master_cache(ck_files)
+    if cached_records is not None:
+        print(f"[cache] Loaded stats cache for {len(cached_records)} checkpoint(s) "
+              f"({_master_cache_path()}).")
+        records = cached_records
+        # Recompute rank_stability_jaccard if missing (older caches may lack it)
+        if any("rank_stability_jaccard" not in r for r in records):
+            records, persistent_counts = compute_rank_stability(records)
+            _save_master_cache(ck_files, records, persistent_counts)
+    else:
+        print(f"Loading checkpoints from {CHECKPOINT_DIR} ...")
+        records = load_checkpoints()
+        if not records:
+            print("No checkpoints found.")
+            # If TensorBoard logs exist, run TB-only analysis so users can still
+            # inspect training behaviour even before the first checkpoint is saved.
+            if TB_LOG_DIR.is_dir():
+                print(f"No checkpoints found — falling back to TensorBoard logs at {TB_LOG_DIR} for analysis.")
+                tb_analyze(TB_LOG_DIR, records=None)
+                return
+            else:
+                print(f"No tensorboard logs found at: {TB_LOG_DIR}")
+                return
+
+        print(f"Found {len(records)} checkpoint(s). Computing weight statistics...")
+        records = compute_weight_stats(records)
+        records, persistent_counts = compute_rank_stability(records)
+
+        print(f"[cache] Saving stats cache to {_master_cache_path()} ...")
+        _save_master_cache(ck_files, records, persistent_counts)
 
     print_summary_table(records)
     print_key_layer_table(records)
