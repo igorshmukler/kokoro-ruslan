@@ -519,6 +519,7 @@ class KokoroTrainer:
         )
         seen_ids: set = set()
         encoder_params = []
+        encoder_ffn_decay_params: list = []  # encoder FFN weights get ffn_weight_decay
         stop_head_params: list = []
         decoder_named: list = []  # (name, param) for further splitting
         for name, param in self.model.named_parameters():
@@ -526,7 +527,13 @@ class KokoroTrainer:
                 continue
             seen_ids.add(id(param))
             if any(name.startswith(prefix) for prefix in encoder_prefixes):
-                encoder_params.append(param)
+                # Split encoder FFN weight matrices into their own decay group.
+                # These are the same GLU FFN layers that were previously hard-
+                # norm-clamped; they now receive ffn_weight_decay instead.
+                if '.ff.' in name and not any(name.endswith(s) for s in _no_decay_suffixes) and not any(s in name for s in _no_decay_substrings):
+                    encoder_ffn_decay_params.append(param)
+                else:
+                    encoder_params.append(param)
             elif name in _stop_head_names:
                 stop_head_params.append(param)
             else:
@@ -573,11 +580,16 @@ class KokoroTrainer:
         stop_head_lr = base_lr * stop_head_lr_mult
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
         decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
+        ffn_weight_decay = getattr(config, 'ffn_weight_decay', weight_decay)
 
         # Build param groups, tagging each with a group_type for scheduler mapping
         param_groups = []
         param_groups.append({'params': encoder_params, 'lr': encoder_lr, 'weight_decay': 0.0,
                              'eps': adam_eps, 'betas': adam_betas, 'group_type': 'encoder'})
+        if encoder_ffn_decay_params:
+            param_groups.append({'params': encoder_ffn_decay_params, 'lr': encoder_lr,
+                                 'weight_decay': ffn_weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'encoder'})
 
         # Decoder no-decay (biases / norms — excluding FFN and attention)
         if decoder_no_decay:
@@ -598,7 +610,7 @@ class KokoroTrainer:
                                  'group_type': 'decoder_attn'})
         if decoder_decay_ffn:
             param_groups.append({'params': decoder_decay_ffn, 'lr': base_lr * decoder_ffn_lr_mult,
-                                 'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'weight_decay': ffn_weight_decay, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'decoder_ffn'})
         if decoder_ffn_no_decay:
             param_groups.append({'params': decoder_ffn_no_decay, 'lr': base_lr * decoder_ffn_lr_mult,
@@ -609,7 +621,7 @@ class KokoroTrainer:
         if stop_head_params:
             param_groups.append({'params': stop_head_params, 'lr': stop_head_lr, 'weight_decay': 0.0,
                                  'eps': adam_eps, 'betas': adam_betas, 'group_type': 'stop_head'})
-        if not encoder_params:
+        if not encoder_params and not encoder_ffn_decay_params:
             # Fallback: single group (no identifiable encoder params)
             param_groups = [{'params': list(self.model.parameters()), 'lr': base_lr,
                              'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas}]
@@ -618,6 +630,7 @@ class KokoroTrainer:
         else:
             # Count params per logical group for logging
             n_encoder = len(encoder_params)
+            n_encoder_ffn = len(encoder_ffn_decay_params)
             n_decoder_no_decay = len(decoder_no_decay)
             n_decoder_other = len(decoder_decay_other)
             n_decoder_ffn = len(decoder_decay_ffn)
@@ -629,11 +642,12 @@ class KokoroTrainer:
             attn_lr = base_lr * decoder_attn_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
+                f"encoder_ffn_decay={n_encoder_ffn} params (lr={encoder_lr:.2e}, wd={ffn_weight_decay}), "
                 f"decoder_no_decay={n_decoder_no_decay} params (lr={base_lr:.2e}, wd=0.0), "
                 f"decoder_other_decay={n_decoder_other} params (lr={base_lr:.2e}, wd={weight_decay}), "
                 f"decoder_attn_decay={n_decoder_attn} params (lr={attn_lr:.2e}, wd={weight_decay}), "
                 f"decoder_attn_no_decay={n_decoder_attn_nd} params (lr={attn_lr:.2e}, wd=0.0), "
-                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={weight_decay}), "
+                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={ffn_weight_decay}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
@@ -822,9 +836,9 @@ class KokoroTrainer:
         # Legacy single-layer reference kept for backward compat with any external code.
         self._dec_ff0_linear1_weight = self._dec_ff_weights[0] if self._dec_ff_weights else None
 
-        # Encoder FFN weights — same GLUFeedForward architecture, same max-norm ceiling.
-        # Encoder FFN receives 5.5× higher LR than decoder FFN but previously had
-        # zero weight norm constraints, allowing unconstrained growth at LR peak.
+        # Encoder FFN weights — kept for optional hard norm clamping (disabled
+        # by default; prefer ffn_weight_decay in the optimizer).
+        # Encoder FFN receives a higher LR than decoder FFN.
         self._enc_ff_weights: list = []
         for i in range(n_encoder_layers):
             for linear_name in ('linear1', 'linear2'):
@@ -843,20 +857,25 @@ class KokoroTrainer:
 
     @torch.no_grad()
     def _apply_weight_norm_constraints(self) -> None:
-        """Project all decoder FF weights back onto their max-norm ball.
+        """Optionally project FFN weights back onto a max-norm ball.
 
-        Called after every successful optimizer step.  The L2 norm of each
-        weight matrix is compared against *dec_ffn_max_weight_norm* and rescaled
-        when it exceeds the ceiling.  All decoder FF linear1 and linear2 weights
-        across all layers share the same cap.
+        Called after every successful optimizer step.  When
+        *dec_ffn_max_weight_norm* is positive the L2 norm of each FFN weight
+        matrix is clamped to that ceiling.
 
-        Config key: dec_ffn_max_weight_norm (default 60.0).
+        **Recommended**: leave this disabled (≤ 0) and rely on *ffn_weight_decay*
+        in the optimizer instead.  Hard norm projection after every step
+        corrupts AdamW momentum/variance states when weights persistently hit
+        the ceiling, causing the optimizer to waste gradient signal sliding
+        along the constraint surface.
+
+        Config key: dec_ffn_max_weight_norm (default 0.0 — disabled).
         Falls back to the legacy dec_ff0_linear1_max_weight_norm key if present.
         Set to 0 or negative to disable.
         """
         max_norm: float = getattr(
             self.config, 'dec_ffn_max_weight_norm',
-            getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
+            getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 0.0)
         )
         if max_norm > 0.0:
             for w in self._dec_ff_weights:
