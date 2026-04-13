@@ -17,7 +17,7 @@ class TrainingConfig:
     output_dir: str = "output_models"
     num_epochs: int = 100  # 100 × ~678 opt-steps/epoch (accum=2) − 1200 warmup ≈ 66,600 OneCycleLR steps
     batch_size: int = 16
-    learning_rate: float = 7.0e-5  # peak LR = learning_rate × max_lr_multiplier = 7.0e-5 × 1.2 = 8.4e-5
+    learning_rate: float = 5.0e-5  # peak LR = 5.0e-5 × 1.0 = 5.0e-5 (reduced from 7.0e-5: 5-ep val_mel regression at peak hold)
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
@@ -25,16 +25,14 @@ class TrainingConfig:
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    # Previous run analysis (40 epochs, max_lr_mult=1.2, pct_start=0.25):
-    # - Best val_mel 1.127 at Ep06, then persistent regression to 1.279 by Ep40
-    # - Peak LR 8.4e-5 pushed model out of early basin; FFN norms hit 55.0 ceiling
-    # - 25% ascending phase too long: model converged by Ep4-6 but LR kept climbing
-    # - SpecAugment at Ep12 compounded LR-ascent instability
-    # - Clip saturation escalated to 14.5% by Ep40
-    # Changes for clean run: mult=1.0, pct_start=0.10, ffn_lr_mult=0.50,
-    # dropout=0.30, grad_norm=1.0, specaug delayed to Ep30 and strengthened.
-    max_lr_multiplier: float = 1.0   # Peak decoder LR = learning_rate × this = 7.0e-5 × 1.0 = 7.0e-5 (reduced from 1.2: overshoot pushed model out of basin by Ep6)
-    pct_start: float = 0.10  # 10% ascending (was 0.25). Model converges by Ep4-6; long ramp destroys the early minimum
+    # Run 1 (40 ep, mult=1.2, pct=0.25, lr=7e-5): best val 1.127@Ep6, regressed→1.279@Ep40
+    # Run 2 (9 ep, mult=1.0, pct=0.10, lr=7e-5): best val 1.353@Ep4, 5 consecutive
+    #   regressions Ep5-9 (1.393→1.488). Peak LR 7.0e-5 held flat Ep2-12 (div_factor=1.0
+    #   makes ascending phase flat), encoder FFN became #2 mover at Ep8 (delta 8.59).
+    #   FFN mult 0.30→0.20 had zero effect. Overfitting: train-val gap flipped -0.13→+0.08.
+    # Run 3: lr=5e-5 (-29%), pct=0.05 (decay starts ~Ep7 vs Ep12).
+    max_lr_multiplier: float = 1.0   # Peak decoder LR = 5.0e-5 × 1.0 = 5.0e-5
+    pct_start: float = 0.05  # 5% ascending → cosine decay starts ~Ep7 (was 0.10 → Ep12, too late)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
@@ -49,13 +47,10 @@ class TrainingConfig:
     stop_head_lr_multiplier: float = 0.2
     # LR multiplier applied specifically to decoder FFN layers (decoder.layers.*.ff.linear1/2).
     # Use <1.0 to reduce step size for the FFN subnetwork (helps stabilise persistent movers).
-    # 0.15 (old run): starved — FFN weights hit hard norm cap, optimizer wasted signal
-    # 0.50 (run 2):   too hot — FFN norms 29.8→51.9 in 6 ep, 100% persistent mover, delta 2.5× old run
-    # 0.30 (run 3, accum=2): effective FFN steps/ep = 678×0.30 = 203, higher than 0.50 run
-    #   (339×0.50=170). Layer-0 linear1 30→62 in 6 ep (+107%), two consecutive
-    #   val_mel regressions Ep5+0.04 Ep6+0.04.  Need 0.20 to bring effective
-    #   steps down to 678×0.20 = 136, below old 0.50 run.
-    decoder_ffn_lr_multiplier: float = 0.20
+    # 0.15 (run 1): starved — FFN hit hard norm cap  |  0.50 (run 2): too hot — norms 29.8→51.9
+    # 0.30 vs 0.20 (run 2): identical val_mel (<0.001 diff) — FFN mult is not the lever.
+    # Restoring 0.30 with lower base LR: peak FFN = 5.0e-5×0.30 = 1.5e-5 (≈ old 7e-5×0.20 = 1.4e-5)
+    decoder_ffn_lr_multiplier: float = 0.30
     # LR multiplier for decoder self-attention and cross-attention layers
     # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
     decoder_attn_lr_multiplier: float = 0.30
@@ -99,7 +94,9 @@ class TrainingConfig:
     # Separate dropout for decoder attention/FFN residual connections.
     # The decoder is more prone to overfitting than the encoder due to
     # teacher forcing, so it benefits from stronger regularization.
-    decoder_dropout: float = 0.30  # Raised from 0.25: combat late-stage overfitting (val mel rising from Ep28+)
+    # 0.30 (run 2): with stochastic depth 0.10 + GLU gating, effective signal
+    # survival ≈ 0.70×0.90×0.50 = 31.5% — too aggressive. Reduced to 0.20.
+    decoder_dropout: float = 0.20
     # Dropout applied to the projected mel input before it enters the decoder.
     decoder_input_dropout: float = 0.15
     max_decoder_seq_len: int = 4000
@@ -142,7 +139,7 @@ class TrainingConfig:
     # caused val_mel Ep12→Ep17 regression).
     # With pct_start=0.10 the LR peaks at ~Ep10; starting at Ep30 gives the
     # model ~20 decay epochs to stabilise before augmentation noise is added.
-    spec_augment_start_epoch: int = 30
+    spec_augment_start_epoch: int = 5
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
