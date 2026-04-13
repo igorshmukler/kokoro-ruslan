@@ -102,8 +102,16 @@ class KokoroTrainer:
         self.config = config
         self.device = torch.device(config.device)
 
-        # Create the tensorboard log directory
+        # Create the tensorboard log directory.
+        # On a fresh (non-resume) start, purge stale event files so
+        # TensorBoard doesn't merge overlapping runs into broken charts.
         log_dir = os.path.join(config.output_dir, 'logs')
+        _is_resume = bool(getattr(config, 'resume_checkpoint', None))
+        if not _is_resume and os.path.isdir(log_dir):
+            import glob as _glob
+            for _ef in _glob.glob(os.path.join(log_dir, 'events.out.tfevents.*')):
+                os.remove(_ef)
+            logger.info("Cleared stale TensorBoard event files for fresh training run")
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir  # stored for writer re-creation on resume
         self.writer = SummaryWriter(log_dir=log_dir)

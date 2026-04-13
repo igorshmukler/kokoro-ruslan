@@ -26,7 +26,7 @@ from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 6  # bumped: stress_indices added as a parallel phoneme-level tensor
+FEATURE_CACHE_VERSION = 7  # bumped: DP aligner recovers spn utterances (real MFA durations)
 
 
 def build_stop_token_targets(
@@ -739,19 +739,17 @@ class RuslanDataset(Dataset):
         num_phonemes = phoneme_indices_tensor.shape[0]
 
         # Try to get MFA alignments first.
-        # strip_outer_silences=True absorbs MFA's leading/trailing <sil> intervals
-        # into the first/last real phoneme frames.  After stripping, the MFA
-        # duration list contains exactly the same slots as our phoneme_sequence
-        # (word phonemes + inter-word <sil> tokens), so lengths match without
-        # requiring truncation/padding in the common case.
+        # get_aligned_durations uses DP sequence alignment (Needleman-Wunsch)
+        # to produce a duration list whose length exactly matches
+        # phoneme_sequence — handling iotation merges, geminate splits,
+        # prosody tokens, and inter-word <sil> automatically.
         mfa_durations = None
         if self.mfa is not None:
-            mfa_durations = self.mfa.get_phoneme_durations(
-                sample['audio_file'], strip_outer_silences=True
+            mfa_durations = self.mfa.get_aligned_durations(
+                sample['audio_file'], phoneme_sequence
             )
 
-        if mfa_durations is not None and len(mfa_durations) > 0:
-            # Use MFA durations
+        if mfa_durations is not None:
             phoneme_durations = torch.tensor(mfa_durations, dtype=torch.long)
 
             # Rescale MFA durations for speed perturbation.
@@ -760,31 +758,10 @@ class RuslanDataset(Dataset):
                 scaled = phoneme_durations.float() / _speed_factor
                 phoneme_durations = torch.clamp(scaled.round().long(), min=1)
 
-            # Handle length mismatch between MFA phonemes and our phonemes
-            if len(phoneme_durations) != num_phonemes:
-                # Log warning only occasionally to avoid spam
-                if idx % 1000 == 0:
-                    logger.warning(f"MFA duration length ({len(phoneme_durations)}) != "
-                                   f"phoneme length ({num_phonemes}) for {sample['audio_file']}")
-
-                # Adjust durations to match phoneme count
-                if len(phoneme_durations) > num_phonemes:
-                    # Truncate
-                    phoneme_durations = phoneme_durations[:num_phonemes]
-                else:
-                    # Pad with estimated durations for missing phonemes
-                    missing = num_phonemes - len(phoneme_durations)
-                    avg_dur = int(phoneme_durations.float().mean().item()) if len(phoneme_durations) > 0 else 5
-                    padding = torch.full((missing,), avg_dur, dtype=torch.long)
-                    phoneme_durations = torch.cat([phoneme_durations, padding])
-
-            # Handle Frame Sum Mismatch (The "Gap")
+            # Reconcile frame sum: ensure sum(durations) == num_mel_frames.
             current_sum = phoneme_durations.sum().item()
             diff = num_mel_frames - current_sum
-
             if diff != 0 and len(phoneme_durations) > 0:
-                # Add the drift (positive or negative) to the last phoneme
-                # This ensures Sum(durations) == mel_spec.shape[1]
                 phoneme_durations[-1] = max(1, phoneme_durations[-1] + diff)
 
             # Ensure durations are at least 1 frame
