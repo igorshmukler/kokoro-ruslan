@@ -1348,7 +1348,7 @@ class KokoroTrainer:
         projection_max_norm = float(self.projection_spike_clip_norm)
         attention_max_norm = float(self.attention_spike_clip_norm)
         ffn_max_norm = float(self.ffn_spike_clip_norm)
-        encoder_ffn_max_norm = float(getattr(self.config, 'encoder_ffn_spike_clip_norm', 10.0))
+        encoder_ffn_max_norm = float(getattr(self.config, 'encoder_ffn_spike_clip_norm', 8.0))
 
         for name, param in self.model.named_parameters():
             if param.grad is None:
@@ -1530,15 +1530,26 @@ class KokoroTrainer:
 
             self.current_optimizer_step += 1
         else:
-            # After warmup, use OneCycleLR or other scheduler
-            self.scheduler.step()
+            # After warmup, use OneCycleLR or other scheduler.
+            # Guard against stepping beyond total_steps — can happen when
+            # DynamicFrameBatchSampler produces more batches than the epoch
+            # count used to initialise OneCycleLR.
+            _onecycle_steps = getattr(self, '_onecycle_steps', None)
+            if _onecycle_steps is not None:
+                _sched_step = getattr(self.scheduler, 'last_epoch', 0)
+                if _sched_step >= _onecycle_steps:
+                    pass  # already at terminal LR; do not step further
+                else:
+                    self.scheduler.step()
+            else:
+                self.scheduler.step()
             if self.use_warmup:
                 self.current_optimizer_step += 1
 
     @staticmethod
     def _apply_spec_augment(
         mel_specs: torch.Tensor,
-        time_mask_max: int = 30,
+        time_mask_max: int = 20,
         freq_mask_max: int = 10,
         num_time_masks: int = 2,
         num_freq_masks: int = 2,
@@ -2110,7 +2121,7 @@ class KokoroTrainer:
                     if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
                         mel_for_model = KokoroTrainer._apply_spec_augment(
                             mel_specs,
-                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 30),
+                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 20),
                             freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
                             num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
                             num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),

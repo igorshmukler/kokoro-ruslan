@@ -764,8 +764,8 @@ class RuslanDataset(Dataset):
             if len(phoneme_durations) != num_phonemes:
                 # Log warning only occasionally to avoid spam
                 if idx % 1000 == 0:
-                    logger.debug(f"MFA duration length ({len(phoneme_durations)}) != "
-                               f"phoneme length ({num_phonemes}) for {sample['audio_file']}")
+                    logger.warning(f"MFA duration length ({len(phoneme_durations)}) != "
+                                   f"phoneme length ({num_phonemes}) for {sample['audio_file']}")
 
                 # Adjust durations to match phoneme count
                 if len(phoneme_durations) > num_phonemes:

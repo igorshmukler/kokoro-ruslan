@@ -44,7 +44,7 @@ class TrainingConfig:
     # lets OneCycleLR peak-phase spikes destabilize it.  0.2× should keep the
     # effective step size well below the adaptive clip threshold
     # while still giving the head meaningful updates every step.
-    stop_head_lr_multiplier: float = 0.2
+    stop_head_lr_multiplier: float = 0.1
     # LR multiplier applied specifically to decoder FFN layers (decoder.layers.*.ff.linear1/2).
     # Use <1.0 to reduce step size for the FFN subnetwork (helps stabilise persistent movers).
     # 0.15 (run 1): starved — FFN hit hard norm cap  |  0.50 (run 2): too hot — norms 29.8→51.9
@@ -157,7 +157,7 @@ class TrainingConfig:
     # treating most frames as non-stop.  With gradient isolation via detach now in
     # place, 25.0 gives sufficient class-balance correction without over-amplifying
     # the already-isolated stop gradient at the peak LR phase.
-    stop_token_pos_weight: float = 25.0
+    stop_token_pos_weight: float = 17.0
     # Temporal smoothing of stop-token targets.
     # Instead of a single hard 1.0 at the last frame, a short exponentially
     # decaying tail is added to the frames immediately before it:
@@ -211,6 +211,9 @@ class TrainingConfig:
     precompute_features: bool = False  # Precompute all features before training starts
     # In-memory feature cache (separate from on-disk feature cache)
     use_memory_cache: bool = True  # Keep features in RAM for faster access; disable to reduce GPU/host memory
+
+    # Adaptive memory management (MPS/GPU pressure-aware cleanup during training)
+    enable_adaptive_memory: bool = True
 
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
