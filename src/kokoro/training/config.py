@@ -318,6 +318,7 @@ class TrainingConfig:
     # AdamW regularization and numerical stability
     weight_decay: float = 0.04   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
     ffn_weight_decay: float = 0.1  # Higher L2 penalty for decoder & encoder FFN weights (replaces hard norm clamping)
+    decoder_ffn_weight_decay: float = 0.35  # Decoder FFN decay — higher than ffn_weight_decay to compensate for 0.3× LR multiplier
     adam_eps: float = 1e-8       # AdamW epsilon for numerical stability
     adam_betas: tuple = (0.9, 0.999)  # AdamW beta coefficients (momentum, RMS)
     # None = auto (enabled on CUDA, disabled otherwise)

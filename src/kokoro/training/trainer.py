@@ -589,6 +589,7 @@ class KokoroTrainer:
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
         decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
         ffn_weight_decay = getattr(config, 'ffn_weight_decay', weight_decay)
+        decoder_ffn_wd = getattr(config, 'decoder_ffn_weight_decay', ffn_weight_decay)
 
         # Build param groups, tagging each with a group_type for scheduler mapping
         param_groups = []
@@ -618,7 +619,7 @@ class KokoroTrainer:
                                  'group_type': 'decoder_attn'})
         if decoder_decay_ffn:
             param_groups.append({'params': decoder_decay_ffn, 'lr': base_lr * decoder_ffn_lr_mult,
-                                 'weight_decay': ffn_weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'weight_decay': decoder_ffn_wd, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'decoder_ffn'})
         if decoder_ffn_no_decay:
             param_groups.append({'params': decoder_ffn_no_decay, 'lr': base_lr * decoder_ffn_lr_mult,
@@ -655,7 +656,7 @@ class KokoroTrainer:
                 f"decoder_other_decay={n_decoder_other} params (lr={base_lr:.2e}, wd={weight_decay}), "
                 f"decoder_attn_decay={n_decoder_attn} params (lr={attn_lr:.2e}, wd={weight_decay}), "
                 f"decoder_attn_no_decay={n_decoder_attn_nd} params (lr={attn_lr:.2e}, wd=0.0), "
-                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={ffn_weight_decay}), "
+                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={decoder_ffn_wd}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
