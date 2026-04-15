@@ -413,10 +413,10 @@ class TestDatasetPhonemePathUsesSil:
 # ---------------------------------------------------------------------------
 class TestCacheVersionBump:
 
-    def test_feature_cache_version_is_4(self):
+    def test_feature_cache_version_is_7(self):
         from kokoro.data.dataset import FEATURE_CACHE_VERSION
-        assert FEATURE_CACHE_VERSION == 6, (
-            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 6.  "
+        assert FEATURE_CACHE_VERSION == 7, (
+            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 7.  "
             "Bump it when the phoneme sequence format changes so stale cache "
             "entries containing the old sequences are invalidated."
         )

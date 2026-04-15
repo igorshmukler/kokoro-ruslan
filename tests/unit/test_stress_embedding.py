@@ -413,5 +413,5 @@ class TestCollateStressIndices:
 class TestCacheVersion:
     """FEATURE_CACHE_VERSION must be 6 now that stress_indices are in the cache."""
 
-    def test_version_equals_6(self):
-        assert FEATURE_CACHE_VERSION == 6
+    def test_version_equals_7(self):
+        assert FEATURE_CACHE_VERSION == 7
