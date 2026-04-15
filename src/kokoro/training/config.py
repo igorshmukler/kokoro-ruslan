@@ -106,6 +106,14 @@ class TrainingConfig:
     stochastic_depth_rate: float = 0.1  # Maximum drop probability for last layer
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
 
+    # FFN output RMSNorm: decouples FFN output magnitude from weight norm growth.
+    # In pre-norm Transformers, LayerNorm on the *input* provides no constraint on
+    # the *output*.  When FFN weights grow, outputs grow proportionally, inflating
+    # gradients across the residual stream.  RMSNorm after linear2 breaks this
+    # feedback loop at the source.  Disabled by default for checkpoint compat;
+    # enable for fresh training runs.
+    ffn_output_norm: bool = True
+
     # Loss weights
     duration_loss_weight: float = 0.35
     # Global scaling of the stop-token loss in the total loss sum.
@@ -225,13 +233,15 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 1.0 # Reduced from 1.5: clip saturation escalated to 14.5% by Ep40, tighter clip reduces outlier batch damage
+    max_grad_norm: float = 1.5 # Restored from 1.0: at 38% clip saturation the global clip distorts gradient direction; per-param pre-clips provide real protection
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 4.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
-    ffn_spike_clip_norm: float = 5.0
+    # Tightened 5.0→3.0: decoder FFN is dominant gradient contributor (24 params,
+    # max_rms 0.50 vs ≤0.12 for all other groups); caps biggest source before global clip
+    ffn_spike_clip_norm: float = 3.0
     # Encoder FFN per-layer pre-clip
     encoder_ffn_spike_clip_norm: float = 8.0
     # Per-parameter clip norm applied exclusively to the stop-token head
@@ -256,11 +266,10 @@ class TrainingConfig:
     # dec_ff0_linear1_max_weight_norm is the legacy single-layer key and is kept
     # for backward compat; dec_ffn_max_weight_norm takes precedence when present.
     #
-    # DISABLED (set to 0): hard norm projection after every step corrupts Adam
-    # momentum/variance states when weights persistently hit the ceiling.  Use
-    # ffn_weight_decay instead for gradient-based regularisation that cooperates
-    # with the optimizer.
-    dec_ffn_max_weight_norm: float = 0.0
+    # Hard norm projection: enabled at 95.0 to arrest runaway decoder FFN growth
+    # (linear1 reached 88.0 at Ep14, growing ~5.7/ep, causing 22%→30% clipping
+    # saturation).  Weight decay alone is ineffective at 0.3× LR multiplier.
+    dec_ffn_max_weight_norm: float = 95.0
     dec_ff0_linear1_max_weight_norm: float = 0.0  # legacy — superseded by dec_ffn_max_weight_norm
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0

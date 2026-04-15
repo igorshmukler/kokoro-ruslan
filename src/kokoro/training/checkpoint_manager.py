@@ -435,9 +435,17 @@ def load_checkpoint(
             # num_heads); discarding them is safe.
             _ALIBI_SUFFIX = '.alibi_slopes'
 
+            # FFN output norm migration: when ffn_output_norm is enabled on a
+            # checkpoint trained without it, the output_norm.weight keys will be
+            # missing.  RMSNorm weight initialises to ones — safe to re-init.
+            _FFN_OUTPUT_NORM_SUFFIX = '.ff.output_norm.weight'
+
             all_missing_are_known = (
                 not missing_keys
-                or all(k.startswith(_NEW_VARIANCE_PREFIX) for k in missing_keys)
+                or all(
+                    k.startswith(_NEW_VARIANCE_PREFIX) or k.endswith(_FFN_OUTPUT_NORM_SUFFIX)
+                    for k in missing_keys
+                )
             )
             all_unexpected_are_known = (
                 not unexpected_keys
@@ -447,9 +455,8 @@ def load_checkpoint(
             if all_missing_are_known and all_unexpected_are_known:
                 if missing_keys:
                     logger.warning(
-                        "Checkpoint is missing variance_adaptor sub-module weights "
-                        f"({len(missing_keys)} keys). This is an expected architecture "
-                        "migration (old checkpoint predates the restructured VarianceAdaptor). "
+                        f"Checkpoint is missing {len(missing_keys)} key(s) from expected "
+                        "architecture migrations (variance_adaptor / ffn_output_norm). "
                         "Loading shared weights and initialising missing keys from scratch."
                     )
                 if unexpected_keys:

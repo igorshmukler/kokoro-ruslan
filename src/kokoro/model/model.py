@@ -43,7 +43,8 @@ class KokoroModel(nn.Module):
                  n_variance_bins: int = 256, pitch_min: float = 50.0,
                  pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0,
                  use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1,
-                 use_stress_embedding: bool = True, qk_norm: bool = False):
+                 use_stress_embedding: bool = True, qk_norm: bool = False,
+                 ffn_output_norm: bool = True):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
@@ -108,7 +109,8 @@ class KokoroModel(nn.Module):
         self.transformer_encoder_layers = nn.ModuleList([
             TransformerEncoderBlock(hidden_dim, n_heads, encoder_ff_dim, encoder_dropout,
                                    drop_path_rate=encoder_drop_path_rates[i],
-                                   qk_norm=qk_norm)
+                                   qk_norm=qk_norm,
+                                   ffn_output_norm=ffn_output_norm)
             for i in range(n_encoder_layers)
         ])
 
@@ -179,7 +181,8 @@ class KokoroModel(nn.Module):
             dropout=self._decoder_dropout,
             num_layers=n_decoder_layers,
             drop_path_rates=decoder_drop_path_rates,
-            qk_norm=qk_norm
+            qk_norm=qk_norm,
+            ffn_output_norm=ffn_output_norm,
         )
 
         # Output projection for Mel Spectrogram
