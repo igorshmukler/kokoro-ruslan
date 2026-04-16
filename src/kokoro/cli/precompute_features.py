@@ -19,7 +19,7 @@ from tqdm import tqdm
 import torch
 
 from kokoro.training.config import TrainingConfig
-from kokoro.data.dataset import RuslanDataset
+from kokoro.data.dataset import RuslanDataset, FEATURE_CACHE_VERSION
 
 logging.basicConfig(
     level=logging.INFO,
@@ -63,10 +63,16 @@ def precompute_features(data_dir: str, config: TrainingConfig, force_recompute: 
         audio_file = sample['audio_file']
         cache_path = cache_dir / f"{audio_file}.pt"
 
-        # Skip if already cached and not forcing recompute
+        # Skip if already cached with current version and not forcing recompute
         if cache_path.exists() and not force_recompute:
-            cached_count += 1
-            continue
+            try:
+                meta = torch.load(cache_path, map_location='cpu', weights_only=False)
+                if meta.get('_cache_version') == FEATURE_CACHE_VERSION:
+                    cached_count += 1
+                    continue
+                # Stale version — fall through to recompute
+            except Exception:
+                pass  # Corrupted file — fall through to recompute
 
         try:
             # Access the item - this will compute and cache it

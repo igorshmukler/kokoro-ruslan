@@ -665,8 +665,19 @@ class EnergyExtractor:
             energy = torch.mean(mel_spec, dim=-1)
             energy = torch.log1p(torch.clamp(energy, min=0.0))
 
-        # Percentile normalisation — robust to outliers, keeps output in [0, 1]
-        if energy.dim() == 1:
+        # Percentile normalisation — robust to outliers, keeps output in [0, 1].
+        # Guard: when the time dimension is very short (≤2 frames), the 5th and
+        # 95th percentiles collapse to (nearly) the same value, making the
+        # denominator degenerate.  Fall back to simple min/max in that case.
+        _T = energy.shape[-1] if energy.dim() >= 1 else 0
+        if _T < 3:
+            if energy.dim() == 1:
+                floor = energy.min()
+                ceil  = energy.max()
+            else:
+                floor = energy.min(dim=-1, keepdim=True).values
+                ceil  = energy.max(dim=-1, keepdim=True).values
+        elif energy.dim() == 1:
             floor = torch.quantile(energy, 0.05)
             ceil  = torch.quantile(energy, 0.95)
         else:

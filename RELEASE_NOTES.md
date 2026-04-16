@@ -2,6 +2,102 @@
 
 This file tracks releases based on `version=` changes in `setup.py`.
 
+## 0.0.35 (2026-04-15)
+
+### FFN output RMSNorm (`transformers.py`, `model.py`, `config.py`, `trainer.py`)
+
+- **Root cause fix for decoder FFN weight norm runaway**: in pre-norm Transformers, LayerNorm on the FFN *input* provides no constraint on the *output*. As FFN weights grow, outputs grow proportionally, inflating gradients across the residual stream in a positive feedback loop. `decoder.layers.0.ff.linear1.weight` grew from 29.8 (init) to 88.0 (3.0× init) in 14 epochs with accelerating growth rate, driving clipping saturation from 0.1% to 30%.
+- **`GLUFeedForward`** (`transformers.py`): new `use_output_norm: bool = False` parameter. When enabled, applies `nn.RMSNorm(d_model)` after `linear2`, decoupling output magnitude from weight growth. Verified: with 3× weight scaling, output norm stays at 1.0× (vs 10.7× without).
+- **Threaded through all constructor chains**: `ffn_output_norm` propagated through `ImprovedTransformerEncoderBlock`, `ImprovedTransformerDecoderBlock`, `ImprovedTransformerDecoder`, and compatibility wrappers `TransformerEncoderBlock` and `TransformerDecoder`.
+- **Model constructor** (`model.py`): `KokoroModel.__init__` accepts `ffn_output_norm: bool = False` and passes to all encoder blocks and decoder.
+- **Config field** (`config.py`): `ffn_output_norm: bool = True`. Disabled by default in code for checkpoint compat; set `True` for fresh training runs.
+- **Trainer wiring** (`trainer.py`): passes `config.ffn_output_norm` to `KokoroModel`.
+
+### MFA phoneme alignment overhaul (`mfa_integration.py`, `dataset.py`)
+
+- **Phone normalization**: `_MFA_PHONE_MAP` (26 entries) maps MFA's `russian_mfa` phoneme inventory to the text-processor IPA inventory — dental diacritics, palatal symbols, velarized laterals, etc. `_normalize_mfa_phone()` applies NFC normalization and combining-character stripping.
+- **DP sequence alignment** (`align_durations()`): Needleman-Wunsch dynamic programming aligner with transitions for 1:1 match, 2:1 iotation merge (`j` + vowel → single token), 1:2 geminate split, prosody token insertion, `<sil>` insertion, and 1:N `spn` (spoken noise) expansion. Achieves 22,199/22,200 aligned files (1 missing TextGrid).
+- **SPN recovery**: single `spn` MFA interval can match K consecutive text-processor phones via `S{k}` transition, recovering all 11,391 spn-affected utterances that were previously rejected.
+- **`get_aligned_durations()`**: new public API used by `dataset.py` replacing the old `get_phoneme_durations()` path. Handles all alignment edge cases natively.
+- **Dataset wiring** (`dataset.py`): `__getitem__` now calls `self.mfa.get_aligned_durations()` instead of `get_phoneme_durations()` with `strip_outer_silences`.
+- **`FEATURE_CACHE_VERSION` bumped 6 → 7** (`dataset.py`): invalidates stale cache entries from pre-DP-aligner phoneme sequences.
+
+### Gradient and weight norm stabilization (`config.py`, `trainer.py`)
+
+- **`max_grad_norm` 1.0 → 1.5**: at 38% clipping saturation, the global clip was distorting gradient direction on over a third of steps. Per-parameter pre-clips provide the real spike protection.
+- **`ffn_spike_clip_norm` 5.0 → 3.0**: decoder FFN is the dominant gradient contributor (24 params, max RMS 0.50 vs ≤0.12 for all other groups). Tighter pre-clip targets the largest source before global clip.
+- **`dec_ffn_max_weight_norm: float = 95.0`** (was 0.0 / disabled): post-step L2 norm clamp on all 12 decoder FFN weight matrices (6 layers × linear1 + linear2) plus encoder FFN matrices. Arrests runaway weight growth when weight decay alone is insufficient at the 0.3× LR multiplier.
+- **`decoder_ffn_weight_decay: float = 0.35`**: dedicated weight decay for decoder FFN param group, wired separately from the shared `ffn_weight_decay` (0.1). Applied via `getattr(config, 'decoder_ffn_weight_decay', ffn_weight_decay)` in the optimizer setup.
+
+### Stop loss tuning (`config.py`)
+
+- **`stop_token_pos_weight` 25 → 17**: reduces stop-loss dominance in early training. The stop/mel loss ratio self-corrected from 0.609 to 0.275 by Ep12.
+- **`stop_head_lr_multiplier` 0.2 → 0.1**: further throttles stop head update magnitude at peak LR.
+
+### Bug fixes
+
+- **Pitch/energy loss weight fallback** (`losses.py`): `getattr` fallbacks for `pitch_loss_weight` and `energy_loss_weight` corrected from `0.1` to `1.0`. The wrong fallback silently scaled pitch/energy gradients by 10× less than intended when config fields were absent.
+- **SpecAugment time_mask_max fallback** (`trainer.py`): default changed from `30` to `20` in both the `getattr` fallback and the method signature, matching the intended config value.
+- **OneCycleLR step overflow guard** (`trainer.py`): when `warmup_steps >= total_steps`, warmup is clamped to `total_steps - 1` to prevent a crash in the `OneCycleLR` constructor.
+- **`encoder_ffn_spike_clip_norm` fallback** (`trainer.py`): corrected from `10.0` to `8.0` to match config default.
+- **Energy percentile normalization guard** (`variance_predictor.py`): when sequence length `T < 3` frames, uses `min`/`max` instead of `quantile(0.05/0.95)` to avoid `RuntimeError` from insufficient elements.
+- **MFA duration mismatch log level** (`dataset.py`): raised from `DEBUG` to `WARNING` so alignment mismatches are visible in normal logging.
+- **Precompute features cache version check** (`precompute_features.py`): fixed to check `_cache_version` before skipping cached files. Previously skipped stale v6 files without recomputing.
+
+### TensorBoard event file cleanup (`trainer.py`)
+
+- On fresh (non-resume) training starts, stale `events.out.tfevents.*` files are removed from the log directory. Prevents broken TensorBoard plots from overlapping runs.
+
+### Checkpoint migration (`checkpoint_manager.py`)
+
+- **FFN output norm migration**: `*.ff.output_norm.weight` keys recognized as expected missing keys during checkpoint loading, enabling `strict=False` load from pre-`ffn_output_norm` checkpoints without error.
+- **Generalized missing-key warning**: migration message now covers both variance_adaptor and ffn_output_norm key families.
+
+### New config fields
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `ffn_output_norm` | `True` | RMSNorm on FFN output to decouple output magnitude from weight growth |
+| `decoder_ffn_weight_decay` | `0.35` | Dedicated weight decay for decoder FFN param group |
+| `enable_adaptive_memory` | `True` | MPS adaptive memory management |
+| `dec_ffn_max_weight_norm` | `95.0` | Post-step max weight norm for FFN matrices |
+
+### Unit tests updated
+
+- `tests/unit/test_sil_aligned_training_path.py` — fixed `_mfa()` helper to return `(alignment, [])` tuple matching updated `parse_textgrid` signature (was returning bare list, causing `ValueError: not enough values to unpack`). Updated `test_dataset_getitem_passes_strip_outer_silences` to assert `get_aligned_durations` (DP aligner) instead of the removed `strip_outer_silences=True` kwarg. 16 test failures resolved.
+
+## 0.0.34 (2026-04-02)
+
+### Model size reduction (`config.py`)
+
+- **`hidden_dim` 768 → 512**: cuts total parameters from ~35M to ~16M. With 22K training utterances (~1,600 params/sample at 35M), the model was deep in the overfitting regime. At 16M (~730 params/sample) the capacity/data ratio is far more tractable.
+- **`encoder_ff_dim` / `decoder_ff_dim` 2048 → 1536**: GLU FFN expansion rebalanced from 5.3× to 4×, reducing FFN dominance in total parameter count.
+
+### Decoder dropout separation (`config.py`, `model.py`, `trainer.py`)
+
+- **`decoder_dropout: float = 0.25`** (new config field): dedicated dropout rate for decoder attention/FFN residual connections, separate from `encoder_dropout` (0.15). The decoder is more prone to overfitting due to teacher forcing and benefits from stronger regularization.
+- **`decoder_input_dropout: float = 0.15`** (new config field): dropout on projected mel input before it enters the decoder (was hardcoded 0.1).
+- **Model wiring** (`model.py`): `KokoroModel.__init__` accepts `decoder_dropout` (default `None` → falls back to `encoder_dropout` for backward compatibility). Stored as `self._decoder_dropout` and passed to `TransformerDecoder`.
+- **Trainer wiring** (`trainer.py`): passes both `decoder_dropout` and `decoder_input_dropout` from config to `KokoroModel`.
+
+### SpecAugment improvements (`config.py`, `trainer.py`)
+
+- **Reduced masking intensity**: `spec_augment_time_mask_max` 30 → 10, `spec_augment_num_time_masks` 2 → 1, `spec_augment_freq_mask_max` 10 → 5. Worst-case temporal masking drops from ~43% to ~7%, preventing the catastrophic autoregressive pathway disruption observed in the previous run (Ep13 shock of +0.053 that never recovered).
+- **Per-sample masking** (`trainer.py`): `_apply_spec_augment` now generates independent masks for each sample in the batch instead of applying one mask batch-wide. Improves gradient diversity across the batch.
+
+### Speed perturbation augmentation (`config.py`, `dataset.py`, `trainer.py`)
+
+- **Audio-level speed perturbation** (`dataset.py`): randomly resamples training audio by a factor in [0.9, 1.1] before feature extraction, effectively multiplying dataset diversity by ~1.5× without additional data. Applied per-sample in `__getitem__` after audio normalization but before mel computation via `torchaudio.functional.resample`.
+- **MFA duration rescaling**: phoneme durations are scaled by `1/factor` (speed up → shorter durations) with `clamp(min=1)`. Existing frame-sum correction handles any rounding residual.
+- **Cache bypass**: augmented samples skip both cache load and save (stochastic perturbation is incompatible with deterministic caching); unperturbed samples use the cache normally.
+- **Training-only**: `is_training` flag added to `RuslanDataset.__init__`; trainer passes `is_training=True` for train, `is_training=False` for validation. Speed perturbation is never applied to validation data.
+- New config fields: `use_speed_perturbation: bool = True`, `speed_perturb_range: float = 0.1`, `speed_perturb_prob: float = 0.5`.
+
+### Training schedule (`config.py`)
+
+- **`num_epochs` 60 → 100**: extends OneCycleLR to ~32,700 steps, adding ~67% more cosine-decay refinement time. Combined with the smaller model, estimated val_mel at Ep100: ~0.70 (central), range 0.65–0.74.
+- **`early_stopping_patience` 10 → 15**: prevents premature stopping during the SpecAugment adaptation window.
+
 ## 0.0.33 (2026-03-28)
 
 ### QK-normalization (`transformers.py`, `model.py`, `config.py`, `trainer.py`)

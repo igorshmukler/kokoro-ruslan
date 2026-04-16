@@ -54,7 +54,7 @@ def test_resampler_is_cached_by_source_rate(tmp_path, monkeypatch):
 
     monkeypatch.setattr("torchaudio.transforms.Resample", _FakeResample)
 
-    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
+    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False, is_training=False)
     _ = dataset[0]
     _ = dataset[0]
 
@@ -73,7 +73,7 @@ def test_feature_cache_lru_respects_entry_limit(tmp_path):
     config.feature_cache_max_entries = 2
     config.feature_cache_max_mb = 8192.0 # 8 GB to hold everything in memory
 
-    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
+    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False, is_training=False)
 
     _ = dataset[0]
     _ = dataset[1]
@@ -97,7 +97,7 @@ def test_feature_cache_lru_respects_memory_limit(tmp_path):
     config.feature_cache_max_entries = 100
     config.feature_cache_max_mb = 0.002  # ~2KB
 
-    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
+    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False, is_training=False)
 
     small = {"mel_spec": torch.zeros(64, dtype=torch.float32), "_cache_version": 2}
     big = {"mel_spec": torch.zeros(2000, dtype=torch.float32), "_cache_version": 2}
@@ -122,7 +122,7 @@ def test_verbose_cache_runtime_logging(tmp_path, caplog):
     )
     config.feature_cache_log_interval = 1
 
-    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False)
+    dataset = RuslanDataset(str(corpus_dir), config, use_mfa=False, is_training=False)
 
     with caplog.at_level(logging.INFO):
         _ = dataset[0]  # miss

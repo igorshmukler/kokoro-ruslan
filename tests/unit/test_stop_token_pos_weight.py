@@ -100,7 +100,7 @@ class TestTrainingConfigDefaults:
         # pos_weight is intentionally decoupled from stop_token_loss_weight.
         # Current value: 35.0 (stable partial correction ~?% of true imbalance).
         # History: 150 → spikes; 100 → grad_norm to 39.8; 50 → stable.
-        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 25.0
+        assert TrainingConfig.__dataclass_fields__['stop_token_pos_weight'].default == 17.0
 
     def test_stop_token_pos_weight_custom_value_survives_post_init(self):
         cfg = TrainingConfig(stop_token_pos_weight=300.0)

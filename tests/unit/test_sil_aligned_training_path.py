@@ -66,8 +66,10 @@ def _mfa(tmp_path: Path, phonemes_and_durations: List[Tuple[str, float]]) -> MFA
     mfa.hop_length = 256
     mfa.sample_rate = 22050
     # Patch parse_textgrid so no real .TextGrid file is needed.
+    # Return (word_alignments, word_boundaries) tuple matching the real signature.
+    alignment = _make_alignment(phonemes_and_durations)
     mfa.parse_textgrid = MagicMock(
-        return_value=_make_alignment(phonemes_and_durations)
+        return_value=(alignment, [])
     )
     return mfa
 
@@ -401,11 +403,11 @@ class TestDatasetPhonemePathUsesSil:
         )
 
     def test_dataset_getitem_passes_strip_outer_silences(self):
-        """__getitem__ must pass strip_outer_silences=True to get_phoneme_durations."""
+        """__getitem__ must use get_aligned_durations (DP aligner handles sil natively)."""
         import inspect
         import kokoro.data.dataset as ds_module
         src = inspect.getsource(ds_module.RuslanDataset.__getitem__)
-        assert "strip_outer_silences=True" in src
+        assert "get_aligned_durations" in src
 
 
 # ---------------------------------------------------------------------------
@@ -413,10 +415,10 @@ class TestDatasetPhonemePathUsesSil:
 # ---------------------------------------------------------------------------
 class TestCacheVersionBump:
 
-    def test_feature_cache_version_is_4(self):
+    def test_feature_cache_version_is_7(self):
         from kokoro.data.dataset import FEATURE_CACHE_VERSION
-        assert FEATURE_CACHE_VERSION == 6, (
-            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 6.  "
+        assert FEATURE_CACHE_VERSION == 7, (
+            f"FEATURE_CACHE_VERSION is {FEATURE_CACHE_VERSION}, expected 7.  "
             "Bump it when the phoneme sequence format changes so stale cache "
             "entries containing the old sequences are invalidated."
         )

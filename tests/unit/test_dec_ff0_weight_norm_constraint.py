@@ -114,7 +114,7 @@ def _set_weight_norm(param: nn.Parameter, target_norm: float) -> None:
 
 def test_config_default_value():
     cfg = TrainingConfig()
-    assert cfg.dec_ff0_linear1_max_weight_norm == 60.0
+    assert cfg.dec_ff0_linear1_max_weight_norm == 0.0
 
 
 def test_config_custom_value_survives_post_init():

@@ -15,26 +15,24 @@ class TrainingConfig:
     # Basic training parameters
     data_dir: str = "data/processed_data"
     output_dir: str = "output_models"
-    num_epochs: int = 60  # 60 × ~339 steps/epoch − 1200 warmup ≈ 19,140 OneCycleLR steps
+    num_epochs: int = 100  # 100 × ~678 opt-steps/epoch (accum=2) − 1200 warmup ≈ 66,600 OneCycleLR steps
     batch_size: int = 16
-    learning_rate: float = 7.0e-5  # peak LR = learning_rate × max_lr_multiplier = 7.0e-5 × 1.2 = 8.4e-5
+    learning_rate: float = 5.0e-5  # peak LR = 5.0e-5 × 1.0 = 5.0e-5 (reduced from 7.0e-5: 5-ep val_mel regression at peak hold)
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
     # Gradient accumulation for larger effective batch sizes
-    gradient_accumulation_steps: int = 4  # Effective batch size = batch_size * gradient_accumulation_steps
+    gradient_accumulation_steps: int = 2  # Effective batch size = batch_size * gradient_accumulation_steps
 
     # Learning rate scheduler (OneCycleLR)
     use_onecycle_lr: bool = True  # Use OneCycleLR instead of CosineAnnealingWarmRestarts
-    # 1.1 → 1.05 (Ep10 of prior run): 2 consecutive regressions; clipping 0.3%→3.8%; encoder FFN
-    # emerged as top-2/3/10 delta movers alongside decoder attention — broad LR peak pressure.
-    # 1.05 run: better best (0.89290 Ep07 vs 0.89001), but regressions arrived 1 ep earlier
-    # (Ep08 +0.0124, Ep09 +0.0240 accelerating) with same encoder FFN top-mover signature.
-    # Clipping was 0.3% at Ep09 — not gradient noise, sustained cosine ascent destabilising
-    # encoder FFN representations at ~98-99% of peak. Both 1.1× and 1.05× hit the same wall.
-    # 1.05 → 1.0: dec peak 5.25→5.0e-5, enc peak 5.775→5.5e-5, FFN 1.05→1.0e-5 (−5% uniform).
-    # Resume from Ep07 (best checkpoint, val_mel=0.89290).
-    max_lr_multiplier: float = 1.2   # Peak decoder LR = learning_rate × this = 7.0e-5 × 1.2 = 8.4e-5
-    pct_start: float = 0.25  # Fraction of OneCycleLR cycle spent ascending to peak — shorter climb, more decay time for refinement
+    # Run 1 (40 ep, mult=1.2, pct=0.25, lr=7e-5): best val 1.127@Ep6, regressed→1.279@Ep40
+    # Run 2 (9 ep, mult=1.0, pct=0.10, lr=7e-5): best val 1.353@Ep4, 5 consecutive
+    #   regressions Ep5-9 (1.393→1.488). Peak LR 7.0e-5 held flat Ep2-12 (div_factor=1.0
+    #   makes ascending phase flat), encoder FFN became #2 mover at Ep8 (delta 8.59).
+    #   FFN mult 0.30→0.20 had zero effect. Overfitting: train-val gap flipped -0.13→+0.08.
+    # Run 3: lr=5e-5 (-29%), pct=0.05 (decay starts ~Ep7 vs Ep12).
+    max_lr_multiplier: float = 1.0   # Peak decoder LR = 5.0e-5 × 1.0 = 5.0e-5
+    pct_start: float = 0.05  # 5% ascending → cosine decay starts ~Ep7 (was 0.10 → Ep12, too late)
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
@@ -46,20 +44,16 @@ class TrainingConfig:
     # lets OneCycleLR peak-phase spikes destabilize it.  0.2× should keep the
     # effective step size well below the adaptive clip threshold
     # while still giving the head meaningful updates every step.
-    stop_head_lr_multiplier: float = 0.2
+    stop_head_lr_multiplier: float = 0.1
     # LR multiplier applied specifically to decoder FFN layers (decoder.layers.*.ff.linear1/2).
     # Use <1.0 to reduce step size for the FFN subnetwork (helps stabilise persistent movers).
-    # 0.5 was still insufficient — all decoder FFN linear1 layers remained 100% persistent movers.
-    # 0.3: peak FFN LR ≈ 1.65e-5. Still too high — 3 consecutive val_mel regressions Ep9-11 at
-    # 99% of LR peak, all mel-only (stop/duration kept improving → FFN is confirmed driver).
-    # Lowered to 0.2: peak FFN LR = base_lr × max_lr_mult × 0.2 ≈ 1.10e-5.
-    decoder_ffn_lr_multiplier: float = 0.2
+    # 0.15 (run 1): starved — FFN hit hard norm cap  |  0.50 (run 2): too hot — norms 29.8→51.9
+    # 0.30 vs 0.20 (run 2): identical val_mel (<0.001 diff) — FFN mult is not the lever.
+    # Restoring 0.30 with lower base LR: peak FFN = 5.0e-5×0.30 = 1.5e-5 (≈ old 7e-5×0.20 = 1.4e-5)
+    decoder_ffn_lr_multiplier: float = 0.30
     # LR multiplier for decoder self-attention and cross-attention layers
     # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
-    # Dec layers 3-5 self_attn consumed 59% of all weight deltas by Ep32 with
-    # Dec.5 w_o growing 27.7→88.2 (3.2×) — driven by running at full base LR.
-    # 0.4× dampens attention updates while still allowing meaningful learning.
-    decoder_attn_lr_multiplier: float = 0.4
+    decoder_attn_lr_multiplier: float = 0.30
 
     # QK-normalization: per-head RMSNorm on Q and K after projection.
     # Decouples attention logit scale from weight norms, preventing unbounded
@@ -84,7 +78,7 @@ class TrainingConfig:
 
     # Model parameters
     n_mels: int = 80
-    hidden_dim: int = 768
+    hidden_dim: int = 512
     n_encoder_layers: int = 6
     n_decoder_layers: int = 6
     n_heads: int = 8
@@ -94,15 +88,31 @@ class TrainingConfig:
     # model params — far too dominant for a 22K-utterance dataset.  Reducing to
     # 2048 gives 5.3× expansion (LLaMA/PaLM convention for GLU: ~2.67× hidden),
     # cutting FFN params by 34% and rebalancing FFN vs attention capacity.
-    encoder_ff_dim: int = 2048
-    decoder_ff_dim: int = 2048
+    encoder_ff_dim: int = 1536
+    decoder_ff_dim: int = 1536
     encoder_dropout: float = 0.15
+    # Separate dropout for decoder attention/FFN residual connections.
+    # The decoder is more prone to overfitting than the encoder due to
+    # teacher forcing, so it benefits from stronger regularization.
+    # 0.30 (run 2): with stochastic depth 0.10 + GLU gating, effective signal
+    # survival ≈ 0.70×0.90×0.50 = 31.5% — too aggressive. Reduced to 0.20.
+    decoder_dropout: float = 0.20
+    # Dropout applied to the projected mel input before it enters the decoder.
+    decoder_input_dropout: float = 0.15
     max_decoder_seq_len: int = 4000
 
     # Stochastic depth (layer dropout) for regularization
     use_stochastic_depth: bool = True  # Enable layer dropout during training
     stochastic_depth_rate: float = 0.1  # Maximum drop probability for last layer
     # Drop probability increases linearly from 0 (first layer) to stochastic_depth_rate (last layer)
+
+    # FFN output RMSNorm: decouples FFN output magnitude from weight norm growth.
+    # In pre-norm Transformers, LayerNorm on the *input* provides no constraint on
+    # the *output*.  When FFN weights grow, outputs grow proportionally, inflating
+    # gradients across the residual stream.  RMSNorm after linear2 breaks this
+    # feedback loop at the source.  Disabled by default for checkpoint compat;
+    # enable for fresh training runs.
+    ffn_output_norm: bool = True
 
     # Loss weights
     duration_loss_weight: float = 0.35
@@ -128,16 +138,16 @@ class TrainingConfig:
     # unmasked frames are unaffected.  Masking forces the decoder to rely on encoder
     # context rather than memorising the previous mel frame.
     use_spec_augment: bool = True
-    spec_augment_time_mask_max: int = 30   # Max consecutive frames masked per mask
-    spec_augment_freq_mask_max: int = 10   # Max consecutive mel bins masked per mask
-    spec_augment_num_time_masks: int = 2   # Number of independent time masks per batch
+    spec_augment_time_mask_max: int = 20   # Doubled from 10: stronger regularisation needed for 22K-sample dataset
+    spec_augment_freq_mask_max: int = 10   # Doubled from 5: mask ~12.5% of mel bins per mask
+    spec_augment_num_time_masks: int = 2   # Doubled from 1: more mask diversity
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
-    # Epoch gate: SpecAugment is too noisy while the LR is still ramping.
-    # With pct_start=0.30 and ~19080 OneCycleLR steps the LR peaks at step
-    # ~6924 (absolute ~Ep20).  SpecAugment should activate AFTER the LR-pressure
-    # regression stabilises — at Ep15 the cosine ascent is ~95% of peak and
-    # regressions from Ep7-10 will have fully extinguished.
-    spec_augment_start_epoch: int = 12
+    # Epoch gate: SpecAugment must start AFTER the LR peak to avoid compounding
+    # ascent-phase instability (previous run: Ep12 onset during 77% LR climb
+    # caused val_mel Ep12→Ep17 regression).
+    # With pct_start=0.10 the LR peaks at ~Ep10; starting at Ep30 gives the
+    # model ~20 decay epochs to stabilise before augmentation noise is added.
+    spec_augment_start_epoch: int = 5
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
@@ -155,7 +165,7 @@ class TrainingConfig:
     # treating most frames as non-stop.  With gradient isolation via detach now in
     # place, 25.0 gives sufficient class-balance correction without over-amplifying
     # the already-isolated stop gradient at the peak LR phase.
-    stop_token_pos_weight: float = 25.0
+    stop_token_pos_weight: float = 17.0
     # Temporal smoothing of stop-token targets.
     # Instead of a single hard 1.0 at the last frame, a short exponentially
     # decaying tail is added to the frames immediately before it:
@@ -190,6 +200,15 @@ class TrainingConfig:
     f_min: float = 0.0
     f_max: float = 8000.0
 
+    # Speed perturbation: randomly resample audio by a factor in
+    # [1 - speed_perturb_range, 1 + speed_perturb_range] before feature
+    # extraction.  Applied per-sample in the training dataset only;
+    # augmented samples bypass the feature cache.  Effectively multiplies
+    # dataset diversity without collecting more data.
+    use_speed_perturbation: bool = True
+    speed_perturb_range: float = 0.1   # ±10% speed (factors 0.9–1.1)
+    speed_perturb_prob: float = 0.5    # Probability of perturbing each sample
+
     # Data loading
     num_workers: int = 0
     pin_memory: bool = False
@@ -201,6 +220,9 @@ class TrainingConfig:
     # In-memory feature cache (separate from on-disk feature cache)
     use_memory_cache: bool = True  # Keep features in RAM for faster access; disable to reduce GPU/host memory
 
+    # Adaptive memory management (MPS/GPU pressure-aware cleanup during training)
+    enable_adaptive_memory: bool = True
+
     # Dynamic batching (batch by total frames instead of fixed size)
     use_dynamic_batching: bool = True  # Enable frame-based batching
     max_frames_per_batch: int = 15000  # Maximum mel frames per batch (auto-adjusted for MPS)
@@ -211,13 +233,15 @@ class TrainingConfig:
     # This is the base ceiling for the adaptive gradient clip norm used during the
     # normal (non-outlier) training step.  The adaptive stabilizer may lower it
     # further for batches with extreme mel lengths or durations.
-    max_grad_norm: float = 2.0 # Global gradient clip ceiling
+    max_grad_norm: float = 1.5 # Restored from 1.0: at 38% clip saturation the global clip distorts gradient direction; per-param pre-clips provide real protection
 
     # Gradient stability safeguards
     projection_spike_clip_norm: float = 20.0
     attention_spike_clip_norm: float = 4.0
     # Per-layer clip norm for decoder FFN linear1/linear2 (consistent regression driver)
-    ffn_spike_clip_norm: float = 5.0
+    # Tightened 5.0→3.0: decoder FFN is dominant gradient contributor (24 params,
+    # max_rms 0.50 vs ≤0.12 for all other groups); caps biggest source before global clip
+    ffn_spike_clip_norm: float = 3.0
     # Encoder FFN per-layer pre-clip
     encoder_ffn_spike_clip_norm: float = 8.0
     # Per-parameter clip norm applied exclusively to the stop-token head
@@ -241,8 +265,12 @@ class TrainingConfig:
     # for a 6-layer decoder).  Set ≤ 0.0 to disable.
     # dec_ff0_linear1_max_weight_norm is the legacy single-layer key and is kept
     # for backward compat; dec_ffn_max_weight_norm takes precedence when present.
-    dec_ffn_max_weight_norm: float = 55.0
-    dec_ff0_linear1_max_weight_norm: float = 60.0  # legacy — superseded by dec_ffn_max_weight_norm
+    #
+    # Hard norm projection: enabled at 95.0 to arrest runaway decoder FFN growth
+    # (linear1 reached 88.0 at Ep14, growing ~5.7/ep, causing 22%→30% clipping
+    # saturation).  Weight decay alone is ineffective at 0.3× LR multiplier.
+    dec_ffn_max_weight_norm: float = 95.0
+    dec_ff0_linear1_max_weight_norm: float = 0.0  # legacy — superseded by dec_ffn_max_weight_norm
     grad_explosion_warmup_steps: int = 400
     grad_explosion_warmup_floor: float = 8000.0
     grad_explosion_min_ema_steps: int = 100
@@ -254,7 +282,7 @@ class TrainingConfig:
     # Validation settings
     validation_split: float = 0.1  # 10% of data for validation
     validation_interval: int = 1  # Run validation every N epochs
-    early_stopping_patience: int = 10  # Stop if no improvement for N epochs
+    early_stopping_patience: int = 15  # Stop if no improvement for N epochs
     early_stopping_min_delta: float = 0.001  # Minimum improvement to count
 
     # Montreal Forced Aligner (MFA) settings
@@ -298,6 +326,8 @@ class TrainingConfig:
     # Optimizer behavior
     # AdamW regularization and numerical stability
     weight_decay: float = 0.04   # L2 penalty applied to decoder/rest param group; encoder group always uses 0.0
+    ffn_weight_decay: float = 0.1  # Higher L2 penalty for decoder & encoder FFN weights (replaces hard norm clamping)
+    decoder_ffn_weight_decay: float = 0.35  # Decoder FFN decay — higher than ffn_weight_decay to compensate for 0.3× LR multiplier
     adam_eps: float = 1e-8       # AdamW epsilon for numerical stability
     adam_betas: tuple = (0.9, 0.999)  # AdamW beta coefficients (momentum, RMS)
     # None = auto (enabled on CUDA, disabled otherwise)

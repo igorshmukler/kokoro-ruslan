@@ -18,6 +18,7 @@ import torch
 import re
 import math
 import statistics
+import pickle
 from pathlib import Path
 from collections import defaultdict
 
@@ -30,6 +31,55 @@ except ImportError:
 
 CHECKPOINT_DIR = Path("my_model")
 TB_LOG_DIR = Path("my_model/logs")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stats cache helpers — makes repeat runs nearly instant
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Bump when the cached record schema changes (invalidates all existing caches)
+_CACHE_VERSION = 3
+
+# Keys to exclude from the cache (large tensor dicts; not needed after stats computed)
+_STATE_DICT_KEYS = ("state_dict", "ema_state_dict")
+
+
+def _master_cache_path() -> Path:
+    return CHECKPOINT_DIR / ".analysis_stats_cache.pkl"
+
+
+def _load_master_cache(files: list) -> tuple:
+    """Return (records, persistent_counts) from cache if valid, else (None, None)."""
+    try:
+        with open(_master_cache_path(), "rb") as fh:
+            data = pickle.load(fh)
+        if data.get("version") != _CACHE_VERSION:
+            return None, None
+        if any(data.get("mtimes", {}).get(str(f)) != f.stat().st_mtime for f in files):
+            return None, None
+        return data["records"], data.get("persistent_counts", {})
+    except Exception:
+        return None, None
+
+
+def _save_master_cache(files: list, records: list, persistent_counts: dict):
+    """Persist records (minus tensor dicts) to the stats cache file."""
+    data = {
+        "version": _CACHE_VERSION,
+        "mtimes": {str(f): f.stat().st_mtime for f in files},
+        "records": [{k: v for k, v in r.items() if k not in _STATE_DICT_KEYS} for r in records],
+        "persistent_counts": persistent_counts,
+    }
+    try:
+        with open(_master_cache_path(), "wb") as fh:
+            pickle.dump(data, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:
+        print(f"[cache] Warning: could not write stats cache: {exc}")
+
+
+def _section(title, width=90):
+    """Print a titled section separator."""
+    print(f"\n{'=' * width}\n{title}\n{'=' * width}")
+
 
 KEY_LAYERS = [
     "mel_projection",
@@ -51,69 +101,38 @@ KEY_LAYERS = [
 # ─────────────────────────────────────────────────────────────────────────────
 
 def classify_param(name: str, cfg=None):
+    """Return (category, pre_clip_cap, lr_key) for a parameter name.
+
+    cap is the per-element gradient-norm cap used by the trainer's pre-clip logic
+    (float('inf') for uncapped groups).  Category coverage is intentionally broad
+    so that the 'other' residual is small and any entry in it is genuinely novel.
     """
-    Return (category, pre_clip_cap, lr_multiplier_key) for a parameter name.
-
-    cap is the per-element gradient-norm cap used by the trainer's pre-clip
-    logic (or float('inf') for truly uncapped groups).
-    lr_multiplier_key is 'decoder' or 'encoder'.
-
-    Category coverage is intentionally broad so that the 'other' residual is
-    small and any entry in it is genuinely novel/unknown.
-    """
-    if cfg is not None:
-        dec_ffn_cap = getattr(cfg, 'ffn_spike_clip_norm',              8.0)
-        enc_ffn_cap = getattr(cfg, 'encoder_ffn_spike_clip_norm',     12.0)
-        attn_cap    = getattr(cfg, 'attention_spike_clip_norm',        20.0)
-        proj_cap    = getattr(cfg, 'projection_spike_clip_norm',       20.0)
-        stop_cap    = getattr(cfg, 'stop_head_spike_clip_norm',         0.5)
-    else:
-        dec_ffn_cap = 8.0
-        enc_ffn_cap = 12.0
-        attn_cap    = 20.0
-        proj_cap    = 20.0
-        stop_cap    = 1.0
-
-    # ── Decoder FFN ──────────────────────────────────────────────────────────
-    # Matches both direct children (.linear1) and sub-module children (.ff.linear1)
-    # lr_key = 'decoder_ffn' so the dedicated param group LR is used when available.
-    if re.search(r'decoder\.layers\.\d+\.(?:ff\.)?(linear1|linear2)', name):
-        return ('dec_ffn',  dec_ffn_cap, 'decoder_ffn')
-    # ── Encoder FFN ──────────────────────────────────────────────────────────
-    if re.search(r'transformer_encoder_layers\.\d+\.(?:ff\.)?(linear1|linear2)', name):
-        return ('enc_ffn',  enc_ffn_cap, 'encoder')
-    # ── Decoder attention ─────────────────────────────────────────────────────
-    if re.search(r'decoder\.layers\.\d+\.(self_attn|cross_attn)\.(w_q|w_k|w_v|w_o)', name):
-        return ('dec_attn', attn_cap,    'decoder')
-    # ── Encoder attention ─────────────────────────────────────────────────────
-    if re.search(r'transformer_encoder_layers\.\d+\.self_attn\.(w_q|w_k|w_v|w_o)', name):
-        return ('enc_attn', attn_cap,    'encoder')
-    # ── Mel projection / output head ─────────────────────────────────────────
-    if re.search(r'(mel_projection|mel_linear)', name):
-        return ('mel_proj', proj_cap,    'decoder')
-    # ── Stop token head ──────────────────────────────────────────────────────
-    if re.search(r'stop_token', name):
-        return ('stop',     stop_cap,    'decoder')
-    # ── Variance adaptors (duration / pitch / energy predictors) ─────────────
-    if re.search(r'(duration_predictor|pitch_predictor|energy_predictor)', name):
-        return ('variance', proj_cap,    'decoder')
-    # ── Text / phoneme embeddings ─────────────────────────────────────────────
-    if re.search(r'(text_embedding|phoneme_embedding|embedding)', name):
-        return ('embedding', float('inf'), 'encoder')
-    # ── Layer normalisation (weights + biases) ────────────────────────────────
-    if re.search(r'(layer_norm|layernorm|norm)\d*\.(weight|bias)$', name, re.IGNORECASE):
-        return ('layer_norm', float('inf'), 'decoder')
-    # ── All bias terms (not already caught above) ─────────────────────────────
+    INF = float('inf')
+    g = lambda a, d: getattr(cfg, a, d) if cfg else d
+    dc = g('ffn_spike_clip_norm', 8.0)
+    ec = g('encoder_ffn_spike_clip_norm', 12.0)
+    ac = g('attention_spike_clip_norm', 20.0)
+    pc = g('projection_spike_clip_norm', 20.0)
+    sc = g('stop_head_spike_clip_norm', 0.5) if cfg else 1.0
+    # (pattern, category, cap, lr_key[, re_flags])  — checked in order
+    for rule in (
+        (r'decoder\.layers\.\d+\.(?:ff\.)?(linear1|linear2)',              'dec_ffn',    dc,  'decoder_ffn'),
+        (r'transformer_encoder_layers\.\d+\.(?:ff\.)?(linear1|linear2)',   'enc_ffn',    ec,  'encoder'),
+        (r'decoder\.layers\.\d+\.(self_attn|cross_attn)\.(w_q|w_k|w_v|w_o)', 'dec_attn', ac, 'decoder'),
+        (r'transformer_encoder_layers\.\d+\.self_attn\.(w_q|w_k|w_v|w_o)', 'enc_attn',  ac,  'encoder'),
+        (r'(mel_projection|mel_linear)',                                    'mel_proj',   pc,  'decoder'),
+        (r'stop_token',                                                     'stop',       sc,  'decoder'),
+        (r'(duration_predictor|pitch_predictor|energy_predictor)',          'variance',   pc,  'decoder'),
+        (r'(text_embedding|phoneme_embedding|embedding)',                   'embedding',  INF, 'encoder'),
+        (r'(layer_norm|layernorm|norm)\d*\.(weight|bias)$',                'layer_norm', INF, 'decoder', re.IGNORECASE),
+        (r'\bconv\b|\bconv1d\b|\bconv2d\b',                                'conv',       pc,  'decoder', re.IGNORECASE),
+        (r'(pos_enc|positional_encoding|pe\.weight)',                       'pos_enc',    INF, 'decoder', re.IGNORECASE),
+    ):
+        if re.search(rule[0], name, rule[4] if len(rule) > 4 else 0):
+            return rule[1], rule[2], rule[3]
     if name.endswith('.bias'):
-        return ('bias', float('inf'), 'decoder')
-    # ── Convolutional layers ──────────────────────────────────────────────────
-    if re.search(r'\bconv\b|\bconv1d\b|\bconv2d\b', name, re.IGNORECASE):
-        return ('conv', proj_cap, 'decoder')
-    # ── Positional encodings (fixed buffers — should not move) ───────────────
-    if re.search(r'(pos_enc|positional_encoding|pe\.weight)', name, re.IGNORECASE):
-        return ('pos_enc', float('inf'), 'decoder')
-    # ── Catch-all for everything genuinely unrecognised ───────────────────────
-    return ('other', float('inf'), 'decoder')
+        return 'bias', INF, 'decoder'
+    return 'other', INF, 'decoder'
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -123,20 +142,13 @@ def classify_param(name: str, cfg=None):
 def param_stats(tensor):
     t = tensor.float()
     with torch.no_grad():
-        has_nan = bool(torch.isnan(t).any())
-        has_inf = bool(torch.isinf(t).any())
-        numel = t.numel()
-        if numel == 0:
-            return {"norm": 0.0, "mean": 0.0, "std": 0.0,
-                    "max_abs": 0.0, "nan": has_nan, "inf": has_inf}
-        return {
-            "norm":    t.norm(2).item(),
-            "mean":    t.mean().item(),
-            "std":     t.std(unbiased=False).item(),
-            "max_abs": t.abs().max().item(),
-            "nan":     has_nan,
-            "inf":     has_inf,
-        }
+        nan, inf_, n = bool(torch.isnan(t).any()), bool(torch.isinf(t).any()), t.numel()
+        if n == 0:
+            return {"norm": 0.0, "mean": 0.0, "std": 0.0, "max_abs": 0.0,
+                    "nan": nan, "inf": inf_, "numel": 0}
+        return {"norm": t.norm(2).item(), "mean": t.mean().item(),
+                "std": t.std(unbiased=False).item(), "max_abs": t.abs().max().item(),
+                "nan": nan, "inf": inf_, "numel": n}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,7 +164,18 @@ def load_checkpoints():
     for f in files:
         epoch_num = int(re.search(r"epoch_(\d+)", f.name).group(1))
         try:
-            ck = torch.load(f, map_location="cpu", weights_only=False)
+            # mmap=True (PyTorch ≥ 2.1) avoids reading tensor data for keys we
+            # immediately drop, turning the optimizer-state load into a no-op.
+            try:
+                ck = torch.load(f, map_location="cpu", weights_only=False, mmap=True)
+            except TypeError:
+                ck = torch.load(f, map_location="cpu", weights_only=False)
+
+            # Drop optimizer / scaler state immediately — ~50 % of each file.
+            # With mmap=True those pages are never read from disk at all.
+            for _key in ("optimizer_state_dict", "ema_optimizer_state_dict",
+                         "scaler_state_dict"):
+                ck.pop(_key, None)
         except Exception as e:
             print(f"[LOAD ERROR] {f.name}: {e}")
             continue
@@ -188,12 +211,12 @@ def compute_weight_stats(records):
     """
     prev_state = None   # dict[name -> float32 tensor] from previous epoch only
 
-    for rec in records:
+    for idx, rec in enumerate(records):
         sd      = rec["state_dict"]
         ema_sd  = rec["ema_state_dict"]
         stats   = {}
         any_nan = any_inf = False
-        total_norm_sq = delta_norm_sq = ema_delta_norm_sq = 0.0
+        total_norm_sq = delta_norm_sq = 0.0
         n_params = 0
 
         with torch.no_grad():
@@ -203,9 +226,8 @@ def compute_weight_stats(records):
                 any_nan = any_nan or s["nan"]
                 any_inf = any_inf or s["inf"]
                 total_norm_sq += s["norm"] ** 2
-                n_params      += tensor.numel()
+                n_params      += s["numel"]
 
-                # Delta from previous live checkpoint
                 if prev_state is not None and name in prev_state:
                     diff = (tensor.float() - prev_state[name]).norm(2).item()
                     stats[name]["delta"] = diff
@@ -213,39 +235,41 @@ def compute_weight_stats(records):
                 else:
                     stats[name]["delta"] = None
 
-            # EMA vs live divergence  (only when EMA dict is present)
             ema_div_norm_sq = 0.0
             has_ema = bool(ema_sd)
             if has_ema:
                 for name, tensor in sd.items():
                     ema_t = ema_sd.get(name)
                     if ema_t is not None:
-                        ema_div = (tensor.float() - ema_t.float()).norm(2).item()
-                        ema_div_norm_sq += ema_div ** 2
+                        ema_div_norm_sq += (tensor.float() - ema_t.float()).norm(2).item() ** 2
 
-        rec["param_stats"]           = stats
-        rec["total_weight_norm"]     = math.sqrt(total_norm_sq)
-        rec["total_delta_norm"]      = math.sqrt(delta_norm_sq) if prev_state is not None else None
-        rec["ema_divergence_norm"]   = math.sqrt(ema_div_norm_sq) if has_ema else None
-        rec["any_nan"]               = any_nan
-        rec["any_inf"]               = any_inf
-        rec["n_params"]              = n_params
+        rec["param_stats"]         = stats
+        rec["total_weight_norm"]   = math.sqrt(total_norm_sq)
+        rec["total_delta_norm"]    = math.sqrt(delta_norm_sq) if prev_state is not None else None
+        rec["ema_divergence_norm"] = math.sqrt(ema_div_norm_sq) if has_ema else None
+        rec["any_nan"]             = any_nan
+        rec["any_inf"]             = any_inf
+        rec["n_params"]            = n_params
 
-        # Delta velocity: ||Δw|| / optimizer_steps_in_epoch  (normalises for step count)
+        # Delta velocity: ||Δw|| / optimizer_steps_in_epoch
         steps_this_epoch = None
-        if (prev_state is not None
+        if (prev_state is not None and idx > 0
                 and isinstance(rec["optimizer_steps"], int)
-                and isinstance(records[records.index(rec) - 1]["optimizer_steps"], int)):
-            steps_this_epoch = (rec["optimizer_steps"]
-                                - records[records.index(rec) - 1]["optimizer_steps"])
+                and isinstance(records[idx - 1]["optimizer_steps"], int)):
+            steps_this_epoch = rec["optimizer_steps"] - records[idx - 1]["optimizer_steps"]
         rec["delta_velocity"] = (
             rec["total_delta_norm"] / steps_this_epoch
             if (rec["total_delta_norm"] is not None and steps_this_epoch and steps_this_epoch > 0)
             else None
         )
 
-        # Build minimal float32 prev_state for next iteration — release old one
         prev_state = {k: v.float() for k, v in sd.items()}
+
+    # Release tensor data from all records now that stats are computed.
+    # param_stats["numel"] is stored, so downstream code never needs the tensors.
+    for rec in records:
+        rec.pop("state_dict", None)
+        rec.pop("ema_state_dict", None)
 
     return records
 
@@ -319,37 +343,25 @@ def print_summary_table(records):
     print("=" * 130)
 
 
-def print_key_layer_table(records):
-    print("\n--- Key layer weight norms per epoch ---")
+def _print_key_layer_table(records, mode="norm"):
+    """mode='norm' prints weight norms; mode='delta' prints L2 changes."""
+    if not records:
+        return
+    label = "weight norms" if mode == "norm" else "weight DELTAS (L2 change from previous checkpoint)"
     epoch_labels = [f"Ep{r['epoch_num']:02d}" for r in records]
+    matched = [n for n in records[0]["param_stats"] if any(k in n for k in KEY_LAYERS)]
+    print(f"\n--- Key layer {label} per epoch ---")
     print(f"{'Layer':<60} " + "  ".join(f"{e:>8}" for e in epoch_labels))
     print("-" * (60 + 10 * len(records)))
-    all_names = list(records[0]["param_stats"].keys()) if records else []
-    matched   = [n for n in all_names if any(k in n for k in KEY_LAYERS)]
     for name in matched:
-        norms = []
+        cells = []
         for r in records:
             s = r["param_stats"].get(name)
-            norms.append(f"{s['norm']:>8.3f}" if s else "       ?")
-        print(f"{name:<60} " + "  ".join(norms))
-
-
-def print_key_layer_delta_table(records):
-    print("\n--- Key layer weight DELTAS (L2 change from previous checkpoint) ---")
-    epoch_labels = [f"Ep{r['epoch_num']:02d}" for r in records]
-    print(f"{'Layer':<60} " + "  ".join(f"{e:>8}" for e in epoch_labels))
-    print("-" * (60 + 10 * len(records)))
-    all_names = list(records[0]["param_stats"].keys()) if records else []
-    matched   = [n for n in all_names if any(k in n for k in KEY_LAYERS)]
-    for name in matched:
-        deltas = []
-        for r in records:
-            s = r["param_stats"].get(name)
-            if s and s.get("delta") is not None:
-                deltas.append(f"{s['delta']:>8.4f}")
+            if mode == "norm":
+                cells.append(f"{s['norm']:>8.3f}" if s else "       ?")
             else:
-                deltas.append("    --  ")
-        print(f"{name:<60} " + "  ".join(deltas))
+                cells.append(f"{s['delta']:>8.4f}" if s and s.get("delta") is not None else "    --  ")
+        print(f"{name:<60} " + "  ".join(cells))
 
 
 def print_biggest_deltas(records):
@@ -378,36 +390,26 @@ def print_persistent_movers(persistent_counts, n_epochs, top_n=10):
 
 
 def flag_regression_epoch(records):
-    """
-    Find epoch with largest delta norm jump that also coincides with a loss
-    increase.  Pure weight jumps on improving loss are not flagged as regression.
-    """
-    candidates = [
-        (r["total_delta_norm"], r)
-        for r in records
-        if r["total_delta_norm"] is not None
-    ]
+    """Top 3 weight-delta candidates for regression onset, cross-referenced with loss direction."""
+    candidates = sorted(
+        ((r["total_delta_norm"], r) for r in records if r["total_delta_norm"] is not None),
+        reverse=True,
+    )
     if not candidates:
         return
-    candidates.sort(reverse=True)
-    top = candidates[:3]
     print("\n--- Largest overall weight changes (top 3 candidates for regression onset) ---")
-    for delta, r in top:
+    for delta, r in candidates[:3]:
         loss_val = r['loss']
         loss_str = f"{loss_val:.6f}" if isinstance(loss_val, float) else str(loss_val)
-        # Cross-reference with loss trend
         idx = next((i for i, rec in enumerate(records) if rec is r), None)
-        if idx is not None and idx > 0:
+        loss_note = ""
+        if idx:
             prev_loss = records[idx - 1]['loss']
-            if (isinstance(loss_val, float) and isinstance(prev_loss, float)
-                    and not math.isnan(loss_val) and not math.isnan(prev_loss)):
-                loss_note = (f"  loss went UP +{loss_val - prev_loss:+.5f}  ← likely regression onset"
-                             if loss_val > prev_loss
-                             else f"  loss went DOWN {loss_val - prev_loss:+.5f}  (weight jump on improving run)")
-            else:
-                loss_note = ""
-        else:
-            loss_note = ""
+            if isinstance(loss_val, float) and isinstance(prev_loss, float) \
+                    and not math.isnan(loss_val) and not math.isnan(prev_loss):
+                diff = loss_val - prev_loss
+                loss_note = (f"  loss went UP +{diff:+.5f}  ← likely regression onset"
+                             if diff > 0 else f"  loss went DOWN {diff:+.5f}  (weight jump on improving run)")
         print(f"  Epoch {r['epoch_num']:>3}  ({r['file']})  delta norm = {delta:.4f}  loss = {loss_str}{loss_note}")
 
 
@@ -416,18 +418,15 @@ def flag_regression_epoch(records):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_cfg_from_records(records):
-    """Extract config from the latest checkpoint record, or fall back to TrainingConfig."""
-    cfg = None
-    if records:
-        try:
-            last = max(records, key=lambda r: r["epoch_num"])
-            cfg = last.get("config")
-        except Exception:
-            pass
+    """Extract config from the latest checkpoint, or fall back to TrainingConfig."""
+    try:
+        cfg = max(records, key=lambda r: r["epoch_num"]).get("config") if records else None
+    except Exception:
+        cfg = None
     if cfg is None:
         try:
             from kokoro.training.config import TrainingConfig
-            cfg = TrainingConfig()
+            return TrainingConfig()
         except Exception:
             pass
     return cfg
@@ -487,17 +486,15 @@ def _linear_slope(ys):
     n = len(ys)
     if n < 2:
         return 0.0, 0.0
-    xs   = list(range(n))
-    xbar = (n - 1) / 2.0
-    ybar = sum(ys) / n
-    ssxx = sum((x - xbar) ** 2 for x in xs)
-    ssxy = sum((x - xbar) * (y - ybar) for x, y in zip(xs, ys))
+    xbar, ybar = (n - 1) / 2.0, sum(ys) / n
+    ssxx = sum((i - xbar) ** 2 for i in range(n))
+    ssxy = sum((i - xbar) * (y - ybar) for i, y in enumerate(ys))
     if ssxx == 0:
         return 0.0, 0.0
     slope = ssxy / ssxx
-    ss_res = sum((y - (ybar + slope * (x - xbar))) ** 2 for x, y in zip(xs, ys))
     ss_tot = sum((y - ybar) ** 2 for y in ys)
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    r2 = (1.0 - sum((y - ybar - slope*(i - xbar))**2 for i, y in enumerate(ys)) / ss_tot
+          if ss_tot else 0.0)
     return slope, r2
 
 
@@ -514,9 +511,7 @@ def print_gradual_degradation_report(records):
       5. Weight-norm drift       — sustained growth/shrinkage of total weight norm
       6. "Best epoch age"        — how many epochs ago was the best checkpoint?
     """
-    print("\n" + "=" * 90)
-    print("CHECKPOINT — Gradual Degradation Report")
-    print("=" * 90)
+    _section("CHECKPOINT — Gradual Degradation Report")
 
     n = len(records)
     if n < 3:
@@ -718,9 +713,7 @@ def tb_print_per_loss_trend(ea, cfg=None):
     aggregate looks stable — the primary cause of gradual degradation.
     """
     sa_epoch = _spec_augment_display_epoch(cfg)
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Per-Loss Component Trend (gradual degradation detector)")
-    print("=" * 90)
+    _section("TENSORBOARD — Per-Loss Component Trend (gradual degradation detector)")
 
     loss_tags = [
         ("mel",       "loss/val_mel_epoch"),
@@ -797,9 +790,7 @@ def tb_print_per_loss_trend(ea, cfg=None):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def tb_print_step_loss_summary(ea):
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Step-level Training Loss Summary")
-    print("=" * 90)
+    _section("TENSORBOARD — Step-level Training Loss Summary")
     tags = ["loss/total", "loss/mel", "loss/stop", "loss/duration", "loss/pitch", "loss/energy"]
     print(f"  {'Tag':<28} {'N':>5}  {'Steps':>10}  {'First':>9}  {'Last':>9}  "
           f"{'Δ':>9}  {'Trend':>7}  {'Mean':>9}  {'Min':>9}  {'Max':>9}")
@@ -822,9 +813,7 @@ def tb_print_val_mel_series(ea, cfg=None):
         return
     sa_epoch = _spec_augment_display_epoch(cfg)
     vm_vals = [v for _, v in vm]
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Val Mel Epoch Series")
-    print("=" * 90)
+    _section("TENSORBOARD — Val Mel Epoch Series")
     prev = None
     for i, (s, v) in enumerate(vm):
         ep = i + 1
@@ -850,9 +839,7 @@ def tb_print_val_mel_series(ea, cfg=None):
 
 
 def tb_print_epoch_table(ea):
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Epoch-level Train vs Val Metrics")
-    print("=" * 90)
+    _section("TENSORBOARD — Epoch-level Train vs Val Metrics")
     epoch_tags = [
         ("mel",       "loss/train_mel_epoch",      "loss/val_mel_epoch"),
         ("total",     "loss/train_total_epoch",    "loss/val_total_epoch"),
@@ -903,9 +890,7 @@ def tb_print_stop_token_analysis(ea, cfg=None):
     sa_epoch = _spec_augment_display_epoch(cfg)
     _vm_raw = _get(ea, "loss/val_mel_epoch")
     _vm_vals = [v for _, v in _vm_raw] if _vm_raw else None
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Stop Token Analysis")
-    print("=" * 90)
+    _section("TENSORBOARD — Stop Token Analysis")
 
     # ── Stop head isolation parameters ──────────────────────────────────────
     print("  Stop head isolation parameters (from loaded config / defaults):")
@@ -974,9 +959,7 @@ def tb_print_stop_token_analysis(ea, cfg=None):
 
 
 def tb_print_gradient_analysis(ea):
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Gradient Health")
-    print("=" * 90)
+    _section("TENSORBOARD — Gradient Health")
     gn  = _get(ea, "stats/grad_norm")
     gnc = _get(ea, "stats/grad_norm_clipped")
 
@@ -1034,9 +1017,7 @@ def tb_print_gradient_analysis(ea):
 
 
 def tb_print_lr_trajectory(ea):
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Learning Rate Trajectory")
-    print("=" * 90)
+    _section("TENSORBOARD — Learning Rate Trajectory")
     groups = [
         ("stats/lr_decoder",     "decoder"),
         ("stats/lr_decoder_ffn", "decoder_ffn"),
@@ -1089,9 +1070,7 @@ def tb_print_mel_stop_window_correlation(ea):
     if not mel:
         return
 
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Mel vs Stop Loss Correlation (200-step windows)")
-    print("=" * 90)
+    _section("TENSORBOARD — Mel vs Stop Loss Correlation (200-step windows)")
     print(f"  {'Window':<12}  {'mel mean':>9}  {'Δmel':>6}  "
           f"{'stop mean':>9}  {'Δstop':>6}  {'LR%':>6}  co-move?")
     print("  " + "-" * 72)
@@ -1340,9 +1319,7 @@ def _collect_diagnostics(ea):
 
 def tb_print_regression_flags(ea, cfg=None):
     sa_epoch = _spec_augment_display_epoch(cfg)
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Regression Flag Summary")
-    print("=" * 90)
+    _section("TENSORBOARD — Regression Flag Summary")
     flags = []
 
     d = _collect_diagnostics(ea)
@@ -1525,7 +1502,6 @@ def analyze_loss_imbalance(ea, records=None):
               'decoder_ffn': avg_lr_ffn}
 
     ps = rec_b.get('param_stats', {})
-    sd = rec_b.get('state_dict', {})
     # Two parallel tallies:
     #   cat_delta_sums  — total |Δw|_L2 per category (numel-weighted; large tensors dominate)
     #   cat_rms_sums    — total avg_grad_rms per category (per-element; useful for cap comparison)
@@ -1543,9 +1519,9 @@ def analyze_loss_imbalance(ea, records=None):
         lr_t = lr_map.get(lr_key, avg_lr_dec)
         if not lr_t or lr_t <= 0:
             continue
-        tensor = sd.get(name)
-        numel  = (tensor.numel() if tensor is not None
-                  else max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12))))
+        # Use numel stored in param_stats (added since cache v2); fall back to estimate
+        numel = (s.get("numel")
+                 or max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12))))
         avg_grad_rms = (delta / math.sqrt(numel)) / (ep_steps * lr_t)
         per_tensor.append((name, cat, avg_grad_rms, cap, numel, delta))
         cat_delta_sums[cat] = cat_delta_sums.get(cat, 0.0) + delta
@@ -1619,9 +1595,7 @@ def tb_print_recommendations(ea, records=None):
     in addition to spike-based ones, and correctly passes records through to
     analyze_loss_imbalance (fixing the empty-param_stats bug).
     """
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Analysis & Recommendations")
-    print("=" * 90)
+    _section("TENSORBOARD — Analysis & Recommendations")
 
     d   = _collect_diagnostics(ea)
     cfg = _get_cfg_from_records(records)
@@ -1999,9 +1973,7 @@ def tb_print_lr_phase_detail(ea, records=None):
     obs_peak_step = (next((s for s, v in lr if v >= obs_max_dec * 0.99), None)
                      if not still_rising else None)
 
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — LR Phase Detail (from 90% of peak onward)")
-    print("=" * 90)
+    _section("TENSORBOARD — LR Phase Detail (from 90% of peak onward)")
     print(f"  schedule      : {cfg_note}")
     if true_peak_dec is not None:
         steps_to_peak = abs_peak_step - curr_step
@@ -2093,9 +2065,7 @@ def tb_print_late_spike_context(ea):
     if not late_spikes:
         return
 
-    print("\n" + "=" * 90)
-    print(f"TENSORBOARD — Late Grad Spike Context ({len(late_spikes)} spikes >5.0 after init)")
-    print("=" * 90)
+    _section(f"TENSORBOARD — Late Grad Spike Context ({len(late_spikes)} spikes >5.0 after init)")
 
     lr_max    = max(v for _, v in lr) if lr else 1.0
     lr_lookup = {s: v for s, v in lr} if lr else {}
@@ -2196,7 +2166,6 @@ def tb_print_spike_cause_analysis(ea, records=None):
 
     groups   = defaultdict(list)   # cat -> [(name, avg_grad_rms, cap, numel)]
     ps       = rec_b.get("param_stats", {})
-    sd       = rec_b.get("state_dict", {})
     unmatched = []  # (name, avg_grad_rms) for 'other' bucket
 
     for name, s in ps.items():
@@ -2207,9 +2176,9 @@ def tb_print_spike_cause_analysis(ea, records=None):
         lr_t = lr_map.get(lr_key, avg_lr_dec)
         if not lr_t or lr_t <= 0:
             continue
-        # numel from the actual tensor when available, fall back to norm²/mean² estimate
-        tensor = sd.get(name)
-        numel  = tensor.numel() if tensor is not None else max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12)))
+        # Use numel stored in param_stats (added since cache v2); fall back to estimate
+        numel = (s.get("numel")
+                 or max(1, int(s["norm"] ** 2 / max(s["mean"] ** 2, 1e-12))))
         # per-element RMS change per step
         avg_grad_rms = (delta / math.sqrt(numel)) / (ep_steps * lr_t)
         groups[cat].append((name, avg_grad_rms, cap, numel))
@@ -2227,9 +2196,7 @@ def tb_print_spike_cause_analysis(ea, records=None):
     else:
         obs_max = 0.0
 
-    print("\n" + "=" * 90)
-    print("TENSORBOARD — Gradient Pre-Clip Pressure Analysis")
-    print("=" * 90)
+    _section("TENSORBOARD — Gradient Pre-Clip Pressure Analysis")
     print(f"  Checkpoint pair : {rec_a['file']}  →  {rec_b['file']}")
     print(f"  Epoch steps     : {ep_steps}")
     ffn_lr_str = f"   ffn: {avg_lr_ffn:.8f}" if avg_lr_ffn is not None else ""
@@ -2410,27 +2377,47 @@ def main():
         print(f"Directory not found: {CHECKPOINT_DIR}")
         return
 
-    print(f"Loading checkpoints from {CHECKPOINT_DIR} ...")
-    records = load_checkpoints()
-    if not records:
-        print("No checkpoints found.")
-        # If TensorBoard logs exist, run TB-only analysis so users can still
-        # inspect training behaviour even before the first checkpoint is saved.
-        if TB_LOG_DIR.is_dir():
-            print(f"No checkpoints found — falling back to TensorBoard logs at {TB_LOG_DIR} for analysis.")
-            tb_analyze(TB_LOG_DIR, records=None)
-            return
-        else:
-            print(f"No tensorboard logs found at: {TB_LOG_DIR}")
-            return
+    # ── Discover checkpoint files (needed for both cache key and loading) ────
+    ck_files = sorted(
+        CHECKPOINT_DIR.glob("checkpoint_epoch_*.pth"),
+        key=lambda p: int(re.search(r"epoch_(\d+)", p.name).group(1)),
+    )
 
-    print(f"Found {len(records)} checkpoint(s). Computing weight statistics...")
-    records = compute_weight_stats(records)
-    records, persistent_counts = compute_rank_stability(records)
+    # ── Try the stats cache first — avoids re-loading all checkpoint files ───
+    cached_records, persistent_counts = _load_master_cache(ck_files)
+    if cached_records is not None:
+        print(f"[cache] Loaded stats cache for {len(cached_records)} checkpoint(s) "
+              f"({_master_cache_path()}).")
+        records = cached_records
+        # Recompute rank_stability_jaccard if missing (older caches may lack it)
+        if any("rank_stability_jaccard" not in r for r in records):
+            records, persistent_counts = compute_rank_stability(records)
+            _save_master_cache(ck_files, records, persistent_counts)
+    else:
+        print(f"Loading checkpoints from {CHECKPOINT_DIR} ...")
+        records = load_checkpoints()
+        if not records:
+            print("No checkpoints found.")
+            # If TensorBoard logs exist, run TB-only analysis so users can still
+            # inspect training behaviour even before the first checkpoint is saved.
+            if TB_LOG_DIR.is_dir():
+                print(f"No checkpoints found — falling back to TensorBoard logs at {TB_LOG_DIR} for analysis.")
+                tb_analyze(TB_LOG_DIR, records=None)
+                return
+            else:
+                print(f"No tensorboard logs found at: {TB_LOG_DIR}")
+                return
+
+        print(f"Found {len(records)} checkpoint(s). Computing weight statistics...")
+        records = compute_weight_stats(records)
+        records, persistent_counts = compute_rank_stability(records)
+
+        print(f"[cache] Saving stats cache to {_master_cache_path()} ...")
+        _save_master_cache(ck_files, records, persistent_counts)
 
     print_summary_table(records)
-    print_key_layer_table(records)
-    print_key_layer_delta_table(records)
+    _print_key_layer_table(records)
+    _print_key_layer_table(records, "delta")
     print_biggest_deltas(records)
     print_persistent_movers(persistent_counts, n_epochs=sum(
         1 for r in records if r.get("rank_stability_jaccard") is not None))

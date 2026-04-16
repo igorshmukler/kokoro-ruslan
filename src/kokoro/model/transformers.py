@@ -70,21 +70,28 @@ class GLUFeedForward(nn.Module):
           → activation(gate) * linear
           → dropout
           → linear2 (dim_feedforward → d_model)
+          → output_norm (optional RMSNorm)
           → dropout
 
     linear2 uses Xavier with gain=0.5 so that the FFN branch starts as a
     near-identity (small contribution to the residual stream) and must earn
     its influence during training, preventing early-epoch FFN dominance.
+
+    When *use_output_norm* is True an RMSNorm is applied after linear2,
+    decoupling the FFN output magnitude from weight growth.  This prevents
+    the runaway norm spiral observed in pre-norm Transformers where
+    LayerNorm on the *input* provides no constraint on the *output*.
     """
 
     def __init__(self, d_model: int, dim_feedforward: int, dropout: float,
-                 activation: str = 'gelu'):
+                 activation: str = 'gelu', use_output_norm: bool = False):
         super().__init__()
         # Expand to 2× so we can split into gate and linear paths
         self.linear1 = nn.Linear(d_model, dim_feedforward * 2)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
         self.activation = _build_activation(activation)
         self.dropout = nn.Dropout(dropout)
+        self.output_norm = nn.RMSNorm(d_model) if use_output_norm else None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -98,7 +105,10 @@ class GLUFeedForward(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear1(x)
         gate, linear = x.chunk(2, dim=-1)
-        return self.dropout(self.linear2(self.dropout(self.activation(gate) * linear)))
+        x = self.linear2(self.dropout(self.activation(gate) * linear))
+        if self.output_norm is not None:
+            x = self.output_norm(x)
+        return self.dropout(x)
 
 
 class MultiHeadAttentionImproved(nn.Module):
@@ -424,7 +434,7 @@ class ImprovedTransformerEncoderBlock(nn.Module):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', use_relative_pos: bool = False,
                  drop_path_rate: float = 0.0, rel_pos_type: str = 'alibi',
-                 qk_norm: bool = False):
+                 qk_norm: bool = False, ffn_output_norm: bool = False):
         super().__init__()
         self.drop_path_rate = drop_path_rate
 
@@ -435,7 +445,8 @@ class ImprovedTransformerEncoderBlock(nn.Module):
         )
 
         # GLU-style feedforward (Gated Linear Unit)
-        self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation)
+        self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation,
+                                 use_output_norm=ffn_output_norm)
 
         # Normalization layers (LayerNorm)
         self.norm1 = nn.LayerNorm(d_model)
@@ -474,7 +485,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
 
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
                  activation: str = 'gelu', rel_pos_type: str = 'alibi',
-                 drop_path_rate: float = 0.0, qk_norm: bool = False):
+                 drop_path_rate: float = 0.0, qk_norm: bool = False,
+                 ffn_output_norm: bool = False):
         super().__init__()
         self.drop_path_rate = drop_path_rate
 
@@ -490,7 +502,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
                                                      qk_norm=qk_norm)
 
         # GLU-style feedforward
-        self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation)
+        self.ff = GLUFeedForward(d_model, dim_feedforward, dropout, activation,
+                                 use_output_norm=ffn_output_norm)
 
         # Normalization layers
         self.norm1 = nn.LayerNorm(d_model) # For self-attention
@@ -566,7 +579,8 @@ class ImprovedTransformerDecoder(nn.Module):
                  dropout: float, num_layers: int, activation: str = 'gelu',
                  rel_pos_type: str = 'alibi',
                  drop_path_rates: Optional[list] = None,
-                 qk_norm: bool = False):
+                 qk_norm: bool = False,
+                 ffn_output_norm: bool = False):
         super().__init__()
         self.num_layers = num_layers
 
@@ -578,7 +592,8 @@ class ImprovedTransformerDecoder(nn.Module):
                 d_model, nhead, dim_feedforward, dropout, activation,
                 rel_pos_type=rel_pos_type,
                 drop_path_rate=drop_path_rates[i],
-                qk_norm=qk_norm
+                qk_norm=qk_norm,
+                ffn_output_norm=ffn_output_norm,
             ) for i in range(num_layers)
         ])
 
@@ -643,11 +658,12 @@ class TransformerEncoderBlock(ImprovedTransformerEncoderBlock):
     RoPE is MPS-safe (operates in native dtype, no mixed-dtype arithmetic).
     """
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int, dropout: float,
-                 drop_path_rate: float = 0.0, qk_norm: bool = False):
+                 drop_path_rate: float = 0.0, qk_norm: bool = False,
+                 ffn_output_norm: bool = False):
         super().__init__(d_model, nhead, dim_feedforward, dropout,
                         activation='gelu', use_relative_pos=True,
                         rel_pos_type='rope', drop_path_rate=drop_path_rate,
-                        qk_norm=qk_norm)
+                        qk_norm=qk_norm, ffn_output_norm=ffn_output_norm)
 
 
 class TransformerDecoder(ImprovedTransformerDecoder):
@@ -659,9 +675,11 @@ class TransformerDecoder(ImprovedTransformerDecoder):
     def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
                  dropout: float, num_layers: int,
                  drop_path_rates: Optional[list] = None,
-                 qk_norm: bool = False):
+                 qk_norm: bool = False,
+                 ffn_output_norm: bool = False):
         super().__init__(d_model, nhead, dim_feedforward, dropout, num_layers,
                         activation='gelu', rel_pos_type='rope',
                         drop_path_rates=drop_path_rates,
-                        qk_norm=qk_norm)
+                        qk_norm=qk_norm,
+                        ffn_output_norm=ffn_output_norm)
 

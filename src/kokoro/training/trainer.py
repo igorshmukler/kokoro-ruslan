@@ -102,8 +102,16 @@ class KokoroTrainer:
         self.config = config
         self.device = torch.device(config.device)
 
-        # Create the tensorboard log directory
+        # Create the tensorboard log directory.
+        # On a fresh (non-resume) start, purge stale event files so
+        # TensorBoard doesn't merge overlapping runs into broken charts.
         log_dir = os.path.join(config.output_dir, 'logs')
+        _is_resume = bool(getattr(config, 'resume_checkpoint', None))
+        if not _is_resume and os.path.isdir(log_dir):
+            import glob as _glob
+            for _ef in _glob.glob(os.path.join(log_dir, 'events.out.tfevents.*')):
+                os.remove(_ef)
+            logger.info("Cleared stale TensorBoard event files for fresh training run")
         os.makedirs(log_dir, exist_ok=True)
         self.log_dir = log_dir  # stored for writer re-creation on resume
         self.writer = SummaryWriter(log_dir=log_dir)
@@ -284,8 +292,8 @@ class KokoroTrainer:
             train_indices = indices[:split_idx]
             val_indices = indices[split_idx:]
             logger.info(f"Dataset split: {len(train_indices)} training, {len(val_indices)} validation samples")
-            self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices)
-            self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices)
+            self.dataset = RuslanDataset(config.data_dir, config, indices=train_indices, is_training=True)
+            self.val_dataset = RuslanDataset(config.data_dir, config, indices=val_indices, is_training=False)
         else:
             logger.info("No validation split - using all data for training")
             self.dataset = full_dataset
@@ -353,6 +361,8 @@ class KokoroTrainer:
             n_heads=getattr(config, 'n_heads', 8),
             encoder_ff_dim=getattr(config, 'encoder_ff_dim', 3072),
             encoder_dropout=getattr(config, 'encoder_dropout', 0.1),
+            decoder_dropout=getattr(config, 'decoder_dropout', None),
+            decoder_input_dropout=getattr(config, 'decoder_input_dropout', 0.1),
             n_decoder_layers=getattr(config, 'n_decoder_layers', 6),
             decoder_ff_dim=getattr(config, 'decoder_ff_dim', 3072),
             max_decoder_seq_len=getattr(config, 'max_decoder_seq_len', 4000),
@@ -367,7 +377,8 @@ class KokoroTrainer:
             energy_max=getattr(config, 'energy_max', 1.0),
             use_stochastic_depth=getattr(config, 'use_stochastic_depth', True),
             stochastic_depth_rate=getattr(config, 'stochastic_depth_rate', 0.1),
-            qk_norm=getattr(config, 'qk_norm', False)
+            qk_norm=getattr(config, 'qk_norm', False),
+            ffn_output_norm=getattr(config, 'ffn_output_norm', False),
         )
         self.model.to(self.device)
 
@@ -517,6 +528,7 @@ class KokoroTrainer:
         )
         seen_ids: set = set()
         encoder_params = []
+        encoder_ffn_decay_params: list = []  # encoder FFN weights get ffn_weight_decay
         stop_head_params: list = []
         decoder_named: list = []  # (name, param) for further splitting
         for name, param in self.model.named_parameters():
@@ -524,7 +536,13 @@ class KokoroTrainer:
                 continue
             seen_ids.add(id(param))
             if any(name.startswith(prefix) for prefix in encoder_prefixes):
-                encoder_params.append(param)
+                # Split encoder FFN weight matrices into their own decay group.
+                # These are the same GLU FFN layers that were previously hard-
+                # norm-clamped; they now receive ffn_weight_decay instead.
+                if '.ff.' in name and not any(name.endswith(s) for s in _no_decay_suffixes) and not any(s in name for s in _no_decay_substrings):
+                    encoder_ffn_decay_params.append(param)
+                else:
+                    encoder_params.append(param)
             elif name in _stop_head_names:
                 stop_head_params.append(param)
             else:
@@ -571,11 +589,17 @@ class KokoroTrainer:
         stop_head_lr = base_lr * stop_head_lr_mult
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
         decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
+        ffn_weight_decay = getattr(config, 'ffn_weight_decay', weight_decay)
+        decoder_ffn_wd = getattr(config, 'decoder_ffn_weight_decay', ffn_weight_decay)
 
         # Build param groups, tagging each with a group_type for scheduler mapping
         param_groups = []
         param_groups.append({'params': encoder_params, 'lr': encoder_lr, 'weight_decay': 0.0,
                              'eps': adam_eps, 'betas': adam_betas, 'group_type': 'encoder'})
+        if encoder_ffn_decay_params:
+            param_groups.append({'params': encoder_ffn_decay_params, 'lr': encoder_lr,
+                                 'weight_decay': ffn_weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'encoder'})
 
         # Decoder no-decay (biases / norms — excluding FFN and attention)
         if decoder_no_decay:
@@ -596,7 +620,7 @@ class KokoroTrainer:
                                  'group_type': 'decoder_attn'})
         if decoder_decay_ffn:
             param_groups.append({'params': decoder_decay_ffn, 'lr': base_lr * decoder_ffn_lr_mult,
-                                 'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas,
+                                 'weight_decay': decoder_ffn_wd, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'decoder_ffn'})
         if decoder_ffn_no_decay:
             param_groups.append({'params': decoder_ffn_no_decay, 'lr': base_lr * decoder_ffn_lr_mult,
@@ -607,7 +631,7 @@ class KokoroTrainer:
         if stop_head_params:
             param_groups.append({'params': stop_head_params, 'lr': stop_head_lr, 'weight_decay': 0.0,
                                  'eps': adam_eps, 'betas': adam_betas, 'group_type': 'stop_head'})
-        if not encoder_params:
+        if not encoder_params and not encoder_ffn_decay_params:
             # Fallback: single group (no identifiable encoder params)
             param_groups = [{'params': list(self.model.parameters()), 'lr': base_lr,
                              'weight_decay': weight_decay, 'eps': adam_eps, 'betas': adam_betas}]
@@ -616,6 +640,7 @@ class KokoroTrainer:
         else:
             # Count params per logical group for logging
             n_encoder = len(encoder_params)
+            n_encoder_ffn = len(encoder_ffn_decay_params)
             n_decoder_no_decay = len(decoder_no_decay)
             n_decoder_other = len(decoder_decay_other)
             n_decoder_ffn = len(decoder_decay_ffn)
@@ -627,11 +652,12 @@ class KokoroTrainer:
             attn_lr = base_lr * decoder_attn_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
+                f"encoder_ffn_decay={n_encoder_ffn} params (lr={encoder_lr:.2e}, wd={ffn_weight_decay}), "
                 f"decoder_no_decay={n_decoder_no_decay} params (lr={base_lr:.2e}, wd=0.0), "
                 f"decoder_other_decay={n_decoder_other} params (lr={base_lr:.2e}, wd={weight_decay}), "
                 f"decoder_attn_decay={n_decoder_attn} params (lr={attn_lr:.2e}, wd={weight_decay}), "
                 f"decoder_attn_no_decay={n_decoder_attn_nd} params (lr={attn_lr:.2e}, wd=0.0), "
-                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={weight_decay}), "
+                f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={decoder_ffn_wd}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
@@ -699,6 +725,7 @@ class KokoroTrainer:
             _enc_mult = getattr(self, '_encoder_lr_multiplier', 1.0)
             _stop_head_lr_mult = float(getattr(config, 'stop_head_lr_multiplier', 0.1))
             decoder_ffn_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
+            decoder_attn_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
 
             # Construct per-param-group max_lr list by inspecting the custom 'group_type'
             max_lr_arg = []
@@ -708,6 +735,8 @@ class KokoroTrainer:
                     max_lr_arg.append(max_lr * _enc_mult)
                 elif gt == 'decoder_ffn':
                     max_lr_arg.append(max_lr * decoder_ffn_mult)
+                elif gt == 'decoder_attn':
+                    max_lr_arg.append(max_lr * decoder_attn_mult)
                 elif gt == 'stop_head':
                     max_lr_arg.append(max_lr * _stop_head_lr_mult)
                 else:
@@ -737,7 +766,10 @@ class KokoroTrainer:
             self._onecycle_div_factor = onecycle_div_factor
             logger.info(
                 f"OneCycleLR scheduler initialized: decoder max_lr={max_lr:.2e}, "
-                f"encoder max_lr={max_lr * _enc_mult:.2e}, total_steps={onecycle_steps} "
+                f"encoder max_lr={max_lr * _enc_mult:.2e}, "
+                f"decoder_attn max_lr={max_lr * decoder_attn_mult:.2e}, "
+                f"decoder_ffn max_lr={max_lr * decoder_ffn_mult:.2e}, "
+                f"total_steps={onecycle_steps} "
                 f"(steps_per_epoch={optimizer_steps_per_epoch}, gradient_accumulation={gradient_accumulation_steps})"
             )
         else:
@@ -814,9 +846,9 @@ class KokoroTrainer:
         # Legacy single-layer reference kept for backward compat with any external code.
         self._dec_ff0_linear1_weight = self._dec_ff_weights[0] if self._dec_ff_weights else None
 
-        # Encoder FFN weights — same GLUFeedForward architecture, same max-norm ceiling.
-        # Encoder FFN receives 5.5× higher LR than decoder FFN but previously had
-        # zero weight norm constraints, allowing unconstrained growth at LR peak.
+        # Encoder FFN weights — kept for optional hard norm clamping (disabled
+        # by default; prefer ffn_weight_decay in the optimizer).
+        # Encoder FFN receives a higher LR than decoder FFN.
         self._enc_ff_weights: list = []
         for i in range(n_encoder_layers):
             for linear_name in ('linear1', 'linear2'):
@@ -835,20 +867,25 @@ class KokoroTrainer:
 
     @torch.no_grad()
     def _apply_weight_norm_constraints(self) -> None:
-        """Project all decoder FF weights back onto their max-norm ball.
+        """Optionally project FFN weights back onto a max-norm ball.
 
-        Called after every successful optimizer step.  The L2 norm of each
-        weight matrix is compared against *dec_ffn_max_weight_norm* and rescaled
-        when it exceeds the ceiling.  All decoder FF linear1 and linear2 weights
-        across all layers share the same cap.
+        Called after every successful optimizer step.  When
+        *dec_ffn_max_weight_norm* is positive the L2 norm of each FFN weight
+        matrix is clamped to that ceiling.
 
-        Config key: dec_ffn_max_weight_norm (default 60.0).
+        **Recommended**: leave this disabled (≤ 0) and rely on *ffn_weight_decay*
+        in the optimizer instead.  Hard norm projection after every step
+        corrupts AdamW momentum/variance states when weights persistently hit
+        the ceiling, causing the optimizer to waste gradient signal sliding
+        along the constraint surface.
+
+        Config key: dec_ffn_max_weight_norm (default 0.0 — disabled).
         Falls back to the legacy dec_ff0_linear1_max_weight_norm key if present.
         Set to 0 or negative to disable.
         """
         max_norm: float = getattr(
             self.config, 'dec_ffn_max_weight_norm',
-            getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 60.0)
+            getattr(self.config, 'dec_ff0_linear1_max_weight_norm', 0.0)
         )
         if max_norm > 0.0:
             for w in self._dec_ff_weights:
@@ -1321,7 +1358,7 @@ class KokoroTrainer:
         projection_max_norm = float(self.projection_spike_clip_norm)
         attention_max_norm = float(self.attention_spike_clip_norm)
         ffn_max_norm = float(self.ffn_spike_clip_norm)
-        encoder_ffn_max_norm = float(getattr(self.config, 'encoder_ffn_spike_clip_norm', 10.0))
+        encoder_ffn_max_norm = float(getattr(self.config, 'encoder_ffn_spike_clip_norm', 8.0))
 
         for name, param in self.model.named_parameters():
             if param.grad is None:
@@ -1485,6 +1522,8 @@ class KokoroTrainer:
                                               'stop_head_lr_multiplier', 0.1))
             decoder_ffn_lr_mult = float(getattr(getattr(self, 'config', None),
                                                 'decoder_ffn_lr_multiplier', 1.0))
+            decoder_attn_lr_mult = float(getattr(getattr(self, 'config', None),
+                                                 'decoder_attn_lr_multiplier', 1.0))
             for param_group in self.optimizer.param_groups:
                 gt = param_group.get('group_type')
                 if gt == 'encoder':
@@ -1493,21 +1532,34 @@ class KokoroTrainer:
                     mult = stop_head_lr_mult
                 elif gt == 'decoder_ffn':
                     mult = decoder_ffn_lr_mult
+                elif gt == 'decoder_attn':
+                    mult = decoder_attn_lr_mult
                 else:
                     mult = 1.0
                 param_group['lr'] = base_lr * mult
 
             self.current_optimizer_step += 1
         else:
-            # After warmup, use OneCycleLR or other scheduler
-            self.scheduler.step()
+            # After warmup, use OneCycleLR or other scheduler.
+            # Guard against stepping beyond total_steps — can happen when
+            # DynamicFrameBatchSampler produces more batches than the epoch
+            # count used to initialise OneCycleLR.
+            _onecycle_steps = getattr(self, '_onecycle_steps', None)
+            if _onecycle_steps is not None:
+                _sched_step = getattr(self.scheduler, 'last_epoch', 0)
+                if _sched_step >= _onecycle_steps:
+                    pass  # already at terminal LR; do not step further
+                else:
+                    self.scheduler.step()
+            else:
+                self.scheduler.step()
             if self.use_warmup:
                 self.current_optimizer_step += 1
 
     @staticmethod
     def _apply_spec_augment(
         mel_specs: torch.Tensor,
-        time_mask_max: int = 30,
+        time_mask_max: int = 20,
         freq_mask_max: int = 10,
         num_time_masks: int = 2,
         num_freq_masks: int = 2,
@@ -1518,17 +1570,20 @@ class KokoroTrainer:
         Returns a masked clone; the original tensor is NOT modified.
         Only the teacher-forced input is masked; the loss target remains the
         unmasked ground-truth mel, so gradients on unmasked frames are exact.
+        Masks are generated independently per sample for maximum diversity.
         """
         B, T, mel_dim = mel_specs.shape
         masked = mel_specs.clone()
-        for _ in range(num_time_masks):
-            t = torch.randint(0, max(1, min(time_mask_max, T // 4)), (1,)).item()
-            t0 = torch.randint(0, max(1, T - t), (1,)).item()
-            masked[:, t0:t0 + t, :] = 0.0
-        for _ in range(num_freq_masks):
-            f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
-            f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
-            masked[:, :, f0:f0 + f] = 0.0
+        time_limit = max(1, min(time_mask_max, T // 4))
+        for b in range(B):
+            for _ in range(num_time_masks):
+                t = torch.randint(0, time_limit, (1,)).item()
+                t0 = torch.randint(0, max(1, T - t), (1,)).item()
+                masked[b, t0:t0 + t, :] = 0.0
+            for _ in range(num_freq_masks):
+                f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
+                f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
+                masked[b, :, f0:f0 + f] = 0.0
         return masked
 
     def _calculate_losses(self, predicted_mel, predicted_log_durations, predicted_stop_logits,
@@ -1656,6 +1711,8 @@ class KokoroTrainer:
                 result['lr_enc'] = tagged['encoder']
             if 'decoder_other' in tagged:
                 result['lr_dec'] = tagged['decoder_other']
+            if 'decoder_attn' in tagged:
+                result['lr_attn'] = tagged['decoder_attn']
             if 'decoder_ffn' in tagged:
                 result['lr_ffn'] = tagged['decoder_ffn']
             if 'stop_head' in tagged:
@@ -2074,7 +2131,7 @@ class KokoroTrainer:
                     if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
                         mel_for_model = KokoroTrainer._apply_spec_augment(
                             mel_specs,
-                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 30),
+                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 20),
                             freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
                             num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
                             num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),
@@ -2880,7 +2937,7 @@ class KokoroTrainer:
                                f"(best: {self.best_val_loss:.4f})")
 
                 # Early stopping check
-                patience = getattr(self.config, 'early_stopping_patience', 10)
+                patience = getattr(self.config, 'early_stopping_patience', 15)
                 if self.epochs_without_improvement >= patience:
                     logger.info(f"Early stopping triggered after {patience} epochs without improvement")
                     logger.info(f"Best validation loss: {self.best_val_loss:.4f}")

@@ -26,7 +26,7 @@ from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 6  # bumped: stress_indices added as a parallel phoneme-level tensor
+FEATURE_CACHE_VERSION = 7  # bumped: DP aligner recovers spn utterances (real MFA durations)
 
 
 def build_stop_token_targets(
@@ -76,7 +76,7 @@ class RuslanDataset(Dataset):
     """Dataset class for Ruslan corpus - optimized for MPS"""
 
     def __init__(self, data_dir: str, config: TrainingConfig, use_mfa: bool = True,
-                 indices: Optional[List[int]] = None):
+                 indices: Optional[List[int]] = None, is_training: bool = True):
         self.data_dir = Path(data_dir)
         self.config = config
         # Adopt restored variance/global stats from config if present so
@@ -92,6 +92,7 @@ class RuslanDataset(Dataset):
         self.phoneme_processor = RussianPhonemeProcessor()
         self.use_mfa = use_mfa
         self.indices = indices  # Subset of indices for train/val split
+        self.is_training = is_training  # Speed perturbation only during training
 
         # Pre-computed feature caching
         self.use_feature_cache = getattr(config, 'use_feature_cache', True)
@@ -609,15 +610,32 @@ class RuslanDataset(Dataset):
         audio_file = sample['audio_file']
         self.feature_cache_requests += 1
 
-        # Try to load from cache first
-        cached_features = self._load_cached_features(audio_file)
-        if cached_features is not None:
-            # Return a copy to avoid mutating shared in-memory cache payload
-            cached_copy = dict(cached_features)
-            cached_copy['text'] = sample['text']
-            cached_copy['audio_file'] = audio_file
-            self._maybe_log_feature_cache_stats()
-            return cached_copy
+        # Decide whether to apply speed perturbation for this sample.
+        # When active the sample must be computed from raw audio (cache bypass)
+        # because the perturbation factor is stochastic.
+        _use_speed_perturb = (
+            self.is_training
+            and getattr(self.config, 'use_speed_perturbation', False)
+            and random.random() < getattr(self.config, 'speed_perturb_prob', 0.5)
+        )
+        if _use_speed_perturb:
+            _speed_factor = 1.0 + random.uniform(
+                -getattr(self.config, 'speed_perturb_range', 0.1),
+                 getattr(self.config, 'speed_perturb_range', 0.1),
+            )
+        else:
+            _speed_factor = 1.0
+
+        # Try to load from cache first (skip when speed-perturbed)
+        if _speed_factor == 1.0:
+            cached_features = self._load_cached_features(audio_file)
+            if cached_features is not None:
+                # Return a copy to avoid mutating shared in-memory cache payload
+                cached_copy = dict(cached_features)
+                cached_copy['text'] = sample['text']
+                cached_copy['audio_file'] = audio_file
+                self._maybe_log_feature_cache_stats()
+                return cached_copy
 
         self.feature_cache_misses += 1
 
@@ -652,6 +670,18 @@ class RuslanDataset(Dataset):
 
         # Normalize audio to prevent numerical issues
         audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
+
+        # Speed perturbation: resample audio to change speaking rate.
+        # Factor > 1.0 speeds up (shorter audio, higher pitch),
+        # factor < 1.0 slows down (longer audio, lower pitch).
+        if _speed_factor != 1.0:
+            orig_sr = self.config.sample_rate
+            # Resample to a different effective sample rate, then back to orig_sr.
+            # This changes the audio length by 1/factor while shifting formants.
+            new_sr = int(orig_sr * _speed_factor)
+            audio = torchaudio.functional.resample(audio, orig_freq=orig_sr, new_freq=new_sr)
+            # Re-normalize after resampling
+            audio = audio / (torch.max(torch.abs(audio)) + 1e-9)
 
         # Pad audio to ensure it's at least `win_length` for STFT ---
         # This is critical for torch.stft not to fail on very short samples.
@@ -709,46 +739,29 @@ class RuslanDataset(Dataset):
         num_phonemes = phoneme_indices_tensor.shape[0]
 
         # Try to get MFA alignments first.
-        # strip_outer_silences=True absorbs MFA's leading/trailing <sil> intervals
-        # into the first/last real phoneme frames.  After stripping, the MFA
-        # duration list contains exactly the same slots as our phoneme_sequence
-        # (word phonemes + inter-word <sil> tokens), so lengths match without
-        # requiring truncation/padding in the common case.
+        # get_aligned_durations uses DP sequence alignment (Needleman-Wunsch)
+        # to produce a duration list whose length exactly matches
+        # phoneme_sequence — handling iotation merges, geminate splits,
+        # prosody tokens, and inter-word <sil> automatically.
         mfa_durations = None
         if self.mfa is not None:
-            mfa_durations = self.mfa.get_phoneme_durations(
-                sample['audio_file'], strip_outer_silences=True
+            mfa_durations = self.mfa.get_aligned_durations(
+                sample['audio_file'], phoneme_sequence
             )
 
-        if mfa_durations is not None and len(mfa_durations) > 0:
-            # Use MFA durations
+        if mfa_durations is not None:
             phoneme_durations = torch.tensor(mfa_durations, dtype=torch.long)
 
-            # Handle length mismatch between MFA phonemes and our phonemes
-            if len(phoneme_durations) != num_phonemes:
-                # Log warning only occasionally to avoid spam
-                if idx % 1000 == 0:
-                    logger.debug(f"MFA duration length ({len(phoneme_durations)}) != "
-                               f"phoneme length ({num_phonemes}) for {sample['audio_file']}")
+            # Rescale MFA durations for speed perturbation.
+            # Speed factor > 1 → fewer mel frames → durations shrink by 1/factor.
+            if _speed_factor != 1.0:
+                scaled = phoneme_durations.float() / _speed_factor
+                phoneme_durations = torch.clamp(scaled.round().long(), min=1)
 
-                # Adjust durations to match phoneme count
-                if len(phoneme_durations) > num_phonemes:
-                    # Truncate
-                    phoneme_durations = phoneme_durations[:num_phonemes]
-                else:
-                    # Pad with estimated durations for missing phonemes
-                    missing = num_phonemes - len(phoneme_durations)
-                    avg_dur = int(phoneme_durations.float().mean().item()) if len(phoneme_durations) > 0 else 5
-                    padding = torch.full((missing,), avg_dur, dtype=torch.long)
-                    phoneme_durations = torch.cat([phoneme_durations, padding])
-
-            # Handle Frame Sum Mismatch (The "Gap")
+            # Reconcile frame sum: ensure sum(durations) == num_mel_frames.
             current_sum = phoneme_durations.sum().item()
             diff = num_mel_frames - current_sum
-
             if diff != 0 and len(phoneme_durations) > 0:
-                # Add the drift (positive or negative) to the last phoneme
-                # This ensures Sum(durations) == mel_spec.shape[1]
                 phoneme_durations[-1] = max(1, phoneme_durations[-1] + diff)
 
             # Ensure durations are at least 1 frame
@@ -848,8 +861,9 @@ class RuslanDataset(Dataset):
             '_cache_version': FEATURE_CACHE_VERSION
         }
 
-        # Save to cache for future use
-        self._save_cached_features(audio_file, features)
+        # Save to cache for future use (skip augmented samples)
+        if _speed_factor == 1.0:
+            self._save_cached_features(audio_file, features)
         self._maybe_log_feature_cache_stats()
 
         return features

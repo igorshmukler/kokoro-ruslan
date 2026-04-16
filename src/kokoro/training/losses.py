@@ -202,8 +202,8 @@ def calculate_training_losses(
         loss_mel
         + loss_duration * config.duration_loss_weight
         + loss_stop_token * config.stop_token_loss_weight
-        + loss_pitch * getattr(config, 'pitch_loss_weight', 0.1)
-        + loss_energy * getattr(config, 'energy_loss_weight', 0.1)
+        + loss_pitch * getattr(config, 'pitch_loss_weight', 1.0)
+        + loss_energy * getattr(config, 'energy_loss_weight', 1.0)
     )
 
     if not torch.isfinite(total_loss):
