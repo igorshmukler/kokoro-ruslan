@@ -54,7 +54,12 @@ def _load_master_cache(files: list) -> tuple:
             data = pickle.load(fh)
         if data.get("version") != _CACHE_VERSION:
             return None, None
-        if any(data.get("mtimes", {}).get(str(f)) != f.stat().st_mtime for f in files):
+        cached_mtimes = data.get("mtimes", {})
+        current_keys = {str(f) for f in files}
+        # Invalidate if cache has files that no longer exist on disk
+        if set(cached_mtimes.keys()) != current_keys:
+            return None, None
+        if any(cached_mtimes.get(str(f)) != f.stat().st_mtime for f in files):
             return None, None
         return data["records"], data.get("persistent_counts", {})
     except Exception:

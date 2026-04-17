@@ -138,9 +138,9 @@ class TrainingConfig:
     # unmasked frames are unaffected.  Masking forces the decoder to rely on encoder
     # context rather than memorising the previous mel frame.
     use_spec_augment: bool = True
-    spec_augment_time_mask_max: int = 20   # Doubled from 10: stronger regularisation needed for 22K-sample dataset
-    spec_augment_freq_mask_max: int = 10   # Doubled from 5: mask ~12.5% of mel bins per mask
-    spec_augment_num_time_masks: int = 2   # Doubled from 1: more mask diversity
+    spec_augment_time_mask_max: int = 10   # Reduced from 20: val_mel regressed 4 epochs without recovery
+    spec_augment_freq_mask_max: int = 5    # Reduced from 10: less aggressive frequency masking
+    spec_augment_num_time_masks: int = 1   # Reduced from 2: single mask sufficient at this stage
     spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
     # Epoch gate: SpecAugment must start AFTER the LR peak to avoid compounding
     # ascent-phase instability (previous run: Ep12 onset during 77% LR climb
