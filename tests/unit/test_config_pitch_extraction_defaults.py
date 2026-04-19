@@ -33,10 +33,8 @@ def test_training_config_convergence_fix_defaults():
         f"duration_loss_weight should be 0.35 (was 0.1); got {config.duration_loss_weight}"
     )
 
-    # Spec augment deferred until after the OneCycleLR peak (~epoch 15) to avoid
-    # compounding ramp-phase instability (empirically caused val regression ep4→ep6)
-    assert config.spec_augment_start_epoch == 5, (
-        f"spec_augment_start_epoch should be 5; got {config.spec_augment_start_epoch}"
+    assert config.spec_augment_start_epoch == 1, (
+        f"spec_augment_start_epoch should be 1; got {config.spec_augment_start_epoch}"
     )
 
     # Encoder FFN pre-clip loosened — the old 10.0 was zeroing microscopic-but-valid gradients
