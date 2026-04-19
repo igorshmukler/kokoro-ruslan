@@ -139,8 +139,8 @@ class TrainingConfig:
     # upstream context without corrupting the causal self-attention chain.
     # Safe from epoch 1: variance predictors and mel input are unaffected.
     use_spec_augment: bool = True
-    spec_augment_time_mask_max: int = 10   # Max consecutive time positions masked in encoder memory
-    spec_augment_freq_mask_max: int = 5    # Max consecutive hidden dims masked (5/512 = ~1%)
+    spec_augment_time_mask_max: int = 5    # Max consecutive time positions masked in encoder memory
+    spec_augment_freq_mask_max: int = 3    # Max consecutive hidden dims masked (3/512 = ~0.6%)
     spec_augment_num_time_masks: int = 1   # Number of independent time masks per sample
     spec_augment_num_freq_masks: int = 2   # Number of independent feature-dim masks per sample
     spec_augment_start_epoch: int = 1      # Safe from Ep1 — no autoregressive chain corruption
