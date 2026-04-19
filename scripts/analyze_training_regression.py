@@ -1029,10 +1029,12 @@ def tb_print_gradient_analysis(ea):
 def tb_print_lr_trajectory(ea):
     _section("TENSORBOARD — Learning Rate Trajectory")
     groups = [
-        ("stats/lr_decoder",     "decoder"),
-        ("stats/lr_decoder_ffn", "decoder_ffn"),
-        ("stats/lr_encoder",     "encoder"),
-        ("stats/lr_stop_head",   "stop_head"),
+        ("stats/lr_decoder",          "decoder"),
+        ("stats/lr_decoder_ffn",      "decoder_ffn"),
+        ("stats/lr_decoder_attn",     "decoder_attn"),
+        ("stats/lr_encoder",          "encoder"),
+        ("stats/lr_stop_head",        "stop_head"),
+        ("stats/lr_variance_embed",   "variance_embed"),
     ]
     for tag, label in groups:
         series = _get(ea, tag)
@@ -2086,6 +2088,15 @@ def tb_print_lr_phase_detail(ea, records=None):
               f"({stop_pct:.4f}% of dec peak  {stop_mult:.3f}× decoder)")
     else:
         print("  stop head LR  : no stats/lr_stop_head data (pre-isolation checkpoint or TB not refreshed)")
+
+    # Variance embedding LR (pitch/energy embeddings, reduced to match cross-attn)
+    var_embed_series = _get(ea, "stats/lr_variance_embed")
+    if var_embed_series:
+        ve_lr_curr = var_embed_series[-1][1]
+        ve_pct     = 100.0 * ve_lr_curr / ref_peak_dec
+        ve_mult    = ve_lr_curr / curr_lr if curr_lr > 0 else 0.0
+        print(f"  var embed LR  : {ve_lr_curr:.8f}  at step {var_embed_series[-1][0]}  "
+              f"({ve_pct:.4f}% of dec peak  {ve_mult:.3f}× decoder)")
 
     thresh_90_step = next((s for s, v in lr if v >= obs_max_dec * 0.90), lr[0][0])
     print(f"\n  Step-by-step from step {thresh_90_step} onward:")
