@@ -10,6 +10,9 @@ class _TinyModel(nn.Module):
         super().__init__()
         self.w = nn.Parameter(torch.tensor(0.0))
 
+    def set_memory_augment(self, fn):
+        pass
+
 
 class _SamplerStub:
     def __init__(self):
