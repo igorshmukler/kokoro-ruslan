@@ -130,7 +130,7 @@ class KokoroTrainer:
                 "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
             },
             "Learning Rate": {
-                "LR (encoder vs decoder vs stop vs ffn vs attn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_decoder_attn", "stats/lr_stop_head"]],
+                "LR (encoder vs decoder vs stop vs ffn vs attn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_decoder_attn", "stats/lr_stop_head", "stats/lr_variance_embed"]],
             },
         })
 
@@ -634,7 +634,7 @@ class KokoroTrainer:
         if variance_embed_params:
             param_groups.append({'params': variance_embed_params, 'lr': base_lr * var_embed_lr_mult,
                                  'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
-                                 'group_type': 'decoder_other'})
+                                 'group_type': 'variance_embed'})
 
         # Stop head group (always present as its own group when identified)
         if stop_head_params:
@@ -751,6 +751,8 @@ class KokoroTrainer:
                     max_lr_arg.append(max_lr * decoder_attn_mult)
                 elif gt == 'stop_head':
                     max_lr_arg.append(max_lr * _stop_head_lr_mult)
+                elif gt == 'variance_embed':
+                    max_lr_arg.append(max_lr * float(getattr(config, 'variance_embedding_lr_multiplier', 0.30)))
                 else:
                     # decoder_other / decoder_no_decay etc.
                     max_lr_arg.append(max_lr)
@@ -1690,6 +1692,8 @@ class KokoroTrainer:
                 self.writer.add_scalar('stats/lr_decoder_attn', tagged['decoder_attn'], step)
             if 'stop_head' in tagged:
                 self.writer.add_scalar('stats/lr_stop_head', tagged['stop_head'], step)
+            if 'variance_embed' in tagged:
+                self.writer.add_scalar('stats/lr_variance_embed', tagged['variance_embed'], step)
         else:
             # Legacy fallback: positional heuristics
             n_pg = len(self.optimizer.param_groups)

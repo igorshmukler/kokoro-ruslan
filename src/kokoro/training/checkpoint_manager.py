@@ -827,6 +827,9 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             _decoder_attn_lr_mult = float(
                 getattr(getattr(trainer, 'config', None), 'decoder_attn_lr_multiplier', 1.0)
             )
+            _var_embed_lr_mult = float(
+                getattr(getattr(trainer, 'config', None), 'variance_embedding_lr_multiplier', 0.30)
+            )
             def _group_mult(pg, idx, n):
                 gt = pg.get('group_type')
                 if gt == 'encoder':
@@ -837,6 +840,8 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                     return _decoder_attn_lr_mult
                 elif gt == 'stop_head':
                     return _stop_head_lr_mult
+                elif gt == 'variance_embed':
+                    return _var_embed_lr_mult
                 elif gt is not None:
                     return 1.0
                 # Legacy positional fallback
