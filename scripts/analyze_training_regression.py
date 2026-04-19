@@ -1669,17 +1669,19 @@ def tb_print_recommendations(ea, records=None):
     if records and len(records) >= 3:
         _embed_names = ('pitch_embedding.weight', 'energy_embedding.weight')
         _xattn_names = ('cross_attn.w_v.weight', 'cross_attn.w_o.weight')
-        # Collect per-epoch deltas for embeddings and cross-attention
+        # Collect per-epoch mean-per-param deltas for embeddings and cross-attention.
+        # Using mean (not sum) because cross-attn matches 12 params (6 layers × {w_v, w_o})
+        # while embeddings match only 2 params.  Raw sums would mask the drift.
         embed_deltas = []
         xattn_deltas = []
         for rec in records:
             ps = rec.get('param_stats', {})
-            e_sum = sum(s.get('delta', 0) or 0 for n, s in ps.items()
-                        if any(en in n for en in _embed_names))
-            x_sum = sum(s.get('delta', 0) or 0 for n, s in ps.items()
-                        if any(xn in n for xn in _xattn_names))
-            embed_deltas.append(e_sum)
-            xattn_deltas.append(x_sum)
+            e_vals = [s.get('delta', 0) or 0 for n, s in ps.items()
+                      if any(en in n for en in _embed_names)]
+            x_vals = [s.get('delta', 0) or 0 for n, s in ps.items()
+                      if any(xn in n for xn in _xattn_names)]
+            embed_deltas.append(statistics.mean(e_vals) if e_vals else 0)
+            xattn_deltas.append(statistics.mean(x_vals) if x_vals else 0)
         # Check the last 3 transitions for accelerating embed drift
         recent_embed = [d for d in embed_deltas[-3:] if d > 0]
         recent_xattn = [d for d in xattn_deltas[-3:] if d > 0]
