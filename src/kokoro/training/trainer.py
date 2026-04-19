@@ -558,11 +558,15 @@ class KokoroTrainer:
         decoder_no_decay: list = []
         decoder_ffn_no_decay: list = []
         decoder_attn_no_decay: list = []
+        variance_embed_params: list = []  # pitch/energy embedding lookup tables
         decoder_decay_tuples: list = []  # (name, param) for decay candidates
+        _variance_embed_substrings = ('pitch_embedding.', 'energy_embedding.')
         for _name, _param in decoder_named:
             if (any(_name.endswith(s) for s in _no_decay_suffixes)
                     or any(s in _name for s in _no_decay_substrings)):
-                if ".ff." in _name:
+                if any(s in _name for s in _variance_embed_substrings):
+                    variance_embed_params.append(_param)
+                elif ".ff." in _name:
                     decoder_ffn_no_decay.append(_param)
                 elif ".self_attn." in _name or ".cross_attn." in _name:
                     decoder_attn_no_decay.append(_param)
@@ -589,6 +593,7 @@ class KokoroTrainer:
         stop_head_lr = base_lr * stop_head_lr_mult
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
         decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
+        var_embed_lr_mult = float(getattr(config, 'variance_embedding_lr_multiplier', 0.30))
         ffn_weight_decay = getattr(config, 'ffn_weight_decay', weight_decay)
         decoder_ffn_wd = getattr(config, 'decoder_ffn_weight_decay', ffn_weight_decay)
 
@@ -626,6 +631,10 @@ class KokoroTrainer:
             param_groups.append({'params': decoder_ffn_no_decay, 'lr': base_lr * decoder_ffn_lr_mult,
                                  'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'decoder_ffn'})
+        if variance_embed_params:
+            param_groups.append({'params': variance_embed_params, 'lr': base_lr * var_embed_lr_mult,
+                                 'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'decoder_other'})
 
         # Stop head group (always present as its own group when identified)
         if stop_head_params:
@@ -648,8 +657,10 @@ class KokoroTrainer:
             n_decoder_attn = len(decoder_decay_attn)
             n_decoder_attn_nd = len(decoder_attn_no_decay)
             n_stop = len(stop_head_params)
+            n_var_embed = len(variance_embed_params)
             ffn_lr = base_lr * decoder_ffn_lr_mult
             attn_lr = base_lr * decoder_attn_lr_mult
+            var_embed_lr = base_lr * var_embed_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
                 f"encoder_ffn_decay={n_encoder_ffn} params (lr={encoder_lr:.2e}, wd={ffn_weight_decay}), "
@@ -659,6 +670,7 @@ class KokoroTrainer:
                 f"decoder_attn_no_decay={n_decoder_attn_nd} params (lr={attn_lr:.2e}, wd=0.0), "
                 f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={decoder_ffn_wd}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
+                f"variance_embed={n_var_embed} params (lr={var_embed_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
 

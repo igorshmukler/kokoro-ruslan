@@ -54,6 +54,14 @@ class TrainingConfig:
     # LR multiplier for decoder self-attention and cross-attention layers
     # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
     decoder_attn_lr_multiplier: float = 0.30
+    # LR multiplier for pitch/energy embedding lookup tables.
+    # These embeddings are added directly to the cross-attention memory;
+    # running them at full base_lr (3.3× decoder_attn LR) causes them to
+    # shift faster than cross-attention can track, creating a positive
+    # feedback loop that drives accelerating mel regression.
+    # Match to decoder_attn_lr_multiplier so the representation and its
+    # consumer converge at the same rate.
+    variance_embedding_lr_multiplier: float = 0.30
 
     # QK-normalization: per-head RMSNorm on Q and K after projection.
     # Decouples attention logit scale from weight norms, preventing unbounded
