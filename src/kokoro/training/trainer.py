@@ -1558,22 +1558,21 @@ class KokoroTrainer:
 
     @staticmethod
     def _apply_spec_augment(
-        mel_specs: torch.Tensor,
-        time_mask_max: int = 20,
-        freq_mask_max: int = 10,
-        num_time_masks: int = 2,
+        tensor: torch.Tensor,
+        time_mask_max: int = 10,
+        freq_mask_max: int = 5,
+        num_time_masks: int = 1,
         num_freq_masks: int = 2,
     ) -> torch.Tensor:
-        """Apply SpecAugment (Park et al. 2019): random time & frequency masking.
+        """Apply SpecAugment-style masking: random time & feature-dim masking.
 
-        mel_specs: (B, T, mel_dim) — teacher-forced decoder input.
+        tensor: (B, T, D) — typically the expanded encoder output used as
+                cross-attention memory for the decoder.
         Returns a masked clone; the original tensor is NOT modified.
-        Only the teacher-forced input is masked; the loss target remains the
-        unmasked ground-truth mel, so gradients on unmasked frames are exact.
         Masks are generated independently per sample for maximum diversity.
         """
-        B, T, mel_dim = mel_specs.shape
-        masked = mel_specs.clone()
+        B, T, D = tensor.shape
+        masked = tensor.clone()
         time_limit = max(1, min(time_mask_max, T // 4))
         for b in range(B):
             for _ in range(num_time_masks):
@@ -1582,7 +1581,7 @@ class KokoroTrainer:
                 masked[b, t0:t0 + t, :] = 0.0
             for _ in range(num_freq_masks):
                 f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
-                f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
+                f0 = torch.randint(0, max(1, D - f), (1,)).item()
                 masked[b, :, f0:f0 + f] = 0.0
         return masked
 
@@ -2020,6 +2019,21 @@ class KokoroTrainer:
         """Train for one epoch with enhanced profiling, mixed precision, and adaptive memory management"""
         self.model.train()
 
+        # Configure encoder-memory SpecAugment for this epoch.
+        _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 1)
+        if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
+            _sa_time  = getattr(self.config, 'spec_augment_time_mask_max', 10)
+            _sa_freq  = getattr(self.config, 'spec_augment_freq_mask_max', 5)
+            _sa_nt    = getattr(self.config, 'spec_augment_num_time_masks', 1)
+            _sa_nf    = getattr(self.config, 'spec_augment_num_freq_masks', 2)
+            self.model.set_memory_augment(
+                lambda mem: KokoroTrainer._apply_spec_augment(
+                    mem, _sa_time, _sa_freq, _sa_nt, _sa_nf,
+                )
+            )
+        else:
+            self.model.set_memory_augment(None)
+
         # Use tensor accumulation to reduce .item() calls (CPU-GPU sync overhead)
         total_loss_epoch = 0.0
         mel_loss_epoch = 0.0
@@ -2124,20 +2138,9 @@ class KokoroTrainer:
                     pitches = transferred.pitches
                     energies = transferred.energies
                     stress_indices = transferred.stress_indices
-                    # SpecAugment: mask teacher-forced mel input; loss target stays unmasked.
-                    # Epoch gate: disabled until after the OneCycleLR peak so spec augment
-                    # does not compound ramp-phase instability.  Default matches config.py.
-                    _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 18)
-                    if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
-                        mel_for_model = KokoroTrainer._apply_spec_augment(
-                            mel_specs,
-                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 20),
-                            freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
-                            num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
-                            num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),
-                        )
-                    else:
-                        mel_for_model = mel_specs
+                    # Mel input is always clean — SpecAugment is now applied
+                    # to the encoder memory inside the model's forward pass.
+                    mel_for_model = mel_specs
 
                 # Adaptive long-sequence handling: cap/truncate oversized batches
                 # instead of skipping them entirely so training still benefits from
@@ -3173,9 +3176,9 @@ class KokoroTrainer:
         Args:
             transferred:   Pre-transferred batch tensors (output of
                            ``_transfer_batch_to_device``).
-            mel_for_model: Mel spectrogram fed to the model; may differ from
-                           ``transferred['mel_specs']`` when SpecAugment is
-                           active.
+            mel_for_model: Mel spectrogram fed to the model (always clean;
+                           SpecAugment is applied to encoder memory inside
+                           the model's forward pass, not to the mel input).
             loss_scale:    Scalar applied to ``total_loss`` before
                            ``.backward()`` — combine ``1/grad_accum_steps``
                            and ``adaptive_loss_scale`` in the caller.

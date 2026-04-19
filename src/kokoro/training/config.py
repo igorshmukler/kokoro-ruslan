@@ -133,21 +133,17 @@ class TrainingConfig:
     pitch_huber_delta: float = 0.05
     energy_huber_delta: float = 0.05  # matched to pitch; old default was 0.5 (still MSE for small errors)
 
-    # SpecAugment (Park et al. 2019) — applied to teacher-forced mel decoder input only.
-    # The unmasked original mel is still used as the loss target, so gradients for
-    # unmasked frames are unaffected.  Masking forces the decoder to rely on encoder
-    # context rather than memorising the previous mel frame.
+    # SpecAugment (Park et al. 2019) — applied to the expanded encoder output
+    # (cross-attention memory), NOT to the autoregressive mel decoder input.
+    # Masking encoder memory forces the decoder to reconstruct from incomplete
+    # upstream context without corrupting the causal self-attention chain.
+    # Safe from epoch 1: variance predictors and mel input are unaffected.
     use_spec_augment: bool = True
-    spec_augment_time_mask_max: int = 10   # Reduced from 20: val_mel regressed 4 epochs without recovery
-    spec_augment_freq_mask_max: int = 5    # Reduced from 10: less aggressive frequency masking
-    spec_augment_num_time_masks: int = 1   # Reduced from 2: single mask sufficient at this stage
-    spec_augment_num_freq_masks: int = 2   # Number of independent frequency masks per batch
-    # Epoch gate: SpecAugment must start AFTER the LR peak to avoid compounding
-    # ascent-phase instability (previous run: Ep12 onset during 77% LR climb
-    # caused val_mel Ep12→Ep17 regression).
-    # With pct_start=0.10 the LR peaks at ~Ep10; starting at Ep30 gives the
-    # model ~20 decay epochs to stabilise before augmentation noise is added.
-    spec_augment_start_epoch: int = 5
+    spec_augment_time_mask_max: int = 10   # Max consecutive time positions masked in encoder memory
+    spec_augment_freq_mask_max: int = 5    # Max consecutive hidden dims masked (5/512 = ~1%)
+    spec_augment_num_time_masks: int = 1   # Number of independent time masks per sample
+    spec_augment_num_freq_masks: int = 2   # Number of independent feature-dim masks per sample
+    spec_augment_start_epoch: int = 1      # Safe from Ep1 — no autoregressive chain corruption
     # Class-imbalance correction for stop-token BCE.
     # Sole purpose: re-weight positive (stop) frames vs negative (non-stop) frames
     # so the model cannot collapse to always-predict-no-stop.
