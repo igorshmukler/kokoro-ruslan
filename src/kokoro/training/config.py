@@ -36,8 +36,11 @@ class TrainingConfig:
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
-    # peak encoder = 5.0e-5 × 1.0 (max_lr) × 1.1 = 5.5e-5
-    encoder_lr_multiplier: float = 1.1
+    # 1.1 (original): encoder memory shifted 3.67× faster than cross-attention (at 0.30×),
+    # causing accelerating cross-attn drift even after embedding LR fix.
+    # 0.65: brings encoder peak to 3.25e-5 — closer to cross-attn's 1.5e-5 (2.17× gap
+    # vs 3.67×), reducing memory drift while still giving encoder meaningful updates.
+    encoder_lr_multiplier: float = 0.65
     # LR multiplier for the stop-token head's dedicated optimizer param group.
     # The stop head is a single Linear(hidden_dim→1) with a heavily skewed target
     # distribution (~137:1 neg/pos).  Running it at the same LR as the decoder
