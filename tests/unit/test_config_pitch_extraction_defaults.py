@@ -24,8 +24,8 @@ def test_training_config_convergence_fix_defaults():
     )
 
     # Encoder gets a separate higher LR to compensate for its much smaller Adam 2nd moments
-    assert config.encoder_lr_multiplier == 1.1, (
-        f"encoder_lr_multiplier should be 1.1; got {config.encoder_lr_multiplier}"
+    assert config.encoder_lr_multiplier == 0.65, (
+        f"encoder_lr_multiplier should be 0.65; got {config.encoder_lr_multiplier}"
     )
 
     # Duration signal raised so the encoder receives stronger gradient from alignment
