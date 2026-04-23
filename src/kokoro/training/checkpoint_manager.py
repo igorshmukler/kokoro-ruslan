@@ -203,6 +203,8 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
             'energy_max': float(getattr(config, 'energy_max', 1.0)),
             'use_stochastic_depth': bool(getattr(config, 'use_stochastic_depth', True)),
             'stochastic_depth_rate': float(getattr(config, 'stochastic_depth_rate', 0.1)),
+            'qk_norm': bool(getattr(config, 'qk_norm', False)),
+            'ffn_output_norm': bool(getattr(config, 'ffn_output_norm', True)),
         },
         'inference_controls': {
             'max_len': int(getattr(config, 'inference_max_len', 1200)),
