@@ -15,7 +15,7 @@ class TrainingConfig:
     # Basic training parameters
     data_dir: str = "data/processed_data"
     output_dir: str = "output_models"
-    num_epochs: int = 100  # 100 × ~678 opt-steps/epoch (accum=2) − 1200 warmup ≈ 66,600 OneCycleLR steps
+    num_epochs: int = 30  # 30 × ~677 opt-steps/epoch ≈ 20,310 total steps; −1200 warmup ≈ 19,110 OneCycleLR steps
     batch_size: int = 16
     learning_rate: float = 5.0e-5  # peak LR = 5.0e-5 × 1.0 = 5.0e-5 (reduced from 7.0e-5: 5-ep val_mel regression at peak hold)
     device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -32,7 +32,7 @@ class TrainingConfig:
     #   FFN mult 0.30→0.20 had zero effect. Overfitting: train-val gap flipped -0.13→+0.08.
     # Run 3: lr=5e-5 (-29%), pct=0.05 (decay starts ~Ep7 vs Ep12).
     max_lr_multiplier: float = 1.0   # Peak decoder LR = 5.0e-5 × 1.0 = 5.0e-5
-    pct_start: float = 0.05  # 5% ascending → cosine decay starts ~Ep7 (was 0.10 → Ep12, too late)
+    pct_start: float = 0.20  # 20% ascending (~3822 steps) → peak at ~step 5022 (~Ep7), then 80% cosine decay
     # Per-group LR multiplier for encoder params (text_embedding, positional_encoding,
     # transformer_encoder_layers). Encoder receives encoder_lr_multiplier × base LR so
     # that the encoder layers get proportionally more gradient signal vs the decoder.
@@ -56,15 +56,19 @@ class TrainingConfig:
     decoder_ffn_lr_multiplier: float = 0.30
     # LR multiplier for decoder self-attention and cross-attention layers
     # (decoder.layers.*.self_attn.* and decoder.layers.*.cross_attn.*).
-    decoder_attn_lr_multiplier: float = 0.30
+    # 0.30 (run 3): cross_attn w_v became #1 delta mover from Ep9, accelerating
+    # to 2.31 at Ep10; val_mel regressed 0.904→0.927→0.966 over Ep9-11.
+    # 0.15: peak attn LR = 5e-5 × 0.15 = 7.5e-6, should halve cross_attn drift.
+    decoder_attn_lr_multiplier: float = 0.15
     # LR multiplier for pitch/energy embedding lookup tables.
     # These embeddings are added directly to the cross-attention memory;
     # running them at full base_lr (3.3× decoder_attn LR) causes them to
     # shift faster than cross-attention can track, creating a positive
     # feedback loop that drives accelerating mel regression.
-    # Match to decoder_attn_lr_multiplier so the representation and its
-    # consumer converge at the same rate.
-    variance_embedding_lr_multiplier: float = 0.30
+    # 0.30 (run 3): after decoder_attn dropped to 0.15, embeddings drifted
+    # 3× faster than cross-attn (1.40 vs 0.47), causing residual +0.013 regression.
+    # 0.15: matches decoder_attn_lr_multiplier for 1:1 drift parity.
+    variance_embedding_lr_multiplier: float = 0.15
 
     # QK-normalization: per-head RMSNorm on Q and K after projection.
     # Decouples attention logit scale from weight norms, preventing unbounded

@@ -138,9 +138,14 @@ class MultiHeadAttentionImproved(nn.Module):
         # QK-normalization: per-head RMSNorm on Q and K after projection.
         # Decouples attention logit magnitude from weight norm, preventing
         # the self-reinforcing growth loop (larger w → larger output → larger grad → larger w).
+        # V-normalization: RMSNorm on V after projection, bounding the value
+        # pathway magnitude independent of w_v weight norm.  Without this the
+        # cross-attention output scales linearly with w_v norm — a blind spot
+        # in pre-norm architectures that drives superlinear weight growth.
         if qk_norm:
             self.q_norm = nn.RMSNorm(self.d_k)
             self.k_norm = nn.RMSNorm(self.d_k)
+            self.v_norm = nn.RMSNorm(self.d_k)
 
         if use_relative_pos:
             if rel_pos_type == 'rope':
@@ -225,7 +230,7 @@ class MultiHeadAttentionImproved(nn.Module):
         # K and V: use precomputed projections if provided (e.g. fixed encoder output
         # during autoregressive inference), otherwise project normally
         if precomputed_k is not None and precomputed_v is not None:
-            # Cross-attention with cached encoder K, V
+            # Cross-attention with cached encoder K, V (already normed at cache time)
             K = precomputed_k
             V = precomputed_v
             updated_cache = None
@@ -234,6 +239,8 @@ class MultiHeadAttentionImproved(nn.Module):
             # Project only the new query frame's K and V
             new_K = self.w_k(key).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2)
             new_V = self.w_v(value).view(batch_size, seq_len_q, self.num_heads, self.d_k).transpose(1, 2)
+            if self.qk_norm:
+                new_V = self.v_norm(new_V)
 
             if len(kv_cache) == 0:
                 # First step — cache starts empty, use only current frame
@@ -250,6 +257,8 @@ class MultiHeadAttentionImproved(nn.Module):
             seq_len_k = key.size(1)
             K = self.w_k(key).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)
             V = self.w_v(value).view(batch_size, seq_len_k, self.num_heads, self.d_k).transpose(1, 2)
+            if self.qk_norm:
+                V = self.v_norm(V)
             updated_cache = None
 
         seq_len_k = K.size(2)
@@ -523,6 +532,8 @@ class ImprovedTransformerDecoderBlock(nn.Module):
         self._cached_cross_V = self.cross_attn.w_v(memory).view(
             memory.size(0), memory.size(1), self.cross_attn.num_heads, self.cross_attn.d_k
         ).transpose(1, 2)
+        if self.cross_attn.qk_norm:
+            self._cached_cross_V = self.cross_attn.v_norm(self._cached_cross_V)
 
     def clear_cross_attention_cache(self) -> None:
         """Release cached K, V after inference completes."""
