@@ -75,8 +75,8 @@ Examples:
     parser.add_argument(
         '--save-every',
         type=int,
-        default=2,
-        help='Save checkpoint every N epochs (default: 2)'
+        default=5,
+        help='Save checkpoint every N epochs (default: 5)'
     )
 
     parser.add_argument(
