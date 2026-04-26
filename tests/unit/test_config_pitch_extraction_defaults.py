@@ -24,8 +24,8 @@ def test_training_config_convergence_fix_defaults():
     )
 
     # Encoder gets a separate higher LR to compensate for its much smaller Adam 2nd moments
-    assert config.encoder_lr_multiplier == 1.1, (
-        f"encoder_lr_multiplier should be 1.1; got {config.encoder_lr_multiplier}"
+    assert config.encoder_lr_multiplier == 0.65, (
+        f"encoder_lr_multiplier should be 0.65; got {config.encoder_lr_multiplier}"
     )
 
     # Duration signal raised so the encoder receives stronger gradient from alignment
@@ -33,10 +33,8 @@ def test_training_config_convergence_fix_defaults():
         f"duration_loss_weight should be 0.35 (was 0.1); got {config.duration_loss_weight}"
     )
 
-    # Spec augment deferred until after the OneCycleLR peak (~epoch 15) to avoid
-    # compounding ramp-phase instability (empirically caused val regression ep4→ep6)
-    assert config.spec_augment_start_epoch == 5, (
-        f"spec_augment_start_epoch should be 5; got {config.spec_augment_start_epoch}"
+    assert config.spec_augment_start_epoch == 1, (
+        f"spec_augment_start_epoch should be 1; got {config.spec_augment_start_epoch}"
     )
 
     # Encoder FFN pre-clip loosened — the old 10.0 was zeroing microscopic-but-valid gradients

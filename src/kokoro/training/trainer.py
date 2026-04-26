@@ -130,7 +130,7 @@ class KokoroTrainer:
                 "Spectral Convergence (train vs val)": ["Multiline", ["metrics/train_spectral_convergence", "metrics/val_spectral_convergence"]],
             },
             "Learning Rate": {
-                "LR (encoder vs decoder vs stop vs ffn vs attn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_decoder_attn", "stats/lr_stop_head"]],
+                "LR (encoder vs decoder vs stop vs ffn vs attn)": ["Multiline", ["stats/lr_encoder", "stats/lr_decoder", "stats/lr_decoder_ffn", "stats/lr_decoder_attn", "stats/lr_stop_head", "stats/lr_variance_embed"]],
             },
         })
 
@@ -558,11 +558,15 @@ class KokoroTrainer:
         decoder_no_decay: list = []
         decoder_ffn_no_decay: list = []
         decoder_attn_no_decay: list = []
+        variance_embed_params: list = []  # pitch/energy embedding lookup tables
         decoder_decay_tuples: list = []  # (name, param) for decay candidates
+        _variance_embed_substrings = ('pitch_embedding.', 'energy_embedding.')
         for _name, _param in decoder_named:
             if (any(_name.endswith(s) for s in _no_decay_suffixes)
                     or any(s in _name for s in _no_decay_substrings)):
-                if ".ff." in _name:
+                if any(s in _name for s in _variance_embed_substrings):
+                    variance_embed_params.append(_param)
+                elif ".ff." in _name:
                     decoder_ffn_no_decay.append(_param)
                 elif ".self_attn." in _name or ".cross_attn." in _name:
                     decoder_attn_no_decay.append(_param)
@@ -589,6 +593,7 @@ class KokoroTrainer:
         stop_head_lr = base_lr * stop_head_lr_mult
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
         decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
+        var_embed_lr_mult = float(getattr(config, 'variance_embedding_lr_multiplier', 0.30))
         ffn_weight_decay = getattr(config, 'ffn_weight_decay', weight_decay)
         decoder_ffn_wd = getattr(config, 'decoder_ffn_weight_decay', ffn_weight_decay)
 
@@ -626,6 +631,10 @@ class KokoroTrainer:
             param_groups.append({'params': decoder_ffn_no_decay, 'lr': base_lr * decoder_ffn_lr_mult,
                                  'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'decoder_ffn'})
+        if variance_embed_params:
+            param_groups.append({'params': variance_embed_params, 'lr': base_lr * var_embed_lr_mult,
+                                 'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'variance_embed'})
 
         # Stop head group (always present as its own group when identified)
         if stop_head_params:
@@ -648,8 +657,10 @@ class KokoroTrainer:
             n_decoder_attn = len(decoder_decay_attn)
             n_decoder_attn_nd = len(decoder_attn_no_decay)
             n_stop = len(stop_head_params)
+            n_var_embed = len(variance_embed_params)
             ffn_lr = base_lr * decoder_ffn_lr_mult
             attn_lr = base_lr * decoder_attn_lr_mult
+            var_embed_lr = base_lr * var_embed_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
                 f"encoder_ffn_decay={n_encoder_ffn} params (lr={encoder_lr:.2e}, wd={ffn_weight_decay}), "
@@ -659,6 +670,7 @@ class KokoroTrainer:
                 f"decoder_attn_no_decay={n_decoder_attn_nd} params (lr={attn_lr:.2e}, wd=0.0), "
                 f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={decoder_ffn_wd}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
+                f"variance_embed={n_var_embed} params (lr={var_embed_lr:.2e}, wd=0.0), "
                 f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
 
@@ -739,6 +751,8 @@ class KokoroTrainer:
                     max_lr_arg.append(max_lr * decoder_attn_mult)
                 elif gt == 'stop_head':
                     max_lr_arg.append(max_lr * _stop_head_lr_mult)
+                elif gt == 'variance_embed':
+                    max_lr_arg.append(max_lr * float(getattr(config, 'variance_embedding_lr_multiplier', 0.30)))
                 else:
                     # decoder_other / decoder_no_decay etc.
                     max_lr_arg.append(max_lr)
@@ -1524,6 +1538,8 @@ class KokoroTrainer:
                                                 'decoder_ffn_lr_multiplier', 1.0))
             decoder_attn_lr_mult = float(getattr(getattr(self, 'config', None),
                                                  'decoder_attn_lr_multiplier', 1.0))
+            var_embed_lr_mult = float(getattr(getattr(self, 'config', None),
+                                              'variance_embedding_lr_multiplier', 0.30))
             for param_group in self.optimizer.param_groups:
                 gt = param_group.get('group_type')
                 if gt == 'encoder':
@@ -1534,6 +1550,8 @@ class KokoroTrainer:
                     mult = decoder_ffn_lr_mult
                 elif gt == 'decoder_attn':
                     mult = decoder_attn_lr_mult
+                elif gt == 'variance_embed':
+                    mult = var_embed_lr_mult
                 else:
                     mult = 1.0
                 param_group['lr'] = base_lr * mult
@@ -1558,22 +1576,21 @@ class KokoroTrainer:
 
     @staticmethod
     def _apply_spec_augment(
-        mel_specs: torch.Tensor,
-        time_mask_max: int = 20,
-        freq_mask_max: int = 10,
-        num_time_masks: int = 2,
+        tensor: torch.Tensor,
+        time_mask_max: int = 10,
+        freq_mask_max: int = 5,
+        num_time_masks: int = 1,
         num_freq_masks: int = 2,
     ) -> torch.Tensor:
-        """Apply SpecAugment (Park et al. 2019): random time & frequency masking.
+        """Apply SpecAugment-style masking: random time & feature-dim masking.
 
-        mel_specs: (B, T, mel_dim) — teacher-forced decoder input.
+        tensor: (B, T, D) — typically the expanded encoder output used as
+                cross-attention memory for the decoder.
         Returns a masked clone; the original tensor is NOT modified.
-        Only the teacher-forced input is masked; the loss target remains the
-        unmasked ground-truth mel, so gradients on unmasked frames are exact.
         Masks are generated independently per sample for maximum diversity.
         """
-        B, T, mel_dim = mel_specs.shape
-        masked = mel_specs.clone()
+        B, T, D = tensor.shape
+        masked = tensor.clone()
         time_limit = max(1, min(time_mask_max, T // 4))
         for b in range(B):
             for _ in range(num_time_masks):
@@ -1582,7 +1599,7 @@ class KokoroTrainer:
                 masked[b, t0:t0 + t, :] = 0.0
             for _ in range(num_freq_masks):
                 f = torch.randint(0, max(1, freq_mask_max), (1,)).item()
-                f0 = torch.randint(0, max(1, mel_dim - f), (1,)).item()
+                f0 = torch.randint(0, max(1, D - f), (1,)).item()
                 masked[b, :, f0:f0 + f] = 0.0
         return masked
 
@@ -1679,6 +1696,8 @@ class KokoroTrainer:
                 self.writer.add_scalar('stats/lr_decoder_attn', tagged['decoder_attn'], step)
             if 'stop_head' in tagged:
                 self.writer.add_scalar('stats/lr_stop_head', tagged['stop_head'], step)
+            if 'variance_embed' in tagged:
+                self.writer.add_scalar('stats/lr_variance_embed', tagged['variance_embed'], step)
         else:
             # Legacy fallback: positional heuristics
             n_pg = len(self.optimizer.param_groups)
@@ -2020,6 +2039,21 @@ class KokoroTrainer:
         """Train for one epoch with enhanced profiling, mixed precision, and adaptive memory management"""
         self.model.train()
 
+        # Configure encoder-memory SpecAugment for this epoch.
+        _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 1)
+        if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
+            _sa_time  = getattr(self.config, 'spec_augment_time_mask_max', 10)
+            _sa_freq  = getattr(self.config, 'spec_augment_freq_mask_max', 5)
+            _sa_nt    = getattr(self.config, 'spec_augment_num_time_masks', 1)
+            _sa_nf    = getattr(self.config, 'spec_augment_num_freq_masks', 2)
+            self.model.set_memory_augment(
+                lambda mem: KokoroTrainer._apply_spec_augment(
+                    mem, _sa_time, _sa_freq, _sa_nt, _sa_nf,
+                )
+            )
+        else:
+            self.model.set_memory_augment(None)
+
         # Use tensor accumulation to reduce .item() calls (CPU-GPU sync overhead)
         total_loss_epoch = 0.0
         mel_loss_epoch = 0.0
@@ -2124,20 +2158,9 @@ class KokoroTrainer:
                     pitches = transferred.pitches
                     energies = transferred.energies
                     stress_indices = transferred.stress_indices
-                    # SpecAugment: mask teacher-forced mel input; loss target stays unmasked.
-                    # Epoch gate: disabled until after the OneCycleLR peak so spec augment
-                    # does not compound ramp-phase instability.  Default matches config.py.
-                    _spec_aug_start = getattr(self.config, 'spec_augment_start_epoch', 18)
-                    if getattr(self.config, 'use_spec_augment', False) and epoch >= _spec_aug_start:
-                        mel_for_model = KokoroTrainer._apply_spec_augment(
-                            mel_specs,
-                            time_mask_max=getattr(self.config, 'spec_augment_time_mask_max', 20),
-                            freq_mask_max=getattr(self.config, 'spec_augment_freq_mask_max', 10),
-                            num_time_masks=getattr(self.config, 'spec_augment_num_time_masks', 2),
-                            num_freq_masks=getattr(self.config, 'spec_augment_num_freq_masks', 2),
-                        )
-                    else:
-                        mel_for_model = mel_specs
+                    # Mel input is always clean — SpecAugment is now applied
+                    # to the encoder memory inside the model's forward pass.
+                    mel_for_model = mel_specs
 
                 # Adaptive long-sequence handling: cap/truncate oversized batches
                 # instead of skipping them entirely so training still benefits from
@@ -3173,9 +3196,9 @@ class KokoroTrainer:
         Args:
             transferred:   Pre-transferred batch tensors (output of
                            ``_transfer_batch_to_device``).
-            mel_for_model: Mel spectrogram fed to the model; may differ from
-                           ``transferred['mel_specs']`` when SpecAugment is
-                           active.
+            mel_for_model: Mel spectrogram fed to the model (always clean;
+                           SpecAugment is applied to encoder memory inside
+                           the model's forward pass, not to the mel input).
             loss_scale:    Scalar applied to ``total_loss`` before
                            ``.backward()`` — combine ``1/grad_accum_steps``
                            and ``adaptive_loss_scale`` in the caller.

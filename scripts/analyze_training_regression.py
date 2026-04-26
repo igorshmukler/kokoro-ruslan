@@ -54,7 +54,12 @@ def _load_master_cache(files: list) -> tuple:
             data = pickle.load(fh)
         if data.get("version") != _CACHE_VERSION:
             return None, None
-        if any(data.get("mtimes", {}).get(str(f)) != f.stat().st_mtime for f in files):
+        cached_mtimes = data.get("mtimes", {})
+        current_keys = {str(f) for f in files}
+        # Invalidate if cache has files that no longer exist on disk
+        if set(cached_mtimes.keys()) != current_keys:
+            return None, None
+        if any(cached_mtimes.get(str(f)) != f.stat().st_mtime for f in files):
             return None, None
         return data["records"], data.get("persistent_counts", {})
     except Exception:
@@ -91,8 +96,12 @@ KEY_LAYERS = [
     "decoder.layers.0.self_attn.w_o",
     "decoder.layers.0.ff.linear1",
     "decoder.layers.0.ff.linear2",
+    "decoder.layers.0.cross_attn.w_v",
+    "decoder.layers.0.cross_attn.w_o",
     "decoder.layers.5.self_attn.w_o",
     "text_embedding",
+    "pitch_embedding",
+    "energy_embedding",
 ]
 
 
@@ -123,6 +132,7 @@ def classify_param(name: str, cfg=None):
         (r'(mel_projection|mel_linear)',                                    'mel_proj',   pc,  'decoder'),
         (r'stop_token',                                                     'stop',       sc,  'decoder'),
         (r'(duration_predictor|pitch_predictor|energy_predictor)',          'variance',   pc,  'decoder'),
+        (r'(pitch_embedding|energy_embedding)',                             'var_embed',  INF, 'decoder'),
         (r'(text_embedding|phoneme_embedding|embedding)',                   'embedding',  INF, 'encoder'),
         (r'(layer_norm|layernorm|norm)\d*\.(weight|bias)$',                'layer_norm', INF, 'decoder', re.IGNORECASE),
         (r'\bconv\b|\bconv1d\b|\bconv2d\b',                                'conv',       pc,  'decoder', re.IGNORECASE),
@@ -1019,10 +1029,12 @@ def tb_print_gradient_analysis(ea):
 def tb_print_lr_trajectory(ea):
     _section("TENSORBOARD — Learning Rate Trajectory")
     groups = [
-        ("stats/lr_decoder",     "decoder"),
-        ("stats/lr_decoder_ffn", "decoder_ffn"),
-        ("stats/lr_encoder",     "encoder"),
-        ("stats/lr_stop_head",   "stop_head"),
+        ("stats/lr_decoder",          "decoder"),
+        ("stats/lr_decoder_ffn",      "decoder_ffn"),
+        ("stats/lr_decoder_attn",     "decoder_attn"),
+        ("stats/lr_encoder",          "encoder"),
+        ("stats/lr_stop_head",        "stop_head"),
+        ("stats/lr_variance_embed",   "variance_embed"),
     ]
     for tag, label in groups:
         series = _get(ea, tag)
@@ -1652,6 +1664,65 @@ def tb_print_recommendations(ea, records=None):
             "(pre-isolation checkpoint).  The dedicated param group becomes active next run.",
         ]))
 
+    # ── Variance embedding / cross-attention LR mismatch ────────────────────
+    # Pitch/energy embeddings are added directly to cross-attention memory.
+    # If they run at a higher LR than cross-attention, the representation
+    # shifts faster than the consumer can track → accelerating mel regression.
+    if records and len(records) >= 3:
+        _embed_names = ('pitch_embedding.weight', 'energy_embedding.weight')
+        _xattn_names = ('cross_attn.w_v.weight', 'cross_attn.w_o.weight')
+        # Collect per-epoch mean-per-param deltas for embeddings and cross-attention.
+        # Using mean (not sum) because cross-attn matches 12 params (6 layers × {w_v, w_o})
+        # while embeddings match only 2 params.  Raw sums would mask the drift.
+        embed_deltas = []
+        xattn_deltas = []
+        for rec in records:
+            ps = rec.get('param_stats', {})
+            e_vals = [s.get('delta', 0) or 0 for n, s in ps.items()
+                      if any(en in n for en in _embed_names)]
+            x_vals = [s.get('delta', 0) or 0 for n, s in ps.items()
+                      if any(xn in n for xn in _xattn_names)]
+            embed_deltas.append(statistics.mean(e_vals) if e_vals else 0)
+            xattn_deltas.append(statistics.mean(x_vals) if x_vals else 0)
+        # Check the last 3 transitions for accelerating embed drift
+        recent_embed = [d for d in embed_deltas[-3:] if d > 0]
+        recent_xattn = [d for d in xattn_deltas[-3:] if d > 0]
+        if len(recent_embed) >= 2 and len(recent_xattn) >= 2:
+            avg_ratio = statistics.mean(
+                e / x for e, x in zip(recent_embed, recent_xattn) if x > 0
+            ) if all(x > 0 for x in recent_xattn) else 0
+            embed_accel = recent_embed[-1] > recent_embed[0] * 1.1  # >10% growth
+            cur_var_embed_mult = cfg_get('variance_embedding_lr_multiplier', 1.0)
+            cur_attn_lr_mult = cfg_get('decoder_attn_lr_multiplier', 1.0)
+            if avg_ratio > 1.5 and embed_accel:
+                sev = 1 if avg_ratio > 2.0 else 2
+                lab = 'CRITICAL' if sev == 1 else 'WARN'
+                body = [
+                    f"Variance embedding drift: pitch/energy embeddings move "
+                    f"{avg_ratio:.1f}× faster than cross-attention (recent 3 transitions).",
+                    f"  Embedding deltas (last 3): {['%.3f' % d for d in recent_embed]}",
+                    f"  Cross-attn deltas (last 3): {['%.3f' % d for d in recent_xattn]}",
+                    f"  Current variance_embedding_lr_multiplier={cur_var_embed_mult:.2f}, "
+                    f"decoder_attn_lr_multiplier={cur_attn_lr_mult:.2f}.",
+                ]
+                if cur_var_embed_mult > cur_attn_lr_mult:
+                    body.append(
+                        f"    → Set variance_embedding_lr_multiplier={cur_attn_lr_mult:.2f} "
+                        f"to match cross-attention LR and stop the feedback loop."
+                    )
+                else:
+                    body.append(
+                        "    → Embeddings already at reduced LR — check if "
+                        "pitch/energy loss weights are too high."
+                    )
+                body.append("    → Resume from best checkpoint after fixing.")
+                recs.append((sev, lab, body))
+            elif avg_ratio > 1.5:
+                recs.append((3, 'INFO', [
+                    f"Variance embeddings moving {avg_ratio:.1f}× faster than cross-attention "
+                    f"but not accelerating. Monitor for drift.",
+                ]))
+
     # ── Gradual degradation (NEW) ────────────────────────────────────────────
     vm = d["val_mel_series"]
     if d.get("val_mel_gradual_drift") and not d["val_mel_regressed"]:
@@ -2017,6 +2088,15 @@ def tb_print_lr_phase_detail(ea, records=None):
               f"({stop_pct:.4f}% of dec peak  {stop_mult:.3f}× decoder)")
     else:
         print("  stop head LR  : no stats/lr_stop_head data (pre-isolation checkpoint or TB not refreshed)")
+
+    # Variance embedding LR (pitch/energy embeddings, reduced to match cross-attn)
+    var_embed_series = _get(ea, "stats/lr_variance_embed")
+    if var_embed_series:
+        ve_lr_curr = var_embed_series[-1][1]
+        ve_pct     = 100.0 * ve_lr_curr / ref_peak_dec
+        ve_mult    = ve_lr_curr / curr_lr if curr_lr > 0 else 0.0
+        print(f"  var embed LR  : {ve_lr_curr:.8f}  at step {var_embed_series[-1][0]}  "
+              f"({ve_pct:.4f}% of dec peak  {ve_mult:.3f}× decoder)")
 
     thresh_90_step = next((s for s, v in lr if v >= obs_max_dec * 0.90), lr[0][0])
     print(f"\n  Step-by-step from step {thresh_90_step} onward:")
