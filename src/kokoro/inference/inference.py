@@ -241,6 +241,8 @@ class KokoroTTS:
                 'energy_max': float(architecture.get('energy_max', 1.0)),
                 'use_stochastic_depth': bool(architecture.get('use_stochastic_depth', True)),
                 'stochastic_depth_rate': float(architecture.get('stochastic_depth_rate', 0.1)),
+                'qk_norm': bool(architecture.get('qk_norm', False)),
+                'ffn_output_norm': bool(architecture.get('ffn_output_norm', True)),
                 'enable_profiling': getattr(self, 'enable_profiling', False),
             }
         else:
@@ -279,6 +281,20 @@ class KokoroTTS:
                     model_kwargs['decoder_ff_dim'], _actual_dec_ff,
                 )
                 model_kwargs['decoder_ff_dim'] = _actual_dec_ff
+
+        # ------------------------------------------------------------------ #
+        # Auto-detect qk_norm from checkpoint weights.                       #
+        # Older checkpoints lack the metadata field but contain the actual   #
+        # q_norm/k_norm/v_norm parameters.  Detect their presence so the     #
+        # model is built with matching architecture.                         #
+        # ------------------------------------------------------------------ #
+        _qk_norm_key = 'transformer_encoder_layers.0.self_attn.q_norm.weight'
+        if _qk_norm_key in state_dict_to_load and not model_kwargs.get('qk_norm', False):
+            logger.info(
+                "Detected qk_norm weights in checkpoint but metadata says qk_norm=False "
+                "(or field was absent). Enabling qk_norm to match checkpoint architecture."
+            )
+            model_kwargs['qk_norm'] = True
 
         model = KokoroModel(
             **model_kwargs

@@ -2,7 +2,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 from torch.utils.checkpoint import checkpoint
 import logging
 import torch.profiler
@@ -200,10 +200,24 @@ class KokoroModel(nn.Module):
         # General dropout
         self.dropout = nn.Dropout(encoder_dropout)
 
+        # Encoder memory augmentation (set by trainer for SpecAugment on
+        # cross-attention memory).  None ⇒ no augmentation.
+        self._memory_augment_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None
+
         # Log gradient checkpointing status
         if self.gradient_checkpointing:
             logger.info(f"Gradient checkpointing enabled with {checkpoint_segments} segments")
             logger.info(f"Encoder layers: {n_encoder_layers}, Decoder layers: {n_decoder_layers}")
+
+    def set_memory_augment(self, fn: Optional[Callable[[torch.Tensor], torch.Tensor]]) -> None:
+        """Set augmentation applied to encoder memory before cross-attention.
+
+        Args:
+            fn: Callable (B, T, D) → (B, T, D) or None to disable.
+                Called only during training on the expanded encoder output
+                that serves as cross-attention memory for the decoder.
+        """
+        self._memory_augment_fn = fn
 
     @property
     def variance_adaptor(self) -> Optional['VarianceAdaptor']:
@@ -612,6 +626,17 @@ class KokoroModel(nn.Module):
                         del encoder_output_padding_mask
 
                         encoder_output_padding_mask = mask_out
+
+                # ── 3b. Encoder memory augmentation (SpecAugment) ────────
+                # Mask positions in the cross-attention memory so the decoder
+                # must reconstruct from incomplete encoder context — the TTS
+                # analog of SpecAugment for ASR.  Applied here (not to the
+                # autoregressive mel input) to avoid cascading corruption
+                # through causal self-attention.
+                if self.training and self._memory_augment_fn is not None:
+                    expanded_encoder_outputs = self._memory_augment_fn(
+                        expanded_encoder_outputs
+                    )
 
                 # ── 4. Decoder input ────────────────────────────────────────
                 decoder_input_projected_with_pe, tgt_mask, mel_padding_mask = \

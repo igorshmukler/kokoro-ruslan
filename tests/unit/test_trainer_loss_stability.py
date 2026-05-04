@@ -87,6 +87,9 @@ class _SingleParamModel(nn.Module):
         predicted_stop_logits = torch.zeros(batch_size, mel_len, device=mel_specs.device) + self.w
         return predicted_mel, predicted_log_durations, predicted_stop_logits, None, None
 
+    def set_memory_augment(self, fn):
+        pass
+
 
 def _make_minimal_training_batch():
     return {

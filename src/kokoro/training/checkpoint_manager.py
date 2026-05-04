@@ -203,6 +203,8 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
             'energy_max': float(getattr(config, 'energy_max', 1.0)),
             'use_stochastic_depth': bool(getattr(config, 'use_stochastic_depth', True)),
             'stochastic_depth_rate': float(getattr(config, 'stochastic_depth_rate', 0.1)),
+            'qk_norm': bool(getattr(config, 'qk_norm', False)),
+            'ffn_output_norm': bool(getattr(config, 'ffn_output_norm', True)),
         },
         'inference_controls': {
             'max_len': int(getattr(config, 'inference_max_len', 1200)),
@@ -827,6 +829,9 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             _decoder_attn_lr_mult = float(
                 getattr(getattr(trainer, 'config', None), 'decoder_attn_lr_multiplier', 1.0)
             )
+            _var_embed_lr_mult = float(
+                getattr(getattr(trainer, 'config', None), 'variance_embedding_lr_multiplier', 0.30)
+            )
             def _group_mult(pg, idx, n):
                 gt = pg.get('group_type')
                 if gt == 'encoder':
@@ -837,6 +842,8 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                     return _decoder_attn_lr_mult
                 elif gt == 'stop_head':
                     return _stop_head_lr_mult
+                elif gt == 'variance_embed':
+                    return _var_embed_lr_mult
                 elif gt is not None:
                     return 1.0
                 # Legacy positional fallback

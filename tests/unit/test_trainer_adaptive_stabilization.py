@@ -34,6 +34,9 @@ class _CountingModel(nn.Module):
         predicted_stop_logits = torch.zeros(batch_size, mel_len, device=mel_specs.device) + self.w
         return predicted_mel, predicted_log_durations, predicted_stop_logits, None, None
 
+    def set_memory_augment(self, fn):
+        pass
+
 
 def _build_trainer_for_stabilization_test(loss_multiplier: float = 1.0) -> KokoroTrainer:
     trainer = KokoroTrainer.__new__(KokoroTrainer)
