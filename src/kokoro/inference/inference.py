@@ -243,6 +243,8 @@ class KokoroTTS:
                 'stochastic_depth_rate': float(architecture.get('stochastic_depth_rate', 0.1)),
                 'qk_norm': bool(architecture.get('qk_norm', False)),
                 'ffn_output_norm': bool(architecture.get('ffn_output_norm', True)),
+                'num_speakers': int(architecture.get('num_speakers', 1)),
+                'speaker_embed_dim': int(architecture.get('speaker_embed_dim', 256)),
                 'enable_profiling': getattr(self, 'enable_profiling', False),
             }
         else:
@@ -295,6 +297,19 @@ class KokoroTTS:
                 "(or field was absent). Enabling qk_norm to match checkpoint architecture."
             )
             model_kwargs['qk_norm'] = True
+
+        # Auto-detect speaker embedding from checkpoint weights
+        _spk_emb_key = 'speaker_embedding.weight'
+        if _spk_emb_key in state_dict_to_load and model_kwargs.get('num_speakers', 1) <= 1:
+            _detected_num_speakers = state_dict_to_load[_spk_emb_key].shape[0]
+            _detected_embed_dim = state_dict_to_load[_spk_emb_key].shape[1]
+            logger.info(
+                f"Detected speaker_embedding in checkpoint ({_detected_num_speakers} speakers, "
+                f"dim={_detected_embed_dim}) but metadata says num_speakers<=1. "
+                "Enabling multi-speaker to match checkpoint architecture."
+            )
+            model_kwargs['num_speakers'] = _detected_num_speakers
+            model_kwargs['speaker_embed_dim'] = _detected_embed_dim
 
         model = KokoroModel(
             **model_kwargs
@@ -494,9 +509,14 @@ class KokoroTTS:
         max_len: Optional[int] = None,
         min_len_ratio: Optional[float] = None,
         min_len_floor: Optional[int] = None,
+        speaker_id: int = 0,
     ) -> torch.Tensor:
         """
         Converts text to speech using the trained model.
+
+        Args:
+            speaker_id: Speaker index (0=RUSLAN, 1=OPENSTT, etc.). Ignored when
+                        model was trained single-speaker (num_speakers=1).
         """
         if not text:
             return torch.empty(0)
@@ -560,6 +580,10 @@ class KokoroTTS:
                     }
                     if explicit_stop:
                         kwargs['post_expected_stop_threshold'] = eff_stop_threshold
+
+                    # Multi-speaker: pass speaker_id if model supports it
+                    if getattr(self.model, 'use_speaker_embedding', False):
+                        kwargs['speaker_ids'] = torch.tensor([speaker_id], dtype=torch.long, device=self.device)
 
                     mel_spec = self.model.forward_inference(**kwargs)
 

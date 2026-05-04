@@ -61,6 +61,7 @@ class BatchOnDevice:
     pitches: Optional[torch.Tensor] = None
     energies: Optional[torch.Tensor] = None
     stress_indices: Optional[torch.Tensor] = None
+    speaker_ids: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -379,6 +380,8 @@ class KokoroTrainer:
             stochastic_depth_rate=getattr(config, 'stochastic_depth_rate', 0.1),
             qk_norm=getattr(config, 'qk_norm', False),
             ffn_output_norm=getattr(config, 'ffn_output_norm', False),
+            num_speakers=getattr(config, 'num_speakers', 1),
+            speaker_embed_dim=getattr(config, 'speaker_embed_dim', 256),
         )
         self.model.to(self.device)
 
@@ -503,6 +506,8 @@ class KokoroTrainer:
         encoder_prefixes = (
             'text_embedding.',
             'stress_embedding.',
+            'speaker_embedding.',
+            'speaker_projection.',
             'encoder_positional_encoding.',
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
@@ -1291,6 +1296,7 @@ class KokoroTrainer:
             pitches=_to_device('pitches', required=False),
             energies=_to_device('energies', required=False),
             stress_indices=_to_device('stress_indices', required=False),
+            speaker_ids=_to_device('speaker_ids', required=False),
         )
 
         self._validate_transferred_batch(transferred)
@@ -3219,6 +3225,7 @@ class KokoroTrainer:
         pitches            = transferred.pitches
         energies           = transferred.energies
         stress_indices     = transferred.stress_indices
+        speaker_ids        = transferred.speaker_ids
 
         # --- Forward pass -------------------------------------------------
         with self.get_autocast_context():
@@ -3227,6 +3234,7 @@ class KokoroTrainer:
                     phoneme_indices, mel_for_model, phoneme_durations,
                     stop_token_targets, pitch_targets=pitches,
                     energy_targets=energies, stress_indices=stress_indices,
+                    speaker_ids=speaker_ids,
                 )
 
         # --- Finite-output guard ------------------------------------------

@@ -205,6 +205,8 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
             'stochastic_depth_rate': float(getattr(config, 'stochastic_depth_rate', 0.1)),
             'qk_norm': bool(getattr(config, 'qk_norm', False)),
             'ffn_output_norm': bool(getattr(config, 'ffn_output_norm', True)),
+            'num_speakers': int(getattr(config, 'num_speakers', 1)),
+            'speaker_embed_dim': int(getattr(config, 'speaker_embed_dim', 256)),
         },
         'inference_controls': {
             'max_len': int(getattr(config, 'inference_max_len', 1200)),
@@ -442,10 +444,17 @@ def load_checkpoint(
             # missing.  RMSNorm weight initialises to ones — safe to re-init.
             _FFN_OUTPUT_NORM_SUFFIX = '.ff.output_norm.weight'
 
+            # Speaker embedding migration: single-speaker → multi-speaker.
+            # speaker_embedding.weight inits to zeros for speaker 0 (backward compat),
+            # speaker_projection.weight/bias are freshly initialised.
+            _SPEAKER_EMBEDDING_PREFIXES = ('speaker_embedding.', 'speaker_projection.')
+
             all_missing_are_known = (
                 not missing_keys
                 or all(
-                    k.startswith(_NEW_VARIANCE_PREFIX) or k.endswith(_FFN_OUTPUT_NORM_SUFFIX)
+                    k.startswith(_NEW_VARIANCE_PREFIX)
+                    or k.endswith(_FFN_OUTPUT_NORM_SUFFIX)
+                    or k.startswith(_SPEAKER_EMBEDDING_PREFIXES)
                     for k in missing_keys
                 )
             )
@@ -458,7 +467,7 @@ def load_checkpoint(
                 if missing_keys:
                     logger.warning(
                         f"Checkpoint is missing {len(missing_keys)} key(s) from expected "
-                        "architecture migrations (variance_adaptor / ffn_output_norm). "
+                        "architecture migrations (variance_adaptor / ffn_output_norm / speaker_embedding). "
                         "Loading shared weights and initialising missing keys from scratch."
                     )
                 if unexpected_keys:
@@ -499,16 +508,26 @@ def load_checkpoint(
         except (ValueError, RuntimeError) as _opt_err:
             _saved_n_groups = len(checkpoint_dict['optimizer_state_dict'].get('param_groups', []))
             _curr_n_groups = len(optimizer.param_groups)
-            if _saved_n_groups != _curr_n_groups:
+            _saved_n_params = len(checkpoint_dict['optimizer_state_dict'].get('state', {}))
+            _curr_n_params = sum(len(g['params']) for g in optimizer.param_groups)
+            if _saved_n_groups != _curr_n_groups or _saved_n_params != _curr_n_params:
                 logger.warning(
-                    f"Optimizer param group count changed ({_saved_n_groups} → {_curr_n_groups}); "
+                    f"Optimizer state mismatch ({_saved_n_groups} groups/{_saved_n_params} params "
+                    f"→ {_curr_n_groups} groups/{_curr_n_params} params); "
                     "skipping optimizer state restore — Adam moments will be re-initialized. "
-                    "This is expected when param groups are added or split between runs "
-                    "(e.g. adding a dedicated stop-head LR group)."
+                    "This is expected when architecture changes between runs "
+                    "(e.g. adding speaker embedding layers)."
                 )
             else:
                 raise
-        scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
+        try:
+            scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
+        except (ValueError, RuntimeError, KeyError) as _sched_err:
+            logger.warning(
+                f"Scheduler state restore failed ({_sched_err}); "
+                "scheduler will restart from step 0. "
+                "This is expected after architecture changes."
+            )
 
         if 'epoch' not in checkpoint_dict or 'loss' not in checkpoint_dict:
             raise RuntimeError("Checkpoint is missing required 'epoch' or 'loss' fields.")

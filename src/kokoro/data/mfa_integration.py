@@ -381,7 +381,7 @@ class MFAIntegration:
                 ["mfa", "version"],
                 capture_output=True,
                 text=True,
-                timeout=10
+                timeout=60
             )
             if result.returncode == 0:
                 logger.info(f"MFA found in PATH: {result.stdout.strip()}")
@@ -401,7 +401,7 @@ class MFAIntegration:
                     [mfa_path, "version"],
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=60
                 )
                 if result.returncode == 0:
                     logger.info(f"MFA version: {result.stdout.strip()}")
