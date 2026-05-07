@@ -407,6 +407,7 @@ def load_checkpoint(
                     "Expected key 'model_state_dict' or 'model'."
                 )
 
+        _architecture_migrated = False
         try:
             model.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
@@ -492,6 +493,10 @@ def load_checkpoint(
                     f"{len(incompatible.missing_keys)} keys initialised from scratch, "
                     f"{len(incompatible.unexpected_keys)} legacy keys discarded."
                 )
+                # Architecture changed — optimizer/scheduler states are incompatible.
+                # Skip their restoration entirely (scheduler load may "succeed" but
+                # produce wrong LR curve when total_steps or param layout changed).
+                _architecture_migrated = True
             else:
                 raise RuntimeError(
                     "Strict checkpoint model load failed due to architecture/state mismatch. "
@@ -503,31 +508,37 @@ def load_checkpoint(
                 "Checkpoint is missing optimizer/scheduler state required for training resume."
             )
 
-        try:
-            optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
-        except (ValueError, RuntimeError) as _opt_err:
-            _saved_n_groups = len(checkpoint_dict['optimizer_state_dict'].get('param_groups', []))
-            _curr_n_groups = len(optimizer.param_groups)
-            _saved_n_params = len(checkpoint_dict['optimizer_state_dict'].get('state', {}))
-            _curr_n_params = sum(len(g['params']) for g in optimizer.param_groups)
-            if _saved_n_groups != _curr_n_groups or _saved_n_params != _curr_n_params:
-                logger.warning(
-                    f"Optimizer state mismatch ({_saved_n_groups} groups/{_saved_n_params} params "
-                    f"→ {_curr_n_groups} groups/{_curr_n_params} params); "
-                    "skipping optimizer state restore — Adam moments will be re-initialized. "
-                    "This is expected when architecture changes between runs "
-                    "(e.g. adding speaker embedding layers)."
-                )
-            else:
-                raise
-        try:
-            scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
-        except (ValueError, RuntimeError, KeyError) as _sched_err:
+        if _architecture_migrated:
             logger.warning(
-                f"Scheduler state restore failed ({_sched_err}); "
-                "scheduler will restart from step 0. "
-                "This is expected after architecture changes."
+                "Architecture migration detected — skipping optimizer and scheduler state "
+                "restoration. Adam moments will re-initialize; OneCycleLR starts fresh."
             )
+        else:
+            try:
+                optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
+            except (ValueError, RuntimeError) as _opt_err:
+                _saved_n_groups = len(checkpoint_dict['optimizer_state_dict'].get('param_groups', []))
+                _curr_n_groups = len(optimizer.param_groups)
+                _saved_n_params = len(checkpoint_dict['optimizer_state_dict'].get('state', {}))
+                _curr_n_params = sum(len(g['params']) for g in optimizer.param_groups)
+                if _saved_n_groups != _curr_n_groups or _saved_n_params != _curr_n_params:
+                    logger.warning(
+                        f"Optimizer state mismatch ({_saved_n_groups} groups/{_saved_n_params} params "
+                        f"→ {_curr_n_groups} groups/{_curr_n_params} params); "
+                        "skipping optimizer state restore — Adam moments will be re-initialized. "
+                        "This is expected when architecture changes between runs "
+                        "(e.g. adding speaker embedding layers)."
+                    )
+                else:
+                    raise
+            try:
+                scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
+            except (ValueError, RuntimeError, KeyError) as _sched_err:
+                logger.warning(
+                    f"Scheduler state restore failed ({_sched_err}); "
+                    "scheduler will restart from step 0. "
+                    "This is expected after architecture changes."
+                )
 
         if 'epoch' not in checkpoint_dict or 'loss' not in checkpoint_dict:
             raise RuntimeError("Checkpoint is missing required 'epoch' or 'loss' fields.")
@@ -629,6 +640,7 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
 
     # Load EMA model state if available
     if trainer.use_ema and trainer.ema_model is not None:
+        _ema_loaded = False
         try:
             if checkpoint is None:
                 checkpoint = torch.load(checkpoint_path, map_location=trainer.device,
@@ -636,20 +648,33 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             if 'ema_model_state_dict' in checkpoint:
                 try:
                     trainer.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+                    _ema_loaded = True
                 except RuntimeError as _ema_err:
-                    # Architecture migration: if the only missing keys are the
-                    # newly-restructured variance_adaptor sub-modules, do a
-                    # partial load and fill the missing keys from the current
-                    # model (which already has them freshly initialised).
+                    # Architecture migration: allow known migration key sets in the EMA
+                    # state dict, mirroring the permissive logic in _strict_resume.
                     _NEW_VP = 'duration_adaptor.variance_adaptor.'
+                    _ALIBI_SUFFIX = '.alibi_slopes'
+                    _FFN_NORM_SUFFIX = '.ff.output_norm.weight'
+                    _SPEAKER_PREFIXES = ('speaker_embedding.', 'speaker_projection.')
                     _incompat = trainer.ema_model.load_state_dict(
                         checkpoint['ema_model_state_dict'], strict=False
                     )
-                    if _incompat.unexpected_keys or not all(
-                        k.startswith(_NEW_VP) for k in _incompat.missing_keys
-                    ):
-                        raise
-                    # Copy freshly-initialised weights from current model into EMA
+                    _unexpected_ok = all(
+                        k.endswith(_ALIBI_SUFFIX) for k in _incompat.unexpected_keys
+                    )
+                    _missing_ok = all(
+                        k.startswith(_NEW_VP)
+                        or k.endswith(_FFN_NORM_SUFFIX)
+                        or k.startswith(_SPEAKER_PREFIXES)
+                        for k in _incompat.missing_keys
+                    )
+                    if not (_unexpected_ok and _missing_ok):
+                        raise RuntimeError(
+                            "EMA state dict has unrecognised incompatible keys, aborting. "
+                            f"Unexpected: {_incompat.unexpected_keys} "
+                            f"Missing: {_incompat.missing_keys}"
+                        ) from _ema_err
+                    # Fill missing keys from the freshly-initialised live model
                     _current_sd = trainer.model.state_dict()
                     _ema_sd = trainer.ema_model.state_dict()
                     for k in _incompat.missing_keys:
@@ -657,17 +682,25 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                             _ema_sd[k] = _current_sd[k].clone()
                     trainer.ema_model.load_state_dict(_ema_sd)
                     logger.warning(
-                        f"EMA partial load: {len(_incompat.missing_keys)} variance_adaptor "
-                        "keys initialised from current model (architecture migration)."
+                        f"EMA partial load: {len(_incompat.missing_keys)} key(s) initialised "
+                        f"from live model, {len(_incompat.unexpected_keys)} legacy key(s) discarded "
+                        "(architecture migration)."
                     )
-                if 'ema_updates' in checkpoint:
-                    trainer.ema_updates = checkpoint['ema_updates']
-                logger.info(f"Loaded EMA model state from checkpoint (updates: {trainer.ema_updates})")
+                    _ema_loaded = True
+
+                if _ema_loaded:
+                    if 'ema_updates' in checkpoint:
+                        trainer.ema_updates = checkpoint['ema_updates']
+                    logger.info(f"Loaded EMA model state from checkpoint (updates: {trainer.ema_updates})")
             else:
                 logger.info("No EMA state found in checkpoint, initializing EMA from current model")
                 trainer.ema_model.load_state_dict(trainer.model.state_dict())
         except Exception as e:
-            logger.warning(f"Could not load EMA state: {e}")
+            logger.warning(f"Could not load EMA state: {e}. Re-initializing EMA from current model weights.")
+            try:
+                trainer.ema_model.load_state_dict(trainer.model.state_dict())
+            except Exception as _reinit_err:
+                logger.error(f"EMA re-initialization also failed: {_reinit_err}")
 
     if checkpoint is not None:
         if 'current_optimizer_step' in checkpoint:
