@@ -26,7 +26,7 @@ from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 7  # bumped: DP aligner recovers spn utterances (real MFA durations)
+FEATURE_CACHE_VERSION = 8  # bumped: speaker_id field added to cached feature dict
 
 
 def build_stop_token_targets(

@@ -514,7 +514,8 @@ class KokoroTrainer:
         # Speaker embedding params get their own LR group (speaker_embedding_lr_multiplier)
         # so freshly-initialized speaker parameters don't train at full encoder LR
         # when resuming from a single-speaker checkpoint.
-        _speaker_embed_prefixes = ('speaker_embedding.', 'speaker_projection.')
+        # speaker_conditioning_norm is included here so it trains at speaker LR, not decoder LR.
+        _speaker_embed_prefixes = ('speaker_embedding.', 'speaker_projection.', 'speaker_conditioning_norm.')
         # stop_token_predictor parameters are carved out before the
         # decoder_no_decay / decoder_decay split so they don't appear in both.
         _stop_head_names = {'stop_token_predictor.weight', 'stop_token_predictor.bias'}
@@ -1843,12 +1844,14 @@ class KokoroTrainer:
                     pitches = transferred.pitches
                     energies = transferred.energies
                     stress_indices = transferred.stress_indices
+                    speaker_ids = transferred.speaker_ids
 
                     # Forward pass (without mixed precision for validation consistency)
                     predicted_mel, predicted_log_durations, predicted_stop_logits, predicted_pitch, predicted_energy = \
                         model_to_validate(phoneme_indices, mel_specs, phoneme_durations, stop_token_targets,
                                  pitch_targets=pitches, energy_targets=energies,
-                                 stress_indices=stress_indices)
+                                 stress_indices=stress_indices,
+                                 speaker_ids=speaker_ids)
 
                     # Loss calculation — pass frame-level pitch/energy targets directly.
                     # losses.py detects they are already frame-level and aligns lengths
