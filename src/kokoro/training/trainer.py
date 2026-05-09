@@ -506,13 +506,15 @@ class KokoroTrainer:
         encoder_prefixes = (
             'text_embedding.',
             'stress_embedding.',
-            'speaker_embedding.',
-            'speaker_projection.',
             'encoder_positional_encoding.',
             'positional_encoding.',   # legacy attribute name
             'transformer_encoder_layers.',
             'encoder_norm.',          # final LayerNorm after encoder stack
         )
+        # Speaker embedding params get their own LR group (speaker_embedding_lr_multiplier)
+        # so freshly-initialized speaker parameters don't train at full encoder LR
+        # when resuming from a single-speaker checkpoint.
+        _speaker_embed_prefixes = ('speaker_embedding.', 'speaker_projection.')
         # stop_token_predictor parameters are carved out before the
         # decoder_no_decay / decoder_decay split so they don't appear in both.
         _stop_head_names = {'stop_token_predictor.weight', 'stop_token_predictor.bias'}
@@ -534,13 +536,16 @@ class KokoroTrainer:
         seen_ids: set = set()
         encoder_params = []
         encoder_ffn_decay_params: list = []  # encoder FFN weights get ffn_weight_decay
+        speaker_embed_params: list = []      # speaker embedding/projection at reduced LR
         stop_head_params: list = []
         decoder_named: list = []  # (name, param) for further splitting
         for name, param in self.model.named_parameters():
             if id(param) in seen_ids:
                 continue
             seen_ids.add(id(param))
-            if any(name.startswith(prefix) for prefix in encoder_prefixes):
+            if any(name.startswith(prefix) for prefix in _speaker_embed_prefixes):
+                speaker_embed_params.append(param)
+            elif any(name.startswith(prefix) for prefix in encoder_prefixes):
                 # Split encoder FFN weight matrices into their own decay group.
                 # These are the same GLU FFN layers that were previously hard-
                 # norm-clamped; they now receive ffn_weight_decay instead.
@@ -599,6 +604,7 @@ class KokoroTrainer:
         decoder_ffn_lr_mult = float(getattr(config, 'decoder_ffn_lr_multiplier', 1.0))
         decoder_attn_lr_mult = float(getattr(config, 'decoder_attn_lr_multiplier', 1.0))
         var_embed_lr_mult = float(getattr(config, 'variance_embedding_lr_multiplier', 0.30))
+        speaker_embed_lr_mult = float(getattr(config, 'speaker_embedding_lr_multiplier', 0.30))
         ffn_weight_decay = getattr(config, 'ffn_weight_decay', weight_decay)
         decoder_ffn_wd = getattr(config, 'decoder_ffn_weight_decay', ffn_weight_decay)
 
@@ -640,6 +646,10 @@ class KokoroTrainer:
             param_groups.append({'params': variance_embed_params, 'lr': base_lr * var_embed_lr_mult,
                                  'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
                                  'group_type': 'variance_embed'})
+        if speaker_embed_params:
+            param_groups.append({'params': speaker_embed_params, 'lr': base_lr * speaker_embed_lr_mult,
+                                 'weight_decay': 0.0, 'eps': adam_eps, 'betas': adam_betas,
+                                 'group_type': 'speaker_embed'})
 
         # Stop head group (always present as its own group when identified)
         if stop_head_params:
@@ -663,9 +673,11 @@ class KokoroTrainer:
             n_decoder_attn_nd = len(decoder_attn_no_decay)
             n_stop = len(stop_head_params)
             n_var_embed = len(variance_embed_params)
+            n_spk_embed = len(speaker_embed_params)
             ffn_lr = base_lr * decoder_ffn_lr_mult
             attn_lr = base_lr * decoder_attn_lr_mult
             var_embed_lr = base_lr * var_embed_lr_mult
+            spk_embed_lr = base_lr * speaker_embed_lr_mult
             logger.info(
                 f"Optimizer param groups: encoder={n_encoder} params (lr={encoder_lr:.2e}, wd=0.0), "
                 f"encoder_ffn_decay={n_encoder_ffn} params (lr={encoder_lr:.2e}, wd={ffn_weight_decay}), "
@@ -676,7 +688,8 @@ class KokoroTrainer:
                 f"decoder_ffn_decay={n_decoder_ffn} params (lr={ffn_lr:.2e}, wd={decoder_ffn_wd}), "
                 f"decoder_ffn_no_decay={n_decoder_ffn_nd} params (lr={ffn_lr:.2e}, wd=0.0), "
                 f"variance_embed={n_var_embed} params (lr={var_embed_lr:.2e}, wd=0.0), "
-                f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
+                + (f"speaker_embed={n_spk_embed} params (lr={spk_embed_lr:.2e}, wd=0.0), " if n_spk_embed > 0 else "")
+                + f"stop_head={n_stop} params (lr={stop_head_lr:.2e}, wd=0.0)"
             )
 
         try:
@@ -758,6 +771,8 @@ class KokoroTrainer:
                     max_lr_arg.append(max_lr * _stop_head_lr_mult)
                 elif gt == 'variance_embed':
                     max_lr_arg.append(max_lr * float(getattr(config, 'variance_embedding_lr_multiplier', 0.30)))
+                elif gt == 'speaker_embed':
+                    max_lr_arg.append(max_lr * float(getattr(config, 'speaker_embedding_lr_multiplier', 0.30)))
                 else:
                     # decoder_other / decoder_no_decay etc.
                     max_lr_arg.append(max_lr)
@@ -1546,6 +1561,8 @@ class KokoroTrainer:
                                                  'decoder_attn_lr_multiplier', 1.0))
             var_embed_lr_mult = float(getattr(getattr(self, 'config', None),
                                               'variance_embedding_lr_multiplier', 0.30))
+            spk_embed_lr_mult = float(getattr(getattr(self, 'config', None),
+                                              'speaker_embedding_lr_multiplier', 0.30))
             for param_group in self.optimizer.param_groups:
                 gt = param_group.get('group_type')
                 if gt == 'encoder':
@@ -1558,6 +1575,8 @@ class KokoroTrainer:
                     mult = decoder_attn_lr_mult
                 elif gt == 'variance_embed':
                     mult = var_embed_lr_mult
+                elif gt == 'speaker_embed':
+                    mult = spk_embed_lr_mult
                 else:
                     mult = 1.0
                 param_group['lr'] = base_lr * mult
@@ -1704,6 +1723,8 @@ class KokoroTrainer:
                 self.writer.add_scalar('stats/lr_stop_head', tagged['stop_head'], step)
             if 'variance_embed' in tagged:
                 self.writer.add_scalar('stats/lr_variance_embed', tagged['variance_embed'], step)
+            if 'speaker_embed' in tagged:
+                self.writer.add_scalar('stats/lr_speaker_embed', tagged['speaker_embed'], step)
         else:
             # Legacy fallback: positional heuristics
             n_pg = len(self.optimizer.param_groups)

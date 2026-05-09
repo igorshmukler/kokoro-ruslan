@@ -102,6 +102,12 @@ class KokoroModel(nn.Module):
         if self.use_speaker_embedding:
             self.speaker_embedding = nn.Embedding(num_speakers, speaker_embed_dim)
             self.speaker_projection = nn.Linear(speaker_embed_dim, hidden_dim)
+            # LayerNorm applied to encoder_output + speaker_projection AFTER the
+            # encoder_norm so that speaker embedding drift can't undo the normalization
+            # invariant that encoder_norm establishes. Without this, speaker_embedding
+            # grows unboundedly (no weight decay on embeddings), continuously shifting
+            # the encoder output distribution the decoder cross-attention sees.
+            self.speaker_conditioning_norm = nn.LayerNorm(hidden_dim)
             # Initialize speaker 0 embedding to zeros so that resuming from a
             # single-speaker checkpoint produces identical outputs for the
             # original speaker on the first step (identity initialization).
@@ -491,9 +497,18 @@ class KokoroModel(nn.Module):
 
             # 1b. Inject speaker embedding (additive conditioning on encoder output)
             if self.use_speaker_embedding and speaker_ids is not None:
+                if speaker_ids.max() >= self.num_speakers:
+                    raise ValueError(
+                        f"speaker_ids contains value {speaker_ids.max().item()} but model "
+                        f"was built with num_speakers={self.num_speakers}."
+                    )
                 spk_emb = self.speaker_embedding(speaker_ids)       # (B, speaker_embed_dim)
                 spk_proj = self.speaker_projection(spk_emb)         # (B, hidden_dim)
-                text_encoded = text_encoded + spk_proj.unsqueeze(1)  # broadcast (B, 1, D) → (B, P, D)
+                # Re-normalize after addition so speaker embedding magnitude drift
+                # (unconstrained by weight decay) cannot undo the encoder_norm invariant.
+                text_encoded = self.speaker_conditioning_norm(
+                    text_encoded + spk_proj.unsqueeze(1)            # broadcast (B,1,D) → (B,P,D)
+                )
 
             # 2. Use unified duration adaptor (either VarianceAdaptorWrapper or
             #    SimpleDurationAdaptor). Pass frame-level pitch/energy targets
