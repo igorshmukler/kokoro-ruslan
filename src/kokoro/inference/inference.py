@@ -679,7 +679,7 @@ class KokoroTTS:
             logger.error(f"Inference failed: {e}")
             raise
 
-    def batch_text_to_speech(self, texts: List[str], output_dir: str):
+    def batch_text_to_speech(self, texts: List[str], output_dir: str, speaker_id: int = 0):
         """Converts multiple texts to speech, saving each to the specified output directory."""
         output_dir_path = Path(output_dir)
         output_dir_path.mkdir(parents=True, exist_ok=True)
@@ -687,7 +687,7 @@ class KokoroTTS:
         for i, text in enumerate(texts):
             output_path = output_dir_path / f"output_{i:03d}.wav"
             try:
-                self.text_to_speech(text, str(output_path))
+                self.text_to_speech(text, str(output_path), speaker_id=speaker_id)
                 logger.info(f"Successfully converted text {i+1} to {output_path}")
             except Exception as e:
                 logger.error(f"Failed to convert text '{text}' (item {i+1}): {e}")
@@ -805,6 +805,14 @@ Examples:
         help="Which weights to use for inference: 'auto' prefers EMA if present, 'ema' requires EMA, 'model' uses the trained model weights."
     )
 
+    parser.add_argument(
+        '--speaker-id',
+        dest='speaker_id',
+        type=int,
+        default=0,
+        help='Speaker ID for multi-speaker models (0=RUSLAN, 1=OPENSTT, etc.). Ignored for single-speaker models (default: 0).'
+    )
+
     return parser.parse_args()
 
 def main():
@@ -853,7 +861,7 @@ def main():
 
                 # Generate a unique output filename for interactive mode
                 output_path_interactive = f"interactive_output_{abs(hash(text_input)) % 10000}.wav"
-                tts.text_to_speech(text_input, output_path_interactive, stop_threshold=args.stop_threshold)
+                tts.text_to_speech(text_input, output_path_interactive, stop_threshold=args.stop_threshold, speaker_id=args.speaker_id)
                 print(f"Audio saved to: {output_path_interactive}")
 
             except KeyboardInterrupt:
@@ -869,7 +877,7 @@ def main():
     elif args.text:
         # Single text conversion
         try:
-            tts.text_to_speech(args.text, args.output)
+            tts.text_to_speech(args.text, args.output, speaker_id=args.speaker_id)
             logger.info(f"Successfully converted text to {args.output}")
         except ValueError as ve:
             logger.error(f"Error converting text '{args.text}': {ve}")
@@ -895,7 +903,7 @@ def main():
                 output_dir_for_batch = Path("./batch_outputs") # Default to a directory if not specified properly
                 logger.info(f"Output for batch text will be saved to '{output_dir_for_batch}'")
 
-            tts.batch_text_to_speech(texts_from_file, str(output_dir_for_batch))
+            tts.batch_text_to_speech(texts_from_file, str(output_dir_for_batch), speaker_id=args.speaker_id)
             logger.info(f"Batch conversion complete. Audio files saved to {output_dir_for_batch}")
 
         except FileNotFoundError:
