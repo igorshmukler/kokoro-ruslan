@@ -26,7 +26,7 @@ from kokoro.data.audio_utils import PhonemeProcessorUtils
 
 logger = logging.getLogger(__name__)
 
-FEATURE_CACHE_VERSION = 7  # bumped: DP aligner recovers spn utterances (real MFA durations)
+FEATURE_CACHE_VERSION = 8  # bumped: speaker_id field added to cached feature dict
 
 
 def build_stop_token_targets(
@@ -74,6 +74,10 @@ except ImportError:
 
 class RuslanDataset(Dataset):
     """Dataset class for Ruslan corpus - optimized for MPS"""
+
+    # Speaker ID mapping: suffix after last '_' in audio_file_stem → integer ID.
+    # New speakers are assigned incrementally. RUSLAN is always speaker 0.
+    SPEAKER_MAP: Dict[str, int] = {'RUSLAN': 0, 'OPENSTT': 1}
 
     def __init__(self, data_dir: str, config: TrainingConfig, use_mfa: bool = True,
                  indices: Optional[List[int]] = None, is_training: bool = True):
@@ -214,6 +218,22 @@ class RuslanDataset(Dataset):
                 "python mfa_integration.py --corpus ./ruslan_corpus --output ./mfa_output"
             )
 
+        # Multi-speaker: number of speakers from config (determines whether
+        # speaker_id is included in batch). Single-speaker mode (num_speakers=1)
+        # produces speaker_id=0 for all samples (ignored by model).
+        self.num_speakers = getattr(config, 'num_speakers', 1)
+
+    @classmethod
+    def _get_speaker_id(cls, audio_file_stem: str) -> int:
+        """Derive speaker ID from audio file stem suffix (e.g. '000001_RUSLAN' → 0)."""
+        parts = audio_file_stem.rsplit('_', 1)
+        if len(parts) == 2:
+            speaker_tag = parts[1]
+            if speaker_tag in cls.SPEAKER_MAP:
+                return cls.SPEAKER_MAP[speaker_tag]
+        # Default to speaker 0 (RUSLAN) for unrecognized patterns
+        return 0
+
     def _get_audio_info_cached(self, audio_path: Path, cache: dict) -> Optional[tuple]:
         """
         Get audio info (sample_rate, num_frames) without loading full waveform.
@@ -282,64 +302,67 @@ class RuslanDataset(Dataset):
         audio_info_cache = self._load_cache()
         cache_updated = False
 
-        metadata_file = self.data_dir / "metadata_RUSLAN_22200.csv"
-        if metadata_file.exists():
-            logger.info(f"Loading metadata from {metadata_file}")
-            # Get total number of lines for accurate progress bar
-            with open(metadata_file, 'r', encoding='utf-8') as f:
-                total_lines = sum(1 for _ in f)
+        # Auto-detect all metadata_*.csv files in data_dir
+        metadata_files = sorted(self.data_dir.glob("metadata_*.csv"))
+        if metadata_files:
+            logger.info(f"Found {len(metadata_files)} metadata file(s): {[f.name for f in metadata_files]}")
+            for metadata_file in metadata_files:
+                logger.info(f"Loading metadata from {metadata_file.name}")
+                # Get total number of lines for accurate progress bar
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    total_lines = sum(1 for _ in f)
 
-            with open(metadata_file, 'r', encoding='utf-8') as f:
-                # Wrap the file iterator with tqdm
-                for line in tqdm(f, total=total_lines, desc="Loading metadata"):
-                    parts = line.strip().split('|')
-                    if len(parts) >= 2:
-                        audio_file_stem = parts[0]
-                        text = parts[1]
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    # Wrap the file iterator with tqdm
+                    for line in tqdm(f, total=total_lines, desc=f"Loading {metadata_file.name}"):
+                        parts = line.strip().split('|')
+                        if len(parts) >= 2:
+                            audio_file_stem = parts[0]
+                            text = parts[1]
 
-                        audio_path = self.data_dir / "wavs" / f"{audio_file_stem}.wav"
-                        if audio_path.exists():
-                            # Get audio info efficiently (cached)
-                            audio_info = self._get_audio_info_cached(audio_path, audio_info_cache)
-                            if audio_info is None:
-                                continue
+                            audio_path = self.data_dir / "wavs" / f"{audio_file_stem}.wav"
+                            if audio_path.exists():
+                                # Get audio info efficiently (cached)
+                                audio_info = self._get_audio_info_cached(audio_path, audio_info_cache)
+                                if audio_info is None:
+                                    continue
 
-                            cache_updated = True
-                            sample_rate, num_frames = audio_info
+                                cache_updated = True
+                                sample_rate, num_frames = audio_info
 
-                            # Calculate mel frames
-                            audio_length_frames = (num_frames - self.config.n_fft) // self.config.hop_length + 1
-                            if audio_length_frames < 1:
-                                audio_length_frames = 1
+                                # Calculate mel frames
+                                audio_length_frames = (num_frames - self.config.n_fft) // self.config.hop_length + 1
+                                if audio_length_frames < 1:
+                                    audio_length_frames = 1
 
-                            # Pre-calculate phoneme length (including inter-word <sil> tokens
-                            # so the estimate matches what __getitem__ will produce).
-                            _raw = self.phoneme_processor.process_text(text)
-                            _seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
-                                _raw, self.phoneme_processor.phoneme_to_id
-                            )
-                            phoneme_length = len(_seq)
+                                # Pre-calculate phoneme length (including inter-word <sil> tokens
+                                # so the estimate matches what __getitem__ will produce).
+                                _raw = self.phoneme_processor.process_text(text)
+                                _seq = PhonemeProcessorUtils.flatten_phoneme_output_with_sil(
+                                    _raw, self.phoneme_processor.phoneme_to_id
+                                )
+                                phoneme_length = len(_seq)
 
-                            # Clip extremely long sequences to prevent memory issues during training
-                            original_frames = audio_length_frames
-                            if audio_length_frames > self.config.max_seq_length:
-                                logger.debug(f"Clipping {audio_file_stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
-                                audio_length_frames = self.config.max_seq_length
-                                # Also adjust phoneme length if it's too long, proportionally
-                                if phoneme_length > 0 and original_frames > 0:
-                                    # Proportionally scale phoneme length
-                                    phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_frames))
-                                    phoneme_length = max(1, phoneme_length)
+                                # Clip extremely long sequences to prevent memory issues during training
+                                original_frames = audio_length_frames
+                                if audio_length_frames > self.config.max_seq_length:
+                                    logger.debug(f"Clipping {audio_file_stem}. Audio frames: {audio_length_frames} > max_seq_length: {self.config.max_seq_length}")
+                                    audio_length_frames = self.config.max_seq_length
+                                    # Also adjust phoneme length if it's too long, proportionally
+                                    if phoneme_length > 0 and original_frames > 0:
+                                        # Proportionally scale phoneme length
+                                        phoneme_length = int(phoneme_length * (self.config.max_seq_length / original_frames))
+                                        phoneme_length = max(1, phoneme_length)
 
-                            samples.append({
-                                'audio_path': str(audio_path),
-                                'text': text,
-                                'audio_file': audio_file_stem,
-                                'audio_length': audio_length_frames,
-                                'phoneme_length': phoneme_length
-                            })
+                                samples.append({
+                                    'audio_path': str(audio_path),
+                                    'text': text,
+                                    'audio_file': audio_file_stem,
+                                    'audio_length': audio_length_frames,
+                                    'phoneme_length': phoneme_length
+                                })
         else:
-            logger.warning(f"Metadata file not found: {metadata_file}. Falling back to directory scan. "
+            logger.warning("No metadata_*.csv files found in data_dir. Falling back to directory scan. "
                            "Note: Lengths will be estimated on the fly for scanned files, which might be slower.")
             wav_dir = self.data_dir / "wavs"
             txt_dir = self.data_dir / "texts"
@@ -854,6 +877,7 @@ class RuslanDataset(Dataset):
             'stop_token_targets': stop_token_targets,
             'pitch': pitch,
             'energy': energy,
+            'speaker_id': self._get_speaker_id(audio_file),
             'text': sample['text'],
             'audio_file': audio_file,
             'mel_length': mel_spec.shape[1], # Actual length after potential clipping
@@ -916,6 +940,7 @@ def collate_fn(batch: List[Dict]) -> Dict:
         'energies':           energies_out,          # (B, T)
         'mel_lengths':        torch.tensor(mel_lengths,     dtype=torch.long),
         'phoneme_lengths':    torch.tensor(phoneme_lengths, dtype=torch.long),
+        'speaker_ids':        torch.tensor([item.get('speaker_id', 0) for item in batch], dtype=torch.long),
         'texts':              [item['text']       for item in batch],
         'audio_files':        [item['audio_file'] for item in batch],
     }

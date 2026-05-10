@@ -44,7 +44,8 @@ class KokoroModel(nn.Module):
                  pitch_max: float = 800.0, energy_min: float = 0.0, energy_max: float = 100.0,
                  use_stochastic_depth: bool = True, stochastic_depth_rate: float = 0.1,
                  use_stress_embedding: bool = True, qk_norm: bool = False,
-                 ffn_output_norm: bool = True):
+                 ffn_output_norm: bool = True,
+                 num_speakers: int = 1, speaker_embed_dim: int = 256):
         """
         Initialize the Kokoro model with Transformer encoder and decoder
 
@@ -91,6 +92,28 @@ class KokoroModel(nn.Module):
         self.use_stress_embedding = use_stress_embedding
         if use_stress_embedding:
             self.stress_embedding = nn.Embedding(3, hidden_dim, padding_idx=0)
+
+        # Multi-speaker embedding: learned embedding per speaker projected to hidden_dim.
+        # Added to encoder output before variance adaptor, conditioning duration/pitch/
+        # energy prediction and decoder cross-attention memory on speaker identity.
+        # When num_speakers <= 1, speaker conditioning is disabled (single-speaker mode).
+        self.num_speakers = num_speakers
+        self.use_speaker_embedding = num_speakers > 1
+        if self.use_speaker_embedding:
+            self.speaker_embedding = nn.Embedding(num_speakers, speaker_embed_dim)
+            self.speaker_projection = nn.Linear(speaker_embed_dim, hidden_dim)
+            # LayerNorm applied to encoder_output + speaker_projection AFTER the
+            # encoder_norm so that speaker embedding drift can't undo the normalization
+            # invariant that encoder_norm establishes. Without this, speaker_embedding
+            # grows unboundedly (no weight decay on embeddings), continuously shifting
+            # the encoder output distribution the decoder cross-attention sees.
+            self.speaker_conditioning_norm = nn.LayerNorm(hidden_dim)
+            # Initialize speaker 0 embedding to zeros so that resuming from a
+            # single-speaker checkpoint produces identical outputs for the
+            # original speaker on the first step (identity initialization).
+            nn.init.zeros_(self.speaker_embedding.weight[0])
+            nn.init.xavier_uniform_(self.speaker_projection.weight)
+            nn.init.zeros_(self.speaker_projection.bias)
 
         self.positional_encoding = PositionalEncoding(
             hidden_dim, dropout=encoder_dropout, max_len=max_decoder_seq_len
@@ -455,6 +478,7 @@ class KokoroModel(nn.Module):
         energy_targets: Optional[torch.Tensor] = None,
         phoneme_durations: Optional[torch.Tensor] = None,
         inference: bool = False,
+        speaker_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Shared helper: encode text, run variance adaptor or fallback duration+length_regulate.
 
@@ -470,6 +494,21 @@ class KokoroModel(nn.Module):
             del phoneme_indices
             if stress_indices is not None:
                 del stress_indices
+
+            # 1b. Inject speaker embedding (additive conditioning on encoder output)
+            if self.use_speaker_embedding and speaker_ids is not None:
+                if speaker_ids.max() >= self.num_speakers:
+                    raise ValueError(
+                        f"speaker_ids contains value {speaker_ids.max().item()} but model "
+                        f"was built with num_speakers={self.num_speakers}."
+                    )
+                spk_emb = self.speaker_embedding(speaker_ids)       # (B, speaker_embed_dim)
+                spk_proj = self.speaker_projection(spk_emb)         # (B, hidden_dim)
+                # Re-normalize after addition so speaker embedding magnitude drift
+                # (unconstrained by weight decay) cannot undo the encoder_norm invariant.
+                text_encoded = self.speaker_conditioning_norm(
+                    text_encoded + spk_proj.unsqueeze(1)            # broadcast (B,1,D) → (B,P,D)
+                )
 
             # 2. Use unified duration adaptor (either VarianceAdaptorWrapper or
             #    SimpleDurationAdaptor). Pass frame-level pitch/energy targets
@@ -573,6 +612,7 @@ class KokoroModel(nn.Module):
         text_padding_mask: Optional[torch.Tensor] = None,
         mel_padding_mask: Optional[torch.Tensor] = None,
         stress_indices: Optional[torch.Tensor] = None,
+        speaker_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, ...]:
         with torch.profiler.record_function("forward_training"):
             batch_size, mel_seq_len = mel_specs.shape[0], mel_specs.shape[1]
@@ -602,6 +642,7 @@ class KokoroModel(nn.Module):
                     energy_targets=energy_targets,
                     phoneme_durations=phoneme_durations,
                     inference=False,
+                    speaker_ids=speaker_ids,
                 )
 
                 # ── 3. Align expanded output to mel length ──────────────────
@@ -685,6 +726,7 @@ class KokoroModel(nn.Module):
         max_len_cap: int = 1600,
         post_expected_stop_threshold: float = 0.2,
         stress_indices: Optional[torch.Tensor] = None,
+        speaker_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Inference mode (gradient checkpointing automatically disabled)
@@ -721,6 +763,7 @@ class KokoroModel(nn.Module):
                         energy_targets=None,
                         phoneme_durations=None,
                         inference=True,
+                        speaker_ids=speaker_ids,
                     )
 
                     # Clear ALiBi distance caches before inference — during generation seq_len
@@ -790,6 +833,7 @@ class KokoroModel(nn.Module):
         text_padding_mask: Optional[torch.Tensor] = None,
         mel_padding_mask: Optional[torch.Tensor] = None,
         stress_indices: Optional[torch.Tensor] = None,
+        speaker_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         Main forward pass that dispatches to training or inference mode.
@@ -809,12 +853,14 @@ class KokoroModel(nn.Module):
                 stop_token_targets, pitch_targets, energy_targets,
                 text_padding_mask, mel_padding_mask,
                 stress_indices=stress_indices,
+                speaker_ids=speaker_ids,
             )
         else:
             return self.forward_inference(
                 phoneme_indices, max_len=self.max_decoder_seq_len,
                 text_padding_mask=text_padding_mask,
                 stress_indices=stress_indices,
+                speaker_ids=speaker_ids,
             )
 
     def get_model_info(self) -> dict:

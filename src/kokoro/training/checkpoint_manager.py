@@ -205,6 +205,8 @@ def build_model_metadata(config: TrainingConfig, model: Optional[torch.nn.Module
             'stochastic_depth_rate': float(getattr(config, 'stochastic_depth_rate', 0.1)),
             'qk_norm': bool(getattr(config, 'qk_norm', False)),
             'ffn_output_norm': bool(getattr(config, 'ffn_output_norm', True)),
+            'num_speakers': int(getattr(config, 'num_speakers', 1)),
+            'speaker_embed_dim': int(getattr(config, 'speaker_embed_dim', 256)),
         },
         'inference_controls': {
             'max_len': int(getattr(config, 'inference_max_len', 1200)),
@@ -405,6 +407,7 @@ def load_checkpoint(
                     "Expected key 'model_state_dict' or 'model'."
                 )
 
+        _architecture_migrated = False
         try:
             model.load_state_dict(model_state_dict, strict=True)
         except RuntimeError as e:
@@ -442,10 +445,17 @@ def load_checkpoint(
             # missing.  RMSNorm weight initialises to ones — safe to re-init.
             _FFN_OUTPUT_NORM_SUFFIX = '.ff.output_norm.weight'
 
+            # Speaker embedding migration: single-speaker → multi-speaker.
+            # speaker_embedding.weight inits to zeros for speaker 0 (backward compat),
+            # speaker_projection.weight/bias are freshly initialised.
+            _SPEAKER_EMBEDDING_PREFIXES = ('speaker_embedding.', 'speaker_projection.')
+
             all_missing_are_known = (
                 not missing_keys
                 or all(
-                    k.startswith(_NEW_VARIANCE_PREFIX) or k.endswith(_FFN_OUTPUT_NORM_SUFFIX)
+                    k.startswith(_NEW_VARIANCE_PREFIX)
+                    or k.endswith(_FFN_OUTPUT_NORM_SUFFIX)
+                    or k.startswith(_SPEAKER_EMBEDDING_PREFIXES)
                     for k in missing_keys
                 )
             )
@@ -458,7 +468,7 @@ def load_checkpoint(
                 if missing_keys:
                     logger.warning(
                         f"Checkpoint is missing {len(missing_keys)} key(s) from expected "
-                        "architecture migrations (variance_adaptor / ffn_output_norm). "
+                        "architecture migrations (variance_adaptor / ffn_output_norm / speaker_embedding). "
                         "Loading shared weights and initialising missing keys from scratch."
                     )
                 if unexpected_keys:
@@ -483,6 +493,10 @@ def load_checkpoint(
                     f"{len(incompatible.missing_keys)} keys initialised from scratch, "
                     f"{len(incompatible.unexpected_keys)} legacy keys discarded."
                 )
+                # Architecture changed — optimizer/scheduler states are incompatible.
+                # Skip their restoration entirely (scheduler load may "succeed" but
+                # produce wrong LR curve when total_steps or param layout changed).
+                _architecture_migrated = True
             else:
                 raise RuntimeError(
                     "Strict checkpoint model load failed due to architecture/state mismatch. "
@@ -494,21 +508,39 @@ def load_checkpoint(
                 "Checkpoint is missing optimizer/scheduler state required for training resume."
             )
 
+        if _architecture_migrated:
+            logger.warning(
+                "Architecture migration detected (additive params). "
+                "Attempting optimizer/scheduler state restore — will fall back gracefully if "
+                "param group layout changed (e.g. new speaker_embed group added)."
+            )
+        # Always attempt optimizer restore. If param groups changed (e.g. new speaker_embed
+        # group added), load_state_dict will fail and we fall through to the mismatch warning.
         try:
             optimizer.load_state_dict(checkpoint_dict['optimizer_state_dict'])
         except (ValueError, RuntimeError) as _opt_err:
             _saved_n_groups = len(checkpoint_dict['optimizer_state_dict'].get('param_groups', []))
             _curr_n_groups = len(optimizer.param_groups)
-            if _saved_n_groups != _curr_n_groups:
+            _saved_n_params = len(checkpoint_dict['optimizer_state_dict'].get('state', {}))
+            _curr_n_params = sum(len(g['params']) for g in optimizer.param_groups)
+            if _saved_n_groups != _curr_n_groups or _saved_n_params != _curr_n_params:
                 logger.warning(
-                    f"Optimizer param group count changed ({_saved_n_groups} → {_curr_n_groups}); "
+                    f"Optimizer state mismatch ({_saved_n_groups} groups/{_saved_n_params} params "
+                    f"→ {_curr_n_groups} groups/{_curr_n_params} params); "
                     "skipping optimizer state restore — Adam moments will be re-initialized. "
-                    "This is expected when param groups are added or split between runs "
-                    "(e.g. adding a dedicated stop-head LR group)."
+                    "This is expected when architecture changes between runs "
+                    "(e.g. adding speaker embedding layers)."
                 )
             else:
                 raise
-        scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
+        try:
+            scheduler.load_state_dict(checkpoint_dict['scheduler_state_dict'])
+        except (ValueError, RuntimeError, KeyError) as _sched_err:
+            logger.warning(
+                f"Scheduler state restore failed ({_sched_err}); "
+                "scheduler will restart from step 0. "
+                "This is expected after architecture changes."
+            )
 
         if 'epoch' not in checkpoint_dict or 'loss' not in checkpoint_dict:
             raise RuntimeError("Checkpoint is missing required 'epoch' or 'loss' fields.")
@@ -610,6 +642,7 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
 
     # Load EMA model state if available
     if trainer.use_ema and trainer.ema_model is not None:
+        _ema_loaded = False
         try:
             if checkpoint is None:
                 checkpoint = torch.load(checkpoint_path, map_location=trainer.device,
@@ -617,20 +650,33 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
             if 'ema_model_state_dict' in checkpoint:
                 try:
                     trainer.ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+                    _ema_loaded = True
                 except RuntimeError as _ema_err:
-                    # Architecture migration: if the only missing keys are the
-                    # newly-restructured variance_adaptor sub-modules, do a
-                    # partial load and fill the missing keys from the current
-                    # model (which already has them freshly initialised).
+                    # Architecture migration: allow known migration key sets in the EMA
+                    # state dict, mirroring the permissive logic in _strict_resume.
                     _NEW_VP = 'duration_adaptor.variance_adaptor.'
+                    _ALIBI_SUFFIX = '.alibi_slopes'
+                    _FFN_NORM_SUFFIX = '.ff.output_norm.weight'
+                    _SPEAKER_PREFIXES = ('speaker_embedding.', 'speaker_projection.')
                     _incompat = trainer.ema_model.load_state_dict(
                         checkpoint['ema_model_state_dict'], strict=False
                     )
-                    if _incompat.unexpected_keys or not all(
-                        k.startswith(_NEW_VP) for k in _incompat.missing_keys
-                    ):
-                        raise
-                    # Copy freshly-initialised weights from current model into EMA
+                    _unexpected_ok = all(
+                        k.endswith(_ALIBI_SUFFIX) for k in _incompat.unexpected_keys
+                    )
+                    _missing_ok = all(
+                        k.startswith(_NEW_VP)
+                        or k.endswith(_FFN_NORM_SUFFIX)
+                        or k.startswith(_SPEAKER_PREFIXES)
+                        for k in _incompat.missing_keys
+                    )
+                    if not (_unexpected_ok and _missing_ok):
+                        raise RuntimeError(
+                            "EMA state dict has unrecognised incompatible keys, aborting. "
+                            f"Unexpected: {_incompat.unexpected_keys} "
+                            f"Missing: {_incompat.missing_keys}"
+                        ) from _ema_err
+                    # Fill missing keys from the freshly-initialised live model
                     _current_sd = trainer.model.state_dict()
                     _ema_sd = trainer.ema_model.state_dict()
                     for k in _incompat.missing_keys:
@@ -638,17 +684,25 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                             _ema_sd[k] = _current_sd[k].clone()
                     trainer.ema_model.load_state_dict(_ema_sd)
                     logger.warning(
-                        f"EMA partial load: {len(_incompat.missing_keys)} variance_adaptor "
-                        "keys initialised from current model (architecture migration)."
+                        f"EMA partial load: {len(_incompat.missing_keys)} key(s) initialised "
+                        f"from live model, {len(_incompat.unexpected_keys)} legacy key(s) discarded "
+                        "(architecture migration)."
                     )
-                if 'ema_updates' in checkpoint:
-                    trainer.ema_updates = checkpoint['ema_updates']
-                logger.info(f"Loaded EMA model state from checkpoint (updates: {trainer.ema_updates})")
+                    _ema_loaded = True
+
+                if _ema_loaded:
+                    if 'ema_updates' in checkpoint:
+                        trainer.ema_updates = checkpoint['ema_updates']
+                    logger.info(f"Loaded EMA model state from checkpoint (updates: {trainer.ema_updates})")
             else:
                 logger.info("No EMA state found in checkpoint, initializing EMA from current model")
                 trainer.ema_model.load_state_dict(trainer.model.state_dict())
         except Exception as e:
-            logger.warning(f"Could not load EMA state: {e}")
+            logger.warning(f"Could not load EMA state: {e}. Re-initializing EMA from current model weights.")
+            try:
+                trainer.ema_model.load_state_dict(trainer.model.state_dict())
+            except Exception as _reinit_err:
+                logger.error(f"EMA re-initialization also failed: {_reinit_err}")
 
     if checkpoint is not None:
         if 'current_optimizer_step' in checkpoint:
@@ -754,68 +808,142 @@ def resume_from_checkpoint(trainer, *, _load_checkpoint_fn=None, _SummaryWriter=
                 else:
                     logger.info("Scheduler params unchanged from checkpoint.")
 
-            # Step-based positioning: use checkpoint global_step as the anchor whenever
-            # available.  LR-value matching (the fallback below) breaks when max_lr has
-            # been changed between runs — a lower new max_lr causes the saved LR to appear
-            # near-peak, which jumps the scheduler forward by many epochs on resume.
+            # Cycle-position-based positioning:
+            #
+            # Priority 1 — use scheduler_state_dict['last_epoch'] (the exact cycle
+            # position within the OneCycleLR at save time) combined with the saved
+            # scheduler_config['onecycle_steps'] for proportional mapping.
+            #
+            # This avoids the previous bug where `global_step - new_warmup_done` was
+            # used as a proxy:  global_step is *cumulative across all runs*, but
+            # warmup_done used the *new* run's warmup config.  When the new cycle is
+            # shorter than global_step - warmup_done the result was capped at
+            # onecycle_steps-1 (≈ final_lr ≈ 0), causing subsequent crash-resumes to
+            # load near-zero-LR checkpoints whose LR-value fallback then fired and
+            # snapped the scheduler back to peak_step (≈ 100% LR), producing the
+            # catastrophic mel-loss regressions seen in the training logs.
+            #
+            # Priority 2 — fall back to global_step minus the *saved* warmup_steps
+            # (from scheduler_config) for checkpoints that pre-date the last_epoch fix.
             _saved_global_step = checkpoint.get('global_step') if checkpoint is not None else None
-            if _saved_global_step is not None:
-                # global_step is saved as current_optimizer_step — already in optimizer-step
-                # units (incremented only on a successful optimizer.step(), never by batch
-                # count or gradient_accumulation_steps).
-                #
-                # OneCycleLR's internal step counter starts at 0 when the manual warmup
-                # ends.  We therefore subtract warmup_steps to get the correct OneCycleLR
-                # position.
-                #
-                # *** DO NOT divide by gradient_accumulation_steps here. ***
-                # global_step is already post-accumulation; dividing by _grad_acc would
-                # halve the resume position, restarting the LR ramp ~1 epoch early on
-                # every resume and causing mel-loss regression (observed epochs 5–6).
-                _warmup_done = (
-                    int(getattr(trainer, 'warmup_steps', 0))
-                    if getattr(trainer, 'use_warmup', False) else 0
-                )
-                target_step = max(0, min(onecycle_steps - 1,
-                                         int(_saved_global_step) - _warmup_done))
-                # Compute the LR at target_step under the NEW schedule using the OneCycleLR
-                # cosine formula (phase 1: base_lr→max_lr; phase 2: max_lr→final_lr).
-                if target_step <= peak_step:
-                    _pct = target_step / max(1, peak_step)
-                    resume_lr = base_lr + (max_lr - base_lr) * (1.0 - math.cos(math.pi * _pct)) / 2.0
-                    resume_lr = max(base_lr, min(max_lr, resume_lr))
+
+            # Extract saved cycle position from the scheduler state dict.
+            _saved_last_epoch: int | None = None
+            if checkpoint is not None:
+                _saved_sched_state = checkpoint.get('scheduler_state_dict')
+                if isinstance(_saved_sched_state, dict):
+                    _raw_le = _saved_sched_state.get('last_epoch')
+                    if _raw_le is not None:
+                        _saved_last_epoch = int(_raw_le)
+
+            # Saved cycle length (for proportional mapping when total_steps changed).
+            _old_onecycle_steps: int = (
+                int(_saved_sched_cfg['onecycle_steps'])
+                if _saved_sched_cfg is not None
+                   and _saved_sched_cfg.get('onecycle_steps') is not None
+                else onecycle_steps
+            )
+            # Saved warmup (to correctly strip it when falling back to global_step).
+            _old_warmup_steps: int = (
+                int(_saved_sched_cfg['warmup_steps'])
+                if _saved_sched_cfg is not None
+                   and _saved_sched_cfg.get('warmup_steps') is not None
+                else (int(getattr(trainer, 'warmup_steps', 0))
+                      if getattr(trainer, 'use_warmup', False) else 0)
+            )
+
+            def _lr_at_step(step: int) -> float:
+                """Compute decoder resume_lr for a given target_step under the new schedule."""
+                if step <= peak_step:
+                    _pct = step / max(1, peak_step)
+                    lr = base_lr + (max_lr - base_lr) * (1.0 - math.cos(math.pi * _pct)) / 2.0
+                    return float(max(base_lr, min(max_lr, lr)))
                 else:
                     _decay_steps = onecycle_steps - peak_step
-                    _pct = (target_step - peak_step) / max(1, _decay_steps)
-                    resume_lr = final_lr + (max_lr - final_lr) * (1.0 + math.cos(math.pi * _pct)) / 2.0
-                    resume_lr = max(final_lr, min(max_lr, resume_lr))
+                    _pct = (step - peak_step) / max(1, _decay_steps)
+                    lr = final_lr + (max_lr - final_lr) * (1.0 + math.cos(math.pi * _pct)) / 2.0
+                    return float(max(final_lr, min(max_lr, lr)))
+
+            if _saved_last_epoch is not None:
+                # Clamp the saved position to its own cycle bounds before mapping.
+                _old_pos = max(0, min(_old_onecycle_steps, _saved_last_epoch))
+                if _old_onecycle_steps == onecycle_steps:
+                    # Identical cycle length: use position directly.
+                    target_step = max(0, min(onecycle_steps - 1, _old_pos))
+                    logger.info(
+                        f"Direct scheduler resume: last_epoch={_saved_last_epoch} "
+                        f"→ target_step={target_step}/{onecycle_steps}"
+                    )
+                else:
+                    # Cycle length changed: map the fractional position proportionally.
+                    _fraction = _old_pos / max(1, _old_onecycle_steps)
+                    target_step = max(0, min(onecycle_steps - 1,
+                                             int(round(_fraction * onecycle_steps))))
+                    logger.info(
+                        f"Proportional scheduler resume: "
+                        f"last_epoch={_old_pos}/{_old_onecycle_steps} "
+                        f"({_fraction:.4f}) → target_step={target_step}/{onecycle_steps}"
+                    )
+                resume_lr = _lr_at_step(target_step)
+            elif _saved_global_step is not None:
+                # Fallback for checkpoints without a readable scheduler_state_dict.
+                # Use global_step minus the *saved* warmup (not the new run's warmup)
+                # to avoid the cumulative-step / new-warmup mismatch that caused the
+                # previous regression.
+                _old_scheduler_step = max(0, int(_saved_global_step) - _old_warmup_steps)
+                _fraction = min(1.0, _old_scheduler_step / max(1, _old_onecycle_steps))
+                target_step = max(0, min(onecycle_steps - 1,
+                                         int(round(_fraction * onecycle_steps))))
+                resume_lr = _lr_at_step(target_step)
                 logger.info(
-                    f"Step-based scheduler resume: global_step={_saved_global_step} "
-                    f"(warmup_done={_warmup_done}) "
-                    f"→ onecycle_step={target_step}/{onecycle_steps}, "
-                    f"resume_lr={resume_lr:.2e} (decoder, new schedule max_lr={max_lr:.2e})"
+                    f"Global-step fallback scheduler resume: "
+                    f"global_step={_saved_global_step} warmup={_old_warmup_steps} "
+                    f"→ old_step={_old_scheduler_step}/{_old_onecycle_steps} "
+                    f"({_fraction:.4f}) → target_step={target_step}/{onecycle_steps}, "
+                    f"resume_lr={resume_lr:.2e}"
                 )
-            elif last_lr >= max_lr:
-                target_step = peak_step
-                resume_lr   = max_lr
-                logger.info(
-                    f"Resume LR ({last_lr:.2e}) >= new max_lr ({max_lr:.2e}); "
-                    f"positioning OneCycleLR at peak (step {peak_step})."
-                )
-            elif last_lr >= base_lr:
-                ratio = (last_lr - base_lr) / (max_lr - base_lr)
-                t = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * ratio))) / math.pi
-                target_step = max(0, min(peak_step, int(round(t * peak_step))))
-                resume_lr   = last_lr
-            elif last_lr >= final_lr:
-                decay_steps = onecycle_steps - peak_step
-                ratio = (last_lr - final_lr) / (max_lr - final_lr)
-                t = math.acos(max(-1.0, min(1.0, 2.0 * ratio - 1.0))) / math.pi
-                target_step = max(peak_step, min(onecycle_steps - 1, peak_step + int(round(t * decay_steps))))
-                resume_lr   = last_lr
             else:
-                target_step = onecycle_steps - 1
-                resume_lr   = final_lr
+                # Last-resort: no scheduler_state_dict, no global_step.
+                # Match the saved optimizer LR value to a cycle position.
+                # WARNING: this can snap to peak if last_lr happened to equal max_lr
+                # (e.g. checkpoint saved during warmup).  Avoid by ensuring checkpoints
+                # always include scheduler_state_dict and global_step.
+                if last_lr >= max_lr:
+                    target_step = peak_step
+                    resume_lr   = max_lr
+                    logger.warning(
+                        f"LR-value fallback (last resort): last_lr ({last_lr:.2e}) >= max_lr "
+                        f"({max_lr:.2e}); positioning at peak (step {peak_step}). "
+                        "This may restart the LR near 100%% — ensure checkpoints include "
+                        "scheduler_state_dict and global_step to avoid this."
+                    )
+                elif last_lr >= base_lr:
+                    ratio = (last_lr - base_lr) / (max_lr - base_lr)
+                    t = math.acos(max(-1.0, min(1.0, 1.0 - 2.0 * ratio))) / math.pi
+                    target_step = max(0, min(peak_step, int(round(t * peak_step))))
+                    resume_lr   = last_lr
+                    logger.info(
+                        f"LR-value fallback (last resort): last_lr={last_lr:.2e} "
+                        f"→ warmup phase target_step={target_step}"
+                    )
+                elif last_lr >= final_lr:
+                    decay_steps = onecycle_steps - peak_step
+                    ratio = (last_lr - final_lr) / (max_lr - final_lr)
+                    t = math.acos(max(-1.0, min(1.0, 2.0 * ratio - 1.0))) / math.pi
+                    target_step = max(peak_step, min(onecycle_steps - 1,
+                                                     peak_step + int(round(t * decay_steps))))
+                    resume_lr   = last_lr
+                    logger.info(
+                        f"LR-value fallback (last resort): last_lr={last_lr:.2e} "
+                        f"→ decay phase target_step={target_step}"
+                    )
+                else:
+                    target_step = onecycle_steps - 1
+                    resume_lr   = final_lr
+                    logger.info(
+                        f"LR-value fallback (last resort): last_lr={last_lr:.2e} below final_lr "
+                        f"→ positioning at end of cycle (target_step={target_step})"
+                    )
 
             # Build per-group max_lr mirroring trainer._setup_scheduler().
             # Uses 'group_type' tag on each param group when present;

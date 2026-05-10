@@ -75,6 +75,12 @@ class TrainingConfig:
     # decoder attention weight growth.  Requires training from scratch.
     qk_norm: bool = True
 
+    # Multi-speaker support: speaker embedding added to encoder output before
+    # variance adaptor so duration/pitch/energy and decoder are all speaker-conditioned.
+    num_speakers: int = 2       # 1 = single-speaker (embedding disabled), >1 enables speaker conditioning
+    speaker_embed_dim: int = 256  # Dimension of learned speaker embedding (projected to hidden_dim)
+    speaker_embedding_lr_multiplier: float = 0.30  # LR multiplier for speaker embedding params
+
     # Linear warmup before OneCycleLR
     use_warmup: bool = True  # Enable linear warmup before OneCycleLR
     warmup_steps: int = 1200  # Number of optimizer steps for linear warmup (not batches!)

@@ -94,7 +94,8 @@ class ModelLoader:
 
         return checkpoint
 
-    def create_model(self, vocab_size: int) -> KokoroModel:
+    def create_model(self, vocab_size: int, num_speakers: int = 1,
+                     speaker_embed_dim: int = 256) -> KokoroModel:
         """Create model with appropriate architecture parameters"""
         # Define model parameters that should match training configuration
         EMBED_DIM = 768
@@ -116,10 +117,12 @@ class ModelLoader:
             decoder_ff_dim=FF_DIM,
             max_decoder_seq_len=MAX_DECODER_SEQ_LEN,
             use_stochastic_depth=False,  # Disabled for inference
-            stochastic_depth_rate=0.0
+            stochastic_depth_rate=0.0,
+            num_speakers=num_speakers,
+            speaker_embed_dim=speaker_embed_dim,
         )
 
-        logger.info(f"Created model with vocab_size={vocab_size}")
+        logger.info(f"Created model with vocab_size={vocab_size}, num_speakers={num_speakers}")
         return model
 
     def load_state_dict(self, model: KokoroModel, checkpoint: dict) -> KokoroModel:
@@ -184,9 +187,26 @@ class ModelLoader:
         # Load checkpoint
         checkpoint = self.load_checkpoint(model_path)
 
+        # Read speaker config from checkpoint metadata so create_model builds
+        # the right architecture (avoids strict load failure on speaker keys).
+        _arch = {}
+        if isinstance(checkpoint, dict):
+            _meta = checkpoint.get('model_metadata') or {}
+            _arch = (_meta.get('architecture') or {}) if isinstance(_meta, dict) else {}
+        _num_speakers = int(_arch.get('num_speakers', 1))
+        _speaker_embed_dim = int(_arch.get('speaker_embed_dim', 256))
+        # Auto-detect from weights if metadata is absent (legacy checkpoint)
+        _spk_key = 'speaker_embedding.weight'
+        _sd = checkpoint.get('model_state_dict') or checkpoint.get('ema_model_state_dict') or {}
+        if _spk_key in _sd and _num_speakers <= 1:
+            _num_speakers = int(_sd[_spk_key].shape[0])
+            _speaker_embed_dim = int(_sd[_spk_key].shape[1])
+            logger.info(f"Auto-detected num_speakers={_num_speakers} from checkpoint weights.")
+
         # Create model
         vocab_size = len(phoneme_processor.phoneme_to_id)
-        model = self.create_model(vocab_size)
+        model = self.create_model(vocab_size, num_speakers=_num_speakers,
+                                  speaker_embed_dim=_speaker_embed_dim)
 
         # Load state dict
         model = self.load_state_dict(model, checkpoint)
